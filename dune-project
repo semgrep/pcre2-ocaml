@@ -3,17 +3,16 @@
 
 (generate_opam_files true)
 
-(source (github tobil4sk/pcre2-ocaml))
+(source (github camlp5/pcre2-ocaml))
 (license "LGPL-2.1-or-later with OCaml-LGPL-linking-exception")
-(homepage "https://mmottl.github.io/pcre-ocaml")
-(documentation "https://mmottl.github.io/pcre-ocaml/api")
+(homepage "https://github.com/camlp5/pcre2-ocaml")
 
-(maintainers "Markus Mottl <markus.mottl@gmail.com>")
+(maintainers "Chet Murthy <chetsky@gmail.com>")
 (authors "Markus Mottl <markus.mottl@gmail.com>")
 
 (package
   (name pcre2)
-  (synopsis "Bindings to the Perl Compatibility Regular Expressions library")
+  (synopsis "Bindings to the Perl Compatibility Regular Expressions library (version 2)")
   (description "\
 pcre2-ocaml offers library functions for string pattern matching and
 substitution, similar to the functionality offered by the Perl language.")
