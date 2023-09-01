@@ -47,8 +47,17 @@ Other reasons to use PCRE2-OCaml:
 
 ### Usage
 
-Please consult the [API](https://mmottl.github.io/pcre-ocaml/api/pcre)
-for details.
+Please run
+```
+$ odig odoc pcre2
+```
+or (maybe?)
+```
+$ dune build @doc
+```
+
+to build API documentation, or consult the old PCRE
+[API](https://mmottl.github.io/pcre-ocaml/api/pcre).
 
 A general concept the user may need to understand is that most functions
 allow for two different kinds of flags:
