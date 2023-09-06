@@ -15,6 +15,7 @@ depends: [
   "ocaml" {>= "4.12"}
   "dune-configurator"
   "conf-libpcre2-8" {build}
+  "ounit2" {with-test}
   "odoc" {with-doc}
 ]
 build: [
