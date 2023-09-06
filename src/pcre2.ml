@@ -1067,7 +1067,7 @@ let full_split ?(iflags = 0L) ?flags ?(rex = def_rex) ?pat
           if prematch &&
             try
               unsafe_pcre2_match
-                iflags rex ~pos ~subj_start:pos ~subj ovector callout;
+                iflags rex ~pos ~subj_start:0 ~subj ovector callout;
                true
             with Not_found -> false
           then
@@ -1085,7 +1085,7 @@ let full_split ?(iflags = 0L) ?flags ?(rex = def_rex) ?pat
           if
             try
               unsafe_pcre2_match
-                iflags rex ~pos ~subj_start:pos ~subj ovector callout;
+                iflags rex ~pos ~subj_start:0 ~subj ovector callout;
               false
             with Not_found -> true
           then
@@ -1103,7 +1103,7 @@ let full_split ?(iflags = 0L) ?flags ?(rex = def_rex) ?pat
                     try
                       unsafe_pcre2_match
                         (* `ANCHORED | `NOTEMPTY *)
-                        (Int64.logor iflags 0x80000004L) rex ~pos ~subj_start:pos ~subj
+                        (Int64.logor iflags 0x80000004L) rex ~pos ~subj_start:0 ~subj
                         ovector callout;
                       true
                     with Not_found -> false

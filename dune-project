@@ -4,7 +4,7 @@
 (generate_opam_files true)
 
 (source (github camlp5/pcre2-ocaml))
-(license "LGPL-2.1-or-later with OCaml-LGPL-linking-exception")
+(license "LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception")
 (homepage "https://github.com/camlp5/pcre2-ocaml")
 
 (maintainers "Chet Murthy <chetsky@gmail.com>")
