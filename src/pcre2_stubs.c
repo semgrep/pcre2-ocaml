@@ -248,8 +248,9 @@ static inline void raise_bad_pattern(int code, size_t pos)
   CAMLparam0();
   CAMLlocal1(v_msg);
   value v_arg;
-  v_msg = caml_alloc_string(128);
-  pcre2_get_error_message(code, (PCRE2_UCHAR *)String_val(v_msg), 128);
+  char msg_buf[128];
+  pcre2_get_error_message(code, (PCRE2_UCHAR *)msg_buf, (sizeof msg_buf) / (sizeof (PCRE2_UCHAR)));
+  v_msg = caml_copy_string(msg_buf);
   v_arg = caml_alloc_small(2, 0);
   Field(v_arg, 0) = v_msg;
   Field(v_arg, 1) = Val_int(pos);
