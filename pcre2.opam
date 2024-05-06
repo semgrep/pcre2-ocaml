@@ -5,11 +5,11 @@ synopsis:
 description: """
 pcre2-ocaml offers library functions for string pattern matching and
 substitution, similar to the functionality offered by the Perl language."""
-maintainer: ["Chet Murthy <chetsky@gmail.com>"]
+maintainer: ["Cooper Pierce <cooper@semgrep.com>"]
 authors: ["Markus Mottl <markus.mottl@gmail.com>"]
 license: "LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception"
-homepage: "https://github.com/camlp5/pcre2-ocaml"
-bug-reports: "https://github.com/camlp5/pcre2-ocaml/issues"
+homepage: "https://github.com/semgrep/pcre2-ocaml"
+bug-reports: "https://github.com/semgrep/pcre2-ocaml/issues"
 depends: [
   "dune" {>= "2.7"}
   "ocaml" {>= "4.12"}
@@ -32,4 +32,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
-dev-repo: "git+https://github.com/camlp5/pcre2-ocaml.git"
+dev-repo: "git+https://github.com/semgrep/pcre2-ocaml.git"
