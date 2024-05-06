@@ -13,9 +13,9 @@
 (package
   (name pcre2)
   (synopsis "Bindings to the Perl Compatibility Regular Expressions library (version 2)")
-  (description "pcre2-ocaml offers library functions for string pattern
-               matching and substitution, similar to the functionality offered
-               by the Perl language.")
+  (description "\
+pcre2-ocaml offers library functions for string pattern matching and
+substitution, similar to the functionality offered by the Perl language.")
   (depends
     (ocaml (>= 4.12))
     dune-configurator
