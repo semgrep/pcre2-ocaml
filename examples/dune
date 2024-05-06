@@ -1,5 +1,4 @@
 (executables
-  (names cloc count_hash pcre2grep subst dfa_restart)
-  (libraries pcre2)
-  (modes byte exe)
-)
+ (names cloc count_hash pcre2grep subst dfa_restart)
+ (libraries pcre2)
+ (modes byte exe))
