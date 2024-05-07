@@ -323,12 +323,6 @@ CAMLprim value pcre2_compile_stub_bc(value v_opt, value v_tables, value v_pat) {
         return pcre2_compile_stub(Int64_val(v_opt), v_tables, v_pat);
 }
 
-/* Gets the depth limit of a regular expression if it exists */
-/* CAMLprim value pcre2_get_depth_limit_stub(value v_rex); */
-
-/* Gets the match limit of a regular expression if it exists */
-/* CAMLprim value pcre2_get_match_limit_stub(value v_rex); */
-
 /* Sets a match limit for a regular expression imperatively */
 CAMLprim value pcre2_set_imp_match_limit_stub(value v_rex, intnat v_lim) {
         pcre2_match_context *mcontext = get_mcontext(v_rex);
