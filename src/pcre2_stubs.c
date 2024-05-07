@@ -56,10 +56,10 @@ typedef const unsigned char *chartables; /* Type of chartable sets */
 
 /* Contents of callout data */
 struct cod {
-        long subj_start;       /* Start of subject string */
-        value *v_substrings_p; /* Pointer to substrings matched so far */
-        value *v_cof_p;        /* Pointer to callout function */
-        value v_exn;           /* Possible exception raised by callout function */
+        size_t subj_start;       /* Start of subject string */
+        value *substrings;       /* Pointer to substrings matched so far */
+        value *callout_function; /* Pointer to callout function */
+        value exn;               /* Possible exception raised by callout function */
 };
 
 /* Cache for exceptions */
@@ -95,74 +95,87 @@ struct pcre2_ocaml_tables {
 #define get_tables(v) Pcre2_ocaml_tables_val(v)->tables
 #define set_tables(v, t) Pcre2_ocaml_tables_val(v)->tables = t
 
-/* Converts subject offsets from C-integers to OCaml-Integers.
+/// Copies the contents of `n` elements of the PCRE2 ovector `src` to the ocaml
+/// array `dst`, returning `&dst[n]`. Each copied value with have `subj_start` added to it to
+/// account for any user-specified offset.
+static inline value_ptr copy_ovector(value_ptr dst, const PCRE2_SIZE *src, size_t n,
+                                     size_t subj_start) {
+        for (size_t i = 0; i < n; ++i) {
+                // In theory a long may not hold this, but realistically subjects will never be long
+                // enough to cause an issue.
+                *dst = Val_long(*src + subj_start);
+                ++src;
+                ++dst;
+        }
 
-   This is a bit tricky, because there are 32- and 64-bit platforms around
-   and OCaml chooses the larger possibility for representing integers when
-   available (also in arrays) - not so the PCRE!
-*/
-static inline void copy_ovector(long subj_start, const size_t *ovec_src, value_ptr ovec_dst,
-                                uint32_t subgroups2) {
-        if (subj_start == 0)
-                while (subgroups2--) {
-                        *ovec_dst = Val_int(*ovec_src);
-                        --ovec_src;
-                        --ovec_dst;
-                }
-        else
-                while (subgroups2--) {
-                        *ovec_dst = Val_long(*ovec_src + subj_start);
-                        --ovec_src;
-                        --ovec_dst;
-                }
+        return dst;
 }
 
 /* Callout handler */
-static int pcre2_callout_handler(pcre2_callout_block *cb, struct cod *cod) {
-        if (cod == NULL) {
+// See <https://www.pcre.org/current/doc/html/pcre2callout.html> for additional information about
+// PCRE2 callouts.
+static int pcre2_callout_handler(pcre2_callout_block *cb, void *data) {
+        CAMLparam0();
+        CAMLlocal2(callout_data, ocaml_result);
+
+        if (data == NULL) {
                 return 0;
         }
+        struct cod *cod = data;
 
-        /* Callout is available */
-        value v_res;
+        const value substrings = *cod->substrings;
+        // `cb->capture_top` is one more than the number of the higest numbered
+        // captured substring (thus far). So then, for the ovector, to find the
+        // offsets for subgroups which are captured we can look from `ovec[2]`
+        // to `ovec[2 * cb->capture_top - 1]`.
+        //
+        // N.B.: `ovec[0]` and `ovec[1]` will always be `PCRE2_UNSET` since the
+        // match is not complete (since we are in a callout).
+        //
+        // See
+        // <https://www.pcre.org/current/doc/html/pcre2callout.html#:~:text=Fields%20for%20all%20callouts>
+        // for more information about this in the context of callouts.
+        // See <https://www.pcre.org/current/doc/html/pcre2api.html#SEC29> for more discussion of
+        // the ovector format in PCRE2.
+        const PCRE2_SIZE full_match_ovec_offset = 2;
+        const uint32_t num_offsets = (2 * cb->capture_top) - full_match_ovec_offset;
 
-        /* Set up parameter array */
-        value v_callout_data = caml_alloc_small(8, 0);
+        const PCRE2_SIZE *ovec_src = cb->offset_vector + full_match_ovec_offset;
+        value_ptr ovec_dst = &Field(Field(substrings, 1), 0);
+        size_t subj_start = cod->subj_start;
 
-        const value v_substrings = *cod->v_substrings_p;
+        copy_ovector(ovec_dst, ovec_src, num_offsets, subj_start);
 
-        const uint32_t capture_top = cb->capture_top;
-        uint32_t subgroups2 = capture_top << 1;
-        const uint32_t subgroups2_1 = subgroups2 - 1;
+        // NOTE: direct assignment here is fine since callout data is allocated
+        // with caml_alloc_small. See
+        // <https://ocaml.org/manual/5.1/intfc.html>, namely rules 5 and 6.
+        callout_data = caml_alloc_small(8, 0);
+        Field(callout_data, 0) = Val_int(cb->callout_number);
+        Field(callout_data, 1) = substrings;
 
-        const size_t *ovec_src = cb->offset_vector + subgroups2_1;
-        value_ptr ovec_dst = &Field(Field(v_substrings, 1), 0) + subgroups2_1;
-        long subj_start = cod->subj_start;
+        // Add the subj_start to account for user provided offset in matching.
+        Field(callout_data, 2) = Val_int(cb->start_match + subj_start);
+        Field(callout_data, 3) = Val_int(cb->current_position + subj_start);
 
-        copy_ovector(subj_start, ovec_src, ovec_dst, subgroups2);
+        Field(callout_data, 4) = Val_int(cb->capture_top);
+        Field(callout_data, 5) = Val_int(cb->capture_last);
+        Field(callout_data, 6) = Val_int(cb->pattern_position);
+        Field(callout_data, 7) = Val_int(cb->next_item_length);
 
-        Field(v_callout_data, 0) = Val_int(cb->callout_number);
-        Field(v_callout_data, 1) = v_substrings;
-        Field(v_callout_data, 2) = Val_int(cb->start_match + subj_start);
-        Field(v_callout_data, 3) = Val_int(cb->current_position + subj_start);
-        Field(v_callout_data, 4) = Val_int(capture_top);
-        Field(v_callout_data, 5) = Val_int(cb->capture_last);
-        Field(v_callout_data, 6) = Val_int(cb->pattern_position);
-        Field(v_callout_data, 7) = Val_int(cb->next_item_length);
+        // Perform callout
+        ocaml_result = caml_callback_exn(*cod->callout_function, callout_data);
 
-        /* Perform callout */
-        v_res = caml_callback_exn(*cod->v_cof_p, v_callout_data);
-
-        if (Is_exception_result(v_res)) {
-                /* Callout raised an exception */
-                const value v_exn = Extract_exception(v_res);
-                if (Field(v_exn, 0) == *pcre2_exc_Backtrack)
-                        return 1;
-                cod->v_exn = v_exn;
-                return PCRE2_ERROR_CALLOUT;
+        if (Is_exception_result(ocaml_result)) {
+                // Callout raised an exception
+                const value exn = Extract_exception(ocaml_result);
+                if (Field(exn, 0) == *pcre2_exc_Backtrack) {
+                        CAMLreturnT(int, 1);
+                }
+                cod->exn = exn;
+                CAMLreturnT(int, PCRE2_ERROR_CALLOUT);
         }
 
-        return 0;
+        CAMLreturnT(int, 0);
 }
 
 /* Fetches the named OCaml-values + caches them and
@@ -465,17 +478,25 @@ static inline void handle_match_error(char *loc, const int ret) {
 }
 
 static inline void handle_pcre2_match_result(size_t *ovec, value v_ovec, size_t ovec_len,
-                                             long subj_start, uint32_t ret) {
-        value_ptr ocaml_ovec = &Field(v_ovec, 0);
-        const uint32_t subgroups2 = ret * 2;
-        const uint32_t subgroups2_1 = subgroups2 - 1;
-        const size_t *ovec_src = ovec + subgroups2_1;
-        value_ptr ovec_clear_stop = ocaml_ovec + (ovec_len * 2) / 3;
-        value_ptr ovec_dst = ocaml_ovec + subgroups2_1;
-        copy_ovector(subj_start, ovec_src, ovec_dst, subgroups2);
-        while (++ovec_dst < ovec_clear_stop) {
-                *ovec_dst = -1;
+                                             size_t subj_start, uint32_t match_ret) {
+        CAMLparam1(v_ovec);
+
+        const size_t num_offsets = 2 * match_ret;
+        value_ptr dst = &Field(v_ovec, 0);
+        // Need to clear 2/3rd of the ovector since the first 2/3rds are
+        // actual substrings and the last 3rd is just scratch space.
+        value_ptr clear_until = dst + (ovec_len * 2) / 3;
+
+        dst = copy_ovector(dst, ovec, num_offsets, subj_start);
+        // We do this so that excess capture groups which may be inspected in
+        // OCaml are correctly reported as having no match.
+        // See <https://github.com/mmottl/pcre-ocaml/issues/5>
+        while (dst < clear_until) {
+                *dst = Val_int(-1);
+                ++dst;
         }
+
+        CAMLreturn0;
 }
 
 /* Executes a pattern match with runtime options, a regular expression, a
@@ -537,12 +558,11 @@ CAMLprim value pcre2_match_stub0(int64_t v_opt, value v_rex, intnat v_pos, intna
                 PCRE2_UCHAR *subj = caml_stat_alloc(sizeof(char) * len);
                 int workspace_len;
                 int *workspace;
-                struct cod cod = {0, (value *)NULL, (value *)NULL, (value)NULL};
+                struct cod cod = {
+                    .subj_start = 0, .substrings = NULL, .callout_function = NULL, .exn = Val_unit};
                 pcre2_match_context *new_mcontext = pcre2_match_context_copy(mcontext);
 
-                pcre2_set_callout(
-                    new_mcontext,
-                    (int (*)(pcre2_callout_block_8 *, void *)) & pcre2_callout_handler, &cod);
+                pcre2_set_callout(new_mcontext, pcre2_callout_handler, &cod);
 
                 cod.subj_start = subj_start;
                 memcpy(subj, ocaml_subj, len);
@@ -555,8 +575,8 @@ CAMLprim value pcre2_match_stub0(int64_t v_opt, value v_rex, intnat v_pos, intna
                 Field(v_substrings, 0) = v_subj;
                 Field(v_substrings, 1) = v_ovec;
 
-                cod.v_substrings_p = &v_substrings;
-                cod.v_cof_p = &v_cof;
+                cod.substrings = &v_substrings;
+                cod.callout_function = &v_cof;
 
                 if (is_dfa) {
                         workspace_len = Wosize_val(v_workspace);
@@ -577,15 +597,14 @@ CAMLprim value pcre2_match_stub0(int64_t v_opt, value v_rex, intnat v_pos, intna
                         }
                         pcre2_match_data_free(match_data);
                         if (ret == PCRE2_ERROR_CALLOUT) {
-                                caml_raise(cod.v_exn);
+                                caml_raise(cod.exn);
                         } else {
                                 handle_match_error("pcre2_match_stub(callout)", ret);
                         }
                 } else {
                         handle_pcre2_match_result(ovec, v_ovec, ovec_len, subj_start, ret);
                         if (is_dfa) {
-                                value_ptr ocaml_workspace_dst =
-                                    &Field(v_workspace, 0);
+                                value_ptr ocaml_workspace_dst = &Field(v_workspace, 0);
                                 const int *workspace_src = workspace;
                                 const int *workspace_src_stop = workspace + workspace_len;
                                 while (workspace_src != workspace_src_stop) {
