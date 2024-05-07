@@ -509,108 +509,101 @@ CAMLprim value pcre2_match_stub0(int64_t v_opt, value v_rex, intnat v_pos, intna
         pos -= subj_start;
         len -= subj_start;
 
-        {
-                const pcre2_code *code = get_rex(v_rex);             /* Compiled pattern */
-                pcre2_match_context *mcontext = get_mcontext(v_rex); /* Match context */
-                PCRE2_SPTR ocaml_subj =
-                    (PCRE2_SPTR)String_val(v_subj) + subj_start; /* Subject string */
+        const pcre2_code *code = get_rex(v_rex);                             /* Compiled pattern */
+        pcre2_match_context *mcontext = get_mcontext(v_rex);                 /* Match context */
+        PCRE2_SPTR ocaml_subj = (PCRE2_SPTR)String_val(v_subj) + subj_start; /* Subject string */
 
-                pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(code, NULL);
+        pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(code, NULL);
 
-                /* Special case when no callout functions specified */
-                if (Is_none(v_maybe_cof)) {
-                        /* Performs the match */
-                        if (is_dfa) {
-                                ret = pcre2_dfa_match(code, ocaml_subj, len, pos, v_opt, match_data,
-                                                      mcontext, (int *)&Field(v_workspace, 0),
-                                                      Wosize_val(v_workspace));
-                        } else {
-                                ret = pcre2_match(code, ocaml_subj, len, pos, v_opt, match_data,
-                                                  mcontext);
-                        }
-
-                        size_t *ovec = pcre2_get_ovector_pointer(match_data);
-
-                        if (ret < 0) {
-                                pcre2_match_data_free(match_data);
-                                handle_match_error("pcre2_match_stub", ret);
-                        } else {
-                                handle_pcre2_match_result(ovec, v_ovec, ovec_len, subj_start, ret);
-                        }
+        /* Special case when no callout functions specified */
+        if (Is_none(v_maybe_cof)) {
+                /* Performs the match */
+                if (is_dfa) {
+                        ret =
+                            pcre2_dfa_match(code, ocaml_subj, len, pos, v_opt, match_data, mcontext,
+                                            (int *)&Field(v_workspace, 0), Wosize_val(v_workspace));
+                } else {
+                        ret = pcre2_match(code, ocaml_subj, len, pos, v_opt, match_data, mcontext);
                 }
 
-                /* There are callout functions */
-                else {
-                        value v_cof = Field(v_maybe_cof, 0);
-                        value v_substrings;
-                        PCRE2_UCHAR *subj = caml_stat_alloc(sizeof(char) * len);
-                        int workspace_len;
-                        int *workspace;
-                        struct cod cod = {0, (value *)NULL, (value *)NULL, (value)NULL};
-                        pcre2_match_context *new_mcontext = pcre2_match_context_copy(mcontext);
+                size_t *ovec = pcre2_get_ovector_pointer(match_data);
 
-                        pcre2_set_callout(new_mcontext,
-                                          (int (*)(pcre2_callout_block_8 *, void *))
-                                              & pcre2_callout_handler,
-                                          &cod);
-
-                        cod.subj_start = subj_start;
-                        memcpy(subj, ocaml_subj, len);
-
-                        Begin_roots4(v_rex, v_cof, v_substrings, v_ovec);
-                        Begin_roots1(v_subj);
-                        v_substrings = caml_alloc_small(2, 0);
-                        End_roots();
-
-                        Field(v_substrings, 0) = v_subj;
-                        Field(v_substrings, 1) = v_ovec;
-
-                        cod.v_substrings_p = &v_substrings;
-                        cod.v_cof_p = &v_cof;
-
-                        if (is_dfa) {
-                                workspace_len = Wosize_val(v_workspace);
-                                workspace = caml_stat_alloc(sizeof(int) * workspace_len);
-                                ret = pcre2_dfa_match(code, subj, len, pos, v_opt, match_data,
-                                                      new_mcontext, (int *)&Field(v_workspace, 0),
-                                                      workspace_len);
-                        } else
-                                ret = pcre2_match(code, subj, len, pos, v_opt, match_data,
-                                                  new_mcontext);
-
-                        caml_stat_free(subj);
-                        End_roots();
-
-                        pcre2_match_context_free(new_mcontext);
-                        size_t *ovec = pcre2_get_ovector_pointer(match_data);
-                        if (ret < 0) {
-                                if (is_dfa) {
-                                        caml_stat_free(workspace);
-                                }
-                                pcre2_match_data_free(match_data);
-                                if (ret == PCRE2_ERROR_CALLOUT) {
-                                        caml_raise(cod.v_exn);
-                                } else {
-                                        handle_match_error("pcre2_match_stub(callout)", ret);
-                                }
-                        } else {
-                                handle_pcre2_match_result(ovec, v_ovec, ovec_len, subj_start, ret);
-                                if (is_dfa) {
-                                        caml_int_ptr ocaml_workspace_dst =
-                                            (caml_int_ptr)&Field(v_workspace, 0);
-                                        const int *workspace_src = workspace;
-                                        const int *workspace_src_stop = workspace + workspace_len;
-                                        while (workspace_src != workspace_src_stop) {
-                                                *ocaml_workspace_dst = *workspace_src;
-                                                ocaml_workspace_dst++;
-                                                workspace_src++;
-                                        }
-                                        caml_stat_free(workspace);
-                                }
-                        }
+                if (ret < 0) {
+                        pcre2_match_data_free(match_data);
+                        handle_match_error("pcre2_match_stub", ret);
+                } else {
+                        handle_pcre2_match_result(ovec, v_ovec, ovec_len, subj_start, ret);
                 }
-                pcre2_match_data_free(match_data);
         }
+
+        /* There are callout functions */
+        else {
+                value v_cof = Field(v_maybe_cof, 0);
+                value v_substrings;
+                PCRE2_UCHAR *subj = caml_stat_alloc(sizeof(char) * len);
+                int workspace_len;
+                int *workspace;
+                struct cod cod = {0, (value *)NULL, (value *)NULL, (value)NULL};
+                pcre2_match_context *new_mcontext = pcre2_match_context_copy(mcontext);
+
+                pcre2_set_callout(
+                    new_mcontext,
+                    (int (*)(pcre2_callout_block_8 *, void *)) & pcre2_callout_handler, &cod);
+
+                cod.subj_start = subj_start;
+                memcpy(subj, ocaml_subj, len);
+
+                Begin_roots4(v_rex, v_cof, v_substrings, v_ovec);
+                Begin_roots1(v_subj);
+                v_substrings = caml_alloc_small(2, 0);
+                End_roots();
+
+                Field(v_substrings, 0) = v_subj;
+                Field(v_substrings, 1) = v_ovec;
+
+                cod.v_substrings_p = &v_substrings;
+                cod.v_cof_p = &v_cof;
+
+                if (is_dfa) {
+                        workspace_len = Wosize_val(v_workspace);
+                        workspace = caml_stat_alloc(sizeof(int) * workspace_len);
+                        ret = pcre2_dfa_match(code, subj, len, pos, v_opt, match_data, new_mcontext,
+                                              (int *)&Field(v_workspace, 0), workspace_len);
+                } else
+                        ret = pcre2_match(code, subj, len, pos, v_opt, match_data, new_mcontext);
+
+                caml_stat_free(subj);
+                End_roots();
+
+                pcre2_match_context_free(new_mcontext);
+                size_t *ovec = pcre2_get_ovector_pointer(match_data);
+                if (ret < 0) {
+                        if (is_dfa) {
+                                caml_stat_free(workspace);
+                        }
+                        pcre2_match_data_free(match_data);
+                        if (ret == PCRE2_ERROR_CALLOUT) {
+                                caml_raise(cod.v_exn);
+                        } else {
+                                handle_match_error("pcre2_match_stub(callout)", ret);
+                        }
+                } else {
+                        handle_pcre2_match_result(ovec, v_ovec, ovec_len, subj_start, ret);
+                        if (is_dfa) {
+                                caml_int_ptr ocaml_workspace_dst =
+                                    (caml_int_ptr)&Field(v_workspace, 0);
+                                const int *workspace_src = workspace;
+                                const int *workspace_src_stop = workspace + workspace_len;
+                                while (workspace_src != workspace_src_stop) {
+                                        *ocaml_workspace_dst = *workspace_src;
+                                        ocaml_workspace_dst++;
+                                        workspace_src++;
+                                }
+                                caml_stat_free(workspace);
+                        }
+                }
+        }
+        pcre2_match_data_free(match_data);
 
         return Val_unit;
 }
