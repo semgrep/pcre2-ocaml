@@ -290,8 +290,8 @@ CAMLprim value pcre2_compile_stub(int64_t v_opt, value v_tables, value v_pat) {
         }
 
         /* Compiles the pattern */
-        pcre2_code *regexp = pcre2_compile((PCRE2_SPTR)String_val(v_pat), length, v_opt,
-                                           &error_code, &error_ofs, ccontext);
+        pcre2_code *regexp =
+            pcre2_compile(Bytes_val(v_pat), length, v_opt, &error_code, &error_ofs, ccontext);
 
         pcre2_compile_context_free(ccontext);
 
@@ -720,7 +720,7 @@ CAMLprim value pcre2_version_stub(value __unused v_unit) {
         CAMLlocal1(v_version);
         v_version = caml_alloc_string(32);
 
-        pcre2_config(PCRE2_CONFIG_VERSION, (void *)String_val(v_version));
+        pcre2_config(PCRE2_CONFIG_VERSION, Bytes_val(v_version));
 
         CAMLreturn(v_version);
 }
