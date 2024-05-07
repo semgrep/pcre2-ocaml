@@ -29,12 +29,6 @@
 #endif
 #endif
 
-#if _WIN64
-typedef long long *caml_int_ptr;
-#else
-typedef long *caml_int_ptr;
-#endif
-
 #if __GNUC__ >= 3
 #define __unused __attribute__((unused))
 #else
@@ -590,8 +584,8 @@ CAMLprim value pcre2_match_stub0(int64_t v_opt, value v_rex, intnat v_pos, intna
                 } else {
                         handle_pcre2_match_result(ovec, v_ovec, ovec_len, subj_start, ret);
                         if (is_dfa) {
-                                caml_int_ptr ocaml_workspace_dst =
-                                    (caml_int_ptr)&Field(v_workspace, 0);
+                                value_ptr ocaml_workspace_dst =
+                                    &Field(v_workspace, 0);
                                 const int *workspace_src = workspace;
                                 const int *workspace_src_stop = workspace + workspace_len;
                                 while (workspace_src != workspace_src_stop) {
