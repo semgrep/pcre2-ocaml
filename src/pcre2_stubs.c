@@ -52,6 +52,8 @@ typedef long *caml_int_ptr;
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
 
+// NOTE: Currently these bindings support only 8-bit code units. Below we use the generically named
+// functions. Future versions could include support for non-8-bit code units.
 #define PCRE2_CODE_UNIT_WIDTH 8
 
 #include <pcre2.h>
@@ -326,7 +328,6 @@ CAMLprim value pcre2_compile_stub_bc(value v_opt, value v_tables, value v_pat) {
 /* CAMLprim value pcre2_get_match_limit_stub(value v_rex); */
 
 /* Sets a match limit for a regular expression imperatively */
-
 CAMLprim value pcre2_set_imp_match_limit_stub(value v_rex, intnat v_lim) {
         pcre2_match_context *mcontext = get_mcontext(v_rex);
         pcre2_set_match_limit(mcontext, v_lim);
@@ -338,7 +339,6 @@ CAMLprim value pcre2_set_imp_match_limit_stub_bc(value v_rex, value v_lim) {
 }
 
 /* Sets a depth limit for a regular expression imperatively */
-
 CAMLprim value pcre2_set_imp_depth_limit_stub(value v_rex, intnat v_lim) {
         pcre2_match_context *mcontext = get_mcontext(v_rex);
         pcre2_set_depth_limit(mcontext, v_lim);
@@ -474,6 +474,8 @@ static inline void handle_match_error(char *loc, const int ret) {
         case PCRE2_ERROR_DFA_WSSIZE:
                 raise_workspace_size();
         default: {
+                // NOTE: PCRE2_ERROR_* are negative, hence why the higher numbered error is our
+                // lower bound here.
                 if (PCRE2_ERROR_UTF8_ERR21 <= ret && ret <= PCRE2_ERROR_UTF8_ERR1) {
                         raise_bad_utf();
                 }
