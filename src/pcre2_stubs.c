@@ -105,7 +105,7 @@ struct pcre2_ocaml_tables {
    and OCaml chooses the larger possibility for representing integers when
    available (also in arrays) - not so the PCRE!
 */
-static inline void copy_ovector(long subj_start, const size_t *ovec_src, caml_int_ptr ovec_dst,
+static inline void copy_ovector(long subj_start, const size_t *ovec_src, value_ptr ovec_dst,
                                 uint32_t subgroups2) {
         if (subj_start == 0)
                 while (subgroups2--) {
@@ -472,12 +472,12 @@ static inline void handle_match_error(char *loc, const int ret) {
 
 static inline void handle_pcre2_match_result(size_t *ovec, value v_ovec, size_t ovec_len,
                                              long subj_start, uint32_t ret) {
-        caml_int_ptr ocaml_ovec = (caml_int_ptr)&Field(v_ovec, 0);
+        value_ptr ocaml_ovec = &Field(v_ovec, 0);
         const uint32_t subgroups2 = ret * 2;
         const uint32_t subgroups2_1 = subgroups2 - 1;
         const size_t *ovec_src = ovec + subgroups2_1;
-        caml_int_ptr ovec_clear_stop = ocaml_ovec + (ovec_len * 2) / 3;
-        caml_int_ptr ovec_dst = ocaml_ovec + subgroups2_1;
+        value_ptr ovec_clear_stop = ocaml_ovec + (ovec_len * 2) / 3;
+        value_ptr ovec_dst = ocaml_ovec + subgroups2_1;
         copy_ovector(subj_start, ovec_src, ovec_dst, subgroups2);
         while (++ovec_dst < ovec_clear_stop)
                 *ovec_dst = -1;
