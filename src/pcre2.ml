@@ -313,7 +313,7 @@ type chtables
 
 external maketables : unit -> chtables = "pcre2_maketables_stub"
 
-external compile : (icflag [@unboxed]) -> chtables option -> string -> regexp
+external compile : bool -> (icflag [@unboxed]) -> chtables option -> string -> regexp
   = "pcre2_compile_stub_bc" "pcre2_compile_stub"
 
 (* external get_match_limit : regexp -> int option = "pcre2_get_match_limit_stub" *)
@@ -331,15 +331,14 @@ external set_imp_depth_limit : regexp -> (int [@untagged]) -> regexp
   = "pcre2_set_imp_depth_limit_stub_bc" "pcre2_set_imp_depth_limit_stub"
   [@@noalloc]
 
-(* TODO implement jit using new pcre2_jit_compile api *)
 let regexp
-      (* ?(jit_compile = false) *)
+      ?(jit_compile = false) 
       ?limit ?depth_limit
       ?(iflags = 0L) ?flags ?chtables pat =
   let rex =
     match flags with
-    | Some flag_list -> compile (cflags flag_list) chtables pat
-    | _ -> compile iflags chtables pat
+    | Some flag_list -> compile jit_compile (cflags flag_list) chtables pat
+    | _ -> compile jit_compile iflags chtables pat
   in
   let rex =
     match limit with
@@ -351,7 +350,7 @@ let regexp
   | Some lim -> set_imp_depth_limit rex lim
 
 let regexp_or
-      (* ?jit_compile *) ?limit ?depth_limit ?(iflags = 0L) ?flags ?chtables pats =
+      ?jit_compile ?limit ?depth_limit ?(iflags = 0L) ?flags ?chtables pats =
   let check pat =
     try ignore (regexp ~iflags ?flags ?chtables pat)
     with Error error -> raise (Regexp_or (pat, error))
@@ -361,7 +360,7 @@ let regexp_or
     let cnv pat = "(?:" ^ pat ^ ")" in
     String.concat "|" (List.rev (List.rev_map cnv pats))
   in
-  regexp (* ?jit_compile *) ?limit ?depth_limit ~iflags ?flags ?chtables big_pat
+  regexp ?jit_compile ?limit ?depth_limit ~iflags ?flags ?chtables big_pat
 
 let bytes_unsafe_blit_string str str_ofs bts bts_ofs len =
   let str_bts = Bytes.unsafe_of_string str in

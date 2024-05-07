@@ -241,20 +241,21 @@ val maketables : unit -> chtables
 (** Generates new set of char tables for the current locale. *)
 
 val regexp :
-  (* ?jit_compile : bool -> *)
+  ?jit_compile : bool ->
   ?limit : int ->
   ?depth_limit : int ->
   ?iflags : icflag ->
   ?flags : cflag list ->
   ?chtables : chtables ->
   string -> regexp
-(** [regexp ?limit ?depth_limit ?iflags ?flags ?chtables pattern]
+(** [regexp ?jit_compile ?limit ?depth_limit ?iflags ?flags ?chtables pattern]
     compiles [pattern] with [flags] when given, with [iflags] otherwise,
     and with char tables [chtables].  If [limit] is specified, this sets
     a limit to the amount of recursion and backtracking (only lower than
     the builtin default!).  If this limit is exceeded, [MatchLimit] will
     be raised during matching.
 
+    @param jit_compile TODO
     @param limit default = no extra limit other than default
     @param depth_limit default = no extra depth_limit other than default
     @param iflags default = no extra flags
@@ -269,14 +270,14 @@ val regexp :
     @see <http://www.perl.com> www.perl.com *)
 
 val regexp_or :
-  (* ?jit_compile : bool -> *)
+  ?jit_compile : bool ->
   ?limit : int ->
   ?depth_limit : int ->
   ?iflags : icflag ->
   ?flags : cflag list ->
   ?chtables : chtables ->
   string list -> regexp
-(** [regexp_or ?limit ?depth_limit ?iflags ?flags ?chtables patterns]
+(** [regexp_or ?jit_compile ?limit ?depth_limit ?iflags ?flags ?chtables patterns]
     like {!regexp}, but combines [patterns] as alternatives (or-patterns) into
     one regular expression.
 *)

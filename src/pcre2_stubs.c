@@ -196,7 +196,7 @@ static void pcre2_dealloc_tables(value v_tables) {
 #if PCRE2_MINOR >= 34
         pcre2_maketables_free(NULL, get_tables(v_tables));
 #else
-        free((void *)get_tables(v_tables));
+        free(get_tables(v_tables));
 #endif
 }
 
@@ -251,10 +251,9 @@ CAMLnoret static inline void raise_bad_pattern(int code, size_t pos) {
         CAMLnoreturn;
 }
 
-CAMLnoret static inline void raise_internal_error(char *msg) {
+CAMLnoret static inline void raise_internal_error(const char *msg) {
         CAMLparam0();
-        CAMLlocal1(v_msg);
-        value v_arg;
+        CAMLlocal2(v_msg, v_arg);
         v_msg = caml_copy_string(msg);
         v_arg = caml_alloc_small(1, 1);
         Field(v_arg, 0) = v_msg;
@@ -272,7 +271,7 @@ static struct custom_operations regexp_ops = {
 /* Makes compiled regular expression from compilation options, an optional
    value of chartables and the pattern string */
 
-CAMLprim value pcre2_compile_stub(int64_t v_opt, value v_tables, value v_pat) {
+CAMLprim value pcre2_compile_stub(value jit, int64_t v_opt, value v_tables, value v_pat) {
         value v_rex; /* Final result -> value of type [regexp] */
         size_t ocaml_regexp_size = sizeof(struct pcre2_ocaml_regexp);
         int error_code = 0;   /* error code for potential error */
@@ -299,6 +298,13 @@ CAMLprim value pcre2_compile_stub(int64_t v_opt, value v_tables, value v_pat) {
                 raise_bad_pattern(error_code, error_ofs);
         }
 
+        if (Bool_val(jit)) {
+                // See also <https://pcre.org/current/doc/html/pcre2jit.html>
+                if (pcre2_jit_compile(regexp, PCRE2_JIT_COMPLETE) < 0) {
+                        raise_internal_error("issue in JIT compilation");
+                }
+        }
+
         /* It's unknown at this point whether JIT compilation is going to be used,
            but we have to decide on a size.  Tests with some simple patterns indicate a
            roughly 50% increase in size when studying without JIT.  A factor of
@@ -313,8 +319,8 @@ CAMLprim value pcre2_compile_stub(int64_t v_opt, value v_tables, value v_pat) {
         return v_rex;
 }
 
-CAMLprim value pcre2_compile_stub_bc(value v_opt, value v_tables, value v_pat) {
-        return pcre2_compile_stub(Int64_val(v_opt), v_tables, v_pat);
+CAMLprim value pcre2_compile_stub_bc(value jit, value v_opt, value v_tables, value v_pat) {
+        return pcre2_compile_stub(jit, Int64_val(v_opt), v_tables, v_pat);
 }
 
 /* Sets a match limit for a regular expression imperatively */
@@ -346,6 +352,7 @@ static inline int pcre2_pattern_info_stub(value v_rex, int what, void *where) {
 
 /* Some stubs for info-functions */
 
+/* clang-format off */ 
 /* Generic macro for getting integer results from pcre2_pattern_info */
 #define make_intnat_info(tp, name, option)                                                     \
         CAMLprim intnat pcre2_##name##_stub(value v_rex) {                                     \
@@ -360,11 +367,15 @@ static inline int pcre2_pattern_info_stub(value v_rex, int what, void *where) {
                 return Val_int(pcre2_##name##_stub(v_rex));                                    \
         }
 
-make_intnat_info(size_t, size, SIZE) make_intnat_info(int, capturecount, CAPTURECOUNT)
-    make_intnat_info(int, backrefmax, BACKREFMAX) make_intnat_info(int, namecount, NAMECOUNT)
-        make_intnat_info(int, nameentrysize, NAMEENTRYSIZE)
 
-            CAMLprim int64_t pcre2_argoptions_stub(value v_rex) {
+make_intnat_info(size_t, size, SIZE)
+make_intnat_info(int, capturecount, CAPTURECOUNT)
+make_intnat_info(int, backrefmax, BACKREFMAX)
+make_intnat_info(int, namecount, NAMECOUNT)
+make_intnat_info(int, nameentrysize, NAMEENTRYSIZE)
+    /* clang-format on */
+
+    CAMLprim int64_t pcre2_argoptions_stub(value v_rex) {
         uint32_t options;
         const int ret = pcre2_pattern_info_stub(v_rex, PCRE2_INFO_ARGOPTIONS, &options);
         if (ret != 0) {
