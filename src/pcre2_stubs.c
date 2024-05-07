@@ -201,48 +201,35 @@ static void pcre2_dealloc_regexp(value v_rex) {
 
 /* Raising exceptions */
 
-CAMLnoreturn_start static inline void raise_pcre2_error(value v_arg) CAMLnoreturn_end;
-
-CAMLnoreturn_start static inline void raise_partial(void) CAMLnoreturn_end;
-
-CAMLnoreturn_start static inline void raise_bad_utf(void) CAMLnoreturn_end;
-
-CAMLnoreturn_start static inline void raise_bad_utf_offset(void) CAMLnoreturn_end;
-
-CAMLnoreturn_start static inline void raise_match_limit(void) CAMLnoreturn_end;
-
-CAMLnoreturn_start static inline void raise_depth_limit(void) CAMLnoreturn_end;
-
-CAMLnoreturn_start static inline void raise_workspace_size(void) CAMLnoreturn_end;
-
-CAMLnoreturn_start static inline void raise_bad_pattern(int code, size_t pos) CAMLnoreturn_end;
-
-CAMLnoreturn_start static inline void raise_internal_error(char *msg) CAMLnoreturn_end;
-
-static inline void raise_pcre2_error(value v_arg) {
+CAMLnoret static inline void raise_pcre2_error(value v_arg) {
         caml_raise_with_arg(*pcre2_exc_Error, v_arg);
 }
 
-static inline void raise_partial(void) {
+CAMLnoret static inline void raise_partial(void) {
         raise_pcre2_error(Val_int(0));
 }
-static inline void raise_bad_utf(void) {
+
+CAMLnoret static inline void raise_bad_utf(void) {
         raise_pcre2_error(Val_int(1));
 }
-static inline void raise_bad_utf_offset(void) {
+
+CAMLnoret static inline void raise_bad_utf_offset(void) {
         raise_pcre2_error(Val_int(2));
 }
-static inline void raise_match_limit(void) {
+
+CAMLnoret static inline void raise_match_limit(void) {
         raise_pcre2_error(Val_int(3));
 }
-static inline void raise_depth_limit(void) {
+
+CAMLnoret static inline void raise_depth_limit(void) {
         raise_pcre2_error(Val_int(4));
 }
-static inline void raise_workspace_size(void) {
+
+CAMLnoret static inline void raise_workspace_size(void) {
         raise_pcre2_error(Val_int(5));
 }
 
-static inline void raise_bad_pattern(int code, size_t pos) {
+CAMLnoret static inline void raise_bad_pattern(int code, size_t pos) {
         CAMLparam0();
         CAMLlocal1(v_msg);
         value v_arg;
@@ -257,7 +244,7 @@ static inline void raise_bad_pattern(int code, size_t pos) {
         CAMLnoreturn;
 }
 
-static inline void raise_internal_error(char *msg) {
+CAMLnoret static inline void raise_internal_error(char *msg) {
         CAMLparam0();
         CAMLlocal1(v_msg);
         value v_arg;
