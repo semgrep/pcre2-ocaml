@@ -276,7 +276,7 @@ static struct custom_operations regexp_ops = {
 
 CAMLprim value pcre2_compile_stub(int64_t v_opt, value v_tables, value v_pat) {
         value v_rex; /* Final result -> value of type [regexp] */
-        size_t regexp_size, ocaml_regexp_size = sizeof(struct pcre2_ocaml_regexp);
+        size_t ocaml_regexp_size = sizeof(struct pcre2_ocaml_regexp);
         int error_code = 0;   /* error code for potential error */
         size_t error_ofs = 0; /* offset in the pattern at which error occurred */
         size_t length = caml_string_length(v_pat);
@@ -297,13 +297,15 @@ CAMLprim value pcre2_compile_stub(int64_t v_opt, value v_tables, value v_pat) {
 
         /* Raises appropriate exception with [BadPattern] if the pattern
            could not be compiled */
-        if (regexp == NULL)
+        if (regexp == NULL) {
                 raise_bad_pattern(error_code, error_ofs);
+        }
 
         /* It's unknown at this point whether JIT compilation is going to be used,
            but we have to decide on a size.  Tests with some simple patterns indicate a
            roughly 50% increase in size when studying without JIT.  A factor of
            two times hence seems like a reasonable bound to use here. */
+        size_t regexp_size;
         pcre2_pattern_info(regexp, PCRE2_INFO_SIZE, &regexp_size);
         v_rex = caml_alloc_custom_mem(&regexp_ops, ocaml_regexp_size, 2 * regexp_size);
 
@@ -375,8 +377,9 @@ make_intnat_info(size_t, size, SIZE) make_intnat_info(int, capturecount, CAPTURE
             CAMLprim int64_t pcre2_argoptions_stub(value v_rex) {
         uint32_t options;
         const int ret = pcre2_pattern_info_stub(v_rex, PCRE2_INFO_ARGOPTIONS, &options);
-        if (ret != 0)
+        if (ret != 0) {
                 raise_internal_error("pcre2_argoptions_stub");
+        }
         return (int64_t)options;
 }
 
@@ -389,22 +392,27 @@ CAMLprim value pcre2_firstcodeunit_stub(value v_rex) {
         uint32_t firstcodetype;
         const int ret = pcre2_pattern_info_stub(v_rex, PCRE2_INFO_FIRSTCODETYPE, &firstcodetype);
 
-        if (ret != 0)
+        if (ret != 0) {
                 raise_internal_error("pcre2_firstcodeunit_stub");
+        }
 
         switch (firstcodetype) {
-        case 2:
+        // start of string or after newline
+        case 2: {
                 return var_Start_only;
-                break; /* [`Start_only] */
-        case 0:
+        }
+        // nothing set
+        case 0: {
                 return var_ANCHORED;
-                break; /* [`ANCHORED] */
+        }
+        // first code unit is set
         case 1: {
                 uint32_t firstcodeunit;
                 const int ret =
                     pcre2_pattern_info_stub(v_rex, PCRE2_INFO_FIRSTCODEUNIT, &firstcodeunit);
-                if (ret != 0)
+                if (ret != 0) {
                         raise_internal_error("pcre2_firstcodeunit_stub");
+                }
 
                 value v_firstbyte;
                 /* Allocates the non-constant constructor [`Char of char] and fills
@@ -414,10 +422,10 @@ CAMLprim value pcre2_firstcodeunit_stub(value v_rex) {
                 Field(v_firstbyte, 1) = Val_int(firstcodeunit);
 
                 return v_firstbyte;
-                break;
         }
-        default: /* Should not happen */
+        default: { /* Should not happen */
                 raise_internal_error("pcre2_firstcodeunit_stub");
+        }
         }
 }
 
@@ -425,20 +433,26 @@ CAMLprim value pcre2_lastcodeunit_stub(value v_rex) {
         uint32_t lastcodetype;
         const int ret = pcre2_pattern_info_stub(v_rex, PCRE2_INFO_LASTCODETYPE, &lastcodetype);
 
-        if (ret != 0)
+        if (ret != 0) {
                 raise_internal_error("pcre2_lastcodeunit_stub");
+        }
 
-        if (lastcodetype == 0)
+        switch (lastcodetype) {
+        case 0: {
                 return Val_none;
-        if (lastcodetype != 1)
-                raise_internal_error("pcre2_lastcodeunit_stub");
-        else {
+        }
+        case 1: {
                 uint32_t lastcodeunit;
                 const int ret =
                     pcre2_pattern_info_stub(v_rex, PCRE2_INFO_LASTCODEUNIT, &lastcodeunit);
-                if (ret != 0)
+                if (ret != 0) {
                         raise_internal_error("pcre2_lastcodeunit_stub");
+                }
                 return caml_alloc_some(Val_int(lastcodeunit));
+        }
+        default: { /* Should not happen */
+                raise_internal_error("pcre2_lastcodeunit_stub");
+        }
         }
 }
 
@@ -460,8 +474,9 @@ static inline void handle_match_error(char *loc, const int ret) {
         case PCRE2_ERROR_DFA_WSSIZE:
                 raise_workspace_size();
         default: {
-                if (PCRE2_ERROR_UTF8_ERR21 <= ret && ret <= PCRE2_ERROR_UTF8_ERR1)
+                if (PCRE2_ERROR_UTF8_ERR21 <= ret && ret <= PCRE2_ERROR_UTF8_ERR1) {
                         raise_bad_utf();
+                }
                 /* Unknown error */
                 char err_buf[100];
                 snprintf(err_buf, 100, "%s: unhandled PCRE2 error code: %d", loc, ret);
@@ -479,8 +494,9 @@ static inline void handle_pcre2_match_result(size_t *ovec, value v_ovec, size_t 
         value_ptr ovec_clear_stop = ocaml_ovec + (ovec_len * 2) / 3;
         value_ptr ovec_dst = ocaml_ovec + subgroups2_1;
         copy_ovector(subj_start, ovec_src, ovec_dst, subgroups2);
-        while (++ovec_dst < ovec_clear_stop)
+        while (++ovec_dst < ovec_clear_stop) {
                 *ovec_dst = -1;
+        }
 }
 
 /* Executes a pattern match with runtime options, a regular expression, a
@@ -492,14 +508,18 @@ CAMLprim value pcre2_match_stub0(int64_t v_opt, value v_rex, intnat v_pos, intna
                                  value v_subj, value v_ovec, value v_maybe_cof, value v_workspace) {
         int ret;
         int is_dfa = v_workspace != (value)NULL;
-        long pos = v_pos, subj_start = v_subj_start;
-        size_t ovec_len = Wosize_val(v_ovec), len = caml_string_length(v_subj);
+        long pos = v_pos;
+        long subj_start = v_subj_start;
+        size_t ovec_len = Wosize_val(v_ovec);
+        size_t len = caml_string_length(v_subj);
 
-        if (pos > (long)len || pos < subj_start)
+        if (pos > (long)len || pos < subj_start) {
                 caml_invalid_argument("Pcre2.pcre2_match_stub: illegal position");
+        }
 
-        if (subj_start > (long)len || subj_start < 0)
+        if (subj_start > (long)len || subj_start < 0) {
                 caml_invalid_argument("Pcre2.pcre2_match_stub: illegal subject start");
+        }
 
         pos -= subj_start;
         len -= subj_start;
@@ -515,13 +535,14 @@ CAMLprim value pcre2_match_stub0(int64_t v_opt, value v_rex, intnat v_pos, intna
                 /* Special case when no callout functions specified */
                 if (Is_none(v_maybe_cof)) {
                         /* Performs the match */
-                        if (is_dfa)
+                        if (is_dfa) {
                                 ret = pcre2_dfa_match(code, ocaml_subj, len, pos, v_opt, match_data,
                                                       mcontext, (int *)&Field(v_workspace, 0),
                                                       Wosize_val(v_workspace));
-                        else
+                        } else {
                                 ret = pcre2_match(code, ocaml_subj, len, pos, v_opt, match_data,
                                                   mcontext);
+                        }
 
                         size_t *ovec = pcre2_get_ovector_pointer(match_data);
 
@@ -578,13 +599,15 @@ CAMLprim value pcre2_match_stub0(int64_t v_opt, value v_rex, intnat v_pos, intna
                         pcre2_match_context_free(new_mcontext);
                         size_t *ovec = pcre2_get_ovector_pointer(match_data);
                         if (ret < 0) {
-                                if (is_dfa)
+                                if (is_dfa) {
                                         caml_stat_free(workspace);
+                                }
                                 pcre2_match_data_free(match_data);
-                                if (ret == PCRE2_ERROR_CALLOUT)
+                                if (ret == PCRE2_ERROR_CALLOUT) {
                                         caml_raise(cod.v_exn);
-                                else
+                                } else {
                                         handle_match_error("pcre2_match_stub(callout)", ret);
+                                }
                         } else {
                                 handle_pcre2_match_result(ovec, v_ovec, ovec_len, subj_start, ret);
                                 if (is_dfa) {
@@ -673,23 +696,25 @@ CAMLprim value pcre2_names_stub(value v_rex) {
         uint32_t name_count;
         uint32_t entry_size;
         const char *tbl_ptr;
-        uint32_t i;
 
         int ret = pcre2_pattern_info_stub(v_rex, PCRE2_INFO_NAMECOUNT, &name_count);
-        if (ret != 0)
+        if (ret != 0) {
                 raise_internal_error("pcre2_names_stub: namecount");
+        }
 
         ret = pcre2_pattern_info_stub(v_rex, PCRE2_INFO_NAMEENTRYSIZE, &entry_size);
-        if (ret != 0)
+        if (ret != 0) {
                 raise_internal_error("pcre2_names_stub: nameentrysize");
+        }
 
         ret = pcre2_pattern_info_stub(v_rex, PCRE2_INFO_NAMETABLE, &tbl_ptr);
-        if (ret != 0)
+        if (ret != 0) {
                 raise_internal_error("pcre2_names_stub: nametable");
+        }
 
         v_res = caml_alloc(name_count, 0);
 
-        for (i = 0; i < name_count; ++i) {
+        for (uint32_t i = 0; i < name_count; ++i) {
                 value v_name = caml_copy_string(tbl_ptr + 2);
                 Store_field(v_res, i, v_name);
                 tbl_ptr += entry_size;
@@ -701,14 +726,14 @@ CAMLprim value pcre2_names_stub(value v_rex) {
 /* Generic stub for getting integer results from pcre2_config */
 static inline int pcre2_config_int(int what) {
         int ret;
-        pcre2_config(what, (void *)&ret);
+        pcre2_config(what, &ret);
         return ret;
 }
 
 /* Generic stub for getting long integer results from pcre2_config */
 static inline long pcre2_config_long(int what) {
         long ret;
-        pcre2_config(what, (void *)&ret);
+        pcre2_config(what, &ret);
         return ret;
 }
 
