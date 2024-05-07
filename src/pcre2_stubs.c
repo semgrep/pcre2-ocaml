@@ -125,45 +125,47 @@ static inline void copy_ovector(long subj_start, const size_t *ovec_src, value_p
 
 /* Callout handler */
 static int pcre2_callout_handler(pcre2_callout_block *cb, struct cod *cod) {
-        if (cod != NULL) {
-                /* Callout is available */
-                value v_res;
+        if (cod == NULL) {
+                return 0;
+        }
 
-                /* Set up parameter array */
-                value v_callout_data = caml_alloc_small(8, 0);
+        /* Callout is available */
+        value v_res;
 
-                const value v_substrings = *cod->v_substrings_p;
+        /* Set up parameter array */
+        value v_callout_data = caml_alloc_small(8, 0);
 
-                const uint32_t capture_top = cb->capture_top;
-                uint32_t subgroups2 = capture_top << 1;
-                const uint32_t subgroups2_1 = subgroups2 - 1;
+        const value v_substrings = *cod->v_substrings_p;
 
-                const size_t *ovec_src = cb->offset_vector + subgroups2_1;
-                caml_int_ptr ovec_dst = &Field(Field(v_substrings, 1), 0) + subgroups2_1;
-                long subj_start = cod->subj_start;
+        const uint32_t capture_top = cb->capture_top;
+        uint32_t subgroups2 = capture_top << 1;
+        const uint32_t subgroups2_1 = subgroups2 - 1;
 
-                copy_ovector(subj_start, ovec_src, ovec_dst, subgroups2);
+        const size_t *ovec_src = cb->offset_vector + subgroups2_1;
+        value_ptr ovec_dst = &Field(Field(v_substrings, 1), 0) + subgroups2_1;
+        long subj_start = cod->subj_start;
 
-                Field(v_callout_data, 0) = Val_int(cb->callout_number);
-                Field(v_callout_data, 1) = v_substrings;
-                Field(v_callout_data, 2) = Val_int(cb->start_match + subj_start);
-                Field(v_callout_data, 3) = Val_int(cb->current_position + subj_start);
-                Field(v_callout_data, 4) = Val_int(capture_top);
-                Field(v_callout_data, 5) = Val_int(cb->capture_last);
-                Field(v_callout_data, 6) = Val_int(cb->pattern_position);
-                Field(v_callout_data, 7) = Val_int(cb->next_item_length);
+        copy_ovector(subj_start, ovec_src, ovec_dst, subgroups2);
 
-                /* Perform callout */
-                v_res = caml_callback_exn(*cod->v_cof_p, v_callout_data);
+        Field(v_callout_data, 0) = Val_int(cb->callout_number);
+        Field(v_callout_data, 1) = v_substrings;
+        Field(v_callout_data, 2) = Val_int(cb->start_match + subj_start);
+        Field(v_callout_data, 3) = Val_int(cb->current_position + subj_start);
+        Field(v_callout_data, 4) = Val_int(capture_top);
+        Field(v_callout_data, 5) = Val_int(cb->capture_last);
+        Field(v_callout_data, 6) = Val_int(cb->pattern_position);
+        Field(v_callout_data, 7) = Val_int(cb->next_item_length);
 
-                if (Is_exception_result(v_res)) {
-                        /* Callout raised an exception */
-                        const value v_exn = Extract_exception(v_res);
-                        if (Field(v_exn, 0) == *pcre2_exc_Backtrack)
-                                return 1;
-                        cod->v_exn = v_exn;
-                        return PCRE2_ERROR_CALLOUT;
-                }
+        /* Perform callout */
+        v_res = caml_callback_exn(*cod->v_cof_p, v_callout_data);
+
+        if (Is_exception_result(v_res)) {
+                /* Callout raised an exception */
+                const value v_exn = Extract_exception(v_res);
+                if (Field(v_exn, 0) == *pcre2_exc_Backtrack)
+                        return 1;
+                cod->v_exn = v_exn;
+                return PCRE2_ERROR_CALLOUT;
         }
 
         return 0;
