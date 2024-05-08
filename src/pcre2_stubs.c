@@ -619,7 +619,7 @@ CAMLprim value pcre2_match_stub0(int64_t v_opt, value v_rex, intnat v_pos, intna
                 } else {
                         handle_pcre2_match_result(ovec, v_ovec, ovec_len, subj_start, ret);
                         if (is_dfa) {
-                                value * ocaml_workspace_dst = &Field(v_workspace, 0);
+                                value *ocaml_workspace_dst = &Field(v_workspace, 0);
                                 const int *workspace_src = workspace;
                                 const int *workspace_src_stop = workspace + workspace_len;
                                 while (workspace_src != workspace_src_stop) {
