@@ -22,11 +22,6 @@
 
 #if defined(_WIN32)
 #define snprintf _snprintf
-#if defined(_DLL)
-#define PCREextern __declspec(dllexport)
-#else
-#define PCREextern
-#endif
 #endif
 
 #if __GNUC__ >= 3
