@@ -98,8 +98,7 @@ struct pcre2_ocaml_tables {
 /// Copies the contents of `n` elements of the PCRE2 ovector `src` to the ocaml
 /// array `dst`, returning `&dst[n]`. Each copied value with have `subj_start` added to it to
 /// account for any user-specified offset.
-static inline value_ptr copy_ovector(value_ptr dst, const PCRE2_SIZE *src, size_t n,
-                                     size_t subj_start) {
+static inline value *copy_ovector(value *dst, const PCRE2_SIZE *src, size_t n, size_t subj_start) {
         for (size_t i = 0; i < n; ++i) {
                 // In theory a long may not hold this, but realistically subjects will never be long
                 // enough to cause an issue.
@@ -141,7 +140,7 @@ static int pcre2_callout_handler(pcre2_callout_block *cb, void *data) {
         const uint32_t num_offsets = (2 * cb->capture_top) - full_match_ovec_offset;
 
         const PCRE2_SIZE *ovec_src = cb->offset_vector + full_match_ovec_offset;
-        value_ptr ovec_dst = &Field(Field(substrings, 1), 0);
+        value *ovec_dst = &Field(Field(substrings, 1), 0);
         size_t subj_start = cod->subj_start;
 
         copy_ovector(ovec_dst, ovec_src, num_offsets, subj_start);
@@ -482,10 +481,10 @@ static inline void handle_pcre2_match_result(size_t *ovec, value v_ovec, size_t 
         CAMLparam1(v_ovec);
 
         const size_t num_offsets = 2 * match_ret;
-        value_ptr dst = &Field(v_ovec, 0);
+        value *dst = &Field(v_ovec, 0);
         // Need to clear 2/3rd of the ovector since the first 2/3rds are
         // actual substrings and the last 3rd is just scratch space.
-        value_ptr clear_until = dst + (ovec_len * 2) / 3;
+        value *clear_until = dst + (ovec_len * 2) / 3;
 
         dst = copy_ovector(dst, ovec, num_offsets, subj_start);
         // We do this so that excess capture groups which may be inspected in
@@ -604,7 +603,7 @@ CAMLprim value pcre2_match_stub0(int64_t v_opt, value v_rex, intnat v_pos, intna
                 } else {
                         handle_pcre2_match_result(ovec, v_ovec, ovec_len, subj_start, ret);
                         if (is_dfa) {
-                                value_ptr ocaml_workspace_dst = &Field(v_workspace, 0);
+                                value * ocaml_workspace_dst = &Field(v_workspace, 0);
                                 const int *workspace_src = workspace;
                                 const int *workspace_src_stop = workspace + workspace_len;
                                 while (workspace_src != workspace_src_stop) {
