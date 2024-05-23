@@ -1,4 +1,4 @@
-(lang dune 2.7)
+(lang dune 3.15)
 (name pcre2)
 
 (generate_opam_files true)
@@ -19,6 +19,9 @@ substitution, similar to the functionality offered by the Perl language.")
   (depends
     (ocaml (>= 4.12))
     dune-configurator
+    ; NOTE: cannot be a test only dep since the ppx must be used to remove the
+    ; test code when _not_ in a test conf.
+    ppx_inline_test
     (conf-libpcre2-8 :build)
     (ounit2 :with-test)
   )

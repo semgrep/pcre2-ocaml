@@ -11,9 +11,10 @@ license: "LGPL-2.1-or-later WITH OCaml-LGPL-linking-exception"
 homepage: "https://github.com/semgrep/pcre2-ocaml"
 bug-reports: "https://github.com/semgrep/pcre2-ocaml/issues"
 depends: [
-  "dune" {>= "2.7"}
+  "dune" {>= "3.15"}
   "ocaml" {>= "4.12"}
   "dune-configurator"
+  "ppx_inline_test"
   "conf-libpcre2-8" {build}
   "ounit2" {with-test}
   "odoc" {with-doc}

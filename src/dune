@@ -1,12 +1,15 @@
 (library
  (public_name pcre2)
+ (preprocess
+  (pps ppx_inline_test))
+ (inline_tests)
  (foreign_stubs
   (language c)
   (names pcre2_stubs)
   (flags
    (:standard)
    (:include c_flags.sexp)
-   -O2
+   -O3
    -fPIC
    -DPIC))
  (c_library_flags
