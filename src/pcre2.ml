@@ -106,6 +106,109 @@ type compile_error =
   | TOO_MANY_CAPTURES (* 197 *)
   | CONDITION_ATOMIC_ASSERTION_EXPECTED (* 198 *)
   | BACKSLASH_K_IN_LOOKAROUND (* 199 *)
+[@@deriving show]
+
+let compile_error_of_int : int -> compile_error = function
+  | 101 -> END_BACKSLASH
+  | 102 -> END_BACKSLASH_C
+  | 103 -> UNKNOWN_ESCAPE
+  | 104 -> QUANTIFIER_OUT_OF_ORDER
+  | 105 -> QUANTIFIER_TOO_BIG
+  | 106 -> MISSING_SQUARE_BRACKET
+  | 107 -> ESCAPE_INVALID_IN_CLASS
+  | 108 -> CLASS_RANGE_ORDER
+  | 109 -> QUANTIFIER_INVALID
+  | 110 -> INTERNAL_UNEXPECTED_REPEAT
+  | 111 -> INVALID_AFTER_PARENS_QUERY
+  | 112 -> POSIX_CLASS_NOT_IN_CLASS
+  | 113 -> POSIX_NO_SUPPORT_COLLATING
+  | 114 -> MISSING_CLOSING_PARENTHESIS
+  | 115 -> BAD_SUBPATTERN_REFERENCE
+  | 116 -> NULL_PATTERN
+  | 117 -> BAD_OPTIONS
+  | 118 -> MISSING_COMMENT_CLOSING
+  | 119 -> PARENTHESES_NEST_TOO_DEEP
+  | 120 -> PATTERN_TOO_LARGE
+  | 121 -> HEAP_FAILED
+  | 122 -> UNMATCHED_CLOSING_PARENTHESIS
+  | 123 -> INTERNAL_CODE_OVERFLOW
+  | 124 -> MISSING_CONDITION_CLOSING
+  | 125 -> LOOKBEHIND_NOT_FIXED_LENGTH
+  | 126 -> ZERO_RELATIVE_REFERENCE
+  | 127 -> TOO_MANY_CONDITION_BRANCHES
+  | 128 -> CONDITION_ASSERTION_EXPECTED
+  | 129 -> BAD_RELATIVE_REFERENCE
+  | 130 -> UNKNOWN_POSIX_CLASS
+  | 131 -> INTERNAL_STUDY_ERROR
+  | 132 -> UNICODE_NOT_SUPPORTED
+  | 133 -> PARENTHESES_STACK_CHECK
+  | 134 -> CODE_POINT_TOO_BIG
+  | 135 -> LOOKBEHIND_TOO_COMPLICATED
+  | 136 -> LOOKBEHIND_INVALID_BACKSLASH_C
+  | 137 -> UNSUPPORTED_ESCAPE_SEQUENCE
+  | 138 -> CALLOUT_NUMBER_TOO_BIG
+  | 139 -> MISSING_CALLOUT_CLOSING
+  | 140 -> ESCAPE_INVALID_IN_VERB
+  | 141 -> UNRECOGNIZED_AFTER_QUERY_P
+  | 142 -> MISSING_NAME_TERMINATOR
+  | 143 -> DUPLICATE_SUBPATTERN_NAME
+  | 144 -> INVALID_SUBPATTERN_NAME
+  | 145 -> UNICODE_PROPERTIES_UNAVAILABLE
+  | 146 -> MALFORMED_UNICODE_PROPERTY
+  | 147 -> UNKNOWN_UNICODE_PROPERTY
+  | 148 -> SUBPATTERN_NAME_TOO_LONG
+  | 149 -> TOO_MANY_NAMED_SUBPATTERNS
+  | 150 -> CLASS_INVALID_RANGE
+  | 151 -> OCTAL_BYTE_TOO_BIG
+  | 152 -> INTERNAL_OVERRAN_WORKSPACE
+  | 153 -> INTERNAL_MISSING_SUBPATTERN
+  | 154 -> DEFINE_TOO_MANY_BRANCHES
+  | 155 -> BACKSLASH_O_MISSING_BRACE
+  | 156 -> INTERNAL_UNKNOWN_NEWLINE
+  | 157 -> BACKSLASH_G_SYNTAX
+  | 158 -> PARENS_QUERY_R_MISSING_CLOSING
+  | 159 -> VERB_ARGUMENT_NOT_ALLOWED
+  | 160 -> VERB_UNKNOWN
+  | 161 -> SUBPATTERN_NUMBER_TOO_BIG
+  | 162 -> SUBPATTERN_NAME_EXPECTED
+  | 163 -> INTERNAL_PARSED_OVERFLOW
+  | 164 -> INVALID_OCTAL
+  | 165 -> SUBPATTERN_NAMES_MISMATCH
+  | 166 -> MARK_MISSING_ARGUMENT
+  | 167 -> INVALID_HEXADECIMAL
+  | 168 -> BACKSLASH_C_SYNTAX
+  | 169 -> BACKSLASH_K_SYNTAX
+  | 170 -> INTERNAL_BAD_CODE_LOOKBEHINDS
+  | 171 -> BACKSLASH_N_IN_CLASS
+  | 172 -> CALLOUT_STRING_TOO_LONG
+  | 173 -> UNICODE_DISALLOWED_CODE_POINT
+  | 174 -> UTF_IS_DISABLED
+  | 175 -> UCP_IS_DISABLED
+  | 176 -> VERB_NAME_TOO_LONG
+  | 177 -> BACKSLASH_U_CODE_POINT_TOO_BIG
+  | 178 -> MISSING_OCTAL_OR_HEX_DIGITS
+  | 179 -> VERSION_CONDITION_SYNTAX
+  | 180 -> INTERNAL_BAD_CODE_AUTO_POSSESS
+  | 181 -> CALLOUT_NO_STRING_DELIMITER
+  | 182 -> CALLOUT_BAD_STRING_DELIMITER
+  | 183 -> BACKSLASH_C_CALLER_DISABLED
+  | 184 -> QUERY_BARJX_NEST_TOO_DEEP
+  | 185 -> BACKSLASH_C_LIBRARY_DISABLED
+  | 186 -> PATTERN_TOO_COMPLICATED
+  | 187 -> LOOKBEHIND_TOO_LONG
+  | 188 -> PATTERN_STRING_TOO_LONG
+  | 189 -> INTERNAL_BAD_CODE
+  | 190 -> INTERNAL_BAD_CODE_IN_SKIP
+  | 191 -> NO_SURROGATES_IN_UTF16
+  | 192 -> BAD_LITERAL_OPTIONS
+  | 193 -> SUPPORTED_ONLY_IN_UNICODE
+  | 194 -> INVALID_HYPHEN_IN_OPTIONS
+  | 195 -> ALPHA_ASSERTION_UNKNOWN
+  | 196 -> SCRIPT_RUN_NOT_AVAILABLE
+  | 197 -> TOO_MANY_CAPTURES
+  | 198 -> CONDITION_ATOMIC_ASSERTION_EXPECTED
+  | 199 -> BACKSLASH_K_IN_LOOKAROUND
+  | n -> invalid_arg (Printf.sprintf "%d is not a valid PCRE2 compile error" n)
 
 type match_error =
   (* "Expected" matching error codes: no match and partial match. *)
@@ -218,6 +321,39 @@ type compile_option =
   | `LITERAL
   | `MATCH_INVALID_UTF ]
 
+let int32_of_compile_option : compile_option -> int32 = function
+  | `ALLOW_EMPTY_CLASS   -> 0x00000001l
+  | `ALT_BSUX            -> 0x00000002l
+  | `AUTO_CALLOUT        -> 0x00000004l
+  | `CASELESS            -> 0x00000008l
+  | `DOLLAR_ENDONLY      -> 0x00000010l
+  | `DOTALL              -> 0x00000020l
+  | `DUPNAMES            -> 0x00000040l
+  | `EXTENDED            -> 0x00000080l
+  | `FIRSTLINE           -> 0x00000100l
+  | `MATCH_UNSET_BACKREF -> 0x00000200l
+  | `MULTILINE           -> 0x00000400l
+  | `NEVER_UCP           -> 0x00000800l
+  | `NEVER_UTF           -> 0x00001000l
+  | `NO_AUTO_CAPTURE     -> 0x00002000l
+  | `NO_AUTO_POSSESS     -> 0x00004000l
+  | `NO_DOTSTAR_ANCHOR   -> 0x00008000l
+  | `NO_START_OPTIMIZE   -> 0x00010000l
+  | `UCP                 -> 0x00020000l
+  | `UNGREEDY            -> 0x00040000l
+  | `UTF                 -> 0x00080000l
+  | `NEVER_BACKSLASH_C   -> 0x00100000l
+  | `ALT_CIRCUMFLEX      -> 0x00200000l
+  | `ALT_VERBNAMES       -> 0x00400000l
+  | `USE_OFFSET_LIMIT    -> 0x00800000l
+  | `EXTENDED_MORE       -> 0x01000000l
+  | `LITERAL             -> 0x02000000l
+  | `MATCH_INVALID_UTF   -> 0x04000000l
+[@@ocamlformat "disable"]
+
+let bitvector_of_compile_options (opts : compile_option list) : int32 =
+  opts |> List.map int32_of_compile_option |> List.fold_left Int32.logor 0l
+
 (* for compile ctx - can combine and just split back as needed in bindings? *)
 type compile_ctx =
   [ `EXTRA_ALLOW_SURROGATE_ESCAPES
@@ -227,18 +363,45 @@ type compile_ctx =
   | `EXTRA_ESCAPED_CR_IS_LF
   | `EXTRA_ALT_BSUX
   | `EXTRA_ALLOW_LOOKAROUND_BSK
-  | `EXTRA_CASELESS_RESTRICT
+  | (* These since 10.43 *)
+    (* TODO: verify? what should we do about versioning?? *)
+    `EXTRA_CASELESS_RESTRICT
   | `EXTRA_ASCII_BSD
   | `EXTRA_ASCII_BSS
   | `EXTRA_ASCII_BSW
   | `EXTRA_ASCII_POSIX
   | `EXTRA_ASCII_DIGIT ]
+(* TODO: impl these for compile *)
+
+let int32_of_compile_ctx_option : compile_ctx -> int32 = function
+  | `EXTRA_ALLOW_SURROGATE_ESCAPES -> 0x00000001l
+  | `EXTRA_BAD_ESCAPE_IS_LITERAL   -> 0x00000002l
+  | `EXTRA_MATCH_WORD              -> 0x00000004l
+  | `EXTRA_MATCH_LINE              -> 0x00000008l
+  | `EXTRA_ESCAPED_CR_IS_LF        -> 0x00000010l
+  | `EXTRA_ALT_BSUX                -> 0x00000020l
+  | `EXTRA_ALLOW_LOOKAROUND_BSK    -> 0x00000040l
+  (* Assumed values. TODO: verify *)
+  | `EXTRA_CASELESS_RESTRICT       -> 0x00000080l
+  | `EXTRA_ASCII_BSD               -> 0x00000100l
+  | `EXTRA_ASCII_BSS               -> 0x00000200l
+  | `EXTRA_ASCII_BSW               -> 0x00000400l
+  | `EXTRA_ASCII_POSIX             -> 0x00000800l
+  | `EXTRA_ASCII_DIGIT             -> 0x00001000l
+[@@ocamlformat "disable"]
 
 type jit_compile_flag =
-  | JIT_COMPLETE
+  | JIT_COMPLETE (* for full matching *)
   | JIT_PARTIAL_SOFT
   | JIT_PARTIAL_HARD
   | JIT_INVALID_UTF
+
+let int32_of_jit_compile_flag : jit_compile_flag -> int32 = function
+  | JIT_COMPLETE     -> 0x00000001l
+  | JIT_PARTIAL_SOFT -> 0x00000002l
+  | JIT_PARTIAL_HARD -> 0x00000004l
+  | JIT_INVALID_UTF  -> 0x00000100l
+[@@ocamlformat "disable"]
 
 type match_option =
   [ `NOTBOL
@@ -273,7 +436,7 @@ type newline_compile_ctx_option =
 
 type bsr = BSR_UNICODE | ANYCRLF
 
-let version : int * int = (10, 43)
+let version : int * int = Bindings.get_version ()
 let config_unicode : bool = true
 
 (** Default limit for calls to internal matching function *)
@@ -295,11 +458,11 @@ type captures (* needs match_data *)
 
 (* Regex pattern kind *)
 
-let compile :
-    ?options:compile_option list ->
-    string ->
-    (interp regex, compile_error) Result.t =
- fun ?options:_ _ -> failwith "todo"
+let compile ?(options : compile_option list = []) (pattern : string) =
+  let options = bitvector_of_compile_options options in
+  (* TODO: error location? *)
+  Bindings.pcre2_compile pattern options
+  |> Result.map_error (fun errorcode -> compile_error_of_int errorcode)
 
 let find :
     ?options:match_option list ->

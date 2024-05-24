@@ -9,8 +9,9 @@
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
 
-#define RESULT_OK_TAG (0)
-#define RESULT_ERROR_TAG (1)
+const int RESULT_OK_TAG = 0;
+const int RESULT_ERROR_TAG = 1;
+const int TUPLE_TAG = 0;
 
 struct ocaml_regex {
         pcre2_code *regex;
@@ -66,7 +67,7 @@ CAMLprim value pcre2_compile_stub(value pattern /* : string */,
 
         if (regex == NULL) {
                 // Returns [Error e] since the pattern could not be compiled.
-                result = caml_alloc_small(2, RESULT_ERROR_TAG);
+                result = caml_alloc_small(1, RESULT_ERROR_TAG);
                 // TODO(cooper): mapping between error codes here and datatype
                 // above.
                 Field(result, 0) = Val_int(error_code);
@@ -81,7 +82,7 @@ CAMLprim value pcre2_compile_stub(value pattern /* : string */,
         regex_of_value(regex_value)->regex = regex;
 
         // Return [Ok regex]
-        result = caml_alloc_small(2, RESULT_OK_TAG);
+        result = caml_alloc_small(1, RESULT_OK_TAG);
         Field(result, 0) = regex_value;
 
         CAMLreturn(result);
@@ -99,12 +100,12 @@ CAMLprim value pcre2_match_stub(value ocaml_re /* : regex */, value subject /* :
                                 uint32_t options /* : int32 */
                                 ) /* : -> match_ option */ {
         CAMLparam2(ocaml_re, subject);
-        CAMLlocal1(result);
+        CAMLlocal2(result, range);
 
         if (subject_offset < 0) {
                 // Need to handle this case manually since PCRE2 takes an unsigned value.
-                result = caml_alloc_small(2, RESULT_ERROR_TAG);
-                Field(result, 0) = PCRE2_ERROR_BADOFFSET;
+                result = caml_alloc_small(1, RESULT_ERROR_TAG);
+                Field(result, 0) = Val_int(PCRE2_ERROR_BADOFFSET);
                 CAMLreturn(result);
         }
         size_t offset = subject_offset;
@@ -118,19 +119,34 @@ CAMLprim value pcre2_match_stub(value ocaml_re /* : regex */, value subject /* :
 
         int ret = pcre2_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset, options,
                               match_data, mcontext);
-        size_t *ovec = pcre2_get_ovector_pointer(match_data);
+        PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (ret < 0) {
                 pcre2_match_data_free(match_data);
-                result = caml_alloc_small(2, RESULT_ERROR_TAG);
-                Field(result, 0) = ret;
+                result = caml_alloc_small(1, RESULT_ERROR_TAG);
+                Field(result, 0) = Val_int(ret);
                 CAMLreturn(result);
         }
 
         pcre2_match_data_free(match_data);
-        result = caml_alloc_small(2, RESULT_OK_TAG);
-        Field(result, 0) = 1;
+
+        range = caml_alloc_small(2, TUPLE_TAG);
+        Field(range, 0) = Val_int(ovec[0]);
+        Field(range, 1) = Val_int(ovec[1]);
+
+        result = caml_alloc_small(1, RESULT_OK_TAG);
+        Field(result, 0) = range;
+
         CAMLreturn(result);
+}
+
+CAMLprim value version_stub(void) {
+        CAMLparam0();
+        CAMLlocal1(version);
+        version = caml_alloc_small(2, TUPLE_TAG);
+        Field(version, 0) = Val_int(PCRE2_MAJOR);
+        Field(version, 1) = Val_int(PCRE2_MINOR);
+        CAMLreturn(version);
 }
 
 CAMLprim void pcre2_ocaml_init(void) {

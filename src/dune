@@ -1,7 +1,7 @@
 (library
  (public_name pcre2)
  (preprocess
-  (pps ppx_inline_test))
+  (pps ppx_inline_test ppx_deriving.show))
  (inline_tests)
  (foreign_stubs
   (language c)

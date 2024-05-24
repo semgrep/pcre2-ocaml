@@ -13,6 +13,32 @@ external pcre2_match :
   string ->
   (int[@untagged]) ->
   (int32[@unboxed]) ->
-  (int, int) Result.t = "pcre2_match_stub" "pcre2_match_stub"
+  (int * int, int) Result.t = "pcre2_match_stub" "pcre2_match_stub"
 
-let%test _ = match pcre2_compile "abc" (Int32.of_int 0) with Ok _ -> true | Error _ -> false
+external get_version : unit -> int * int = "version_stub"
+
+(* TODO: maybe testo dune integration??? *)
+module Test = struct
+  let ( let* ) x f = match x with Ok x -> f x | Error _ -> false
+
+  let%test "compile basic pattern" =
+    match pcre2_compile "abc" (Int32.of_int 0) with
+    | Ok _ -> true
+    | Error _ -> false
+
+  type match_result = (int * int, int) Result.result [@@deriving show]
+
+  let match_expect re subj predicate =
+    match pcre2_match re subj 0 0l with
+    | x when predicate x -> true
+    | x ->
+        Format.(fprintf err_formatter "%a\n" pp_match_result x);
+        false
+
+  let%test "match basic pattern" =
+    let* re = pcre2_compile "abc" 0l in
+    match_expect    re "abc"        (function Ok (0, 3) -> true | _ -> false)
+    && match_expect re "123abc456"  (function Ok (3, 6) -> true | _ -> false)
+    && match_expect re "123abc"     (function Ok (3, 6) -> true | _ -> false)
+    && match_expect re "123ac"      (function Error _   -> true | _ -> false)
+end
