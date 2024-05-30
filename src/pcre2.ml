@@ -1,3 +1,13 @@
+let ( >+= ) = Fun.flip Option.map
+
+type interp = Bindings.interp
+type jit = Bindings.jit
+type 'a regex = 'a Bindings.regex
+type match_ = string * int * int (* need only ovec? *)
+type range = { start : int; end_ : int }
+type captures = string * int array (* needs match_data *)
+type substitution
+
 [@@@warning "-32"]
 
 (* Registers exceptions with the C runtime and caches polymorphic variants *)
@@ -292,8 +302,17 @@ type match_error =
   | DFA_UINVALID_UTF (* (-66) *)
   | INVALIDOFFSET (* (-67) *)
 
+type compile_match_options = [ `ANCHORED | `NO_UTF_CHECK | `ENDANCHORED ]
+
+let int32_of_compile_match_option : compile_match_options -> int32 = function
+  | `ANCHORED     -> 0x80000000l
+  | `NO_UTF_CHECK -> 0x40000000l
+  | `ENDANCHORED  -> 0x20000000l
+[@@ocamlformat "disable"]
+
 type compile_option =
-  [ `ALLOW_EMPTY_CLASS
+  [ compile_match_options
+  | `ALLOW_EMPTY_CLASS
   | `ALT_BSUX
   | `AUTO_CALLOUT
   | `CASELESS
@@ -322,33 +341,34 @@ type compile_option =
   | `MATCH_INVALID_UTF ]
 
 let int32_of_compile_option : compile_option -> int32 = function
-  | `ALLOW_EMPTY_CLASS   -> 0x00000001l
-  | `ALT_BSUX            -> 0x00000002l
-  | `AUTO_CALLOUT        -> 0x00000004l
-  | `CASELESS            -> 0x00000008l
-  | `DOLLAR_ENDONLY      -> 0x00000010l
-  | `DOTALL              -> 0x00000020l
-  | `DUPNAMES            -> 0x00000040l
-  | `EXTENDED            -> 0x00000080l
-  | `FIRSTLINE           -> 0x00000100l
-  | `MATCH_UNSET_BACKREF -> 0x00000200l
-  | `MULTILINE           -> 0x00000400l
-  | `NEVER_UCP           -> 0x00000800l
-  | `NEVER_UTF           -> 0x00001000l
-  | `NO_AUTO_CAPTURE     -> 0x00002000l
-  | `NO_AUTO_POSSESS     -> 0x00004000l
-  | `NO_DOTSTAR_ANCHOR   -> 0x00008000l
-  | `NO_START_OPTIMIZE   -> 0x00010000l
-  | `UCP                 -> 0x00020000l
-  | `UNGREEDY            -> 0x00040000l
-  | `UTF                 -> 0x00080000l
-  | `NEVER_BACKSLASH_C   -> 0x00100000l
-  | `ALT_CIRCUMFLEX      -> 0x00200000l
-  | `ALT_VERBNAMES       -> 0x00400000l
-  | `USE_OFFSET_LIMIT    -> 0x00800000l
-  | `EXTENDED_MORE       -> 0x01000000l
-  | `LITERAL             -> 0x02000000l
-  | `MATCH_INVALID_UTF   -> 0x04000000l
+  | #compile_match_options as opt -> int32_of_compile_match_option opt
+  | `ALLOW_EMPTY_CLASS            -> 0x00000001l
+  | `ALT_BSUX                     -> 0x00000002l
+  | `AUTO_CALLOUT                 -> 0x00000004l
+  | `CASELESS                     -> 0x00000008l
+  | `DOLLAR_ENDONLY               -> 0x00000010l
+  | `DOTALL                       -> 0x00000020l
+  | `DUPNAMES                     -> 0x00000040l
+  | `EXTENDED                     -> 0x00000080l
+  | `FIRSTLINE                    -> 0x00000100l
+  | `MATCH_UNSET_BACKREF          -> 0x00000200l
+  | `MULTILINE                    -> 0x00000400l
+  | `NEVER_UCP                    -> 0x00000800l
+  | `NEVER_UTF                    -> 0x00001000l
+  | `NO_AUTO_CAPTURE              -> 0x00002000l
+  | `NO_AUTO_POSSESS              -> 0x00004000l
+  | `NO_DOTSTAR_ANCHOR            -> 0x00008000l
+  | `NO_START_OPTIMIZE            -> 0x00010000l
+  | `UCP                          -> 0x00020000l
+  | `UNGREEDY                     -> 0x00040000l
+  | `UTF                          -> 0x00080000l
+  | `NEVER_BACKSLASH_C            -> 0x00100000l
+  | `ALT_CIRCUMFLEX               -> 0x00200000l
+  | `ALT_VERBNAMES                -> 0x00400000l
+  | `USE_OFFSET_LIMIT             -> 0x00800000l
+  | `EXTENDED_MORE                -> 0x01000000l
+  | `LITERAL                      -> 0x02000000l
+  | `MATCH_INVALID_UTF            -> 0x04000000l
 [@@ocamlformat "disable"]
 
 let bitvector_of_compile_options (opts : compile_option list) : int32 =
@@ -390,165 +410,63 @@ let int32_of_compile_ctx_option : compile_ctx -> int32 = function
   | `EXTRA_ASCII_DIGIT             -> 0x00001000l
 [@@ocamlformat "disable"]
 
-type jit_compile_flag =
-  | JIT_COMPLETE (* for full matching *)
-  | JIT_PARTIAL_SOFT
-  | JIT_PARTIAL_HARD
-  | JIT_INVALID_UTF
-
-let int32_of_jit_compile_flag : jit_compile_flag -> int32 = function
-  | JIT_COMPLETE     -> 0x00000001l
-  | JIT_PARTIAL_SOFT -> 0x00000002l
-  | JIT_PARTIAL_HARD -> 0x00000004l
-  | JIT_INVALID_UTF  -> 0x00000100l
-[@@ocamlformat "disable"]
-
-type match_option =
-  [ `NOTBOL
-  | `NOTEOL
-  | `NOTEMPTY
-  | `NOTEMPTY_ATSTART
-  | `PARTIAL_SOFT
-  | `PARTIAL_HARD
-  | `DFA_RESTART (* pcre2_dfa_match() only *)
-  | `DFA_SHORTEST (* pcre2_dfa_match() only *)
-  | `SUBSTITUTE_GLOBAL (* pcre2_substitute() only *)
-  | `SUBSTITUTE_EXTENDED (* pcre2_substitute() only *)
-  | `SUBSTITUTE_UNSET_EMPTY (* pcre2_substitute() only *)
-  | `SUBSTITUTE_UNKNOWN_UNSET (* pcre2_substitute() only *)
-  | `SUBSTITUTE_OVERFLOW_LENGTH (* pcre2_substitute() only *)
-  | `NO_JIT (* not for pcre2_dfa_match() *)
-  | `COPY_MATCHED_SUBJECT
-  | `SUBSTITUTE_LITERAL (* pcre2_substitute() only *)
-  | `SUBSTITUTE_MATCHED (* pcre2_substitute() only *)
-  | `SUBSTITUTE_REPLACEMENT_ONLY (* pcre2_substitute() only *)
-  | `DISABLE_RECURSELOOP_CHECK
-    (* not for pcre2_dfa_match() or pcre2_jit_match() *) ]
-(* TODO: split to enforce restrictions (maybe except `NO_JIT) *)
-
-type newline_compile_ctx_option =
-  | NEWLINE_CR
-  | NEWLINE_LF
-  | NEWLINE_CRLF
-  | NEWLINE_ANY
-  | NEWLINE_ANYCRLF
-  | NEWLINE_NUL
-
-type bsr = BSR_UNICODE | ANYCRLF
-
-let version : int * int = Bindings.get_version ()
-let config_unicode : bool = true
-
-(** Default limit for calls to internal matching function *)
-let config_match_limit : int = -1
-
-(** Default limit for depth of nested backtracking *)
-let config_depth_limit : int = -1
-
-(** Indicates use of stack recursion in matching function *)
-let config_stackrecurse : bool = true
-
-(** Compiled regular expressions *)
-
-type interp = Bindings.interp
-type jit = Bindings.jit
-type 'a regex = 'a Bindings.regex
-type match_ (* need only ovec? *)
-type captures (* needs match_data *)
-
-(* Regex pattern kind *)
-
-let compile ?(options : compile_option list = []) (pattern : string) =
-  let options = bitvector_of_compile_options options in
-  (* TODO: error location? *)
-  Bindings.pcre2_compile pattern options
-  |> Result.map_error (fun errorcode -> compile_error_of_int errorcode)
-
-let find :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    _ regex ->
-    string ->
-    match_ option =
- fun ?options:_ ?subject_offset:_ _ _ -> failwith "todo"
-
-let find_iter :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    _ regex ->
-    string ->
-    match_ Seq.t =
- fun ?options:_ ?subject_offset:_ _ _ -> failwith "todo"
-
-let captures :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    _ regex ->
-    string ->
-    captures option =
- fun ?options:_ ?subject_offset:_ _ _ -> failwith "todo"
-
-let captures_iter :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    _ regex ->
-    string ->
-    captures Seq.t =
- fun ?options:_ ?subject_offset:_ _ _ -> failwith "todo"
-
-let split :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    ?limit:int ->
-    _ regex ->
-    string ->
-    string list =
- fun ?options:_ ?subject_offset:_ ?limit:_ _ _ -> failwith "todo"
-
-let is_match :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    _ regex ->
-    string ->
-    bool =
- fun ?options:_ ?subject_offset:_ _ _ -> failwith "todo"
-
-type substitution
-
-let subst : string -> substitution = fun _ -> failwith "todo"
-
-let replace :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    _ regex ->
-    substitution ->
-    string ->
-    string =
- fun ?options:_ ?subject_offset:_ _ _ _ -> failwith "todo"
-
 (* Fastpath to JIT match for perf *)
 module Jit = struct
-  let compile :
-      ?options:compile_option list ->
-      string ->
-      (interp regex, compile_error) Result.t =
-   fun ?options:_ _ -> failwith "todo"
+  type compile_flag =
+    | JIT_COMPLETE
+    | JIT_PARTIAL_SOFT
+    | JIT_PARTIAL_HARD
+    | JIT_INVALID_UTF
 
-  let find :
-      ?options:match_option list ->
-      ?subject_offset:int ->
-      jit regex ->
-      string ->
-      match_ option =
-   fun ?options:_ ?subject_offset:_ _ _ -> failwith "todo"
+  let int32_of_compile_flag : compile_flag -> int32 = function
+    | JIT_COMPLETE     -> 0x00000001l
+    | JIT_PARTIAL_SOFT -> 0x00000002l
+    | JIT_PARTIAL_HARD -> 0x00000004l
+    | JIT_INVALID_UTF  -> 0x00000100l
+  [@@ocamlformat "disable"]
 
-  let find_iter :
-      ?options:match_option list ->
-      ?subject_offset:int ->
-      jit regex ->
-      string ->
-      match_ Seq.t =
-   fun ?options:_ ?subject_offset:_ _ _ -> failwith "todo"
+  type match_option =
+    [ `NOTBOL
+    | `NOTEOL
+    | `NOTEMPTY
+    | `NOTEMPTY_ATSTART
+    | `PARTIAL_SOFT
+    | `PARTIAL_HARD ]
+
+  let int32_of_match_option : match_option -> int32 = function
+    | `NOTBOL           -> 0x00000001l
+    | `NOTEOL           -> 0x00000002l
+    | `NOTEMPTY         -> 0x00000004l
+    | `NOTEMPTY_ATSTART -> 0x00000008l
+    | `PARTIAL_HARD     -> 0x00000010l
+    | `PARTIAL_SOFT     -> 0x00000020l
+  [@@ocamlformat "disable"]
+
+  let bitvector_of_match_options (opts : match_option list) : int32 =
+    opts |> List.map int32_of_match_option |> List.fold_left Int32.logor 0l
+
+  let compile ?(options : compile_option list = []) (interp : interp regex) :
+      (jit regex, compile_error) Result.t =
+    let options = bitvector_of_compile_options options in
+    (* TODO: error location? *)
+    Bindings.pcre2_jit_compile interp options
+    |> Result.map_error compile_error_of_int
+
+  let find ?(options : match_option list = []) ?(subject_offset : int = 0)
+      (re : jit regex) (subject : string) : match_ option =
+    let options = bitvector_of_match_options options in
+    match Bindings.pcre2_jit_match re subject subject_offset options with
+    | Ok (i, j) -> Some (subject, i, j)
+    | Error _ -> None
+
+  (* TODO(cooper): dedup impl with a functor? *)
+  let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
+      (re : jit regex) (subject : string) : match_ Seq.t =
+    Seq.unfold
+      (fun offset ->
+        find ~options ~subject_offset:offset re subject
+        >+= fun ((_, _, j) as m) -> (m, j))
+      subject_offset
 
   let captures :
       ?options:match_option list ->
@@ -575,13 +493,10 @@ module Jit = struct
       string list =
    fun ?options:_ ?subject_offset:_ ?limit:_ _ _ -> failwith "todo"
 
-  let is_match :
-      ?options:match_option list ->
-      ?subject_offset:int ->
-      jit regex ->
-      string ->
-      bool =
-   fun ?options:_ ?subject_offset:_ _ _ -> failwith "todo"
+  (* TODO(cooper): dedup impl with a functor? *)
+  let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)
+      (re : jit regex) (subject : string) : bool =
+    find ~options ~subject_offset re subject |> Option.is_some
 
   let replace :
       ?options:match_option list ->
@@ -592,3 +507,148 @@ module Jit = struct
       string =
    fun ?options:_ ?subject_offset:_ _ _ _ -> failwith "todo"
 end
+
+type dfa_match_option =
+  (* shared *)
+  [ Jit.match_option
+  | compile_match_options
+  | `COPY_MATCHED_SUBJECT
+  | `DISABLE_RECURSELOOP_CHECK
+  | (* exclusive *)
+    `DFA_RESTART
+  | `DFA_SHORTEST ]
+
+type match_option =
+  (* shared *)
+  [ Jit.match_option
+  | `COPY_MATCHED_SUBJECT
+  | `DISABLE_RECURSELOOP_CHECK
+  | `NO_JIT ]
+
+let int32_of_match_option : match_option -> int32 = function
+  | #Jit.match_option as jit_opt -> Jit.int32_of_match_option jit_opt
+  | `COPY_MATCHED_SUBJECT -> 0x00004000l
+  | `DISABLE_RECURSELOOP_CHECK -> 0x00040000l
+  | `NO_JIT -> 0x00002000l
+
+let bitvector_of_match_options (opts : match_option list) : int32 =
+  opts |> List.map int32_of_match_option |> List.fold_left Int32.logor 0l
+
+type subst_options =
+  (* shared *)
+  [ Jit.match_option
+  | compile_match_options
+  | `NO_JIT
+  | (* exclusive *)
+    `SUBSTITUTE_GLOBAL
+  | `SUBSTITUTE_EXTENDED
+  | `SUBSTITUTE_UNSET_EMPTY
+  | `SUBSTITUTE_UNKNOWN_UNSET
+  | `SUBSTITUTE_OVERFLOW_LENGTH
+  | `SUBSTITUTE_LITERAL
+  | `SUBSTITUTE_MATCHED
+  | `SUBSTITUTE_REPLACEMENT_ONLY ]
+
+type newline_compile_ctx_option =
+  | NEWLINE_CR
+  | NEWLINE_LF
+  | NEWLINE_CRLF
+  | NEWLINE_ANY
+  | NEWLINE_ANYCRLF
+  | NEWLINE_NUL
+
+type bsr = BSR_UNICODE | ANYCRLF
+
+let version : int * int = Bindings.get_version ()
+let config_unicode : bool = true
+
+(** Default limit for calls to internal matching function *)
+let config_match_limit : int = -1
+
+(** Default limit for depth of nested backtracking *)
+let config_depth_limit : int = -1
+
+(** Indicates use of stack recursion in matching function *)
+let config_stackrecurse : bool = true
+
+(** Compiled regular expressions *)
+
+(* Regex pattern kind *)
+
+let compile ?(options : compile_option list = []) (pattern : string) :
+    (interp regex, compile_error) Result.t =
+  let options = bitvector_of_compile_options options in
+  (* TODO: error location? *)
+  Bindings.pcre2_compile pattern options
+  |> Result.map_error compile_error_of_int
+
+let find ?(options : match_option list = []) ?(subject_offset : int = 0)
+    (re : _ regex) (subject : string) : match_ option =
+  let options = bitvector_of_match_options options in
+  match Bindings.pcre2_match re subject subject_offset options with
+  | Ok (i, j) -> Some (subject, i, j)
+  | Error _ -> None
+
+let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
+    (re : _ regex) (subject : string) : match_ Seq.t =
+  Seq.unfold
+    (fun offset ->
+      find ~options ~subject_offset:offset re subject
+      >+= fun ((_, _, j) as m) -> (m, j))
+    subject_offset
+
+let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
+    (re : _ regex) (subject : string) : captures option =
+  let options = bitvector_of_match_options options in
+  match Bindings.pcre2_capture re subject subject_offset options with
+  | Ok arr -> Some arr
+  | Error _ -> None
+
+let captures_iter :
+    ?options:match_option list ->
+    ?subject_offset:int ->
+    _ regex ->
+    string ->
+    captures Seq.t =
+  Seq.unfold
+    (fun offset ->
+      captures ~options ~subject_offset:offset re subject
+      >+= fun ((_, _, j) as m) -> (m, j))
+    subject_offset
+
+let split :
+    ?options:match_option list ->
+    ?subject_offset:int ->
+    ?limit:int ->
+    _ regex ->
+    string ->
+    string list =
+ fun ?options:_ ?subject_offset:_ ?limit:_ _ _ -> failwith "todo"
+
+let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)
+    (re : _ regex) (subject : string) : bool =
+  find ~options ~subject_offset re subject |> Option.is_some
+
+let subst : string -> substitution = fun _ -> failwith "todo"
+
+let replace :
+    ?options:match_option list ->
+    ?subject_offset:int ->
+    _ regex ->
+    substitution ->
+    string ->
+    string =
+ fun ?options:_ ?subject_offset:_ _ _ _ -> failwith "todo"
+
+let range_of_match (_, start, end_) = { start; end_ }
+
+let match_of_captures ((subject, arr) : captures) (i : int) : match_ option =
+  if 0 <= 2 * i && (2 * i) + 1 < Array.length arr then
+    Some (subject, arr.(2 * i), arr.((2 * i) + 1))
+  else None
+
+let named_match_of_captures ((subject, arr) : captures) (group_name : string) :
+    match_ option =
+  if 0 <= 2 * i && (2 * i) + 1 < Array.length arr then
+    Some (subject, arr.(2 * i), arr.((2 * i) + 1))
+  else None

@@ -1,3 +1,15 @@
+type jit = [ `JIT ]
+type interp = [ `Interp ]
+
+type 'a regex constraint 'a = [< jit | interp ]
+(** Compiled regular expressions *)
+
+type match_
+type captures
+type substitution
+
+type range = { start: int; end_: int }
+
 type compile_error =
   | END_BACKSLASH
   | END_BACKSLASH_C
@@ -182,8 +194,11 @@ type match_error =
   | DFA_UINVALID_UTF (* (-66) *)
   | INVALIDOFFSET (* (-67) *)
 
+type compile_match_options = [ `ANCHORED | `NO_UTF_CHECK | `ENDANCHORED ]
+
 type compile_option =
-  [ `ALLOW_EMPTY_CLASS
+  [ compile_match_options
+  | `ALLOW_EMPTY_CLASS
   | `ALT_BSUX
   | `AUTO_CALLOUT
   | `CASELESS
@@ -211,147 +226,22 @@ type compile_option =
   | `LITERAL
   | `MATCH_INVALID_UTF ]
 
-(* for compile ctx - can combine and just split back as needed in bindings? *)
-type compile_ctx =
-  [ `EXTRA_ALLOW_SURROGATE_ESCAPES
-  | `EXTRA_BAD_ESCAPE_IS_LITERAL
-  | `EXTRA_MATCH_WORD
-  | `EXTRA_MATCH_LINE
-  | `EXTRA_ESCAPED_CR_IS_LF
-  | `EXTRA_ALT_BSUX
-  | `EXTRA_ALLOW_LOOKAROUND_BSK
-  | `EXTRA_CASELESS_RESTRICT
-  | `EXTRA_ASCII_BSD
-  | `EXTRA_ASCII_BSS
-  | `EXTRA_ASCII_BSW
-  | `EXTRA_ASCII_POSIX
-  | `EXTRA_ASCII_DIGIT ]
-
-type jit_compile_flag =
-  | JIT_COMPLETE
-  | JIT_PARTIAL_SOFT
-  | JIT_PARTIAL_HARD
-  | JIT_INVALID_UTF
-
-type match_option =
-  [ `NOTBOL
-  | `NOTEOL
-  | `NOTEMPTY
-  | `NOTEMPTY_ATSTART
-  | `PARTIAL_SOFT
-  | `PARTIAL_HARD
-  | `DFA_RESTART (* pcre2_dfa_match() only *)
-  | `DFA_SHORTEST (* pcre2_dfa_match() only *)
-  | `SUBSTITUTE_GLOBAL (* pcre2_substitute() only *)
-  | `SUBSTITUTE_EXTENDED (* pcre2_substitute() only *)
-  | `SUBSTITUTE_UNSET_EMPTY (* pcre2_substitute() only *)
-  | `SUBSTITUTE_UNKNOWN_UNSET (* pcre2_substitute() only *)
-  | `SUBSTITUTE_OVERFLOW_LENGTH (* pcre2_substitute() only *)
-  | `NO_JIT (* not for pcre2_dfa_match() *)
-  | `COPY_MATCHED_SUBJECT
-  | `SUBSTITUTE_LITERAL (* pcre2_substitute() only *)
-  | `SUBSTITUTE_MATCHED (* pcre2_substitute() only *)
-  | `SUBSTITUTE_REPLACEMENT_ONLY (* pcre2_substitute() only *)
-  | `DISABLE_RECURSELOOP_CHECK
-    (* not for pcre2_dfa_match() or pcre2_jit_match() *) ]
-(* TODO: split to enforce restrictions (maybe except `NO_JIT) *)
-(* TODO: add match_context options (depth, heap, match) limits here or separately? *)
-
-type newline_compile_ctx_option =
-  | NEWLINE_CR
-  | NEWLINE_LF
-  | NEWLINE_CRLF
-  | NEWLINE_ANY
-  | NEWLINE_ANYCRLF
-  | NEWLINE_NUL
-
-type bsr = BSR_UNICODE | ANYCRLF
-
-(** Version information *)
-val version : int * int
-(** Version of the PCRE2-C-library (major, minor) *)
-
-val config_unicode : bool
-(** Indicates whether unicode support is enabled *)
-
-val config_match_limit : int
-(** Default limit for calls to internal matching function *)
-
-val config_depth_limit : int
-(** Default limit for depth of nested backtracking *)
-
-val config_stackrecurse : bool
-(** Indicates use of stack recursion in matching function *)
-
-type jit = [ `JIT ]
-type interp = [ `Interp ]
-
-type 'a regex constraint 'a = [< jit | interp ]
-(** Compiled regular expressions *)
-
-type match_
-type captures
-
-(* Regex pattern kind *)
-
-val compile :
-  ?options:compile_option list ->
-  string ->
-  (interp regex, compile_error) Result.t
-
-val find :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  _ regex ->
-  string ->
-  match_ option
-
-val find_iter :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  _ regex ->
-  string ->
-  match_ Seq.t
-
-val captures :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  _ regex ->
-  string ->
-  captures option
-
-val captures_iter :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  _ regex ->
-  string ->
-  captures Seq.t
-
-val split :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  ?limit:int ->
-  _ regex ->
-  string ->
-  string list
-
-val is_match :
-  ?options:match_option list -> ?subject_offset:int -> _ regex -> string -> bool
-
-type substitution
-
-val subst : string -> substitution
-
-val replace :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  _ regex ->
-  substitution ->
-  string ->
-  string
-
 (* Fastpath to JIT match for perf *)
 module Jit : sig
+  type compile_flag =
+    | JIT_COMPLETE
+    | JIT_PARTIAL_SOFT
+    | JIT_PARTIAL_HARD
+    | JIT_INVALID_UTF
+
+  type match_option =
+    [ `NOTBOL
+    | `NOTEOL
+    | `NOTEMPTY
+    | `NOTEMPTY_ATSTART
+    | `PARTIAL_SOFT
+    | `PARTIAL_HARD ]
+
   val find :
     ?options:match_option list ->
     ?subject_offset:int ->
@@ -403,3 +293,141 @@ module Jit : sig
     string ->
     string
 end
+
+(* for compile ctx - can combine and just split back as needed in bindings? *)
+type compile_ctx =
+  [ `EXTRA_ALLOW_SURROGATE_ESCAPES
+  | `EXTRA_BAD_ESCAPE_IS_LITERAL
+  | `EXTRA_MATCH_WORD
+  | `EXTRA_MATCH_LINE
+  | `EXTRA_ESCAPED_CR_IS_LF
+  | `EXTRA_ALT_BSUX
+  | `EXTRA_ALLOW_LOOKAROUND_BSK
+  | `EXTRA_CASELESS_RESTRICT
+  | `EXTRA_ASCII_BSD
+  | `EXTRA_ASCII_BSS
+  | `EXTRA_ASCII_BSW
+  | `EXTRA_ASCII_POSIX
+  | `EXTRA_ASCII_DIGIT ]
+
+type dfa_match_option =
+  (* shared *)
+  [ Jit.match_option
+  | compile_match_options
+  | `COPY_MATCHED_SUBJECT
+  | `DISABLE_RECURSELOOP_CHECK
+  | (* exclusive *)
+    `DFA_RESTART
+  | `DFA_SHORTEST ]
+
+type match_option =
+  (* shared *)
+  [ Jit.match_option
+  | `COPY_MATCHED_SUBJECT
+  | `DISABLE_RECURSELOOP_CHECK
+  | `NO_JIT
+    (* not for pcre2_dfa_match() *)
+    (* not for pcre2_dfa_match() or pcre2_jit_match() *) ]
+(* TODO: split to enforce restrictions (maybe except `NO_JIT) *)
+(* TODO: add match_context options (depth, heap, match) limits here or separately? *)
+
+type subst_options =
+  (* shared *)
+  [ Jit.match_option
+  | compile_match_options
+  | `NO_JIT
+  | (* exclusive *)
+    `SUBSTITUTE_GLOBAL
+  | `SUBSTITUTE_EXTENDED
+  | `SUBSTITUTE_UNSET_EMPTY
+  | `SUBSTITUTE_UNKNOWN_UNSET
+  | `SUBSTITUTE_OVERFLOW_LENGTH
+  | `SUBSTITUTE_LITERAL
+  | `SUBSTITUTE_MATCHED
+  | `SUBSTITUTE_REPLACEMENT_ONLY ]
+
+type newline_compile_ctx_option =
+  | NEWLINE_CR
+  | NEWLINE_LF
+  | NEWLINE_CRLF
+  | NEWLINE_ANY
+  | NEWLINE_ANYCRLF
+  | NEWLINE_NUL
+
+type bsr = BSR_UNICODE | ANYCRLF
+
+(** Version information *)
+val version : int * int
+(** Version of the PCRE2-C-library (major, minor) *)
+
+val config_unicode : bool
+(** Indicates whether unicode support is enabled *)
+
+val config_match_limit : int
+(** Default limit for calls to internal matching function *)
+
+val config_depth_limit : int
+(** Default limit for depth of nested backtracking *)
+
+val config_stackrecurse : bool
+(** Indicates use of stack recursion in matching function *)
+
+(* Regex pattern kind *)
+
+val compile :
+  ?options:compile_option list ->
+  string ->
+  (interp regex, compile_error) Result.t
+
+val find :
+  ?options:match_option list ->
+  ?subject_offset:int ->
+  _ regex ->
+  string ->
+  match_ option
+
+val find_iter :
+  ?options:match_option list ->
+  ?subject_offset:int ->
+  _ regex ->
+  string ->
+  match_ Seq.t
+
+val captures :
+  ?options:match_option list ->
+  ?subject_offset:int ->
+  _ regex ->
+  string ->
+  captures option
+
+val captures_iter :
+  ?options:match_option list ->
+  ?subject_offset:int ->
+  _ regex ->
+  string ->
+  captures Seq.t
+
+val split :
+  ?options:match_option list ->
+  ?subject_offset:int ->
+  ?limit:int ->
+  _ regex ->
+  string ->
+  string list
+
+val is_match :
+  ?options:match_option list -> ?subject_offset:int -> _ regex -> string -> bool
+
+val subst : string -> substitution
+
+val replace :
+  ?options:match_option list ->
+  ?subject_offset:int ->
+  _ regex ->
+  substitution ->
+  string ->
+  string
+
+val range_of_match : match_ -> range
+val range_of_captures : captures -> int -> match_ option
+val named_range_of_captures : captures -> string -> match_ option
