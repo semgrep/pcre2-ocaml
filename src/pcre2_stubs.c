@@ -6,6 +6,7 @@
 #include <stdlib.h>
 
 #include "caml/alloc.h"
+#include "caml/config.h"
 #include "caml/custom.h"
 #include "caml/memory.h"
 #include "caml/misc.h"
@@ -354,61 +355,43 @@ PCRE2_SPTR names_of_regex(const pcre2_code *regex, uint32_t *name_count, uint32_
         return name_table;
 }
 
-void add_capture_group_names_to_matches(const pcre2_code *re, value matches, int num_captures) {
-        CAMLparam1(matches);
-        CAMLlocal1(name);
+value make_capture_group_name_table(const pcre2_code *re) {
+        CAMLparam0();
+        CAMLlocal3(name, pair, array);
 
         uint32_t name_count;
         uint32_t entry_size;
         PCRE2_SPTR names = names_of_regex(re, &name_count, &entry_size);
 
         if (!names) {
-                // The match succeeded, but the names are not avaliable. This
-                // shouldn't really be possible, but we can still return the
-                // matches thus far. We should make each array empty since they
-                // were previously just set to a placeholder unit value.
-                for (int i = 0; i < num_captures; ++i) {
-                        // SAFETY(caml_alloc_small): There are no fields in the
-                        // allocation, so it is trivially well-formed.
-                        Store_field(Field(matches, i), 2, caml_alloc_small(0, ARRAY_TAG));
+                array = caml_alloc_small(0, ARRAY_TAG);
+                // SAFETY(caml_alloc_small): There are no fields in the
+                // allocation, so it is trivially well-formed.
+                CAMLreturn(array);
+        }
+
+        if (name_count < Max_young_wosize) { /* likely */
+                // SAFETY: This array is fully initialized with well-formed
+                // values by the following loop before
+                array = caml_alloc_small(name_count, ARRAY_TAG);
+                for (size_t i = 0; i < name_count; ++i) {
+                        Field(array, i) = Val_unit;
                 }
-                CAMLreturn0;
-        }
-
-        // TODO: should we cache this with the regex? Seems wasteful to repeat
-        // this.
-        size_t *num_names = (size_t[MAX_SMALL_NAMES_ARRAY_LEN]){0};
-        bool did_malloc_num_names = false;
-        if (name_count > MAX_SMALL_NAMES_ARRAY_LEN) {
-                num_names = calloc(name_count, sizeof *num_names);
-                did_malloc_num_names = true;
-        }
-
-        for (size_t i = 0; i < name_count; ++i) {
-                const size_t j = i * entry_size;
-                uint32_t group_number = (names[j] << 8) | names[j + 1];
-                ++num_names[group_number];
-        }
-
-        for (int i = 0; i < num_captures; ++i) {
-                Store_field(Field(matches, i), 2, caml_alloc_tuple(num_names[i]));
+        } else {
+                array = caml_alloc_tuple(name_count);
         }
 
         for (size_t i = 0; i < name_count; ++i) {
                 const size_t j = i * entry_size;
                 uint32_t group_number = (names[j] << 8) | names[j + 1];
                 name = caml_copy_string((const char *)&names[j + 2]);
-                assert(num_names[group_number] > 0
-                       && "Mismatched count of names for a capture group");
-                Store_field(Field(Field(matches, group_number), 2), num_names[group_number], name);
-                --num_names[group_number];
+                pair = caml_alloc_small(2, TUPLE_TAG);
+                Field(pair, 0) = name;
+                Field(pair, 1) = Val_int(group_number);
+                caml_modify(&Field(array, i), pair);
         }
 
-        if (did_malloc_num_names) {
-                free(num_names);
-        }
-
-        CAMLreturn0;
+        CAMLreturn(array);
 }
 
 /// Match with the provided pattern.
@@ -423,7 +406,8 @@ CAMLprim value capture_unboxed(value ocaml_re /* : _ regex */, value subject /* 
                                uint32_t options /* : int32 */
                                ) /* : -> match_ option */ {
         CAMLparam2(ocaml_re, subject);
-        CAMLlocal4(result, matches, match, name);
+        CAMLlocal5(result, matches, match, name, name_table);
+        CAMLlocal1(matches_and_table);
 
         if (subject_offset < 0) {
                 // Need to handle this case manually since PCRE2 takes an unsigned value.
@@ -459,36 +443,39 @@ CAMLprim value capture_unboxed(value ocaml_re /* : _ regex */, value subject /* 
                 CAMLreturn(result);
         }
 
-        matches = caml_alloc_tuple(num_captures);
+        matches /* : (int * int) array */ = caml_alloc_tuple(num_captures);
         for (int i = 0; i < num_captures; ++i) {
                 // SAFETY: This block must be filled with well-formed values
                 // before the next allocation. The next allocation is no
                 // earlier than the end of this loop iteration. All fields of
-                // this tuple are assigned to by the end of the loop. Note that
-                // the last element, the string array, is not yet known;
-                // instead, a unit value is temporarily stored to satisfy this
-                // requirement.
-                match /* : int * int * string array */ = caml_alloc_small(3, TUPLE_TAG);
+                // this tuple are assigned to by the end of the loop.
+                match /* : int * int */ = caml_alloc_small(2, TUPLE_TAG);
                 // The i-th capture group (the 0-th being the full match) is at
                 // [2i, 2i+1] in ovec.
                 int start = 2 * i;
                 int end = 2 * i + 1;
                 Field(match, 0) = Val_int(ovec[start]);
                 Field(match, 1) = Val_int(ovec[end]);
-                Field(match, 2) = Val_unit;
-                Store_field(matches, i, match);
+                caml_modify(&Field(matches, i), match);
         }
 
         // TODO: cache this? May not be that expensive, but if it is then probably worth since we'll
-        // match many times.
-        add_capture_group_names_to_matches(re, matches, num_captures);
+        // match w/ capture many times.
+        name_table = make_capture_group_name_table(re);
 
         pcre2_match_data_free(match_data);
 
         // SAFETY: This allocation is immediately filled with well-formed
+        // values.
+        matches_and_table = caml_alloc_small(2, TUPLE_TAG);
+        Field(matches_and_table, 0) = matches;
+        Field(matches_and_table, 1) = name_table;
+
+        // SAFETY: This allocation is immediately filled with well-formed
         // values prior to returning.
-        result = caml_alloc_small(1, RESULT_OK_TAG);
-        Field(result, 0) = matches;
+        result /* : ((int * int) array * (string * int) array, _) Result.t */ =
+            caml_alloc_small(1, RESULT_OK_TAG);
+        Field(result, 0) = matches_and_table;
 
         CAMLreturn(result);
 }

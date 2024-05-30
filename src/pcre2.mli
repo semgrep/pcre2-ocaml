@@ -4,11 +4,11 @@ type interp = [ `Interp ]
 type 'a regex constraint 'a = [< jit | interp ]
 (** Compiled regular expressions *)
 
-type match_
-type captures
+type match_ [@@deriving show]
+type captures [@@deriving show]
 type substitution
 
-type range = { start: int; end_: int }
+type range = { start: int; end_: int } [@@deriving show]
 
 type compile_error =
   | END_BACKSLASH
@@ -429,5 +429,5 @@ val replace :
   string
 
 val range_of_match : match_ -> range
-val range_of_captures : captures -> int -> match_ option
-val named_range_of_captures : captures -> string -> match_ option
+val match_of_captures : captures -> int -> match_ option
+val named_match_of_captures : captures -> string -> match_ option

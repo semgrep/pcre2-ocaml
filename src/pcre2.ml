@@ -1,14 +1,42 @@
-let ( >+= ) = Fun.flip Option.map
+[@@@warning "-32"]
+
+let ( >+= ) x f = Option.map f x
 
 type interp = Bindings.interp
 type jit = Bindings.jit
 type 'a regex = 'a Bindings.regex
-type match_ = string * int * int (* need only ovec? *)
-type range = { start : int; end_ : int }
-type captures = string * int array (* needs match_data *)
+type match_ = string * int * int (* need only ovec? *) [@@deriving show]
+type range = { start : int; end_ : int } [@@deriving show]
+
+type captures = string * (int * int) array * (string * int) array
+[@@deriving show]
+
+(* needs match_data *)
 type substitution
 
-[@@@warning "-32"]
+let range_of_match (_, start, end_) = { start; end_ }
+
+let range_of_captures (_, matches, _) =
+  (* Array should always be at least length 1 *)
+  let start, end_ = matches.(0) in
+  { start; end_ }
+
+let match_of_captures ((subject, matches, _) : captures) (i : int) :
+    match_ option =
+  if 0 <= i && i < Array.length matches then
+    let start, end_ = matches.(i) in
+    Some (subject, start, end_)
+  else None
+
+let named_match_of_captures ((subject, matches, names) : captures)
+    (group_name : string) : match_ option =
+  Array.find_map
+    (fun (s, i) -> if String.equal group_name s then Some i else None)
+    names
+  >+= fun i ->
+  let start, end_ = matches.(i) in
+  (subject, start, end_)
+
 
 (* Registers exceptions with the C runtime and caches polymorphic variants *)
 let () = Bindings.pcre2_ocaml_init ()
@@ -464,8 +492,8 @@ module Jit = struct
       (re : jit regex) (subject : string) : match_ Seq.t =
     Seq.unfold
       (fun offset ->
-        find ~options ~subject_offset:offset re subject
-        >+= fun ((_, _, j) as m) -> (m, j))
+        find ~options ~subject_offset:offset re subject >+= fun (m : match_) ->
+        (m, (range_of_match m).end_))
       subject_offset
 
   let captures :
@@ -586,34 +614,31 @@ let find ?(options : match_option list = []) ?(subject_offset : int = 0)
     (re : _ regex) (subject : string) : match_ option =
   let options = bitvector_of_match_options options in
   match Bindings.pcre2_match re subject subject_offset options with
-  | Ok (i, j) -> Some (subject, i, j)
+  | Ok (start, end_) -> Some (subject, start, end_)
   | Error _ -> None
 
 let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
     (re : _ regex) (subject : string) : match_ Seq.t =
   Seq.unfold
     (fun offset ->
-      find ~options ~subject_offset:offset re subject
-      >+= fun ((_, _, j) as m) -> (m, j))
+      find ~options ~subject_offset:offset re subject >+= fun (m : match_) ->
+      (m, (range_of_match m).end_))
     subject_offset
 
 let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
     (re : _ regex) (subject : string) : captures option =
   let options = bitvector_of_match_options options in
   match Bindings.pcre2_capture re subject subject_offset options with
-  | Ok arr -> Some arr
+  | Ok (arr, names) -> Some (subject, arr, names)
   | Error _ -> None
 
-let captures_iter :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    _ regex ->
-    string ->
+let captures_iter ?(options : match_option list = [])
+    ?(subject_offset : int = 0) (re : _ regex) (subject : string) :
     captures Seq.t =
   Seq.unfold
     (fun offset ->
       captures ~options ~subject_offset:offset re subject
-      >+= fun ((_, _, j) as m) -> (m, j))
+      >+= fun (c : captures) -> (c, (range_of_captures c).end_))
     subject_offset
 
 let split :
@@ -639,16 +664,3 @@ let replace :
     string ->
     string =
  fun ?options:_ ?subject_offset:_ _ _ _ -> failwith "todo"
-
-let range_of_match (_, start, end_) = { start; end_ }
-
-let match_of_captures ((subject, arr) : captures) (i : int) : match_ option =
-  if 0 <= 2 * i && (2 * i) + 1 < Array.length arr then
-    Some (subject, arr.(2 * i), arr.((2 * i) + 1))
-  else None
-
-let named_match_of_captures ((subject, arr) : captures) (group_name : string) :
-    match_ option =
-  if 0 <= 2 * i && (2 * i) + 1 < Array.length arr then
-    Some (subject, arr.(2 * i), arr.((2 * i) + 1))
-  else None
