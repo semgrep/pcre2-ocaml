@@ -40,7 +40,6 @@ let named_match_of_captures ((subject, matches, names) : captures)
   let start, end_ = matches.(i) in
   (subject, start, end_)
 
-
 (* Registers exceptions with the C runtime and caches polymorphic variants *)
 let () = Bindings.pcre2_ocaml_init ()
 

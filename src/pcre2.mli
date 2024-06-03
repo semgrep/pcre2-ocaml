@@ -7,8 +7,7 @@ type 'a regex constraint 'a = [< jit | interp ]
 type match_ [@@deriving show]
 type captures [@@deriving show]
 type substitution
-
-type range = { start: int; end_: int } [@@deriving show]
+type range = { start : int; end_ : int } [@@deriving show]
 
 type compile_error =
   | END_BACKSLASH
