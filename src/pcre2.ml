@@ -16,6 +16,9 @@ type substitution
 
 let range_of_match (_, start, end_) = { start; end_ }
 
+let substring_of_match (subject, start, end_) =
+  String.sub subject start (end_ - start)
+
 let range_of_captures (_, matches, _) =
   (* Array should always be at least length 1 *)
   let start, end_ = matches.(0) in

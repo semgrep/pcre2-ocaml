@@ -435,5 +435,9 @@ val replace :
   string
 
 val range_of_match : match_ -> range
+
+(* TODO: not a huge fan since this requires creating a copy. Consider some way
+   we could have a string view type? *)
+val substring_of_match : match_ -> string
 val match_of_captures : captures -> int -> match_ option
 val named_match_of_captures : captures -> string -> match_ option
