@@ -379,6 +379,12 @@ val compile :
   string ->
   (interp regex, compile_error) Result.t
 
+val capture_groups : _ regex -> (string * int) array
+(** [captures_groups r] is an array comprising the names and numbering of each
+    named capture group in [r]. NOTE: the names are not in any particular
+    order. I.e., the n-th entry in the array is not necessarily capture group
+    number n. *)
+
 val find :
   ?options:match_option list ->
   ?subject_offset:int ->

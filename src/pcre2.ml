@@ -610,6 +610,8 @@ let compile ?(options : compile_option list = []) (pattern : string) :
   Bindings.pcre2_compile pattern options
   |> Result.map_error compile_error_of_int
 
+let capture_groups (r : _ regex) = Bindings.get_capture_groups r
+
 let find ?(options : match_option list = []) ?(subject_offset : int = 0)
     (re : _ regex) (subject : string) : match_ option =
   let options = bitvector_of_match_options options in

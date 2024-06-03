@@ -355,7 +355,7 @@ PCRE2_SPTR names_of_regex(const pcre2_code *regex, uint32_t *name_count, uint32_
         return name_table;
 }
 
-value make_capture_group_name_table(const pcre2_code *re) {
+value make_capture_group_name_table(const pcre2_code *re) /* -> (string * int) array */ {
         CAMLparam0();
         CAMLlocal3(name, pair, array);
 
@@ -483,4 +483,10 @@ CAMLprim value capture_unboxed(value ocaml_re /* : _ regex */, value subject /* 
 /// Boxed argument version of [capture_unboxed] (for bytecode).
 CAMLprim value capture(value *argv, int argc UNUSED) {
         return match_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
+}
+
+///
+CAMLprim value get_capture_groups(value ocaml_regex /* : regex */) /* -> (string * int) array */ {
+        CAMLparam1(ocaml_regex);
+        CAMLreturn(make_capture_group_name_table(regex_of_value(ocaml_regex)->regex));
 }
