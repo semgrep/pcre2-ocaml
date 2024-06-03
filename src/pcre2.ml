@@ -442,18 +442,24 @@ let int32_of_compile_ctx_option : compile_ctx -> int32 = function
 
 (* Fastpath to JIT match for perf *)
 module Jit = struct
-  type compile_flag =
-    | JIT_COMPLETE
-    | JIT_PARTIAL_SOFT
-    | JIT_PARTIAL_HARD
-    | JIT_INVALID_UTF
+  type matching_mode = JIT_COMPLETE | JIT_PARTIAL_SOFT | JIT_PARTIAL_HARD
 
-  let int32_of_compile_flag : compile_flag -> int32 = function
+  let int32_of_matching_mode : matching_mode -> int32 = function
     | JIT_COMPLETE     -> 0x00000001l
     | JIT_PARTIAL_SOFT -> 0x00000002l
     | JIT_PARTIAL_HARD -> 0x00000004l
-    | JIT_INVALID_UTF  -> 0x00000100l
   [@@ocamlformat "disable"]
+
+  type compile_option =
+    (* one of these three is required. Refactor appropriately? *)
+    | JIT_INVALID_UTF (* [@deprecated "MATCH_INVALID_UTF should be used instead"] *)
+  (* deprecated (not sure when v10.34ish?) - use MATCH_INVALID_UTF *)
+
+  let int32_of_compile_option : compile_option -> int32 = function
+    | (JIT_INVALID_UTF [@alert "-deprecated"]) -> 0x00000100l
+
+  let bitvector_of_compile_options (opts : compile_option list) : int32 =
+    opts |> List.map int32_of_compile_option |> List.fold_left Int32.logor 0l
 
   type match_option =
     [ `NOTBOL
@@ -475,9 +481,11 @@ module Jit = struct
   let bitvector_of_match_options (opts : match_option list) : int32 =
     opts |> List.map int32_of_match_option |> List.fold_left Int32.logor 0l
 
-  let compile ?(options : compile_option list = []) (interp : interp regex) :
+  let compile ?(options : compile_option list = [])
+      ?(mode : matching_mode = JIT_COMPLETE) (interp : interp regex) :
       (jit regex, compile_error) Result.t =
-    let options = bitvector_of_compile_options options in
+    let mode = int32_of_matching_mode mode in
+    let options = Int32.logor mode (bitvector_of_compile_options options) in
     (* TODO: error location? *)
     Bindings.pcre2_jit_compile interp options
     |> Result.map_error compile_error_of_int

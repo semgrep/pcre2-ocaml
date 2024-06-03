@@ -227,11 +227,8 @@ type compile_option =
 
 (* Fastpath to JIT match for perf *)
 module Jit : sig
-  type compile_flag =
-    | JIT_COMPLETE
-    | JIT_PARTIAL_SOFT
-    | JIT_PARTIAL_HARD
-    | JIT_INVALID_UTF
+  type matching_mode = JIT_COMPLETE | JIT_PARTIAL_SOFT | JIT_PARTIAL_HARD
+  type compile_option = JIT_INVALID_UTF
 
   type match_option =
     [ `NOTBOL
@@ -240,6 +237,12 @@ module Jit : sig
     | `NOTEMPTY_ATSTART
     | `PARTIAL_SOFT
     | `PARTIAL_HARD ]
+
+  val compile :
+    ?options:compile_option list ->
+    ?mode:matching_mode ->
+    interp regex ->
+    (jit regex, compile_error) Result.t
 
   val find :
     ?options:match_option list ->
