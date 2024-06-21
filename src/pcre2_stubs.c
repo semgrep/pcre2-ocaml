@@ -153,7 +153,7 @@ CAMLprim value match_unboxed(value ocaml_re /* : _ regex */, value subject /* : 
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
-                Field(result, 0) = PCRE2_ERROR_BADOFFSET;
+                Field(result, 0) = Val_int(PCRE2_ERROR_BADOFFSET);
                 CAMLreturn(result);
         }
         size_t offset = subject_offset;
@@ -438,7 +438,7 @@ CAMLprim value capture_unboxed(
                 // SAFETY: This allocation is immediately filled with well-formed values prior to
                 // returning.
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
-                Field(result, 0) = PCRE2_ERROR_BADOFFSET;
+                Field(result, 0) = Val_int(PCRE2_ERROR_BADOFFSET);
                 CAMLreturn(result);
         }
         size_t offset = subject_offset;
