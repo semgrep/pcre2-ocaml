@@ -113,8 +113,8 @@ type compile_error =
 
 type match_error =
   (* "Expected" matching error codes: no match and partial match. *)
-  | NOMATCH (* (-1) *)
-  | PARTIAL (* (-2) *)
+  (* | NOMATCH (* (-1) *)
+     | PARTIAL (* (-2) *) *)
   (* Error codes for UTF-8 validity checks. See man 3 pcre2unicode. *)
   | UTF8_ERR1 (* (-3) *)
   | UTF8_ERR2 (* (-4) *)

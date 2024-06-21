@@ -144,9 +144,9 @@ CAMLprim value compile(value *argv, int argc UNUSED) {
 CAMLprim value match_unboxed(value ocaml_re /* : _ regex */, value subject /* : string */,
                              intnat subject_offset /* : int [@untagged] */,
                              uint32_t options /* : int32 */
-                             ) /* : -> (int * int, int) Result.t */ {
+                             ) /* : -> ((int * int) option, int) Result.t */ {
         CAMLparam2(ocaml_re, subject);
-        CAMLlocal2(result, range);
+        CAMLlocal3(result, range, match);
 
         // Need to handle this case manually since PCRE2 takes an unsigned value.
         if (subject_offset < 0) {
@@ -169,7 +169,14 @@ CAMLprim value match_unboxed(value ocaml_re /* : _ regex */, value subject /* : 
                               match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
-        if (ret <= 0) {
+        if (ret == PCRE2_ERROR_NOMATCH || ret == PCRE2_ERROR_PARTIAL) {
+                pcre2_match_data_free(match_data);
+                // SAFETY: This allocation is immediately filled with
+                // well-formed values prior to returning.
+                result = caml_alloc_small(1, RESULT_OK_TAG);
+                Field(result, 0) = Val_none;
+                CAMLreturn(result);
+        } else if (ret <= 0) {
                 pcre2_match_data_free(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
@@ -185,10 +192,14 @@ CAMLprim value match_unboxed(value ocaml_re /* : _ regex */, value subject /* : 
 
         pcre2_match_data_free(match_data);
 
-        // SAFETY: This allocation is immediately filled with well-formed
-        // values prior to returning.
+        // SAFETY: This allocation is immediately filled with well-formed values.
+        match = caml_alloc_small(1, OPTION_SOME_TAG);
+        Field(match, 0) = range;
+
+        // SAFETY: This allocation is immediately filled with
+        // well-formed values prior to returning.
         result = caml_alloc_small(1, RESULT_OK_TAG);
-        Field(result, 0) = range;
+        Field(result, 0) = match;
 
         CAMLreturn(result);
 }
@@ -257,7 +268,7 @@ CAMLprim value jit_compile(value *argv, int argc UNUSED) {
 CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject /* : string */,
                                  int subject_offset /* : int [@untagged] */,
                                  uint32_t options /* : int32 */
-                                 ) /* : -> match_ option */ {
+                                 ) /* : -> ((int * int) option, int) Result.t */ {
         // TODO: Mostly copied from match_stub impl
         //
         //
@@ -276,7 +287,7 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
         // PCRE2_NOTEMPTY, PCRE2_NOTEMPTY_ATSTART, PCRE2_PARTIAL_HARD, and
         // PCRE2_PARTIAL_SOFT. Unsupported options are ignored.
         CAMLparam2(ocaml_re, subject);
-        CAMLlocal2(result, range);
+        CAMLlocal3(result, range, match);
 
         // Need to handle this case manually since PCRE2 takes an unsigned value.
         if (subject_offset < 0) {
@@ -299,7 +310,14 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
                                   options, match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
-        if (ret <= 0) {
+        if (ret == PCRE2_ERROR_NOMATCH || ret == PCRE2_ERROR_PARTIAL) {
+                pcre2_match_data_free(match_data);
+                // SAFETY: This allocation is immediately filled with
+                // well-formed values prior to returning.
+                result = caml_alloc_small(1, RESULT_OK_TAG);
+                Field(result, 0) = Val_none;
+                CAMLreturn(result);
+        } else if (ret <= 0) {
                 pcre2_match_data_free(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
@@ -314,6 +332,10 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
         Field(range, 1) = Val_int(ovec[1]);
 
         pcre2_match_data_free(match_data);
+
+        // SAFETY: This allocation is immediately filled with well-formed values.
+        match = caml_alloc_small(1, OPTION_SOME_TAG);
+        Field(match, 0) = range;
 
         // SAFETY: This allocation is immediately filled with
         // well-formed values prior to returning.
@@ -401,17 +423,17 @@ value make_capture_group_name_table(const pcre2_code *re) /* -> (string * int) a
 // TODO: allow reusing the pcre2_match_data struct so that exec_all / find_iter
 // / captures_iter can avoid a bunch of allocations. Ideally this function doesn't allocate
 // (except maybe a result).
-CAMLprim value capture_unboxed(value ocaml_re /* : _ regex */, value subject /* : string */,
-                               intnat subject_offset /* : int [@untagged] */,
-                               uint32_t options /* : int32 */
-                               ) /* : -> match_ option */ {
+CAMLprim value capture_unboxed(
+    value ocaml_re /* : _ regex */, value subject /* : string */,
+    intnat subject_offset /* : int [@untagged] */, uint32_t options /* : int32 */
+    ) /* : -> (((int * int) array * (string * int) array) option, match_error) Result.t */ {
         CAMLparam2(ocaml_re, subject);
         CAMLlocal5(result, matches, match, name, name_table);
-        CAMLlocal1(matches_and_table);
+        CAMLlocal2(matches_and_table, match_opt);
 
         if (subject_offset < 0) {
                 // Need to handle this case manually since PCRE2 takes an unsigned value.
-                // FIXME: reuslt or option from this function? need to see if meaningful errors can
+                // FIXME: result or option from this function? need to see if meaningful errors can
                 // occur
                 // SAFETY: This allocation is immediately filled with well-formed values prior to
                 // returning.
@@ -434,7 +456,14 @@ CAMLprim value capture_unboxed(value ocaml_re /* : _ regex */, value subject /* 
                                        options, match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
-        if (num_captures <= 0) {
+        if (num_captures == PCRE2_ERROR_NOMATCH || num_captures == PCRE2_ERROR_PARTIAL) {
+                pcre2_match_data_free(match_data);
+                // SAFETY: This allocation is immediately filled with
+                // well-formed values prior to returning.
+                result = caml_alloc_small(1, RESULT_OK_TAG);
+                Field(result, 0) = Val_none;
+                CAMLreturn(result);
+        } else if (num_captures <= 0) {
                 pcre2_match_data_free(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
@@ -467,15 +496,22 @@ CAMLprim value capture_unboxed(value ocaml_re /* : _ regex */, value subject /* 
 
         // SAFETY: This allocation is immediately filled with well-formed
         // values.
-        matches_and_table = caml_alloc_small(2, TUPLE_TAG);
+        matches_and_table /* : (int * int) array * (string * int) array */ =
+            caml_alloc_small(2, TUPLE_TAG);
         Field(matches_and_table, 0) = matches;
         Field(matches_and_table, 1) = name_table;
 
         // SAFETY: This allocation is immediately filled with well-formed
+        // values.
+        match_opt /* : ((int * int) array * (string * int) array) option */ =
+            caml_alloc_small(1, OPTION_SOME_TAG);
+        Field(match_opt, 0) = matches_and_table;
+
+        // SAFETY: This allocation is immediately filled with well-formed
         // values prior to returning.
-        result /* : ((int * int) array * (string * int) array, _) Result.t */ =
+        result /* : (((int * int) array * (string * int) array) option, _) Result.t */ =
             caml_alloc_small(1, RESULT_OK_TAG);
-        Field(result, 0) = matches_and_table;
+        Field(result, 0) = match_opt;
 
         CAMLreturn(result);
 }
