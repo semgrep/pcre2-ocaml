@@ -35,7 +35,9 @@ external pcre2_jit_match :
   ((int * int) option, int) Result.t = "jit_match" "jit_match_unboxed"
 
 external get_version : unit -> int * int = "get_version"
-external get_capture_groups : _ regex -> (string * int) array = "get_capture_groups"
+
+external get_capture_groups : _ regex -> (string * int) array
+  = "get_capture_groups"
 
 (* TODO: maybe testo dune integration??? *)
 (*

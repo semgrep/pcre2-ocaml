@@ -1,13 +1,6 @@
-type jit = [ `JIT ]
-type interp = [ `Interp ]
-
-type 'a regex constraint 'a = [< jit | interp ]
-(** Compiled regular expressions *)
-
-type match_ [@@deriving show]
-type captures [@@deriving show]
+type match_ [@@deriving show, eq]
+type captures [@@deriving show, eq]
 type substitution
-type range = { start : int; end_ : int } [@@deriving show]
 
 type compile_error =
   | END_BACKSLASH
@@ -109,7 +102,7 @@ type compile_error =
   | TOO_MANY_CAPTURES
   | CONDITION_ATOMIC_ASSERTION_EXPECTED
   | BACKSLASH_K_IN_LOOKAROUND
-[@@deriving show]
+[@@deriving show, eq]
 
 type match_error =
   (* "Expected" matching error codes: no match and partial match. *)
@@ -192,171 +185,149 @@ type match_error =
   | INTERNAL_DUPMATCH (* (-65) *)
   | DFA_UINVALID_UTF (* (-66) *)
   | INVALIDOFFSET (* (-67) *)
-
-type compile_match_options = [ `ANCHORED | `NO_UTF_CHECK | `ENDANCHORED ]
-
-type compile_option =
-  [ compile_match_options
-  | `ALLOW_EMPTY_CLASS
-  | `ALT_BSUX
-  | `AUTO_CALLOUT
-  | `CASELESS
-  | `DOLLAR_ENDONLY
-  | `DOTALL
-  | `DUPNAMES
-  | `EXTENDED
-  | `FIRSTLINE
-  | `MATCH_UNSET_BACKREF
-  | `MULTILINE
-  | `NEVER_UCP
-  | `NEVER_UTF
-  | `NO_AUTO_CAPTURE
-  | `NO_AUTO_POSSESS
-  | `NO_DOTSTAR_ANCHOR
-  | `NO_START_OPTIMIZE
-  | `UCP
-  | `UNGREEDY
-  | `UTF
-  | `NEVER_BACKSLASH_C
-  | `ALT_CIRCUMFLEX
-  | `ALT_VERBNAMES
-  | `USE_OFFSET_LIMIT
-  | `EXTENDED_MORE
-  | `LITERAL
-  | `MATCH_INVALID_UTF ]
+[@@deriving show, eq]
 
 (* Fastpath to JIT match for perf *)
-module Jit : sig
-  type matching_mode = JIT_COMPLETE | JIT_PARTIAL_SOFT | JIT_PARTIAL_HARD
-  type compile_option = JIT_INVALID_UTF
 
-  type match_option =
-    [ `NOTBOL
-    | `NOTEOL
-    | `NOTEMPTY
-    | `NOTEMPTY_ATSTART
-    | `PARTIAL_SOFT
-    | `PARTIAL_HARD ]
+module Options : sig
+  module Jit : sig
+    type matching_mode = JIT_COMPLETE | JIT_PARTIAL_SOFT | JIT_PARTIAL_HARD
+    type jit_only_compile_option = [ `JIT_INVALID_UTF ]
 
-  val compile :
-    ?options:compile_option list ->
-    ?mode:matching_mode ->
-    interp regex ->
-    (jit regex, compile_error) Result.t
+    type match_option =
+      [ `NOTBOL
+      | `NOTEOL
+      | `NOTEMPTY
+      | `NOTEMPTY_ATSTART
+      | `PARTIAL_SOFT
+      | `PARTIAL_HARD ]
+  end
 
-  val find :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    jit regex ->
-    string ->
-    match_ option
+  module Interp : sig
+    type compile_match_options = [ `ANCHORED | `NO_UTF_CHECK | `ENDANCHORED ]
 
-  val find_iter :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    jit regex ->
-    string ->
-    match_ Seq.t
+    type compile_option =
+      [ compile_match_options
+      | `ALLOW_EMPTY_CLASS
+      | `ALT_BSUX
+      | `AUTO_CALLOUT
+      | `CASELESS
+      | `DOLLAR_ENDONLY
+      | `DOTALL
+      | `DUPNAMES
+      | `EXTENDED
+      | `FIRSTLINE
+      | `MATCH_UNSET_BACKREF
+      | `MULTILINE
+      | `NEVER_UCP
+      | `NEVER_UTF
+      | `NO_AUTO_CAPTURE
+      | `NO_AUTO_POSSESS
+      | `NO_DOTSTAR_ANCHOR
+      | `NO_START_OPTIMIZE
+      | `UCP
+      | `UNGREEDY
+      | `UTF
+      | `NEVER_BACKSLASH_C
+      | `ALT_CIRCUMFLEX
+      | `ALT_VERBNAMES
+      | `USE_OFFSET_LIMIT
+      | `EXTENDED_MORE
+      | `LITERAL
+      | `MATCH_INVALID_UTF ]
 
-  val captures :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    jit regex ->
-    string ->
-    captures option
+    (* for compile ctx - can combine and just split back as needed in bindings? *)
+    type compile_ctx =
+      [ `EXTRA_ALLOW_SURROGATE_ESCAPES
+      | `EXTRA_BAD_ESCAPE_IS_LITERAL
+      | `EXTRA_MATCH_WORD
+      | `EXTRA_MATCH_LINE
+      | `EXTRA_ESCAPED_CR_IS_LF
+      | `EXTRA_ALT_BSUX
+      | `EXTRA_ALLOW_LOOKAROUND_BSK
+      | `EXTRA_CASELESS_RESTRICT
+      | `EXTRA_ASCII_BSD
+      | `EXTRA_ASCII_BSS
+      | `EXTRA_ASCII_BSW
+      | `EXTRA_ASCII_POSIX
+      | `EXTRA_ASCII_DIGIT ]
 
-  val captures_iter :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    jit regex ->
-    string ->
-    captures Seq.t
+    type match_option =
+      (* shared *)
+      [ Jit.match_option
+      | `COPY_MATCHED_SUBJECT
+      | `DISABLE_RECURSELOOP_CHECK
+      | `NO_JIT
+        (* not for pcre2_dfa_match() *)
+        (* not for pcre2_dfa_match() or pcre2_jit_match() *) ]
+    (* TODO: split to enforce restrictions (maybe except `NO_JIT) *)
+    (* TODO: add match_context options (depth, heap, match) limits here or separately? *)
 
-  val split :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    ?limit:int ->
-    jit regex ->
-    string ->
-    string list
+    type subst_options =
+      (* shared *)
+      [ Jit.match_option
+      | compile_match_options
+      | `NO_JIT
+      | (* exclusive *)
+        `SUBSTITUTE_GLOBAL
+      | `SUBSTITUTE_EXTENDED
+      | `SUBSTITUTE_UNSET_EMPTY
+      | `SUBSTITUTE_UNKNOWN_UNSET
+      | `SUBSTITUTE_OVERFLOW_LENGTH
+      | `SUBSTITUTE_LITERAL
+      | `SUBSTITUTE_MATCHED
+      | `SUBSTITUTE_REPLACEMENT_ONLY ]
 
-  val is_match :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    jit regex ->
-    string ->
-    bool
+    type newline_compile_ctx_option =
+      | NEWLINE_CR
+      | NEWLINE_LF
+      | NEWLINE_CRLF
+      | NEWLINE_ANY
+      | NEWLINE_ANYCRLF
+      | NEWLINE_NUL
 
-  val replace :
-    ?options:match_option list ->
-    ?subject_offset:int ->
-    jit regex ->
-    substitution ->
-    string ->
-    string
+    type bsr = BSR_UNICODE | ANYCRLF
+  end
+end
+(* TODO: hide, need since you can't do with type t = A | B or have
+   type t = A | B
+   include FOO with type t = t
+*)
+
+module Interp : sig
+  include module type of Options.Interp
+
+  include
+    Intf.Matcher
+      with type match_ = match_
+       and type captures = captures
+       and type substitution = substitution
+       and type compile_option = Options.Interp.compile_option
+       and type compile_error = compile_error
+       and type match_option = Options.Interp.match_option
+       and type match_error = match_error
 end
 
-(* for compile ctx - can combine and just split back as needed in bindings? *)
-type compile_ctx =
-  [ `EXTRA_ALLOW_SURROGATE_ESCAPES
-  | `EXTRA_BAD_ESCAPE_IS_LITERAL
-  | `EXTRA_MATCH_WORD
-  | `EXTRA_MATCH_LINE
-  | `EXTRA_ESCAPED_CR_IS_LF
-  | `EXTRA_ALT_BSUX
-  | `EXTRA_ALLOW_LOOKAROUND_BSK
-  | `EXTRA_CASELESS_RESTRICT
-  | `EXTRA_ASCII_BSD
-  | `EXTRA_ASCII_BSS
-  | `EXTRA_ASCII_BSW
-  | `EXTRA_ASCII_POSIX
-  | `EXTRA_ASCII_DIGIT ]
+module Jit : sig
+  include module type of Options.Jit
 
-type dfa_match_option =
-  (* shared *)
-  [ Jit.match_option
-  | compile_match_options
-  | `COPY_MATCHED_SUBJECT
-  | `DISABLE_RECURSELOOP_CHECK
-  | (* exclusive *)
-    `DFA_RESTART
-  | `DFA_SHORTEST ]
+  include
+    Intf.Matcher
+      with type match_ = match_
+       and type captures = captures
+       and type substitution = substitution
+       and type compile_option =
+        [ Options.Jit.jit_only_compile_option | Options.Interp.compile_option ]
+       and type compile_error = compile_error
+       and type match_option = Options.Jit.match_option
+       and type match_error = match_error
 
-type match_option =
-  (* shared *)
-  [ Jit.match_option
-  | `COPY_MATCHED_SUBJECT
-  | `DISABLE_RECURSELOOP_CHECK
-  | `NO_JIT
-    (* not for pcre2_dfa_match() *)
-    (* not for pcre2_dfa_match() or pcre2_jit_match() *) ]
-(* TODO: split to enforce restrictions (maybe except `NO_JIT) *)
-(* TODO: add match_context options (depth, heap, match) limits here or separately? *)
-
-type subst_options =
-  (* shared *)
-  [ Jit.match_option
-  | compile_match_options
-  | `NO_JIT
-  | (* exclusive *)
-    `SUBSTITUTE_GLOBAL
-  | `SUBSTITUTE_EXTENDED
-  | `SUBSTITUTE_UNSET_EMPTY
-  | `SUBSTITUTE_UNKNOWN_UNSET
-  | `SUBSTITUTE_OVERFLOW_LENGTH
-  | `SUBSTITUTE_LITERAL
-  | `SUBSTITUTE_MATCHED
-  | `SUBSTITUTE_REPLACEMENT_ONLY ]
-
-type newline_compile_ctx_option =
-  | NEWLINE_CR
-  | NEWLINE_LF
-  | NEWLINE_CRLF
-  | NEWLINE_ANY
-  | NEWLINE_ANYCRLF
-  | NEWLINE_NUL
-
-type bsr = BSR_UNICODE | ANYCRLF
+  val of_interp :
+    ?options:jit_only_compile_option list ->
+    ?mode:matching_mode ->
+    Interp.t ->
+    (t, compile_error) Result.t
+end
 
 (** Version information *)
 val version : int * int
@@ -374,72 +345,12 @@ val config_depth_limit : int
 val config_stackrecurse : bool
 (** Indicates use of stack recursion in matching function *)
 
-(* Regex pattern kind *)
-
-val compile :
-  ?options:compile_option list ->
-  string ->
-  (interp regex, compile_error) Result.t
-
-val capture_groups : _ regex -> (string * int) array
-(** [captures_groups r] is an array comprising the names and numbering of each
-    named capture group in [r]. NOTE: the names are not in any particular
-    order. I.e., the n-th entry in the array is not necessarily capture group
-    number n. *)
-
-val find :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  _ regex ->
-  string ->
-  match_ option
-
-val find_iter :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  _ regex ->
-  string ->
-  match_ Seq.t
-
-val captures :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  _ regex ->
-  string ->
-  captures option
-
-val captures_iter :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  _ regex ->
-  string ->
-  captures Seq.t
-
-val split :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  ?limit:int ->
-  _ regex ->
-  string ->
-  string list
-
-val is_match :
-  ?options:match_option list -> ?subject_offset:int -> _ regex -> string -> bool
-
-val subst : string -> substitution
-
-val replace :
-  ?options:match_option list ->
-  ?subject_offset:int ->
-  _ regex ->
-  substitution ->
-  string ->
-  string
-
-val range_of_match : match_ -> range
-
-(* TODO: not a huge fan since this requires creating a copy. Consider some way
-   we could have a string view type? *)
-val substring_of_match : match_ -> string
-val match_of_captures : captures -> int -> match_ option
-val named_match_of_captures : captures -> string -> match_ option
+type dfa_match_option =
+  (* shared *)
+  [ Options.Jit.match_option
+  | Options.Interp.compile_match_options
+  | `COPY_MATCHED_SUBJECT
+  | `DISABLE_RECURSELOOP_CHECK
+  | (* exclusive *)
+    `DFA_RESTART
+  | `DFA_SHORTEST ]
