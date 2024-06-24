@@ -136,11 +136,13 @@ CAMLprim value compile(value *argv, int argc UNUSED) {
 
 /// Match with the provided pattern.
 ///
-/// @param[in] regex The compiled regex to use for matching.
+/// @param[in] ocaml_re The compiled regex to use for matching.
+/// @param[in] subject The string to be searched.
+/// @param[in] subject_offset The byte index in the subject at which to begin.
 /// @param[in] options Matching options, specified via a bitvector . See `pcre2_match(3)`.
-// TODO: allow reusing the pcre2_match_data struct so that exec_all / find_iter
-// / captures_iter can avoid a bunch of allocations. Ideally this function doesn't allocate
-// (except maybe a result).
+// TODO: allow reusing the pcre2_match_data struct so that find_iter can
+// avoid a bunch of allocations.
+// Ideally this function doesn't allocate except for some `caml_alloc_small`s.
 CAMLprim value match_unboxed(value ocaml_re /* : _ regex */, value subject /* : string */,
                              intnat subject_offset /* : int [@untagged] */,
                              uint32_t options /* : int32 */
@@ -260,11 +262,12 @@ CAMLprim value jit_compile(value *argv, int argc UNUSED) {
 
 /// Match with the provided JIT compiled regex.
 ///
-/// @param[in] regex The JIT-enabled regex.
-/// @param[in] options Matching options, specified via a bitvector . See
-/// `pcre2_match(3)`. NOTE: PCRE2_ZERO_TERMINATED is not supported.
-// TODO: Just drop PCRE2_ZERO_TERMINATED? I don't think it much makes sense if we take ocaml
-// strings.
+/// @param[in] ocaml_re The JIT regex to use for matching.
+/// @param[in] subject The string to be searched.
+/// @param[in] subject_offset The byte index in the subject at which to begin.
+/// @param[in] options Matching options, specified via a bitvector. See
+/// `pcre2_match(3)`. NOTE: PCRE2_ZERO_TERMINATED is not supported, but this
+/// isn't much of an issue since we are dealing with OCaml strings.
 CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject /* : string */,
                                  int subject_offset /* : int [@untagged] */,
                                  uint32_t options /* : int32 */
@@ -416,13 +419,21 @@ value make_capture_group_name_table(const pcre2_code *re) /* -> (string * int) a
         CAMLreturn(array);
 }
 
-/// Match with the provided pattern.
+/// Wrapper for [make_capture_group_name_table] which takes a regex as an OCaml
+/// value, instead of directly.
+CAMLprim value get_capture_groups(value ocaml_regex /* : regex */) /* -> (string * int) array */ {
+        CAMLparam1(ocaml_regex);
+        CAMLreturn(make_capture_group_name_table(regex_of_value(ocaml_regex)->regex));
+}
+
+/// Match, with capture groups, the provided pattern.
 ///
-/// @param[in] regex The compiled regex to use for matching.
+/// @param[in] ocaml_re The compiled regex to use for matching.
+/// @param[in] subject The string to be searched.
+/// @param[in] subject_offset The byte index in the subject at which to begin.
 /// @param[in] options Matching options, specified via a bitvector . See `pcre2_match(3)`.
-// TODO: allow reusing the pcre2_match_data struct so that exec_all / find_iter
-// / captures_iter can avoid a bunch of allocations. Ideally this function doesn't allocate
-// (except maybe a result).
+// TODO: allow reusing the pcre2_match_data struct so that captures_iter can avoid a bunch of
+// allocations. Ideally this function doesn't allocate (except maybe a result).
 CAMLprim value capture_unboxed(
     value ocaml_re /* : _ regex */, value subject /* : string */,
     intnat subject_offset /* : int [@untagged] */, uint32_t options /* : int32 */
@@ -521,8 +532,110 @@ CAMLprim value capture(value *argv, int argc UNUSED) {
         return match_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
 }
 
+/// Match, with capture groups, the provided JIT-enabled pattern.
 ///
-CAMLprim value get_capture_groups(value ocaml_regex /* : regex */) /* -> (string * int) array */ {
-        CAMLparam1(ocaml_regex);
-        CAMLreturn(make_capture_group_name_table(regex_of_value(ocaml_regex)->regex));
+/// @param[in] ocaml_re The compiled regex to use for matching.
+/// @param[in] subject The string to be searched.
+/// @param[in] subject_offset The byte index in the subject at which to begin.
+/// @param[in] options Matching options, specified via a bitvector . See `pcre2_match(3)`.
+// TODO: allow reusing the pcre2_match_data struct so that captures_iter can avoid a bunch of
+// allocations. Ideally this function doesn't allocate (except maybe a result).
+CAMLprim value jit_capture_unboxed(
+    value ocaml_re /* : _ regex */, value subject /* : string */,
+    intnat subject_offset /* : int [@untagged] */, uint32_t options /* : int32 */
+    ) /* : -> (((int * int) array * (string * int) array) option, match_error) Result.t */ {
+        CAMLparam2(ocaml_re, subject);
+        CAMLlocal5(result, matches, match, name, name_table);
+        CAMLlocal2(matches_and_table, match_opt);
+
+        if (subject_offset < 0) {
+                // Need to handle this case manually since PCRE2 takes an unsigned value.
+                // FIXME: result or option from this function? need to see if meaningful errors can
+                // occur
+                // SAFETY: This allocation is immediately filled with well-formed values prior to
+                // returning.
+                result = caml_alloc_small(1, RESULT_ERROR_TAG);
+                Field(result, 0) = Val_int(PCRE2_ERROR_BADOFFSET);
+                CAMLreturn(result);
+        }
+        size_t offset = subject_offset;
+        size_t subject_length = caml_string_length(subject);
+
+        const pcre2_code *re = regex_of_value(ocaml_re)->regex;
+        // TODO: support match/depth limits. Or callouts. May need to be
+        // bundled with the compiled regex.
+        pcre2_match_context *mcontext = NULL;
+        pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
+
+        // NOTE: Really one more than number of captures since it includes the
+        // full match.
+        // SAFETY: Passing in the value of String_val(subject) here is fine
+        // since a GC cannot occur.
+        int num_captures = pcre2_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset,
+                                       options, match_data, mcontext);
+        PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
+
+        if (num_captures == PCRE2_ERROR_NOMATCH || num_captures == PCRE2_ERROR_PARTIAL) {
+                pcre2_match_data_free(match_data);
+                // SAFETY: This allocation is immediately filled with
+                // well-formed values prior to returning.
+                result = caml_alloc_small(1, RESULT_OK_TAG);
+                Field(result, 0) = Val_none;
+                CAMLreturn(result);
+        } else if (num_captures <= 0) {
+                pcre2_match_data_free(match_data);
+                // SAFETY: This allocation is immediately filled with
+                // well-formed values prior to returning.
+                result = caml_alloc_small(1, RESULT_ERROR_TAG);
+                Field(result, 0) = Val_int(num_captures);
+                CAMLreturn(result);
+        }
+
+        matches /* : (int * int) array */ = caml_alloc_tuple(num_captures);
+        for (int i = 0; i < num_captures; ++i) {
+                // SAFETY: This block must be filled with well-formed values
+                // before the next allocation. The next allocation is no
+                // earlier than the end of this loop iteration. All fields of
+                // this tuple are assigned to by the end of the loop.
+                match /* : int * int */ = caml_alloc_small(2, TUPLE_TAG);
+                // The i-th capture group (the 0-th being the full match) is at
+                // [2i, 2i+1] in ovec.
+                int start = 2 * i;
+                int end = 2 * i + 1;
+                Field(match, 0) = Val_int(ovec[start]);
+                Field(match, 1) = Val_int(ovec[end]);
+                caml_modify(&Field(matches, i), match);
+        }
+
+        // TODO: cache this? May not be that expensive, but if it is then probably worth since we'll
+        // match w/ capture many times.
+        name_table = make_capture_group_name_table(re);
+
+        pcre2_match_data_free(match_data);
+
+        // SAFETY: This allocation is immediately filled with well-formed
+        // values.
+        matches_and_table /* : (int * int) array * (string * int) array */ =
+            caml_alloc_small(2, TUPLE_TAG);
+        Field(matches_and_table, 0) = matches;
+        Field(matches_and_table, 1) = name_table;
+
+        // SAFETY: This allocation is immediately filled with well-formed
+        // values.
+        match_opt /* : ((int * int) array * (string * int) array) option */ =
+            caml_alloc_small(1, OPTION_SOME_TAG);
+        Field(match_opt, 0) = matches_and_table;
+
+        // SAFETY: This allocation is immediately filled with well-formed
+        // values prior to returning.
+        result /* : (((int * int) array * (string * int) array) option, _) Result.t */ =
+            caml_alloc_small(1, RESULT_OK_TAG);
+        Field(result, 0) = match_opt;
+
+        CAMLreturn(result);
+}
+
+/// Boxed argument version of [capture_unboxed] (for bytecode).
+CAMLprim value jit_capture(value *argv, int argc UNUSED) {
+        return match_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
 }

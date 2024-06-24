@@ -34,6 +34,14 @@ external pcre2_jit_match :
   (int32[@unboxed]) ->
   ((int * int) option, int) Result.t = "jit_match" "jit_match_unboxed"
 
+external pcre2_jit_capture :
+  jit regex ->
+  string ->
+  (int[@untagged]) ->
+  (int32[@unboxed]) ->
+  (((int * int) array * (string * int) array) option, int) Result.t
+  = "jit_capture" "jit_capture_unboxed"
+
 external get_version : unit -> int * int = "get_version"
 
 external get_capture_groups : _ regex -> (string * int) array
