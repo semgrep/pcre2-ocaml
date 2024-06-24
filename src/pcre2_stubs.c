@@ -1,5 +1,3 @@
-// NOTE: Currently these bindings support only 8-bit code units. Below we use the generically named
-// functions. Future versions could include support for non-8-bit code units.
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -12,6 +10,9 @@
 #include "caml/misc.h"
 #include "caml/mlvalues.h"
 
+// NOTE: Currently these bindings support only 8-bit code units. Below we use
+// the generically named functions. Future versions could include support for
+// non-8-bit code units.
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
 
@@ -27,8 +28,8 @@ const int RESULT_ERROR_TAG = 1;
 const int TUPLE_TAG = 0;
 const int ARRAY_TAG = 0;
 
-/// The maximum size which is used for a temporary array to count the number of strings
-/// corresponding to each numbered capture group.
+/// The maximum size which is used for a temporary array to count the number of
+/// strings corresponding to each numbered capture group.
 ///
 /// This should be large enough that most (reasonable) patterns have fewer
 /// numbered capture groups than this value, but small enough it is reasonable
@@ -100,6 +101,9 @@ CAMLprim value compile_unboxed(value pattern /* : string */,
 
         pcre2_compile_context *ccontext = NULL;
         // TODO(cooper): allocated compile_context for the "extra" options if need be.
+        // SAFETY: Passing in the value of String_val(subject) here is fine
+        // since a GC cannot occur (and the resulting value, which is held across GC, does not refer
+        // to the string).
         pcre2_code *regex = pcre2_compile((PCRE2_SPTR)String_val(pattern), pattern_len, options,
                                           &error_code, &error_offset, ccontext);
         pcre2_compile_context_free(ccontext);
@@ -140,8 +144,8 @@ CAMLprim value compile(value *argv, int argc UNUSED) {
 /// @param[in] subject The string to be searched.
 /// @param[in] subject_offset The byte index in the subject at which to begin.
 /// @param[in] options Matching options, specified via a bitvector . See `pcre2_match(3)`.
-// TODO: allow reusing the pcre2_match_data struct so that find_iter can
-// avoid a bunch of allocations.
+// TODO: allow reusing the pcre2_match_data struct so that exec_all / find_iter
+// / captures_iter can avoid a bunch of allocations.
 // Ideally this function doesn't allocate except for some `caml_alloc_small`s.
 CAMLprim value match_unboxed(value ocaml_re /* : _ regex */, value subject /* : string */,
                              intnat subject_offset /* : int [@untagged] */,
@@ -309,6 +313,8 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
         pcre2_match_context *mcontext = NULL;
         pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
 
+        // SAFETY: Passing in the value of String_val(subject) here is fine
+        // since a GC cannot occur.
         int ret = pcre2_jit_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset,
                                   options, match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
@@ -380,13 +386,19 @@ PCRE2_SPTR names_of_regex(const pcre2_code *regex, uint32_t *name_count, uint32_
         return name_table;
 }
 
-value make_capture_group_name_table(const pcre2_code *re) /* -> (string * int) array */ {
+/// Returns the named capture groups and their corresponding numbering for a
+/// given regex.
+///
+/// @param[in] regex The regex to return the named capture groups of.
+/// @return An array of OCaml values comprising tuples `(n, i)` of the name `n`
+/// and numbering `i` of the named capture groups present in the regex.
+value make_capture_group_name_table(const pcre2_code *regex) /* -> (string * int) array */ {
         CAMLparam0();
         CAMLlocal3(name, pair, array);
 
         uint32_t name_count;
         uint32_t entry_size;
-        PCRE2_SPTR names = names_of_regex(re, &name_count, &entry_size);
+        PCRE2_SPTR names = names_of_regex(regex, &name_count, &entry_size);
 
         if (!names) {
                 array = caml_alloc_small(0, ARRAY_TAG);
@@ -463,6 +475,8 @@ CAMLprim value capture_unboxed(
 
         // NOTE: Really one more than number of captures since it includes the
         // full match.
+        // SAFETY: Passing in the value of String_val(subject) here is fine
+        // since a GC cannot occur.
         int num_captures = pcre2_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset,
                                        options, match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
