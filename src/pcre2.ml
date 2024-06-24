@@ -759,7 +759,7 @@ module Jit = struct
     | Ok None -> Ok None
     | Error n -> Error (match_error_of_int n)
 
-  (* TODO(cooper): dedup impl with a functor? *)
+  (* TODO(cooper): dedup impl with a functor? - entirely derived from find *)
   let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (match_, match_error) Result.t Seq.t =
     Seq.unfold
@@ -770,22 +770,26 @@ module Jit = struct
         | Error e -> Some (Error e, String.length subject))
       subject_offset
 
-  let captures :
-      ?options:match_option list ->
-      ?subject_offset:int ->
-      t ->
-      string ->
-      (captures option, match_error) Result.t =
-   fun ?options:_ ?subject_offset:_ _ _ -> failwith "todo"
+  let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
+      (re : t) (subject : string) : (captures option, match_error) Result.t =
+    let options = bitvector_of_match_options options in
+    match Bindings.pcre2_jit_capture re subject subject_offset options with
+    | Ok (Some (arr, names)) -> Ok (Some (subject, arr, names))
+    | Ok None -> Ok None
+    | Error n -> Error (match_error_of_int n)
 
-  (* TODO(cooper): dedup impl with a functor? *)
-  let captures_iter :
-      ?options:match_option list ->
-      ?subject_offset:int ->
-      t ->
-      string ->
+  (* TODO(cooper): dedup impl with a functor? - entirely derived from
+     captures  *)
+  let captures_iter ?(options : match_option list = [])
+      ?(subject_offset : int = 0) (re : t) (subject : string) :
       (captures, match_error) Result.t Seq.t =
-   fun ?options:_ ?subject_offset:_ _ _ -> failwith "todo"
+    Seq.unfold
+      (fun offset ->
+        match captures ~options ~subject_offset:offset re subject with
+        | Ok (Some (c : captures)) -> Some (Ok c, (range_of_captures c).end_)
+        | Ok None -> None
+        | Error e -> Some (Error e, String.length subject))
+      subject_offset
 
   let split :
       ?options:match_option list ->
