@@ -690,14 +690,27 @@ module Interp = struct
         | Error e -> Some (Error e, String.length subject))
       subject_offset
 
-  let split :
-      ?options:match_option list ->
-      ?subject_offset:int ->
-      ?limit:int ->
-      t ->
-      string ->
+  let split ?(options : match_option list = []) ?(subject_offset : int = 0)
+      ?(limit : int option) (re : t) (subject : string) :
       (string list, match_error) Result.t =
-   fun ?options:_ ?subject_offset:_ ?limit:_ _ _ -> failwith "todo"
+    let delims = find_iter ~options ~subject_offset re subject in
+    let delims =
+      match limit with
+      | Some n when n > 0 -> Seq.take (n - 1) delims
+      | None -> delims
+      | _ -> invalid_arg "todo: decide how to handle 0 or negative limit"
+    in
+    Seq.fold_left
+      (fun x m ->
+        match (x, m) with
+        | Ok (start, acc), Ok m ->
+            let { start = delim_start; end_ = delim_end } = range_of_match m in
+            let sub = String.sub subject start (delim_start - start) in
+            Ok (delim_end, sub :: acc)
+        | e, _ -> e)
+      (Ok (0, []))
+      delims
+    |> Result.map snd |> Result.map List.rev
 
   let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (bool, match_error) Result.t =
@@ -792,14 +805,27 @@ module Jit = struct
         | Error e -> Some (Error e, String.length subject))
       subject_offset
 
-  let split :
-      ?options:match_option list ->
-      ?subject_offset:int ->
-      ?limit:int ->
-      t ->
-      string ->
+  let split ?(options : match_option list = []) ?(subject_offset : int = 0)
+      ?(limit : int option) (re : t) (subject : string) :
       (string list, match_error) Result.t =
-   fun ?options:_ ?subject_offset:_ ?limit:_ _ _ -> failwith "todo"
+    let delims = find_iter ~options ~subject_offset re subject in
+    let delims =
+      match limit with
+      | Some n when n > 0 -> Seq.take (n - 1) delims
+      | None -> delims
+      | _ -> invalid_arg "todo: decide how to handle 0 or negative limit"
+    in
+    Seq.fold_left
+      (fun x m ->
+        match (x, m) with
+        | Ok (start, acc), Ok m ->
+            let { start = delim_start; end_ = delim_end } = range_of_match m in
+            let sub = String.sub subject start (delim_start - start) in
+            Ok (delim_end, sub :: acc)
+        | e, _ -> e)
+      (Ok (0, []))
+      delims
+    |> Result.map snd |> Result.map List.rev
 
   (* TODO(cooper): dedup impl with a functor? *)
   let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)
