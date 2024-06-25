@@ -3,105 +3,151 @@ type captures [@@deriving show, eq]
 type substitution
 
 type compile_error =
-  | END_BACKSLASH
+  | END_BACKSLASH  (** A pattern string ends in a backslash *)
   | END_BACKSLASH_C
+      (** A pattern string ends in \c, which should require an additional
+          character following it. *)
   | UNKNOWN_ESCAPE
+      (** An unrecognized character, not suitable for starting an escape
+          sequence, followed a backslash. *)
   | QUANTIFIER_OUT_OF_ORDER
-  | QUANTIFIER_TOO_BIG
-  | MISSING_SQUARE_BRACKET
+      (** The numbers were out of order in a {} quantifier (i.e., {n,m} where
+          n > m). *)
+  | QUANTIFIER_TOO_BIG  (** A limit was too big in a {} quantifier. *)
+  | MISSING_SQUARE_BRACKET  (** Missing terminating ] for a character class *)
   | ESCAPE_INVALID_IN_CLASS
-  | CLASS_RANGE_ORDER
-  | QUANTIFIER_INVALID
-  | INTERNAL_UNEXPECTED_REPEAT
-  | INVALID_AFTER_PARENS_QUERY
+      (** Invalid escape sequence in a characters class *)
+  | CLASS_RANGE_ORDER  (** Range out of order in character class *)
+  | QUANTIFIER_INVALID  (** Quantifier does not follow a repeatable item *)
+  | INTERNAL_UNEXPECTED_REPEAT  (** Internal error *)
+  | INVALID_AFTER_PARENS_QUERY  (** Unrecognized character after (? or (?- *)
   | POSIX_CLASS_NOT_IN_CLASS
+      (** POSIX named classes are supported only within a class *)
   | POSIX_NO_SUPPORT_COLLATING
-  | MISSING_CLOSING_PARENTHESIS
-  | BAD_SUBPATTERN_REFERENCE
+      (** POSIX collating elements are not supported *)
+  | MISSING_CLOSING_PARENTHESIS  (** Missing closing parenthesis. *)
+  | BAD_SUBPATTERN_REFERENCE  (** Reference to non-existent subpattern *)
   | NULL_PATTERN
-  | BAD_OPTIONS
-  | MISSING_COMMENT_CLOSING
-  | PARENTHESES_NEST_TOO_DEEP
-  | PATTERN_TOO_LARGE
-  | HEAP_FAILED
-  | UNMATCHED_CLOSING_PARENTHESIS
-  | INTERNAL_CODE_OVERFLOW
-  | MISSING_CONDITION_CLOSING
+      (** Pattern passed as a null pointer but with non-zero length *)
+  | BAD_OPTIONS  (** Unrecognized option bits *)
+  | MISSING_COMMENT_CLOSING  (** Missing ) after (?# comment *)
+  | PARENTHESES_NEST_TOO_DEEP  (** Parentheses are nested too deeply *)
+  | PATTERN_TOO_LARGE  (** Regular expression is too large *)
+  | HEAP_FAILED  (** Failed to allocate heap memory *)
+  | UNMATCHED_CLOSING_PARENTHESIS  (** Unmatched closing parenthesis *)
+  | INTERNAL_CODE_OVERFLOW  (** Internal *)
+  | MISSING_CONDITION_CLOSING  (** Missing closing parenthesis for condition *)
   | LOOKBEHIND_NOT_FIXED_LENGTH
-  | ZERO_RELATIVE_REFERENCE
+      (** Length of a lookbehind assertion is not limited *)
+  | ZERO_RELATIVE_REFERENCE  (** A relative value of zero is not permitted *)
   | TOO_MANY_CONDITION_BRANCHES
-  | CONDITION_ASSERTION_EXPECTED
-  | BAD_RELATIVE_REFERENCE
-  | UNKNOWN_POSIX_CLASS
-  | INTERNAL_STUDY_ERROR
-  | UNICODE_NOT_SUPPORTED
+      (** Conditional subpattern contains more than two branches *)
+  | CONDITION_ASSERTION_EXPECTED  (** Assertion expected after (?( or (?(?C) *)
+  | BAD_RELATIVE_REFERENCE  (** Digit expected ater (?+ or (?- *)
+  | UNKNOWN_POSIX_CLASS  (** Unknown POSIX class name *)
+  | INTERNAL_STUDY_ERROR  (** Internal *)
+  | UNICODE_NOT_SUPPORTED  (** No Unicode support *)
   | PARENTHESES_STACK_CHECK
+      (** Parentheses are too deeply nested (stack check) *)
   | CODE_POINT_TOO_BIG
-  | LOOKBEHIND_TOO_COMPLICATED
+      (** The character code point value in \x{} or \o{} is too large *)
+  | LOOKBEHIND_TOO_COMPLICATED  (** Lookbehind is too complicated *)
   | LOOKBEHIND_INVALID_BACKSLASH_C
+      (** \C is not allowed in a lookbehind assertion in the current
+          UTF-{8,16,32} mode *)
   | UNSUPPORTED_ESCAPE_SEQUENCE
-  | CALLOUT_NUMBER_TOO_BIG
-  | MISSING_CALLOUT_CLOSING
-  | ESCAPE_INVALID_IN_VERB
-  | UNRECOGNIZED_AFTER_QUERY_P
+      (** PCRE2 does not suport \F, \L, \l, \N{name}, \U or \u *)
+  | CALLOUT_NUMBER_TOO_BIG  (** Number after (?C is greater than 255 *)
+  | MISSING_CALLOUT_CLOSING  (** Closing parenthesis for (?C missing *)
+  | ESCAPE_INVALID_IN_VERB  (** invalid escape sequence in ( *VERB) name *)
+  | UNRECOGNIZED_AFTER_QUERY_P  (** Unrecognized character after (?P *)
   | MISSING_NAME_TERMINATOR
+      (** Syntax error in subpattern name (missing terminator?) *)
   | DUPLICATE_SUBPATTERN_NAME
-  | INVALID_SUBPATTERN_NAME
+      (** two named subpatterns have  the same name (PCRE2_DUPNAMES not set) *)
+  | INVALID_SUBPATTERN_NAME  (** subpattern naem must start with a non-digit *)
   | UNICODE_PROPERTIES_UNAVAILABLE
-  | MALFORMED_UNICODE_PROPERTY
-  | UNKNOWN_UNICODE_PROPERTY
+      (** This version of PCRE2 does not support \P, \p or \X *)
+  | MALFORMED_UNICODE_PROPERTY  (** Malformed \P or \p sequence *)
+  | UNKNOWN_UNICODE_PROPERTY  (** Unknown property after \P or \p *)
   | SUBPATTERN_NAME_TOO_LONG
+      (** Subpattern name is too long (max MAX_NAME_SIZE) code units *)
   | TOO_MANY_NAMED_SUBPATTERNS
-  | CLASS_INVALID_RANGE
+      (** Too many named subpatterns (max MAX_NAME_SIZE) *)
+  | CLASS_INVALID_RANGE  (** Invalid range in character class *)
   | OCTAL_BYTE_TOO_BIG
-  | INTERNAL_OVERRAN_WORKSPACE
-  | INTERNAL_MISSING_SUBPATTERN
+      (** Octal value is greater than \377 in 8-bit non-UTF-8 *)
+  | INTERNAL_OVERRAN_WORKSPACE  (** Internal *)
+  | INTERNAL_MISSING_SUBPATTERN  (** Internal *)
   | DEFINE_TOO_MANY_BRANCHES
-  | BACKSLASH_O_MISSING_BRACE
-  | INTERNAL_UNKNOWN_NEWLINE
+      (** DEFINE subpattern contains more than one branch *)
+  | BACKSLASH_O_MISSING_BRACE  (** Missing opening brace after \o *)
+  | INTERNAL_UNKNOWN_NEWLINE  (** Internal *)
   | BACKSLASH_G_SYNTAX
+      (** \g is not followed by a braced, angle-bracketed, or quoted
+          name/number or by a plain number *)
   | PARENS_QUERY_R_MISSING_CLOSING
+      (** (?R (recursive pattern call) must be followed by a closing
+          parenthesis *)
   | VERB_ARGUMENT_NOT_ALLOWED
-  | VERB_UNKNOWN
-  | SUBPATTERN_NUMBER_TOO_BIG
-  | SUBPATTERN_NAME_EXPECTED
-  | INTERNAL_PARSED_OVERFLOW
-  | INVALID_OCTAL
+      (** obsolete - an argument is not allowed for ACCEPT, FAIL or COMMIT *)
+  | VERB_UNKNOWN  (** ( *VERB) not recognized or malformed *)
+  | SUBPATTERN_NUMBER_TOO_BIG  (** Subpattern number is too big *)
+  | SUBPATTERN_NAME_EXPECTED  (** Subpattern name expected *)
+  | INTERNAL_PARSED_OVERFLOW  (** Internal *)
+  | INVALID_OCTAL  (** Non-octal character in \o{} (closing brace missing?) *)
   | SUBPATTERN_NAMES_MISMATCH
-  | MARK_MISSING_ARGUMENT
+      (** Different names for subpatterns of the same number are not allowed *)
+  | MARK_MISSING_ARGUMENT  (** ( *MARK) must have an argument *)
   | INVALID_HEXADECIMAL
-  | BACKSLASH_C_SYNTAX
+      (** Non-hex character in \x{} (closing brace missing?) *)
+  | BACKSLASH_C_SYNTAX  (** \c must be followed by a letter or one of [\]^_? *)
   | BACKSLASH_K_SYNTAX
-  | INTERNAL_BAD_CODE_LOOKBEHINDS
-  | BACKSLASH_N_IN_CLASS
-  | CALLOUT_STRING_TOO_LONG
+      (** \k is not followed by a braced, angle-bracketed, or quoted name *)
+  | INTERNAL_BAD_CODE_LOOKBEHINDS  (** Internal *)
+  | BACKSLASH_N_IN_CLASS  (** \N is not supported in a class *)
+  | CALLOUT_STRING_TOO_LONG  (** Callout srtring is too long *)
   | UNICODE_DISALLOWED_CODE_POINT
-  | UTF_IS_DISABLED
-  | UCP_IS_DISABLED
-  | VERB_NAME_TOO_LONG
+      (** Disallowed unicode code point (>= \0xd800 && <= 0xdfff) *)
+  | UTF_IS_DISABLED  (** Using UTF is disabled by the application *)
+  | UCP_IS_DISABLED  (** Using UCP is disabled by the application *)
+  | VERB_NAME_TOO_LONG  (** name is too long in MARK, PRUNE, SKIP or THEN *)
   | BACKSLASH_U_CODE_POINT_TOO_BIG
-  | MISSING_OCTAL_OR_HEX_DIGITS
+      (** Character code point value in \u sequence is too large *)
+  | MISSING_OCTAL_OR_HEX_DIGITS  (** Digits missing in \x{} or \o{} or \N{U+} *)
   | VERSION_CONDITION_SYNTAX
-  | INTERNAL_BAD_CODE_AUTO_POSSESS
+      (** Syntax error or number too big in (?(VERSION condition *)
+  | INTERNAL_BAD_CODE_AUTO_POSSESS  (** Internal *)
   | CALLOUT_NO_STRING_DELIMITER
+      (** Missing terminating delimiter for callout with string argument *)
   | CALLOUT_BAD_STRING_DELIMITER
-  | BACKSLASH_C_CALLER_DISABLED
+      (** Unrecognized string delimiter follows (?C *)
+  | BACKSLASH_C_CALLER_DISABLED  (** Using \C is disabled by the application *)
   | QUERY_BARJX_NEST_TOO_DEEP
+      (** (?| and/or (?J: or (?x: parentheses are too deeply nested *)
   | BACKSLASH_C_LIBRARY_DISABLED
-  | PATTERN_TOO_COMPLICATED
-  | LOOKBEHIND_TOO_LONG
+      (** Using \C is disabled in this PCRE2 library *)
+  | PATTERN_TOO_COMPLICATED  (** Regular expression is too complicated *)
+  | LOOKBEHIND_TOO_LONG  (** Lookbehind assertion is too long *)
   | PATTERN_STRING_TOO_LONG
-  | INTERNAL_BAD_CODE
-  | INTERNAL_BAD_CODE_IN_SKIP
+      (** Pattern string is longer than the limit set by the application *)
+  | INTERNAL_BAD_CODE  (** Internal *)
+  | INTERNAL_BAD_CODE_IN_SKIP  (** Internal *)
   | NO_SURROGATES_IN_UTF16
-  | BAD_LITERAL_OPTIONS
+      (** EXTRA_ALLOW_SURROGRATE_ESCAPES is not allowed in UTF-16 mode *)
+  | BAD_LITERAL_OPTIONS  (** Invalid options bits with PCRE2_LITERAL *)
   | SUPPORTED_ONLY_IN_UNICODE
-  | INVALID_HYPHEN_IN_OPTIONS
-  | ALPHA_ASSERTION_UNKNOWN
+      (** \N{U+dddd} is supported only in Unicode mode *)
+  | INVALID_HYPHEN_IN_OPTIONS  (** Invalid hyphen in option setting *)
+  | ALPHA_ASSERTION_UNKNOWN  (** alpha_assertion not recognized *)
   | SCRIPT_RUN_NOT_AVAILABLE
-  | TOO_MANY_CAPTURES
+      (** Script runs require Unicode support, which this version of PCRE2 does
+          not have *)
+  | TOO_MANY_CAPTURES  (** Too many capturing groups (max 65535) *)
   | CONDITION_ATOMIC_ASSERTION_EXPECTED
+      (** Atomic assertion expected after (?( or (?(?C) *)
   | BACKSLASH_K_IN_LOOKAROUND
+      (** \K is not allowed in lookarounds (cf.  EXTRA_ALLOW_LOOKAROUND_BSK) *)
 [@@deriving show, eq]
 
 type match_error =
@@ -274,8 +320,8 @@ type match_error =
           pattern, that is, the number is greater than the number of capturing
           parentheses.
 
-          - in substitution: returned for a non-existent substring insertion, unless
-          PCRE2_SUBSTITUTE_UNKNOWN_UNSET is set.
+          - in substitution: returned for a non-existent substring insertion,
+          unless PCRE2_SUBSTITUTE_UNKNOWN_UNSET is set.
         *)
   | NOUNIQUESUBSTRING
       (** Returned when there is more than one capture group with a given name
@@ -300,7 +346,8 @@ type match_error =
   | UNSET
       (** - in substrings: The substring did not participate in the match. For
           example, if the pattern is (abc)|(def) and the subject is "def", and
-          the ovector contains at least two capturing slots, substring number 1 is unset.
+          the ovector contains at least two capturing slots, substring number 1
+          is unset.
 
           - in substitution: returned for an unset substring insertion
           (including an unknown substring when PCRE2_SUBSTITUTE_UNKNOWN_UNSET
@@ -322,7 +369,8 @@ type match_error =
           match started earlier than the current position in the subject, which
           can happen if \K is used in an assertion *)
   | TOOMANYREPLACE
-      (** The number of total substitutions would exceed the maximum integer and cause overflow. *)
+      (** The number of total substitutions would exceed the maximum integer
+          and cause overflow. *)
   | BADSERIALIZEDDATA  (** Invalid arguments to pcre2_serialize *)
   | HEAPLIMIT  (** The heap limit was reached. *)
   | CONVERT_SYNTAX  (** Syntax error in pcre2_convert *)
