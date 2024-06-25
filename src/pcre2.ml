@@ -68,6 +68,7 @@ module Error = struct
     | BAD_SUBPATTERN_REFERENCE
     | NULL_PATTERN
     | BAD_OPTIONS
+      (* TODO: can we make this not possible with the API we expose? *)
     | MISSING_COMMENT_CLOSING
     | PARENTHESES_NEST_TOO_DEEP
     | PATTERN_TOO_LARGE
@@ -296,10 +297,10 @@ module Error = struct
     | BADMAGIC
     | BADMODE
     | BADOFFSET
-    | BADOPTION
+    | BADOPTION (* TODO: shouldn't be possible? *)
     | BADREPLACEMENT
     | BADUTFOFFSET
-    | CALLOUT  (** Never used by PCRE2 itself *)
+    | CALLOUT
     | DFA_BADRESTART
     | DFA_RECURSE
     | DFA_UCOND
@@ -313,7 +314,7 @@ module Error = struct
     | NOMEMORY
     | NOSUBSTRING
     | NOUNIQUESUBSTRING
-    | NULL
+    | NULL (* TODO: shouldn't be possible? *)
     | RECURSELOOP
     | DEPTHLIMIT
     | UNAVAILABLE
@@ -779,7 +780,7 @@ module Jit = struct
     | Error n -> Error (match_error_of_int n)
 
   (* TODO(cooper): dedup impl with a functor? - entirely derived from
-     captures  *)
+     captures *)
   let captures_iter ?(options : match_option list = [])
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (captures, match_error) Result.t Seq.t =

@@ -19,7 +19,7 @@ type compile_error =
   | MISSING_CLOSING_PARENTHESIS
   | BAD_SUBPATTERN_REFERENCE
   | NULL_PATTERN
-  | BAD_OPTIONS (* probably should not be possible *)
+  | BAD_OPTIONS
   | MISSING_COMMENT_CLOSING
   | PARENTHESES_NEST_TOO_DEEP
   | PATTERN_TOO_LARGE
@@ -61,7 +61,7 @@ type compile_error =
   | INTERNAL_UNKNOWN_NEWLINE
   | BACKSLASH_G_SYNTAX
   | PARENS_QUERY_R_MISSING_CLOSING
-  | VERB_ARGUMENT_NOT_ALLOWED (* OBSOLETE; Should not occur - since when? *)
+  | VERB_ARGUMENT_NOT_ALLOWED
   | VERB_UNKNOWN
   | SUBPATTERN_NUMBER_TOO_BIG
   | SUBPATTERN_NAME_EXPECTED
@@ -105,86 +105,234 @@ type compile_error =
 [@@deriving show, eq]
 
 type match_error =
-  (* "Expected" matching error codes: no match and partial match. *)
-  (* | NOMATCH (* (-1) *)
-     | PARTIAL (* (-2) *) *)
   (* Error codes for UTF-8 validity checks. See man 3 pcre2unicode. *)
-  | UTF8_ERR1 (* (-3) *)
-  | UTF8_ERR2 (* (-4) *)
-  | UTF8_ERR3 (* (-5) *)
-  | UTF8_ERR4 (* (-6) *)
-  | UTF8_ERR5 (* (-7) *)
-  | UTF8_ERR6 (* (-8) *)
-  | UTF8_ERR7 (* (-9) *)
-  | UTF8_ERR8 (* (-10) *)
-  | UTF8_ERR9 (* (-11) *)
-  | UTF8_ERR10 (* (-12) *)
-  | UTF8_ERR11 (* (-13) *)
-  | UTF8_ERR12 (* (-14) *)
-  | UTF8_ERR13 (* (-15) *)
-  | UTF8_ERR14 (* (-16) *)
-  | UTF8_ERR15 (* (-17) *)
-  | UTF8_ERR16 (* (-18) *)
-  | UTF8_ERR17 (* (-19) *)
-  | UTF8_ERR18 (* (-20) *)
-  | UTF8_ERR19 (* (-21) *)
-  | UTF8_ERR20 (* (-22) *)
-  | UTF8_ERR21 (* (-23) *)
-  (* TODO(* (non-8 support) *):
-     (* Error codes for UTF-16 validity checks *)
-     | UTF16_ERR1      (* (-24) *)
-     | UTF16_ERR2      (* (-25) *)
-     | UTF16_ERR3      (* (-26) *)
-     | (* Error codes for UTF-32 validity checks *)
-     | UTF32_ERR1      (* (-27) *)
-     | UTF32_ERR2      (* (-28) *)
-  *)
+  | UTF8_ERR1
+      (** The string ends with a truncated UTF-8 character; 1 byte is missing.
+       *)
+  | UTF8_ERR2
+      (** The string ends with a truncated UTF-8 character; 2 bytes are
+          missing. *)
+  | UTF8_ERR3
+      (** The string ends with a truncated UTF-8 character; 3 bytes are
+          missing. *)
+  | UTF8_ERR4
+      (** The string ends with a truncated UTF-8 character; 4 bytes are
+          missing. Note that this is possible since although RFC 3629 restricts
+          UTF-8 characters to be no longer than 4 bytes, the encoding scheme
+          (originally defined by RFC 2279) allows for up to 6 bytes, and this
+          is checked first. *)
+  | UTF8_ERR5
+      (** The string ends with a truncated UTF-8 character; 5 bytes are
+          missing. Note that this is possible since although RFC 3629 restricts
+          UTF-8 characters to be no longer than 4 bytes, the encoding scheme
+          (originally defined by RFC 2279) allows for up to 6 bytes, and this
+          is checked first. *)
+  | UTF8_ERR6
+      (** The two most significant bits of the 2nd byte of the character do not
+          have the binary value 0b10. *)
+  | UTF8_ERR7
+      (** The two most significant bits of the 3rd byte of the character do not
+          have the binary value 0b10. *)
+  | UTF8_ERR8
+      (** The two most significant bits of the 4th byte of the character do not
+          have the binary value 0b10. *)
+  | UTF8_ERR9
+      (** The two most significant bits of the 5th byte of the character do not
+          have the binary value 0b10. Note that this is possible since although
+          RFC 3629 restricts UTF-8 characters to be no longer than 4 bytes, the
+          encoding scheme (originally defined by RFC 2279) allows for up to 6
+          bytes, and this is checked first.*)
+  | UTF8_ERR10
+      (** The two most significant bits of the 6th byte of the character do not
+          have the binary value 0b10. Note that this is possible since although
+          RFC 3629 restricts UTF-8 characters to be no longer than 4 bytes, the
+          encoding scheme (originally defined by RFC 2279) allows for up to 6
+          bytes, and this is checked first.*)
+  | UTF8_ERR11
+      (** A character that is valid by the RFC 2279 rules is 5 bytes long;
+          these code points are excluded by RFC 3629. *)
+  | UTF8_ERR12
+      (** A character that is valid by the RFC 2279 rules is 6 bytes long;
+          these code points are excluded by RFC 3629. *)
+  | UTF8_ERR13
+      (** A 4 byte character has a value greater than 0x10ffff; these code
+          points are excluded by RFC 3629. *)
+  | UTF8_ERR14
+      (** A 3 byte character has a value in the range 0xd800 to 0xdfff; this
+        range of code points are reserved by RFC 3629 for use with UTF-16, and
+        so are excluded from UTF-8. *)
+  | UTF8_ERR15
+      (** A 2 byte character is "overlong", that is, it codes for a value that
+          can be represented by fewer bytes, which is invalid. For example, the
+          two bytes 0xc0, 0xae give the value 0x2e, whose correct coding uses
+          just one byte. *)
+  | UTF8_ERR16
+      (** A 3 byte character is "overlong", that is, it codes for a value that
+          can be represented by fewer bytes, which is invalid. *)
+  | UTF8_ERR17
+      (** A 4 byte character is "overlong", that is, it codes for a value that
+          can be represented by fewer bytes, which is invalid. *)
+  | UTF8_ERR18
+      (** A 5 byte character is "overlong", that is, it codes for a value that
+          can be represented by fewer bytes, which is invalid. Note that this
+          is possible since although RFC 3629 restricts
+          UTF-8 characters to be no longer than 4 bytes, the encoding scheme
+          (originally defined by RFC 2279) allows for up to 6 bytes, and this
+          is checked first. *)
+  | UTF8_ERR19
+      (** A 6 byte character is "overlong", that is, it codes for a value that
+          can be represented by fewer bytes, which is invalid. Note that this
+          is possible since although RFC 3629 restricts
+          UTF-8 characters to be no longer than 4 bytes, the encoding scheme
+          (originally defined by RFC 2279) allows for up to 6 bytes, and this
+          is checked first.*)
+  | UTF8_ERR20
+      (** The two most significant bits of the first byte of a character have
+          the binary value 0b10 (that is, the most significant bit is 1 and the
+          second is 0). Such a byte can only validly occur as the second or
+          subsequent byte of a multi-byte character. *)
+  | UTF8_ERR21
+      (** The first byte of a character has the value 0xfe or 0xff. These
+          values can never occur in a valid UTF-8 string. *)
   (* Miscellaneous error codes for pcre2[_dfa]_match, substring extraction
-     functions, context functions, and serializing functions. They are in numerical
-     order. Originally they were in alphabetical order too, but now that PCRE2 is
-     released, the numbers must not be changed. *)
-  | BADDATA (* (-29) *)
+     functions, context functions, and serializing functions. *)
+  | BADDATA  (** Invalid data was provided to the function *)
   | MIXEDTABLES
-  (* (-30) *)
-  (* Name was changed *)
-  | BADMAGIC (* (-31) *)
-  | BADMODE (* (-32) *)
-  | BADOFFSET (* (-33) *)
-  | BADOPTION (* (-34) *)
-  | BADREPLACEMENT (* (-35) *)
-  | BADUTFOFFSET (* (-36) *)
-  | CALLOUT (* (-37) *)
-  (* Never used by PCRE2 itself *)
-  | DFA_BADRESTART (* (-38) *)
-  | DFA_RECURSE (* (-39) *)
-  | DFA_UCOND (* (-40) *)
-  | DFA_UFUNC (* (-41) *)
-  | DFA_UITEM (* (-42) *)
-  | DFA_WSSIZE (* (-43) *)
-  | INTERNAL (* (-44) *)
-  | JIT_BADOPTION (* (-45) *)
-  | JIT_STACKLIMIT (* (-46) *)
-  | MATCHLIMIT (* (-47) *)
-  | NOMEMORY (* (-48) *)
-  | NOSUBSTRING (* (-49) *)
-  | NOUNIQUESUBSTRING (* (-50) *)
-  | NULL (* (-51) *)
-  | RECURSELOOP (* (-52) *)
-  | DEPTHLIMIT (* (-53) *)
-  | UNAVAILABLE (* (-54) *)
-  | UNSET (* (-55) *)
-  | BADOFFSETLIMIT (* (-56) *)
-  | BADREPESCAPE (* (-57) *)
-  | REPMISSINGBRACE (* (-58) *)
-  | BADSUBSTITUTION (* (-59) *)
-  | BADSUBSPATTERN (* (-60) *)
-  | TOOMANYREPLACE (* (-61) *)
-  | BADSERIALIZEDDATA (* (-62) *)
-  | HEAPLIMIT (* (-63) *)
-  | CONVERT_SYNTAX (* (-64) *)
-  | INTERNAL_DUPMATCH (* (-65) *)
-  | DFA_UINVALID_UTF (* (-66) *)
-  | INVALIDOFFSET (* (-67) *)
+      (** During serialization, the patterns do not all use the same tables *)
+  | BADMAGIC
+      (** PCRE2 stores a 4-byte "magic number" at the start of the compiled
+          code, to catch the case when it is passed a junk pointer. This is the
+          error that is returned when the magic number is not present. *)
+  | BADMODE
+      (** This error is given when a compiled pattern is passed to a function
+          in a library of a different code unit width, for example, a pattern
+          compiled by the 8-bit library is passed to a 16-bit or 32-bit library
+          function. *)
+  | BADOFFSET
+      (** The value of the subject offset was negative or greater than the
+          length of the subject. *)
+  | BADOPTION  (** An unrecognized bit was set in the options argument. *)
+  | BADREPLACEMENT
+      (** used for miscellaneous syntax errors in the replacement string with
+          pcre2_substitute *)
+  | BADUTFOFFSET
+      (** The UTF code unit sequence that was passed as a subject was checked
+    and found to be valid (the PCRE2_NO_UTF_CHECK option was not set), but the
+    value of startoffset did not point to the beginning of a UTF character or
+    the end of the subject. *)
+  | CALLOUT
+      (**  This error is never generated by pcre2_match() itself. It is
+           provided for use by callout functions that want to cause
+           pcre2_match() or pcre2_callout_enumerate() to return a distinctive
+           error code. *)
+  | DFA_BADRESTART
+      (**  When pcre2_dfa_match() is called with the PCRE2_DFA_RESTART option,
+           some plausibility checks are made on the contents of the workspace,
+           which should contain data about the previous partial match. If any
+           of these checks fail, this error is given. *)
+  | DFA_RECURSE
+      (**  When a recursion or subroutine call is processed, the matching
+           function calls itself recursively, using private memory for the
+           ovector and workspace. This error is given if the internal ovector
+           is not large enough. This should be extremely rare, as a vector of
+           size 1000 is used. *)
+  | DFA_UCOND
+      (** This return is given if pcre2_dfa_match() encounters a condition item
+          that uses a backreference for the condition, or a test for recursion
+          in a specific capture group. These are not supported. *)
+  | DFA_UFUNC
+      (** A convenience function unsupported by the DFA was used on the result
+          of a DFA match (e.g., extraction by substring name) *)
+  | DFA_UITEM
+      (** This return is given if pcre2_dfa_match() encounters an item in the
+          pattern that it does not support, for instance, the use of \C in a
+          UTF mode or a backreference. *)
+  | DFA_WSSIZE
+      (** This return is given if pcre2_dfa_match() runs out of space in the
+          workspace vector. *)
+  | INTERNAL
+      (** An unexpected internal error has occurred. This error could be caused
+          by a bug in PCRE2 or by overwriting of the compiled pattern. *)
+  | JIT_BADOPTION
+      (** A matching mode which was not compiled was requested, or an unknown
+          bit was set in jit compilation options. *)
+  | JIT_STACKLIMIT
+      (** This error is returned when a pattern that was successfully studied
+          using JIT is being matched, but the memory available for the
+          just-in-time processing stack is not large enough. See the pcre2jit
+          documentation for more details *)
+  | MATCHLIMIT  (** The backtracking match limit was reached. *)
+  | NOMEMORY
+      (** Heap memory is used to remember backtracking points. This error is
+          given when the memory allocation function (default or custom) fails.
+          Note that a different error, PCRE2_ERROR_HEAPLIMIT, is given if the
+          amount of memory needed exceeds the heap limit. PCRE2_ERROR_NOMEMORY
+          is also returned if PCRE2_COPY_MATCHED_SUBJECT is set and memory
+          allocation fails. *)
+  | NOSUBSTRING
+      (** - in substrings: There is no substring with that number in the
+          pattern, that is, the number is greater than the number of capturing
+          parentheses.
+
+          - in substitution: returned for a non-existent substring insertion, unless
+          PCRE2_SUBSTITUTE_UNKNOWN_UNSET is set.
+        *)
+  | NOUNIQUESUBSTRING
+      (** Returned when there is more than one capture group with a given name
+          and this would result in ambiguity.
+        *)
+  | NULL
+      (** Either the code, subject, or match_data argument was passed as NULL.
+       *)
+  | RECURSELOOP
+      (** This error is returned when pcre2_match() detects a recursion loop
+          within the pattern. Specifically, it means that either the whole
+          pattern or a capture group has been called recursively for the second
+          time at the same position in the subject string. Some simple patterns
+          that might do this are detected and faulted at compile time, but more
+          complicated cases, in particular mutual recursions between two
+          different groups, cannot be detected until matching is attempted. *)
+  | DEPTHLIMIT  (** The nested backtracking depth limit was reached. *)
+  | UNAVAILABLE
+      (** The substring number, though not greater than the number of captures
+          in the pattern, is greater than the number of slots in the ovector,
+          so the substring could not be captured. *)
+  | UNSET
+      (** - in substrings: The substring did not participate in the match. For
+          example, if the pattern is (abc)|(def) and the subject is "def", and
+          the ovector contains at least two capturing slots, substring number 1 is unset.
+
+          - in substitution: returned for an unset substring insertion
+          (including an unknown substring when PCRE2_SUBSTITUTE_UNKNOWN_UNSET
+          is set) when the simple (non-extended) syntax is used and
+          PCRE2_SUBSTITUTE_UNSET_EMPTY is not set
+        *)
+  | BADOFFSETLIMIT
+      (** An offset limit was set but the flag was not set at compile time *)
+  | BADREPESCAPE
+      (** invalid escape sequence in a replacement string used with
+          pcre2_substitute *)
+  | REPMISSINGBRACE
+      (** missing closing curly bracket in a replacement string used with
+          pcre2_substitute *)
+  | BADSUBSTITUTION
+      (** syntax error in extended group substitution in pcre2_substitute *)
+  | BADSUBSPATTERN
+      (** in pcre2_substitute, the pattern match ended before it started or the
+          match started earlier than the current position in the subject, which
+          can happen if \K is used in an assertion *)
+  | TOOMANYREPLACE
+      (** The number of total substitutions would exceed the maximum integer and cause overflow. *)
+  | BADSERIALIZEDDATA  (** Invalid arguments to pcre2_serialize *)
+  | HEAPLIMIT  (** The heap limit was reached. *)
+  | CONVERT_SYNTAX  (** Syntax error in pcre2_convert *)
+  | INTERNAL_DUPMATCH
+      (** An internal error in substitution led to a duplicate match *)
+  | DFA_UINVALID_UTF
+      (** This return is given if pcre2_dfa_match() is called for a pattern
+          that was compiled with PCRE2_MATCH_INVALID_UTF. This is not supported
+          for DFA matching. *)
+  | INVALIDOFFSET  (** internal error, should not occur *)
 [@@deriving show, eq]
 
 (* Fastpath to JIT match for perf *)
