@@ -1,4 +1,4 @@
-(lang dune 3.15)
+(lang dune 3.12)
 (name pcre2)
 
 (generate_opam_files true)
