@@ -29,6 +29,8 @@ module Match = struct
     let start, end_ = matches.(0) in
     { start; end_ }
 
+  let captures_length ((_, matches, _) : captures) : int = Array.length matches
+
   let match_of_captures ((subject, matches, _) : captures) (i : int) :
       match_ option =
     if 0 <= i && i < Array.length matches then

@@ -23,6 +23,7 @@ module type Matcher = sig
      have more variability. No need to generalize now, but useful if we add
      other engines like re2 or vectorscan *)
 
+  val captures_length : captures -> int
   val match_of_captures : captures -> int -> match_ option
   val named_match_of_captures : captures -> string -> match_ option
   (* TODO: see comment on [captures]; unclear of generality of this *)
