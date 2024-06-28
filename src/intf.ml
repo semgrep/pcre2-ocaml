@@ -36,6 +36,8 @@ module type Matcher = sig
   val compile :
     ?options:compile_option list -> string -> (t, compile_error) Result.t
 
+  val capture_groups : t -> (string * int) list
+
   val find :
     ?options:match_option list ->
     ?subject_offset:int ->

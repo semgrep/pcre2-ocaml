@@ -653,7 +653,7 @@ module Interp = struct
     Bindings.pcre2_compile pattern options
     |> Result.map_error compile_error_of_int
 
-  let capture_groups (r : t) = Bindings.get_capture_groups r
+  let capture_groups (r : t) = Bindings.get_capture_groups r |> Array.to_list
 
   let find ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (match_ option, match_error) Result.t =
@@ -766,6 +766,8 @@ module Jit = struct
     of_interp ~options:jit_options ~mode:JIT_COMPLETE interp
   (* TODO: determine best way to support matching mode with uniform interface.
      Probably make options more abstract in the shared interface *)
+
+  let capture_groups (r : t) = Bindings.get_capture_groups r |> Array.to_list
 
   let find ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (match_ option, match_error) Result.t =
