@@ -28,14 +28,6 @@ const int RESULT_ERROR_TAG = 1;
 const int TUPLE_TAG = 0;
 const int ARRAY_TAG = 0;
 
-/// The maximum size which is used for a temporary array to count the number of
-/// strings corresponding to each numbered capture group.
-///
-/// This should be large enough that most (reasonable) patterns have fewer
-/// numbered capture groups than this value, but small enough it is reasonable
-/// to have an array of this size for each capturing match.
-#define MAX_SMALL_NAMES_ARRAY_LEN (64)
-
 struct ocaml_regex {
         pcre2_code *regex;
 };
