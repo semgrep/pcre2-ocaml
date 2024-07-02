@@ -48,7 +48,9 @@ let simple_captures ctxt =
           (c >>= (fun c -> match_of_captures c 2) >+= range_of_match);
         assert_equal ~printer
           (Ok (Some { start = 2; end_ = 3 }))
-          (c >>= (fun c -> match_of_captures c 3) >+= range_of_match))
+          (c >>= (fun c -> match_of_captures c 3) >+= range_of_match);
+        assert_equal ~printer (Ok None)
+          (c >>= (fun c -> match_of_captures c 4) >+= range_of_match))
 
 let bad_pattern ctxt =
   Interp.(
