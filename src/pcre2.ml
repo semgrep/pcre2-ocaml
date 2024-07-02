@@ -16,9 +16,6 @@ module Match = struct
   type captures = string * (int * int) array * (string * int) array
   [@@deriving show, eq]
 
-  (* needs match_data *)
-  type substitution
-
   let range_of_match (_, start, end_) = { start; end_ }
 
   let substring_of_match (subject, start, end_) =
@@ -717,17 +714,6 @@ module Interp = struct
   let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (bool, match_error) Result.t =
     find ~options ~subject_offset re subject |> Result.map Option.is_some
-
-  let subst : string -> substitution = fun _ -> failwith "todo"
-
-  let replace :
-      ?options:match_option list ->
-      ?subject_offset:int ->
-      t ->
-      substitution ->
-      string ->
-      (string, match_error) Result.t =
-   fun ?options:_ ?subject_offset:_ _ _ _ -> failwith "todo"
 end
 
 (* Fastpath to JIT match for perf *)
@@ -835,15 +821,4 @@ module Jit = struct
   let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (bool, match_error) Result.t =
     find ~options ~subject_offset re subject |> Result.map Option.is_some
-
-  let subst = Interp.subst
-
-  let replace :
-      ?options:match_option list ->
-      ?subject_offset:int ->
-      t ->
-      substitution ->
-      string ->
-      (string, match_error) Result.t =
-   fun ?options:_ ?subject_offset:_ _ _ _ -> failwith "todo"
 end

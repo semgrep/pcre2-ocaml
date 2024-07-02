@@ -82,22 +82,4 @@ module type Matcher = sig
     t ->
     string ->
     (bool, match_error) Result.t
-
-  type substitution
-
-  val subst : string -> substitution
-  (* TODO: options? *)
-
-  val replace :
-    ?options:match_option list ->
-    (* TODO: subst options? *)
-    ?subject_offset:int ->
-    t ->
-    substitution ->
-    string ->
-    (string, match_error) Result.t
-  (* TODO: Consider more granularity in error types. For now, we just have
-     one match_error type for conviencnce, but some error could be local to,
-     e.g., replacement/substitution or splitting, so we may benefit from a
-     different type for each *)
 end

@@ -1,6 +1,5 @@
 type match_ [@@deriving show, eq]
 type captures [@@deriving show, eq]
-type substitution
 
 type compile_error =
   | END_BACKSLASH  (** A pattern string ends in a backslash *)
@@ -485,10 +484,6 @@ module Options : sig
     type bsr = BSR_UNICODE | ANYCRLF
   end
 end
-(* TODO: hide, need since you can't do with type t = A | B or have
-   type t = A | B
-   include FOO with type t = t
-*)
 
 module Interp : sig
   include module type of Options.Interp
@@ -497,7 +492,6 @@ module Interp : sig
     Intf.Matcher
       with type match_ = match_
        and type captures = captures
-       and type substitution = substitution
        and type compile_option = Options.Interp.compile_option
        and type compile_error = compile_error
        and type match_option = Options.Interp.match_option
@@ -511,7 +505,6 @@ module Jit : sig
     Intf.Matcher
       with type match_ = match_
        and type captures = captures
-       and type substitution = substitution
        and type compile_option =
         [ Options.Jit.jit_only_compile_option | Options.Interp.compile_option ]
        and type compile_error = compile_error
