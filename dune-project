@@ -8,7 +8,9 @@
 (homepage "https://github.com/semgrep/pcre2-ocaml")
 
 (maintainers "Cooper Pierce <cooper@semgrep.com>")
-(authors "Markus Mottl <markus.mottl@gmail.com>")
+(authors
+  "Cooper Pierce <cooper@semgrep.com>"
+  "Markus Mottl <markus.mottl@gmail.com>")
 
 (package
   (name pcre2)
