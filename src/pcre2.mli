@@ -1,6 +1,10 @@
 type match_ [@@deriving show, eq]
-type captures [@@deriving show, eq]
+(** An individual match, either of a whole pattern or of a capture group. *)
 
+type captures [@@deriving show, eq]
+(** A set comprising an entire match alongside any matches for capture groups *)
+
+(** Errors which may occur during compilation of the pattern *)
 type compile_error =
   | END_BACKSLASH  (** A pattern string ends in a backslash *)
   | END_BACKSLASH_C
@@ -149,6 +153,7 @@ type compile_error =
       (** \K is not allowed in lookarounds (cf.  EXTRA_ALLOW_LOOKAROUND_BSK) *)
 [@@deriving show, eq]
 
+(** Errors which may occur during matching of a pattern *)
 type match_error =
   (* Error codes for UTF-8 validity checks. See man 3 pcre2unicode. *)
   | UTF8_ERR1
@@ -516,6 +521,9 @@ module Jit : sig
     ?mode:matching_mode ->
     Interp.t ->
     (t, compile_error) Result.t
+  (** [of_interp options mode re] is either [Ok jit_re], the JIT-enabled
+      version of the provided pattern, or [Error c], where [c] is the relevant
+      compilation error. *)
 end
 
 (** Version information *)
