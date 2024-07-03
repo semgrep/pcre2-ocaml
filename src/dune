@@ -1,12 +1,20 @@
 (library
-  (public_name pcre2)
-  (foreign_stubs
-    (language c)
-    (names pcre2_stubs)
-    (flags (:standard) (:include c_flags.sexp) -O2 -fPIC -DPIC))
-  (c_library_flags (:include c_library_flags.sexp))
-)
+ (public_name pcre2)
+ (preprocess
+  (pps ppx_inline_test ppx_deriving.show ppx_deriving.eq))
+ (inline_tests)
+ (foreign_stubs
+  (language c)
+  (names pcre2_stubs)
+  (flags
+   (:standard)
+   (:include c_flags.sexp)
+   -g))
+ (c_library_flags
+  (:include c_library_flags.sexp)
+  (-g)))
 
 (rule
-  (targets c_flags.sexp c_library_flags.sexp)
-  (action (run ./config/discover.exe)))
+ (targets c_flags.sexp c_library_flags.sexp)
+ (action
+  (run ./config/discover.exe)))

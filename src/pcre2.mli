@@ -1,1018 +1,553 @@
-(*
-   PCRE2-OCAML - Perl Compatibility Regular Expressions for OCaml
+type match_ [@@deriving show, eq]
+(** An individual match, either of a whole pattern or of a capture group. *)
 
-   Copyright (C) 1999-  Markus Mottl
-   email: markus.mottl@gmail.com
-   WWW:   http://www.ocaml.info
+type captures [@@deriving show, eq]
+(** A set comprising an entire match alongside any matches for capture groups *)
 
-   This library is free software; you can redistribute it and/or
-   modify it under the terms of the GNU Lesser General Public
-   License as published by the Free Software Foundation; either
-   version 2.1 of the License, or (at your option) any later version.
+(** Errors which may occur during compilation of the pattern *)
+type compile_error =
+  | END_BACKSLASH  (** A pattern string ends in a backslash *)
+  | END_BACKSLASH_C
+      (** A pattern string ends in \c, which should require an additional
+          character following it. *)
+  | UNKNOWN_ESCAPE
+      (** An unrecognized character, not suitable for starting an escape
+          sequence, followed a backslash. *)
+  | QUANTIFIER_OUT_OF_ORDER
+      (** The numbers were out of order in a {} quantifier (i.e., {n,m} where
+          n > m). *)
+  | QUANTIFIER_TOO_BIG  (** A limit was too big in a {} quantifier. *)
+  | MISSING_SQUARE_BRACKET  (** Missing terminating ] for a character class *)
+  | ESCAPE_INVALID_IN_CLASS
+      (** Invalid escape sequence in a characters class *)
+  | CLASS_RANGE_ORDER  (** Range out of order in character class *)
+  | QUANTIFIER_INVALID  (** Quantifier does not follow a repeatable item *)
+  | INTERNAL_UNEXPECTED_REPEAT  (** Internal error *)
+  | INVALID_AFTER_PARENS_QUERY  (** Unrecognized character after (? or (?- *)
+  | POSIX_CLASS_NOT_IN_CLASS
+      (** POSIX named classes are supported only within a class *)
+  | POSIX_NO_SUPPORT_COLLATING
+      (** POSIX collating elements are not supported *)
+  | MISSING_CLOSING_PARENTHESIS  (** Missing closing parenthesis. *)
+  | BAD_SUBPATTERN_REFERENCE  (** Reference to non-existent subpattern *)
+  | NULL_PATTERN
+      (** Pattern passed as a null pointer but with non-zero length *)
+  | BAD_OPTIONS  (** Unrecognized option bits *)
+  | MISSING_COMMENT_CLOSING  (** Missing ) after (?# comment *)
+  | PARENTHESES_NEST_TOO_DEEP  (** Parentheses are nested too deeply *)
+  | PATTERN_TOO_LARGE  (** Regular expression is too large *)
+  | HEAP_FAILED  (** Failed to allocate heap memory *)
+  | UNMATCHED_CLOSING_PARENTHESIS  (** Unmatched closing parenthesis *)
+  | INTERNAL_CODE_OVERFLOW  (** Internal *)
+  | MISSING_CONDITION_CLOSING  (** Missing closing parenthesis for condition *)
+  | LOOKBEHIND_NOT_FIXED_LENGTH
+      (** Length of a lookbehind assertion is not limited *)
+  | ZERO_RELATIVE_REFERENCE  (** A relative value of zero is not permitted *)
+  | TOO_MANY_CONDITION_BRANCHES
+      (** Conditional subpattern contains more than two branches *)
+  | CONDITION_ASSERTION_EXPECTED  (** Assertion expected after (?( or (?(?C) *)
+  | BAD_RELATIVE_REFERENCE  (** Digit expected ater (?+ or (?- *)
+  | UNKNOWN_POSIX_CLASS  (** Unknown POSIX class name *)
+  | INTERNAL_STUDY_ERROR  (** Internal *)
+  | UNICODE_NOT_SUPPORTED  (** No Unicode support *)
+  | PARENTHESES_STACK_CHECK
+      (** Parentheses are too deeply nested (stack check) *)
+  | CODE_POINT_TOO_BIG
+      (** The character code point value in \x{} or \o{} is too large *)
+  | LOOKBEHIND_TOO_COMPLICATED  (** Lookbehind is too complicated *)
+  | LOOKBEHIND_INVALID_BACKSLASH_C
+      (** \C is not allowed in a lookbehind assertion in the current
+          UTF-{8,16,32} mode *)
+  | UNSUPPORTED_ESCAPE_SEQUENCE
+      (** PCRE2 does not suport \F, \L, \l, \N{name}, \U or \u *)
+  | CALLOUT_NUMBER_TOO_BIG  (** Number after (?C is greater than 255 *)
+  | MISSING_CALLOUT_CLOSING  (** Closing parenthesis for (?C missing *)
+  | ESCAPE_INVALID_IN_VERB  (** invalid escape sequence in ( *VERB) name *)
+  | UNRECOGNIZED_AFTER_QUERY_P  (** Unrecognized character after (?P *)
+  | MISSING_NAME_TERMINATOR
+      (** Syntax error in subpattern name (missing terminator?) *)
+  | DUPLICATE_SUBPATTERN_NAME
+      (** two named subpatterns have  the same name (PCRE2_DUPNAMES not set) *)
+  | INVALID_SUBPATTERN_NAME  (** subpattern naem must start with a non-digit *)
+  | UNICODE_PROPERTIES_UNAVAILABLE
+      (** This version of PCRE2 does not support \P, \p or \X *)
+  | MALFORMED_UNICODE_PROPERTY  (** Malformed \P or \p sequence *)
+  | UNKNOWN_UNICODE_PROPERTY  (** Unknown property after \P or \p *)
+  | SUBPATTERN_NAME_TOO_LONG
+      (** Subpattern name is too long (max MAX_NAME_SIZE) code units *)
+  | TOO_MANY_NAMED_SUBPATTERNS
+      (** Too many named subpatterns (max MAX_NAME_SIZE) *)
+  | CLASS_INVALID_RANGE  (** Invalid range in character class *)
+  | OCTAL_BYTE_TOO_BIG
+      (** Octal value is greater than \377 in 8-bit non-UTF-8 *)
+  | INTERNAL_OVERRAN_WORKSPACE  (** Internal *)
+  | INTERNAL_MISSING_SUBPATTERN  (** Internal *)
+  | DEFINE_TOO_MANY_BRANCHES
+      (** DEFINE subpattern contains more than one branch *)
+  | BACKSLASH_O_MISSING_BRACE  (** Missing opening brace after \o *)
+  | INTERNAL_UNKNOWN_NEWLINE  (** Internal *)
+  | BACKSLASH_G_SYNTAX
+      (** \g is not followed by a braced, angle-bracketed, or quoted
+          name/number or by a plain number *)
+  | PARENS_QUERY_R_MISSING_CLOSING
+      (** (?R (recursive pattern call) must be followed by a closing
+          parenthesis *)
+  | VERB_ARGUMENT_NOT_ALLOWED
+      (** obsolete - an argument is not allowed for ACCEPT, FAIL or COMMIT *)
+  | VERB_UNKNOWN  (** ( *VERB) not recognized or malformed *)
+  | SUBPATTERN_NUMBER_TOO_BIG  (** Subpattern number is too big *)
+  | SUBPATTERN_NAME_EXPECTED  (** Subpattern name expected *)
+  | INTERNAL_PARSED_OVERFLOW  (** Internal *)
+  | INVALID_OCTAL  (** Non-octal character in \o{} (closing brace missing?) *)
+  | SUBPATTERN_NAMES_MISMATCH
+      (** Different names for subpatterns of the same number are not allowed *)
+  | MARK_MISSING_ARGUMENT  (** ( *MARK) must have an argument *)
+  | INVALID_HEXADECIMAL
+      (** Non-hex character in \x{} (closing brace missing?) *)
+  | BACKSLASH_C_SYNTAX  (** \c must be followed by a letter or one of [\]^_? *)
+  | BACKSLASH_K_SYNTAX
+      (** \k is not followed by a braced, angle-bracketed, or quoted name *)
+  | INTERNAL_BAD_CODE_LOOKBEHINDS  (** Internal *)
+  | BACKSLASH_N_IN_CLASS  (** \N is not supported in a class *)
+  | CALLOUT_STRING_TOO_LONG  (** Callout srtring is too long *)
+  | UNICODE_DISALLOWED_CODE_POINT
+      (** Disallowed unicode code point (>= \0xd800 && <= 0xdfff) *)
+  | UTF_IS_DISABLED  (** Using UTF is disabled by the application *)
+  | UCP_IS_DISABLED  (** Using UCP is disabled by the application *)
+  | VERB_NAME_TOO_LONG  (** name is too long in MARK, PRUNE, SKIP or THEN *)
+  | BACKSLASH_U_CODE_POINT_TOO_BIG
+      (** Character code point value in \u sequence is too large *)
+  | MISSING_OCTAL_OR_HEX_DIGITS  (** Digits missing in \x{} or \o{} or \N{U+} *)
+  | VERSION_CONDITION_SYNTAX
+      (** Syntax error or number too big in (?(VERSION condition *)
+  | INTERNAL_BAD_CODE_AUTO_POSSESS  (** Internal *)
+  | CALLOUT_NO_STRING_DELIMITER
+      (** Missing terminating delimiter for callout with string argument *)
+  | CALLOUT_BAD_STRING_DELIMITER
+      (** Unrecognized string delimiter follows (?C *)
+  | BACKSLASH_C_CALLER_DISABLED  (** Using \C is disabled by the application *)
+  | QUERY_BARJX_NEST_TOO_DEEP
+      (** (?| and/or (?J: or (?x: parentheses are too deeply nested *)
+  | BACKSLASH_C_LIBRARY_DISABLED
+      (** Using \C is disabled in this PCRE2 library *)
+  | PATTERN_TOO_COMPLICATED  (** Regular expression is too complicated *)
+  | LOOKBEHIND_TOO_LONG  (** Lookbehind assertion is too long *)
+  | PATTERN_STRING_TOO_LONG
+      (** Pattern string is longer than the limit set by the application *)
+  | INTERNAL_BAD_CODE  (** Internal *)
+  | INTERNAL_BAD_CODE_IN_SKIP  (** Internal *)
+  | NO_SURROGATES_IN_UTF16
+      (** EXTRA_ALLOW_SURROGRATE_ESCAPES is not allowed in UTF-16 mode *)
+  | BAD_LITERAL_OPTIONS  (** Invalid options bits with PCRE2_LITERAL *)
+  | SUPPORTED_ONLY_IN_UNICODE
+      (** \N{U+dddd} is supported only in Unicode mode *)
+  | INVALID_HYPHEN_IN_OPTIONS  (** Invalid hyphen in option setting *)
+  | ALPHA_ASSERTION_UNKNOWN  (** alpha_assertion not recognized *)
+  | SCRIPT_RUN_NOT_AVAILABLE
+      (** Script runs require Unicode support, which this version of PCRE2 does
+          not have *)
+  | TOO_MANY_CAPTURES  (** Too many capturing groups (max 65535) *)
+  | CONDITION_ATOMIC_ASSERTION_EXPECTED
+      (** Atomic assertion expected after (?( or (?(?C) *)
+  | BACKSLASH_K_IN_LOOKAROUND
+      (** \K is not allowed in lookarounds (cf.  EXTRA_ALLOW_LOOKAROUND_BSK) *)
+[@@deriving show, eq]
 
-   This library is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-   Lesser General Public License for more details.
+(** Errors which may occur during matching of a pattern *)
+type match_error =
+  (* Error codes for UTF-8 validity checks. See man 3 pcre2unicode. *)
+  | UTF8_ERR1
+      (** The string ends with a truncated UTF-8 character; 1 byte is missing.
+       *)
+  | UTF8_ERR2
+      (** The string ends with a truncated UTF-8 character; 2 bytes are
+          missing. *)
+  | UTF8_ERR3
+      (** The string ends with a truncated UTF-8 character; 3 bytes are
+          missing. *)
+  | UTF8_ERR4
+      (** The string ends with a truncated UTF-8 character; 4 bytes are
+          missing. Note that this is possible since although RFC 3629 restricts
+          UTF-8 characters to be no longer than 4 bytes, the encoding scheme
+          (originally defined by RFC 2279) allows for up to 6 bytes, and this
+          is checked first. *)
+  | UTF8_ERR5
+      (** The string ends with a truncated UTF-8 character; 5 bytes are
+          missing. Note that this is possible since although RFC 3629 restricts
+          UTF-8 characters to be no longer than 4 bytes, the encoding scheme
+          (originally defined by RFC 2279) allows for up to 6 bytes, and this
+          is checked first. *)
+  | UTF8_ERR6
+      (** The two most significant bits of the 2nd byte of the character do not
+          have the binary value 0b10. *)
+  | UTF8_ERR7
+      (** The two most significant bits of the 3rd byte of the character do not
+          have the binary value 0b10. *)
+  | UTF8_ERR8
+      (** The two most significant bits of the 4th byte of the character do not
+          have the binary value 0b10. *)
+  | UTF8_ERR9
+      (** The two most significant bits of the 5th byte of the character do not
+          have the binary value 0b10. Note that this is possible since although
+          RFC 3629 restricts UTF-8 characters to be no longer than 4 bytes, the
+          encoding scheme (originally defined by RFC 2279) allows for up to 6
+          bytes, and this is checked first.*)
+  | UTF8_ERR10
+      (** The two most significant bits of the 6th byte of the character do not
+          have the binary value 0b10. Note that this is possible since although
+          RFC 3629 restricts UTF-8 characters to be no longer than 4 bytes, the
+          encoding scheme (originally defined by RFC 2279) allows for up to 6
+          bytes, and this is checked first.*)
+  | UTF8_ERR11
+      (** A character that is valid by the RFC 2279 rules is 5 bytes long;
+          these code points are excluded by RFC 3629. *)
+  | UTF8_ERR12
+      (** A character that is valid by the RFC 2279 rules is 6 bytes long;
+          these code points are excluded by RFC 3629. *)
+  | UTF8_ERR13
+      (** A 4 byte character has a value greater than 0x10ffff; these code
+          points are excluded by RFC 3629. *)
+  | UTF8_ERR14
+      (** A 3 byte character has a value in the range 0xd800 to 0xdfff; this
+        range of code points are reserved by RFC 3629 for use with UTF-16, and
+        so are excluded from UTF-8. *)
+  | UTF8_ERR15
+      (** A 2 byte character is "overlong", that is, it codes for a value that
+          can be represented by fewer bytes, which is invalid. For example, the
+          two bytes 0xc0, 0xae give the value 0x2e, whose correct coding uses
+          just one byte. *)
+  | UTF8_ERR16
+      (** A 3 byte character is "overlong", that is, it codes for a value that
+          can be represented by fewer bytes, which is invalid. *)
+  | UTF8_ERR17
+      (** A 4 byte character is "overlong", that is, it codes for a value that
+          can be represented by fewer bytes, which is invalid. *)
+  | UTF8_ERR18
+      (** A 5 byte character is "overlong", that is, it codes for a value that
+          can be represented by fewer bytes, which is invalid. Note that this
+          is possible since although RFC 3629 restricts
+          UTF-8 characters to be no longer than 4 bytes, the encoding scheme
+          (originally defined by RFC 2279) allows for up to 6 bytes, and this
+          is checked first. *)
+  | UTF8_ERR19
+      (** A 6 byte character is "overlong", that is, it codes for a value that
+          can be represented by fewer bytes, which is invalid. Note that this
+          is possible since although RFC 3629 restricts
+          UTF-8 characters to be no longer than 4 bytes, the encoding scheme
+          (originally defined by RFC 2279) allows for up to 6 bytes, and this
+          is checked first.*)
+  | UTF8_ERR20
+      (** The two most significant bits of the first byte of a character have
+          the binary value 0b10 (that is, the most significant bit is 1 and the
+          second is 0). Such a byte can only validly occur as the second or
+          subsequent byte of a multi-byte character. *)
+  | UTF8_ERR21
+      (** The first byte of a character has the value 0xfe or 0xff. These
+          values can never occur in a valid UTF-8 string. *)
+  (* Miscellaneous error codes for pcre2[_dfa]_match, substring extraction
+     functions, context functions, and serializing functions. *)
+  | BADDATA  (** Invalid data was provided to the function *)
+  | MIXEDTABLES
+      (** During serialization, the patterns do not all use the same tables *)
+  | BADMAGIC
+      (** PCRE2 stores a 4-byte "magic number" at the start of the compiled
+          code, to catch the case when it is passed a junk pointer. This is the
+          error that is returned when the magic number is not present. *)
+  | BADMODE
+      (** This error is given when a compiled pattern is passed to a function
+          in a library of a different code unit width, for example, a pattern
+          compiled by the 8-bit library is passed to a 16-bit or 32-bit library
+          function. *)
+  | BADOFFSET
+      (** The value of the subject offset was negative or greater than the
+          length of the subject. *)
+  | BADOPTION  (** An unrecognized bit was set in the options argument. *)
+  | BADREPLACEMENT
+      (** used for miscellaneous syntax errors in the replacement string with
+          pcre2_substitute *)
+  | BADUTFOFFSET
+      (** The UTF code unit sequence that was passed as a subject was checked
+    and found to be valid (the PCRE2_NO_UTF_CHECK option was not set), but the
+    value of startoffset did not point to the beginning of a UTF character or
+    the end of the subject. *)
+  | CALLOUT
+      (**  This error is never generated by pcre2_match() itself. It is
+           provided for use by callout functions that want to cause
+           pcre2_match() or pcre2_callout_enumerate() to return a distinctive
+           error code. *)
+  | DFA_BADRESTART
+      (**  When pcre2_dfa_match() is called with the PCRE2_DFA_RESTART option,
+           some plausibility checks are made on the contents of the workspace,
+           which should contain data about the previous partial match. If any
+           of these checks fail, this error is given. *)
+  | DFA_RECURSE
+      (**  When a recursion or subroutine call is processed, the matching
+           function calls itself recursively, using private memory for the
+           ovector and workspace. This error is given if the internal ovector
+           is not large enough. This should be extremely rare, as a vector of
+           size 1000 is used. *)
+  | DFA_UCOND
+      (** This return is given if pcre2_dfa_match() encounters a condition item
+          that uses a backreference for the condition, or a test for recursion
+          in a specific capture group. These are not supported. *)
+  | DFA_UFUNC
+      (** A convenience function unsupported by the DFA was used on the result
+          of a DFA match (e.g., extraction by substring name) *)
+  | DFA_UITEM
+      (** This return is given if pcre2_dfa_match() encounters an item in the
+          pattern that it does not support, for instance, the use of \C in a
+          UTF mode or a backreference. *)
+  | DFA_WSSIZE
+      (** This return is given if pcre2_dfa_match() runs out of space in the
+          workspace vector. *)
+  | INTERNAL
+      (** An unexpected internal error has occurred. This error could be caused
+          by a bug in PCRE2 or by overwriting of the compiled pattern. *)
+  | JIT_BADOPTION
+      (** A matching mode which was not compiled was requested, or an unknown
+          bit was set in jit compilation options. *)
+  | JIT_STACKLIMIT
+      (** This error is returned when a pattern that was successfully studied
+          using JIT is being matched, but the memory available for the
+          just-in-time processing stack is not large enough. See the pcre2jit
+          documentation for more details *)
+  | MATCHLIMIT  (** The backtracking match limit was reached. *)
+  | NOMEMORY
+      (** Heap memory is used to remember backtracking points. This error is
+          given when the memory allocation function (default or custom) fails.
+          Note that a different error, PCRE2_ERROR_HEAPLIMIT, is given if the
+          amount of memory needed exceeds the heap limit. PCRE2_ERROR_NOMEMORY
+          is also returned if PCRE2_COPY_MATCHED_SUBJECT is set and memory
+          allocation fails. *)
+  | NOSUBSTRING
+      (** - in substrings: There is no substring with that number in the
+          pattern, that is, the number is greater than the number of capturing
+          parentheses.
 
-   You should have received a copy of the GNU Lesser General Public
-   License along with this library; if not, write to the Free Software
-   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
-*)
+          - in substitution: returned for a non-existent substring insertion,
+          unless PCRE2_SUBSTITUTE_UNKNOWN_UNSET is set.
+        *)
+  | NOUNIQUESUBSTRING
+      (** Returned when there is more than one capture group with a given name
+          and this would result in ambiguity.
+        *)
+  | NULL
+      (** Either the code, subject, or match_data argument was passed as NULL.
+       *)
+  | RECURSELOOP
+      (** This error is returned when pcre2_match() detects a recursion loop
+          within the pattern. Specifically, it means that either the whole
+          pattern or a capture group has been called recursively for the second
+          time at the same position in the subject string. Some simple patterns
+          that might do this are detected and faulted at compile time, but more
+          complicated cases, in particular mutual recursions between two
+          different groups, cannot be detected until matching is attempted. *)
+  | DEPTHLIMIT  (** The nested backtracking depth limit was reached. *)
+  | UNAVAILABLE
+      (** The substring number, though not greater than the number of captures
+          in the pattern, is greater than the number of slots in the ovector,
+          so the substring could not be captured. *)
+  | UNSET
+      (** - in substrings: The substring did not participate in the match. For
+          example, if the pattern is (abc)|(def) and the subject is "def", and
+          the ovector contains at least two capturing slots, substring number 1
+          is unset.
 
-(** Perl Compatibility Regular Expressions for OCaml
+          - in substitution: returned for an unset substring insertion
+          (including an unknown substring when PCRE2_SUBSTITUTE_UNKNOWN_UNSET
+          is set) when the simple (non-extended) syntax is used and
+          PCRE2_SUBSTITUTE_UNSET_EMPTY is not set
+        *)
+  | BADOFFSETLIMIT
+      (** An offset limit was set but the flag was not set at compile time *)
+  | BADREPESCAPE
+      (** invalid escape sequence in a replacement string used with
+          pcre2_substitute *)
+  | REPMISSINGBRACE
+      (** missing closing curly bracket in a replacement string used with
+          pcre2_substitute *)
+  | BADSUBSTITUTION
+      (** syntax error in extended group substitution in pcre2_substitute *)
+  | BADSUBSPATTERN
+      (** in pcre2_substitute, the pattern match ended before it started or the
+          match started earlier than the current position in the subject, which
+          can happen if \K is used in an assertion *)
+  | TOOMANYREPLACE
+      (** The number of total substitutions would exceed the maximum integer
+          and cause overflow. *)
+  | BADSERIALIZEDDATA  (** Invalid arguments to pcre2_serialize *)
+  | HEAPLIMIT  (** The heap limit was reached. *)
+  | CONVERT_SYNTAX  (** Syntax error in pcre2_convert *)
+  | INTERNAL_DUPMATCH
+      (** An internal error in substitution led to a duplicate match *)
+  | DFA_UINVALID_UTF
+      (** This return is given if pcre2_dfa_match() is called for a pattern
+          that was compiled with PCRE2_MATCH_INVALID_UTF. This is not supported
+          for DFA matching. *)
+  | INVALIDOFFSET  (** internal error, should not occur *)
+[@@deriving show, eq]
 
-    {e %%VERSION%% - {{:%%PKG_HOMEPAGE%%}homepage}}
-*)
+(* Fastpath to JIT match for perf *)
 
+module Options : sig
+  module Jit : sig
+    type matching_mode = JIT_COMPLETE | JIT_PARTIAL_SOFT | JIT_PARTIAL_HARD
+    type jit_only_compile_option = [ `JIT_INVALID_UTF ]
 
-(** {5 Exceptions} *)
+    type match_option =
+      [ `NOTBOL
+      | `NOTEOL
+      | `NOTEMPTY
+      | `NOTEMPTY_ATSTART
+      | `PARTIAL_SOFT
+      | `PARTIAL_HARD ]
+  end
 
-type error =
-  | Partial  (** String only matched the pattern partially *)
-  | BadPattern of string * int  (** [BadPattern (msg, pos)] regular
-                                    expression is malformed.  The reason
-                                    is in [msg], the position of the
-                                    error in the pattern in [pos]. *)
-  | BadUTF  (** UTF string being matched is invalid *)
-  | BadUTFOffset  (** Gets raised when a UTF string being matched with
-                       offset is invalid. *)
-  | MatchLimit  (** Maximum allowed number of match attempts with
-                    backtracking or recursion is reached during matching.
-                    ALL FUNCTIONS CALLING THE MATCHING ENGINE MAY RAISE
-                    IT!!! *)
-  | DepthLimit
-  | WorkspaceSize  (** Raised by {!pcre2_dfa_match} when the provided
-                       workspace array is too small. See documention on
-                       {!pcre2_dfa_match} for details on workspace array
-                       sizing. *)
-  | InternalError of string
-      (** [InternalError msg] C-library exhibits unknown/undefined
-          behaviour.  The reason is in [msg]. *)
+  module Interp : sig
+    type compile_match_options = [ `ANCHORED | `NO_UTF_CHECK | `ENDANCHORED ]
 
-(** Exception indicating PCRE errors. *)
-exception Error of error
+    type compile_option =
+      [ compile_match_options
+      | `ALLOW_EMPTY_CLASS
+      | `ALT_BSUX
+      | `AUTO_CALLOUT
+      | `CASELESS
+      | `DOLLAR_ENDONLY
+      | `DOTALL
+      | `DUPNAMES
+      | `EXTENDED
+      | `FIRSTLINE
+      | `MATCH_UNSET_BACKREF
+      | `MULTILINE
+      | `NEVER_UCP
+      | `NEVER_UTF
+      | `NO_AUTO_CAPTURE
+      | `NO_AUTO_POSSESS
+      | `NO_DOTSTAR_ANCHOR
+      | `NO_START_OPTIMIZE
+      | `UCP
+      | `UNGREEDY
+      | `UTF
+      | `NEVER_BACKSLASH_C
+      | `ALT_CIRCUMFLEX
+      | `ALT_VERBNAMES
+      | `USE_OFFSET_LIMIT
+      | `EXTENDED_MORE
+      | `LITERAL
+      | `MATCH_INVALID_UTF ]
 
-(** [Backtrack] used in callout functions to force backtracking. *)
-exception Backtrack
+    (* for compile ctx - can combine and just split back as needed in bindings? *)
+    type compile_ctx =
+      [ `EXTRA_ALLOW_SURROGATE_ESCAPES
+      | `EXTRA_BAD_ESCAPE_IS_LITERAL
+      | `EXTRA_MATCH_WORD
+      | `EXTRA_MATCH_LINE
+      | `EXTRA_ESCAPED_CR_IS_LF
+      | `EXTRA_ALT_BSUX
+      | `EXTRA_ALLOW_LOOKAROUND_BSK
+      | `EXTRA_CASELESS_RESTRICT
+      | `EXTRA_ASCII_BSD
+      | `EXTRA_ASCII_BSS
+      | `EXTRA_ASCII_BSW
+      | `EXTRA_ASCII_POSIX
+      | `EXTRA_ASCII_DIGIT ]
 
-(** [Regexp_or (pat, error)] gets raised for sub-pattern [pat] by [regexp_or]
-    if it failed to compile. *)
-exception Regexp_or of string * error
+    type match_option =
+      (* shared *)
+      [ Jit.match_option
+      | `COPY_MATCHED_SUBJECT
+      | `DISABLE_RECURSELOOP_CHECK
+      | `NO_JIT
+        (* not for pcre2_dfa_match() *)
+        (* not for pcre2_dfa_match() or pcre2_jit_match() *) ]
+    (* TODO: split to enforce restrictions (maybe except `NO_JIT) *)
+    (* TODO: add match_context options (depth, heap, match) limits here or separately? *)
 
-(** {6 Compilation and runtime flags and their conversion functions} *)
+    type subst_options =
+      (* shared *)
+      [ Jit.match_option
+      | compile_match_options
+      | `NO_JIT
+      | (* exclusive *)
+        `SUBSTITUTE_GLOBAL
+      | `SUBSTITUTE_EXTENDED
+      | `SUBSTITUTE_UNSET_EMPTY
+      | `SUBSTITUTE_UNKNOWN_UNSET
+      | `SUBSTITUTE_OVERFLOW_LENGTH
+      | `SUBSTITUTE_LITERAL
+      | `SUBSTITUTE_MATCHED
+      | `SUBSTITUTE_REPLACEMENT_ONLY ]
 
-(** Internal representation of compilation flags *)
-type icflag
+    type newline_compile_ctx_option =
+      | NEWLINE_CR
+      | NEWLINE_LF
+      | NEWLINE_CRLF
+      | NEWLINE_ANY
+      | NEWLINE_ANYCRLF
+      | NEWLINE_NUL
 
-(** Internal representation of runtime flags *)
-and  irflag
+    type bsr = BSR_UNICODE | ANYCRLF
+  end
+end
 
-(** Compilation flags *)
-and cflag =
-  [ `ALLOW_EMPTY_CLASS   (** Allow empty classes *)
-  | `ALT_BSUX            (** Alternative handling of \u, \U, and \x *)
-  | `ALT_CIRCUMFLEX      (** Alternative handling of ^ in multiline mode *)
-  | `ALT_VERBNAMES       (** Process backslashes in verb names *)
-  | `ANCHORED            (** Pattern matches only at start of string *)
-  | `AUTO_CALLOUT        (** Automatically inserts callouts with id 255
-                             before each pattern item *)
-  | `CASELESS            (** Case insensitive matching *)
-  | `DOLLAR_ENDONLY      (** '$' in pattern matches only at end of string *)
-  | `DOTALL              (** '.' matches all characters (newlines, too) *)
-  | `DUPNAMES            (** Allow duplicate names for subpatterns *)
-  | `ENDANCHORED         (** Pattern can match only at end of subject *)
-  | `EXTENDED            (** Ignores whitespace and PERL-comments. Behaves
-                             like the '/x'-option in PERL *)
-  | `EXTENDED_MORE
-  | `FIRSTLINE           (** Unanchored patterns must match before/at first NL *)
-  | `LITERAL             (** Pattern characters are all literal *)
-  | `MATCH_INVALID_UTF   (** Enable support for matching invalid UTF *)
-  | `MATCH_UNSET_BACKREF (** Match unset backreferences *)
-  | `MULTILINE           (** '^' and '$' match before/after newlines,
-                             not just at the beginning/end of a string *)
-  | `NEVER_BACKSLASH_C   (** Lock out the use of \C in patterns *)
-  | `NEVER_UCP           (** Lock out UCP, e.g. via (\*UCP) *)
-  | `NEVER_UTF           (** Lock out UTF, e.g. via (\*UTF) *)
-  | `NO_AUTO_CAPTURE     (** Disables the use of numbered capturing parentheses *)
-  | `NO_AUTO_POSSESS     (** Disable auto-possessification *)
-  | `NO_DOTSTAR_ANCHOR   (** Disable automatic anchoring for .* *)
-  | `NO_START_OPTIMIZE   (** Disable match-time start optimizations *)
-  | `NO_UTF_CHECK        (** Do not check the pattern for UTF validity (only
-                             relevant if UTF is set)
-                             WARNING: with this flag enabled, invalid UTF strings
-                             may cause a crash, loop, or give incorrect results *)
-  | `UCP                 (** Use Unicode properties for \d, \w, etc. *)
-  | `UNGREEDY            (** Quantifiers not greedy anymore, only
-                             if followed by '?' *)
-  | `USE_OFFSET_LIMIT    (** Enable offset limit for unanchored matching *)
-  | `UTF                 (** Treat pattern and subjects as UTF strings *)
-  ]
+module Interp : sig
+  include module type of Options.Interp
 
-val cflags : cflag list -> icflag
-(** [cflags cflag_list] converts a list of compilation flags to
-    their internal representation. *)
+  include
+    Intf.Matcher
+      with type match_ = match_
+       and type captures = captures
+       and type compile_option = Options.Interp.compile_option
+       and type compile_error = compile_error
+       and type match_option = Options.Interp.match_option
+       and type match_error = match_error
+end
 
-val cflag_list : icflag -> cflag list
-(** [cflag_list cflags] converts internal representation of
-    compilation flags to a list. *)
+module Jit : sig
+  include module type of Options.Jit
 
-(** Runtime flags *)
-type rflag =
-  [
-  | `ANCHORED             (** Match only at the first position *)
-  | `COPY_MATCHED_SUBJECT (** On success, make a private subject copy *)
-  | `DFA_RESTART          (** Causes matching to proceed presuming the subject
-                              string is further to one partially matched previously
-                              using the same int-array working set.  May only be
-                              used with {!pcre2_dfa_match} or {!unsafe_pcre2_dfa_match},
-                              and should always be paired with {!`PARTIAL}. *)
-  | `DFA_SHORTEST         (** Return only the shortest match *)
-  | `ENDANCHORED          (** Pattern can match only at end of subject *)
-  | `NOTBOL               (** Beginning of string is not treated as beginning of line *)
-  | `NOTEOL               (** End of string is not treated as end of line *)
-  | `NOTEMPTY             (** An empty string is not a valid match *)
-  | `NOTEMPTY_ATSTART     (** An empty string at the start of the subject is not
-                              a valid match *)
-  | `NO_JIT               (** Do not use JIT matching *)
-  | `NO_UTF_CHECK         (** Do not check the subject for UTF validity (only
-                              relevant if PCRE2_UTF was set at compile time) *)
-  | `PARTIAL_HARD         (** Throw Pcre2.Partial for a partial match even if there
-                              is a full match *)
-  | `PARTIAL_SOFT         (** Throw Pcre2.Partial for a partial match if no full
-                              matches are found *)
-  ]
+  include
+    Intf.Matcher
+      with type match_ = match_
+       and type captures = captures
+       and type compile_option =
+        [ Options.Jit.jit_only_compile_option | Options.Interp.compile_option ]
+       and type compile_error = compile_error
+       and type match_option = Options.Jit.match_option
+       and type match_error = match_error
 
-val rflags : rflag list -> irflag
-(** [rflags rflag_list] converts a list of runtime flags to
-    their internal representation. *)
-
-val rflag_list : irflag -> rflag list
-(** [rflag_list rflags] converts internal representation of
-    runtime flags to a list. *)
-
-
-(** {6 Information on the PCRE2-configuration (build-time options)} *)
+  val of_interp :
+    ?options:jit_only_compile_option list ->
+    ?mode:matching_mode ->
+    Interp.t ->
+    (t, compile_error) Result.t
+  (** [of_interp options mode re] is either [Ok jit_re], the JIT-enabled
+      version of the provided pattern, or [Error c], where [c] is the relevant
+      compilation error. *)
+end
 
 (** Version information *)
-val version : string  (** Version of the PCRE2-C-library *)
+val version : int * int
+(** Version of the PCRE2-C-library (major, minor) *)
 
-(** Indicates whether unicode support is enabled *)
 val config_unicode : bool
+(** Indicates whether unicode support is enabled *)
 
-(** Character used as newline *)
-val config_newline : char
-
-(** Number of bytes used for internal linkage of regular expressions *)
-val config_link_size : int
-
-(** Default limit for calls to internal matching function *)
 val config_match_limit : int
+(** Default limit for calls to internal matching function *)
 
-(** Default limit for depth of nested backtracking *)
 val config_depth_limit : int
+(** Default limit for depth of nested backtracking *)
 
-(** Indicates use of stack recursion in matching function *)
 val config_stackrecurse : bool
-
-
-(** {3 Information on patterns} *)
-
-(** Information on matching of "first chars" in patterns *)
-type firstcodeunit_info =
-  [ `Char of char  (** Fixed first character *)
-  | `Start_only    (** Pattern matches at beginning and end of newlines *)
-  | `ANCHORED      (** Pattern is anchored *)
-  ]
-
-type regexp (** Compiled regular expressions *)
-
-(** [options regexp] @return compilation flags of [regexp]. *)
-val options : regexp -> icflag
-
-(** [size regexp] @return memory size of [regexp]. *)
-val size : regexp -> int
-
-(** [capturecount regexp] @return number of capturing subpatterns in
-    [regexp]. *)
-val capturecount : regexp -> int
-
-(** [backrefmax regexp] @return number of highest backreference in [regexp]. *)
-val backrefmax : regexp -> int
-
-(** [namecount regexp] @return number of named subpatterns in [regexp]. *)
-val namecount : regexp -> int
-
-(** [nameentrysize regexp] @return size of longest name of named
-    subpatterns in [regexp] + 3. *)
-val nameentrysize : regexp -> int
-
-(** [names regex] @return array of names of named substrings in [regexp]. *)
-val names : regexp -> string array
-
-(** [firstcodeunit regexp] @return firstcodeunit info on [regexp]. *)
-val firstcodeunit : regexp -> firstcodeunit_info
-
-(** [lastcodeunit regexp] @return some last matching character of [regexp]
-    if available, [None] otherwise. *)
-val lastcodeunit : regexp -> char option
-
-val get_stringnumber : regexp -> string -> int
-(** [get_stringnumber rex name] @return the index of the named substring
-    [name] in regular expression [rex]. This index can then be used with
-    [get_substring].
-
-    @raise Invalid_arg if there is no such named substring. *)
-
-(* val get_match_limit : regexp -> int option *)
-(** [get_match_limit rex] @return some match limit of regular expression
-    [rex] or [None]. *)
-
-(* val get_depth_limit : regexp -> int option *)
-(** [get_depth_limit rex] @return some depth limit of regular expression
-    [rex] or [None]. *)
-
-
-(** {6 Compilation of patterns} *)
-
-type chtables (** Alternative set of char tables for pattern matching *)
-
-val maketables : unit -> chtables
-(** Generates new set of char tables for the current locale. *)
-
-val regexp :
-  (* ?jit_compile : bool -> *)
-  ?limit : int ->
-  ?depth_limit : int ->
-  ?iflags : icflag ->
-  ?flags : cflag list ->
-  ?chtables : chtables ->
-  string -> regexp
-(** [regexp ?limit ?depth_limit ?iflags ?flags ?chtables pattern]
-    compiles [pattern] with [flags] when given, with [iflags] otherwise,
-    and with char tables [chtables].  If [limit] is specified, this sets
-    a limit to the amount of recursion and backtracking (only lower than
-    the builtin default!).  If this limit is exceeded, [MatchLimit] will
-    be raised during matching.
-
-    @param limit default = no extra limit other than default
-    @param depth_limit default = no extra depth_limit other than default
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param chtables default = builtin char tables
-
-    @return the regular expression.
-
-    For detailed documentation on how you can specify PERL-style regular
-    expressions (= patterns), please consult the PCRE2-documentation
-    ("man pcre2pattern") or PERL-manuals.
-    @see <http://www.perl.com> www.perl.com *)
-
-val regexp_or :
-  (* ?jit_compile : bool -> *)
-  ?limit : int ->
-  ?depth_limit : int ->
-  ?iflags : icflag ->
-  ?flags : cflag list ->
-  ?chtables : chtables ->
-  string list -> regexp
-(** [regexp_or ?limit ?depth_limit ?iflags ?flags ?chtables patterns]
-    like {!regexp}, but combines [patterns] as alternatives (or-patterns) into
-    one regular expression.
-*)
-
-val quote : string -> string
-(** [quote str] @return the quoted string of [str]. *)
-
-
-(** {6 Subpattern extraction} *)
-
-type substrings (** Information on substrings after pattern matching *)
-
-val get_subject : substrings -> string
-(** [get_subject substrings] @return the subject string of [substrings]. *)
-
-val num_of_subs : substrings -> int
-(** [num_of_subs substrings] @return number of strings in [substrings]
-    (whole match inclusive). *)
-
-val get_substring : substrings -> int -> string
-(** [get_substring substrings n] @return the [n]th substring
-    (0 is whole match) of [substrings].
-
-    @raise Invalid_argument if [n] is not in the range of the number of
-    substrings.
-    @raise Not_found if the corresponding subpattern did not capture
-           a substring. *)
-
-val get_substring_ofs : substrings -> int -> int * int
-(** [get_substring_ofs substrings n] @return the offset tuple of the
-    [n]th substring of [substrings] (0 is whole match).
-
-    @raise Invalid_argument if [n] is not in the range of the number
-           of substrings.
-    @raise Not_found if the corresponding subpattern did not capture
-           a substring. *)
-
-val get_substrings :
-  ?full_match : bool ->
-  substrings -> string array
-(** [get_substrings ?full_match substrings] @return the array of
-    substrings in [substrings]. It includes the full match at index 0
-    when [full_match] is [true], the captured substrings only when it
-    is [false]. If a subpattern did not capture a substring, the empty
-    string is returned in the corresponding position instead.
-
-    @param full_match default = true *)
-
-val get_opt_substrings :
-  ?full_match : bool ->
-  substrings -> string option array
-(** [get_opt_substrings ?full_match substrings] @return the array of
-    optional substrings in [substrings]. It includes [Some full_match_str]
-    at index 0 when [full_match] is [true], [Some captured_substrings]
-    only when it is [false]. If a subpattern did not capture a substring,
-    [None] is returned in the corresponding position instead.
-
-    @param full_match default = true *)
-
-val get_named_substring : regexp -> string -> substrings -> string
-(** [get_named_substring rex name substrings] @return the named substring
-    [name] in regular expression [rex] and [substrings].
-
-    @raise Invalid_argument if there is no such named substring.
-    @raise Not_found if the corresponding subpattern did not capture
-           a substring. *)
-
-val get_named_substring_ofs : regexp -> string -> substrings -> int * int
-(** [get_named_substring_ofs rex name substrings] @return the offset
-    tuple of the named substring [name] in regular expression [rex] and
-    [substrings].
-
-    @raise Invalid_argument if there is no such named substring.
-    @raise Not_found if the corresponding subpattern did not capture
-           a substring. *)
-
-
-(** {6 Callouts} *)
-
-type callout_data =
-  {
-    callout_number : int; (** Callout number *)
-    substrings : substrings; (** Substrings matched so far *)
-    start_match : int;  (** Subject start offset of current match attempt *)
-    current_position : int;  (** Subject offset of current match pointer *)
-    capture_top : int;  (** Number of the highest captured substring so far *)
-    capture_last : int;  (** Number of the most recently captured substring *)
-    pattern_position : int;  (** Offset of next match item in pattern string *)
-    next_item_length : int;  (** Length of next match item in pattern string *)
-  }
-
-(** Type of callout functions *)
-type callout = callout_data -> unit
-(** Callouts are referred to in patterns as "(?Cn)" where "n" is a
-    [callout_number] ranging from 0 to 255.  Substrings captured so far
-    are accessible as usual via [substrings].  You will have to consider
-    [capture_top] and [capture_last] to know about the current state of
-    valid substrings.
-
-    By raising exception [Backtrack] within a callout function, the user
-    can force the pattern matching engine to backtrack to other possible
-    solutions.  Other exceptions will terminate matching immediately
-    and return control to OCaml.
-*)
-
-
-(** {6 Matching of patterns and subpattern extraction} *)
-
-val pcre2_match :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?callout : callout ->
-  string -> int array
-(** [pcre2_match ?iflags ?flags ?rex ?pat ?pos ?callout subj] @return an
-    array of offsets that describe the position of matched subpatterns in
-    the string [subj] starting at position [pos] with pattern [pat] when
-    given, regular expression [rex] otherwise. The array also contains
-    additional workspace needed by the match engine. Uses [flags] when
-    given, the precompiled [iflags] otherwise. Callouts are handled by
-    [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param callout default = ignore callouts
-
-    @raise Not_found if pattern does not match. *)
-
-val pcre2_dfa_match :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?callout : callout ->
-  ?workspace : int array ->
-  string -> int array
-(** [pcre2_dfa_match ?iflags ?flags ?rex ?pat ?pos ?callout ?workspace subj]
-    invokes the "alternative" DFA matching function.
-
-    @return an array of offsets that describe the position of matched
-    subpatterns in the string [subj] starting at position [pos] with pattern
-    [pat] when given, regular expression [rex] otherwise. The array also
-    contains additional workspace needed by the match engine. Uses [flags]
-    when given, the precompiled [iflags] otherwise. Requires a
-    sufficiently-large [workspace] array. Callouts are handled by [callout].
-
-    Note that the returned array of offsets are quite different from those
-    returned by {!pcre2_match} et al.  The motivating use case for the DFA
-    match function is to be able to restart a partial match with N additional
-    input segments.  Because the match function/workspace does not store
-    segments seen previously, the offsets returned when a match completes will
-    refer only to the matching portion of the last subject string provided.
-    Thus, returned offsets from this function should not be used to support
-    extracting captured submatches.  If you need to capture submatches
-    from a series of inputs incrementally matched with this function, you'll
-    need to concatenate those inputs that yield a successful match here and
-    re-run the same pattern against that single subject string.
-
-    Aside from an absolute minimum of [20], PCRE does not provide any
-    guidance regarding the size of workspace array needed by any given
-    pattern.  Therefore, it is wise to appropriately handle the possible
-    [WorkspaceSize] error.  If raised, you can allocate a new, larger
-    workspace array and begin the DFA matching process again.
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param callout default = ignore callouts
-    @param workspace default = fresh array of length [20]
-
-    @raise Not_found if the pattern match has failed
-    @raise Error Partial if the pattern has matched partially; a subsequent
-                         exec call with the same pattern and workspace
-                         (adding the [DFA_RESTART] flag) be made to either
-                         further advance or complete the partial match.
-    @raise Error WorkspaceSize if the workspace array is too small to
-                               accommodate the DFA state required by the
-                               supplied pattern *)
-
-val exec :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?callout : callout ->
-  string -> substrings
-(** [exec ?iflags ?flags ?rex ?pat ?pos ?callout subj] @return substring
-    information on string [subj] starting at position [pos] with pattern
-    [pat] when given, regular expression [rex] otherwise. Uses [flags]
-    when given, the precompiled [iflags] otherwise. Callouts are handled
-    by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param callout default = ignore callouts
-
-    @raise Not_found if pattern does not match. *)
-
-val exec_all :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?callout : callout ->
-  string -> substrings array
-(** [exec_all ?iflags ?flags ?rex ?pat ?pos ?callout subj] @return
-    an array of substring information of all matching substrings in
-    string [subj] starting at position [pos] with pattern [pat] when
-    given, regular expression [rex] otherwise. Uses [flags] when given,
-    the precompiled [iflags] otherwise. Callouts are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param callout default = ignore callouts
-
-    @raise Not_found if pattern does not match. *)
-
-val next_match :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?callout : callout ->
-  substrings -> substrings
-(** [next_match ?iflags ?flags ?rex ?pat ?pos ?callout substrs] @return
-    substring information on the match that follows on the last
-    match denoted by [substrs], jumping over [pos] characters (also
-    backwards!), using pattern [pat] when given, regular expression
-    [rex] otherwise. Uses [flags] when given, the precompiled [iflags]
-    otherwise. Callouts are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param callout default = ignore callouts
-
-    @raise Not_found if pattern does not match.
-    @raise Invalid_arg if [pos] let matching start outside of
-           the subject string. *)
-
-val extract :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?full_match : bool ->
-  ?callout : callout ->
-  string -> string array
-(** [extract ?iflags ?flags ?rex ?pat ?pos ?full_match ?callout subj]
-    @return the array of substrings that match [subj] starting at
-    position [pos], using pattern [pat] when given, regular expression
-    [rex] otherwise. Uses [flags] when given, the precompiled [iflags]
-    otherwise. It includes the full match at index 0 when [full_match] is
-    [true], the captured substrings only when it is [false]. Callouts are
-    handled by [callout].  If a subpattern did not capture a substring,
-    the empty string is returned in the corresponding position instead.
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param full_match default = true
-    @param callout default = ignore callouts
-
-    @raise Not_found if pattern does not match. *)
-
-val extract_opt :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?full_match : bool ->
-  ?callout : callout ->
-  string -> string option array
-(** [extract_opt ?iflags ?flags ?rex ?pat ?pos ?full_match ?callout subj]
-    @return the array of optional substrings that match [subj] starting
-    at position [pos], using pattern [pat] when given, regular expression
-    [rex] otherwise. Uses [flags] when given, the precompiled [iflags]
-    otherwise. It includes [Some full_match_str] at index 0 when
-    [full_match] is [true], [Some captured-substrings] only when it is
-    [false]. Callouts are handled by [callout].  If a subpattern did
-    not capture a substring, [None] is returned in the corresponding
-    position instead.
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param full_match default = true
-    @param callout default = ignore callouts
-
-    @raise Not_found if pattern does not match. *)
-
-val extract_all :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?full_match : bool ->
-  ?callout : callout ->
-  string -> string array array
-(** [extract_all ?iflags ?flags ?rex ?pat ?pos ?full_match ?callout subj]
-    @return an array of arrays of all matching substrings that match
-    [subj] starting at position [pos], using pattern [pat] when given,
-    regular expression [rex] otherwise. Uses [flags] when given, the
-    precompiled [iflags] otherwise. It includes the full match at index
-    0 of the extracted string arrays when [full_match] is [true], the
-    captured substrings only when it is [false]. Callouts are handled by
-    [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param full_match default = true
-    @param callout default = ignore callouts
-
-    @raise Not_found if pattern does not match. *)
-
-val extract_all_opt :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?full_match : bool ->
-  ?callout : callout ->
-  string -> string option array array
-(** [extract_all_opt
-      ?iflags ?flags ?rex ?pat ?pos ?full_match ?callout subj]
-    @return an array of arrays of all optional matching substrings that
-    match [subj] starting at position [pos], using pattern [pat] when
-    given, regular expression [rex] otherwise. Uses [flags] when given,
-    the precompiled [iflags] otherwise. It includes [Some full_match_str]
-    at index 0 of the extracted string arrays when [full_match] is [true],
-    [Some captured_substrings] only when it is [false]. Callouts are
-    handled by [callout].  If a subpattern did not capture a substring,
-    [None] is returned in the corresponding position instead.
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param full_match default = true
-    @param callout default = ignore callouts
-
-    @raise Not_found if pattern does not match. *)
-
-val pmatch :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?callout : callout ->
-  string -> bool
-(** [pmatch ?iflags ?flags ?rex ?pat ?pos ?callout subj] @return [true]
-    if [subj] is matched by pattern [pat] when given, regular expression
-    [rex] otherwise, starting at position [pos]. Uses [flags] when given,
-    the precompiled [iflags] otherwise. Callouts are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param callout default = ignore callouts *)
-
-
-(** {6 String substitution} *)
-
-(** Information on substitution patterns *)
-type substitution
-
-val subst : string -> substitution
-(** [subst str] converts the string [str] representing a
-    substitution pattern to the internal representation
-
-    The contents of the substitution string [str] can be normal text
-    mixed with any of the following (mostly as in PERL):
-
-    - {e $\[0-9\]+}  - a "$" immediately followed by an arbitrary number.
-                       "$0" stands for the name of the executable,
-                       any other number for the n-th backreference.
-    - {e $&}         - the whole matched pattern
-    - {e $`}         - the text before the match
-    - {e $'}         - the text after the match
-    - {e $+}         - the last group that matched
-    - {e $$}         - a single "$"
-    - {e $!}         - delimiter which does not appear in the substitution.
-                       Can be used to part "$[0-9]+" from an immediately
-                       following other number. *)
-
-val replace :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?itempl : substitution ->
-  ?templ : string ->
-  ?callout : callout ->
-  string -> string
-(** [replace ?iflags ?flags ?rex ?pat ?pos ?itempl ?templ ?callout subj]
-    replaces all substrings of [subj] matching pattern [pat] when given,
-    regular expression [rex] otherwise, starting at position [pos] with
-    the substitution string [templ] when given, [itempl] otherwise. Uses
-    [flags] when given, the precompiled [iflags] otherwise. Callouts
-    are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param itempl default = empty string
-    @param templ default = ignored
-    @param callout default = ignore callouts
-
-    @raise Failure if there are backreferences to nonexistent subpatterns. *)
-
-val qreplace :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?templ : string ->
-  ?callout : callout ->
-  string -> string
-(** [qreplace ?iflags ?flags ?rex ?pat ?pos ?templ ?callout subj]
-    replaces all substrings of [subj] matching pattern [pat] when given,
-    regular expression [rex] otherwise, starting at position [pos]
-    with the string [templ]. Uses [flags] when given, the precompiled
-    [iflags] otherwise. Callouts are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param templ default = ignored
-    @param callout default = ignore callouts *)
-
-val substitute_substrings :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?callout : callout ->
-  subst : (substrings -> string) ->
-  string -> string
-(** [substitute_substrings ?iflags ?flags ?rex ?pat ?pos ?callout ~subst subj]
-    replaces all substrings of [subj] matching pattern [pat] when given,
-    regular expression [rex] otherwise, starting at position [pos]
-    with the result of function [subst] applied to the substrings
-    of the match. Uses [flags] when given, the precompiled [iflags]
-    otherwise. Callouts are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param callout default = ignore callouts *)
-
-val substitute :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?callout : callout ->
-  subst : (string -> string) ->
-  string -> string
-(** [substitute ?iflags ?flags ?rex ?pat ?pos ?callout ~subst subj]
-    replaces all substrings of [subj] matching pattern [pat] when given,
-    regular expression [rex] otherwise, starting at position [pos] with
-    the result of function [subst] applied to the match. Uses [flags]
-    when given, the precompiled [iflags] otherwise. Callouts are handled
-    by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param callout default = ignore callouts *)
-
-val replace_first :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?itempl : substitution ->
-  ?templ : string ->
-  ?callout : callout ->
-  string -> string
-(** [replace_first ?iflags ?flags ?rex ?pat ?pos ?itempl ?templ ?callout subj]
-    replaces the first substring of [subj] matching pattern [pat] when
-    given, regular expression [rex] otherwise, starting at position
-    [pos] with the substitution string [templ] when given, [itempl]
-    otherwise. Uses [flags] when given, the precompiled [iflags]
-    otherwise. Callouts are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param itempl default = empty string
-    @param templ default = ignored
-    @param callout default = ignore callouts
-
-    @raise Failure if there are backreferences to nonexistent subpatterns. *)
-
-val qreplace_first :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?templ : string ->
-  ?callout : callout ->
-  string -> string
-(** [qreplace_first ?iflags ?flags ?rex ?pat ?pos ?templ ?callout subj]
-    replaces the first substring of [subj] matching pattern [pat] when
-    given, regular expression [rex] otherwise, starting at position [pos]
-    with the string [templ]. Uses [flags] when given, the precompiled
-    [iflags] otherwise. Callouts are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param templ default = ignored
-    @param callout default = ignore callouts *)
-
-val substitute_substrings_first :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?callout : callout ->
-  subst : (substrings -> string) ->
-  string -> string
-(** [substitute_substrings_first
-       ?iflags ?flags ?rex ?pat ?pos ?callout ~subst subj]
-    replaces the first substring of [subj] matching pattern [pat] when
-    given, regular expression [rex] otherwise, starting at position
-    [pos] with the result of function [subst] applied to the substrings
-    of the match. Uses [flags] when given, the precompiled [iflags]
-    otherwise. Callouts are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param callout default = ignore callouts *)
-
-val substitute_first :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?callout : callout ->
-  subst : (string -> string) ->
-  string -> string
-(** [substitute_first ?iflags ?flags ?rex ?pat ?pos ?callout ~subst subj]
-    replaces the first substring of [subj] matching pattern [pat] when
-    given, regular expression [rex] otherwise, starting at position
-    [pos] with the result of function [subst] applied to the match. Uses
-    [flags] when given, the precompiled [iflags] otherwise. Callouts
-    are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param callout default = ignore callouts *)
-
-
-(** {6 Splitting} *)
-
-val split :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?max : int ->
-  ?callout : callout ->
-  string -> string list
-(** [split ?iflags ?flags ?rex ?pat ?pos ?max ?callout subj] splits [subj]
-    into a list of at most [max] strings, using as delimiter pattern
-    [pat] when given, regular expression [rex] otherwise, starting at
-    position [pos]. Uses [flags] when given, the precompiled [iflags]
-    otherwise. If [max] is zero, trailing empty fields are stripped. If
-    it is negative, it is treated as arbitrarily large. If neither [pat]
-    nor [rex] are specified, leading whitespace will be stripped! Should
-    behave exactly as in PERL. Callouts are handled by [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param max default = 0
-    @param callout default = ignore callouts *)
-
-val asplit :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?max : int ->
-  ?callout : callout ->
-  string -> string array
-(** [asplit ?iflags ?flags ?rex ?pat ?pos ?max ?callout subj] same as
-    {!Pcre2.split} but @return an array instead of a list. *)
-
-(** Result of a {!Pcre2.full_split} *)
-type split_result = Text of string        (** Text part of split string *)
-                  | Delim of string       (** Delimiter part of split string *)
-                  | Group of int * string (** Subgroup of matched delimiter
-                                              (subgroup_nr, subgroup_str) *)
-                  | NoGroup               (** Unmatched subgroup *)
-
-val full_split :
-  ?iflags : irflag ->
-  ?flags : rflag list ->
-  ?rex : regexp ->
-  ?pat : string ->
-  ?pos : int ->
-  ?max : int ->
-  ?callout : callout ->
-  string -> split_result list
-(** [full_split ?iflags ?flags ?rex ?pat ?pos ?max ?callout subj] splits
-    [subj] into a list of at most [max] elements of type "split_result",
-    using as delimiter pattern [pat] when given, regular expression
-    [rex] otherwise, starting at position [pos]. Uses [flags] when given,
-    the precompiled [iflags] otherwise. If [max] is zero, trailing empty
-    fields are stripped. If it is negative, it is treated as arbitrarily
-    large. Should behave exactly as in PERL. Callouts are handled by
-    [callout].
-
-    @param iflags default = no extra flags
-    @param flags default = ignored
-    @param rex default = matches whitespace
-    @param pat default = ignored
-    @param pos default = 0
-    @param max default = 0
-    @param callout default = ignore callouts *)
-
-
-(** {6 Additional convenience functions} *)
-
-val foreach_line :
-  ?ic : in_channel ->
-  (string -> unit) -> unit
-(** [foreach_line ?ic f] applies [f] to each line in inchannel [ic] until
-    the end-of-file is reached.
-
-    @param ic default = stdin *)
-
-val foreach_file : string list -> (string -> in_channel -> unit) -> unit
-(** [foreach_file filenames f] opens each file in the list [filenames]
-    for input and applies [f] to each filename and the corresponding
-    channel. Channels are closed after each operation (even when
-    exceptions occur - they get reraised afterwards!). *)
-
-
-(** {6 {b UNSAFE STUFF - USE WITH CAUTION!}} *)
-
-val unsafe_pcre2_match :
-  irflag ->
-  regexp ->
-  pos : int ->
-  subj_start : int ->
-  subj : string ->
-  int array ->
-  callout option ->
-  unit
-(** [unsafe_pcre2_match flags rex ~pos ~subj_start ~subj offset_vector callout].
-    You should read the C-source to know what happens.
-    If you do not understand it - {b don't use this function!} *)
-
-val make_ovector : regexp -> int * int array
-(** [make_ovector regexp] calculates the tuple (subgroups2, ovector)
-    which is the number of subgroup offsets and the offset array. *)
-
-val unsafe_pcre2_dfa_match :
-  irflag ->
-  regexp ->
-  pos : int ->
-  subj_start : int ->
-  subj : string ->
-  int array ->
-  callout option ->
-  workspace : int array ->
-  unit
-(** [unsafe_pcre2_dfa_match flags rex ~pos ~subj_start ~subj offset_vector callout
-    ~workpace].
-    You should read the C-source to know what happens.
-    If you do not understand it - {b don't use this function!} *)
+(** Indicates use of stack recursion in matching function *)
+
+type dfa_match_option =
+  (* shared *)
+  [ Options.Jit.match_option
+  | Options.Interp.compile_match_options
+  | `COPY_MATCHED_SUBJECT
+  | `DISABLE_RECURSELOOP_CHECK
+  | (* exclusive *)
+    `DFA_RESTART
+  | `DFA_SHORTEST ]
