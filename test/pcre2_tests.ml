@@ -73,6 +73,22 @@ let non_contiguous_capture ctxt =
         assert_equal ~printer (Ok None)
           (c >>= (fun c -> match_of_captures c 4) >+= range_of_match))
 
+let non_contiguous_named_capture ctxt =
+  Interp.(
+    match compile "(?<A>a)(?:(?<B>b)|(?<C>c))" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let printer = [%show: (range option, match_error) result] in
+        let c = captures re "ac" in
+        assert_equal ~printer
+          (Ok (Some { start = 0; end_ = 1 }))
+          (c >>= (fun c -> named_match_of_captures c "A") >+= range_of_match);
+        assert_equal ~printer (Ok None)
+          (c >>= (fun c -> named_match_of_captures c "B") >+= range_of_match);
+        assert_equal ~printer
+          (Ok (Some { start = 1; end_ = 2 }))
+          (c >>= (fun c -> named_match_of_captures c "C") >+= range_of_match))
+
 let bad_pattern ctxt =
   Interp.(
     match compile "ab(" with
@@ -103,6 +119,7 @@ let suite =
          "simple_test" >:: simple_test;
          "simple_test" >:: simple_captures;
          "non_contiguous_capture" >:: non_contiguous_capture;
+         "non_contiguous_named_capture" >:: non_contiguous_named_capture;
          "bad_pattern" >:: bad_pattern;
          "bad_offset" >:: bad_offset;
          "version" >:: check_version;
