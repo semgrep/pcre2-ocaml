@@ -52,6 +52,27 @@ let simple_captures ctxt =
         assert_equal ~printer (Ok None)
           (c >>= (fun c -> match_of_captures c 4) >+= range_of_match))
 
+let non_contiguous_capture ctxt =
+  Interp.(
+    match compile "(a)(?:(b)|(c))" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let printer = [%show: (range option, match_error) result] in
+        let c = captures re "ac" in
+        assert_equal ~printer
+          (Ok (Some { start = 0; end_ = 2 }))
+          (c >>= (fun c -> match_of_captures c 0) >+= range_of_match);
+        assert_equal ~printer
+          (Ok (Some { start = 0; end_ = 1 }))
+          (c >>= (fun c -> match_of_captures c 1) >+= range_of_match);
+        assert_equal ~printer (Ok None)
+          (c >>= (fun c -> match_of_captures c 2) >+= range_of_match);
+        assert_equal ~printer
+          (Ok (Some { start = 1; end_ = 2 }))
+          (c >>= (fun c -> match_of_captures c 3) >+= range_of_match);
+        assert_equal ~printer (Ok None)
+          (c >>= (fun c -> match_of_captures c 4) >+= range_of_match))
+
 let bad_pattern ctxt =
   Interp.(
     match compile "ab(" with
@@ -81,6 +102,7 @@ let suite =
   >::: [
          "simple_test" >:: simple_test;
          "simple_test" >:: simple_captures;
+         "non_contiguous_capture" >:: non_contiguous_capture;
          "bad_pattern" >:: bad_pattern;
          "bad_offset" >:: bad_offset;
          "version" >:: check_version;
