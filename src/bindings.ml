@@ -2,6 +2,10 @@ type jit = [ `JIT ]
 type interp = [ `Interp ]
 type 'a regex constraint 'a = [< jit | interp ]
 
+let unset = (-1, -1)
+(* Since -1 == PCRE2_UNSET.
+   TODO: obtain this value as part of the bindings, rather than like so *)
+
 external pcre2_ocaml_init : unit -> unit = "pcre2_ocaml_init"
 
 external pcre2_compile :

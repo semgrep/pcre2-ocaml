@@ -31,8 +31,8 @@ module Match = struct
   let match_of_captures ((subject, matches, _) : captures) (i : int) :
       match_ option =
     if 0 <= i && i < Array.length matches then
-      let start, end_ = matches.(i) in
-      Some (subject, start, end_)
+      let ((start, end_) as match_) = matches.(i) in
+      if match_ = Bindings.unset then None else Some (subject, start, end_)
     else None
 
   let named_match_of_captures ((subject, matches, names) : captures)
