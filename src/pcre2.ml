@@ -28,22 +28,23 @@ module Match = struct
 
   let captures_length ((_, matches, _) : captures) : int = Array.length matches
 
-  let match_of_captures ((subject, matches, _) : captures) (i : int) :
-      match_ option =
+  let get_match i matches =
     if 0 <= i && i < Array.length matches then
       let ((start, end_) as match_) = matches.(i) in
-      if match_ = Bindings.unset then None else Some (subject, start, end_)
+      if match_ = Bindings.unset then None else Some (start, end_)
     else None
+
+  let match_of_captures ((subject, matches, _) : captures) (i : int) :
+      match_ option =
+    get_match i matches >+= fun (start, end_) -> (subject, start, end_)
 
   let named_match_of_captures ((subject, matches, names) : captures)
       (group_name : string) : match_ option =
     Array.find_map
       (fun (s, i) ->
-        if String.equal group_name s then
-          let start, end_ = matches.(i) in
-          Some (subject, start, end_)
-        else None)
+        if String.equal group_name s then get_match i matches else None)
       names
+    >+= fun (start, end_) -> (subject, start, end_)
 end
 
 include Match
