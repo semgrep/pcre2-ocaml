@@ -151,8 +151,8 @@ module type Matcher = sig
   (** [split re subject] is a list of substrings of [subject] obtained by
       splitting it by removing matches [re] generates. If [subject_offset] is
       provided, matching to determine where to split starts there instead of
-      the start of [subject]. If [limit] is provided then only the first
-      [limit] matches are considered for splitting.
+      the start of [subject]. If [limit] is provided then [subject] will be
+      split into at most that many substrings.
 
       If a matching error occurs during this process, [Error e] is returned.
     *)

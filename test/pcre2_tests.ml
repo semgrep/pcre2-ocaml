@@ -116,7 +116,7 @@ let split_comma ctxt =
         let printer = [%show: (string list, match_error) result] in
         assert_equal ~printer (Ok [ "a"; "b"; "c" ]) (split re "a,b,c");
         assert_equal ~printer (Ok [ "a"; "b"; "c"; "" ]) (split re "a,b,c,");
-        assert_equal ~printer (Ok [ "a"; "bc" ]) (split ~limit:1 re "a,b,c,"))
+        assert_equal ~printer (Ok [ "a"; "b,c," ]) (split ~limit:2 re "a,b,c,"))
 
 let check_version ctxt =
   let major, minor = Pcre2.version in
@@ -128,7 +128,7 @@ let suite =
   >::: [
          "simple_test" >:: simple_test;
          "simple_captures" >:: simple_captures;
-          "split_comma" >:: split_comma;
+         "split_comma" >:: split_comma;
          "non_contiguous_capture" >:: non_contiguous_capture;
          "non_contiguous_named_capture" >:: non_contiguous_named_capture;
          "bad_pattern" >:: bad_pattern;
