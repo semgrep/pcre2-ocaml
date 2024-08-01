@@ -700,17 +700,28 @@ module Interp = struct
       | None -> delims
       | _ -> invalid_arg "todo: decide how to handle 0 or negative limit"
     in
-    Seq.fold_left
-      (fun x m ->
-        match (x, m) with
-        | Ok (start, acc), Ok m ->
-            let { start = delim_start; end_ = delim_end } = range_of_match m in
-            let sub = String.sub subject start (delim_start - start) in
-            Ok (delim_end, sub :: acc)
-        | e, _ -> e)
-      (Ok (0, []))
-      delims
-    |> Result.map snd |> Result.map List.rev
+    let* end_offset, substrings =
+      Seq.fold_left
+        (fun x m ->
+          match (x, m) with
+          | Ok (start, acc), Ok m ->
+              let { start = delim_start; end_ = delim_end } =
+                range_of_match m
+              in
+              let sub = String.sub subject start (delim_start - start) in
+              Ok (delim_end, sub :: acc)
+          | e, _ -> e)
+        (Ok (0, []))
+        delims
+    in
+    Ok
+      ((* We still have one more substring to add: the one after the last
+          delimiter. *)
+       String.(sub subject end_offset (length subject - end_offset))
+       :: substrings
+      (* ... and we built this in reverse to be fast---but let's return it in
+         the right order. *)
+      |> List.rev)
 
   let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (bool, match_error) Result.t =
@@ -806,17 +817,28 @@ module Jit = struct
       | None -> delims
       | _ -> invalid_arg "todo: decide how to handle 0 or negative limit"
     in
-    Seq.fold_left
-      (fun x m ->
-        match (x, m) with
-        | Ok (start, acc), Ok m ->
-            let { start = delim_start; end_ = delim_end } = range_of_match m in
-            let sub = String.sub subject start (delim_start - start) in
-            Ok (delim_end, sub :: acc)
-        | e, _ -> e)
-      (Ok (0, []))
-      delims
-    |> Result.map snd |> Result.map List.rev
+    let* end_offset, substrings =
+      Seq.fold_left
+        (fun x m ->
+          match (x, m) with
+          | Ok (start, acc), Ok m ->
+              let { start = delim_start; end_ = delim_end } =
+                range_of_match m
+              in
+              let sub = String.sub subject start (delim_start - start) in
+              Ok (delim_end, sub :: acc)
+          | e, _ -> e)
+        (Ok (0, []))
+        delims
+    in
+    Ok
+      ((* We still have one more substring to add: the one after the last
+          delimiter. *)
+       String.(sub subject end_offset (length subject - end_offset))
+       :: substrings
+      (* ... and we built this in reverse to be fast---but let's return it in
+         the right order. *)
+      |> List.rev)
 
   (* TODO(cooper): dedup impl with a functor? *)
   let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)

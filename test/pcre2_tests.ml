@@ -108,6 +108,16 @@ let bad_offset ctxt =
         assert_equal ~printer (Error BADOFFSET)
           (find ~subject_offset:10 re "123abc456" >+= range_of_match))
 
+let split_comma ctxt =
+  Interp.(
+    match compile "," with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let printer = [%show: (string list, match_error) result] in
+        assert_equal ~printer (Ok [ "a"; "b"; "c" ]) (split re "a,b,c");
+        assert_equal ~printer (Ok [ "a"; "b"; "c"; "" ]) (split re "a,b,c,");
+        assert_equal ~printer (Ok [ "a"; "bc" ]) (split ~limit:1 re "a,b,c,"))
+
 let check_version ctxt =
   let major, minor = Pcre2.version in
   assert_equal ~printer:string_of_int 10 major;
@@ -117,7 +127,8 @@ let suite =
   "Test pcre"
   >::: [
          "simple_test" >:: simple_test;
-         "simple_test" >:: simple_captures;
+         "simple_captures" >:: simple_captures;
+          "split_comma" >:: split_comma;
          "non_contiguous_capture" >:: non_contiguous_capture;
          "non_contiguous_named_capture" >:: non_contiguous_named_capture;
          "bad_pattern" >:: bad_pattern;
