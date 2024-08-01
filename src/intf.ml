@@ -27,6 +27,10 @@ module type Matcher = sig
      have more variability. No need to generalize now, but useful if we add
      other engines like re2 or vectorscan *)
 
+  val range_of_captures : captures -> range
+  (** [range_of_captures c] is range of the matched text, providing the start
+      and end byte offsets. *)
+
   val captures_length : captures -> int
   (** [captures_length c] is the number of matches contained in [c]. *)
 
