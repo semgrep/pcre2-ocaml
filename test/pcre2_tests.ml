@@ -39,7 +39,7 @@ let simple_captures ctxt =
         let c = captures re "abc" in
         assert_equal ~printer
           (Ok (Some { start = 0; end_ = 3 }))
-          (c >>= (fun c -> match_of_captures c 0) >+= range_of_match);
+          (c >+= range_of_captures);
         assert_equal ~printer
           (Ok (Some { start = 0; end_ = 1 }))
           (c >>= (fun c -> match_of_captures c 1) >+= range_of_match);
