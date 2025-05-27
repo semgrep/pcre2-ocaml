@@ -490,6 +490,9 @@ module Options : sig
   end
 end
 
+module type Matcher = Intf.Matcher
+(** Module type for matchers. *)
+
 module Interp : sig
   include module type of Options.Interp
 
