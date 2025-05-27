@@ -287,8 +287,13 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
         CAMLparam2(ocaml_re, subject);
         CAMLlocal3(result, range, match);
 
-        // Need to handle this case manually since PCRE2 takes an unsigned value.
-        if (subject_offset < 0) {
+        // For lower bound, need to handle this case manually since PCRE2 takes
+        // an unsigned value.
+        //
+        // NOTE: need upper bound check here since we use pcre2_jit_match later and we want to
+        // ensure we consistently return BADOFFSET rather than just failing to
+        // find for JIT only.
+        if (!(0 <= subject_offset && (mlsize_t)subject_offset < caml_string_length(subject))) {
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
@@ -553,7 +558,10 @@ CAMLprim value jit_capture_unboxed(
         CAMLlocal5(result, matches, match, name, name_table);
         CAMLlocal2(matches_and_table, match_opt);
 
-        if (subject_offset < 0) {
+        // NOTE: need upper bound check here since we use pcre2_jit_match later and we want to
+        // ensure we consistently return BADOFFSET rather than just failing to
+        // find for JIT only.
+        if (!(0 <= subject_offset && (mlsize_t)subject_offset < caml_string_length(subject))) {
                 // Need to handle this case manually since PCRE2 takes an unsigned value.
                 // FIXME: result or option from this function? need to see if meaningful errors can
                 // occur
