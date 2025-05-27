@@ -447,8 +447,8 @@ CAMLprim value capture_unboxed(
     intnat subject_offset /* : int [@untagged] */, uint32_t options /* : int32 */
     ) /* : -> (((int * int) array * (string * int) array) option, match_error) Result.t */ {
         CAMLparam2(ocaml_re, subject);
-        CAMLlocal5(result, matches, match, name, name_table);
-        CAMLlocal2(matches_and_table, match_opt);
+        CAMLlocal5(result, matches, match, name_table, matches_and_table);
+        CAMLlocal1(match_opt);
 
         if (subject_offset < 0) {
                 // Need to handle this case manually since PCRE2 takes an unsigned value.
@@ -555,8 +555,8 @@ CAMLprim value jit_capture_unboxed(
     intnat subject_offset /* : int [@untagged] */, uint32_t options /* : int32 */
     ) /* : -> (((int * int) array * (string * int) array) option, match_error) Result.t */ {
         CAMLparam2(ocaml_re, subject);
-        CAMLlocal5(result, matches, match, name, name_table);
-        CAMLlocal2(matches_and_table, match_opt);
+        CAMLlocal5(result, matches, match, name_table, matches_and_table);
+        CAMLlocal1(match_opt);
 
         // NOTE: need upper bound check here since we use pcre2_jit_match later and we want to
         // ensure we consistently return BADOFFSET rather than just failing to
