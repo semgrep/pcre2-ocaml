@@ -340,7 +340,7 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
         // SAFETY: This allocation is immediately filled with
         // well-formed values prior to returning.
         result = caml_alloc_small(1, RESULT_OK_TAG);
-        Field(result, 0) = range;
+        Field(result, 0) = match;
 
         CAMLreturn(result);
 }
