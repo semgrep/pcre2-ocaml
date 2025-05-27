@@ -534,7 +534,7 @@ CAMLprim value capture_unboxed(
 
 /// Boxed argument version of [capture_unboxed] (for bytecode).
 CAMLprim value capture(value *argv, int argc UNUSED) {
-        return match_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
+        return capture_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
 }
 
 /// Match, with capture groups, the provided JIT-enabled pattern.
@@ -642,5 +642,5 @@ CAMLprim value jit_capture_unboxed(
 
 /// Boxed argument version of [capture_unboxed] (for bytecode).
 CAMLprim value jit_capture(value *argv, int argc UNUSED) {
-        return match_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
+        return jit_capture_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
 }
