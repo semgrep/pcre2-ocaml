@@ -584,8 +584,9 @@ CAMLprim value jit_capture_unboxed(
         // full match.
         // SAFETY: Passing in the value of String_val(subject) here is fine
         // since a GC cannot occur.
-        int num_captures = pcre2_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset,
-                                       options, match_data, mcontext);
+        // TODO: Compare notes on using pcre2_jit_match in jit_match_unboxed.
+        int num_captures = pcre2_jit_match(re, (PCRE2_SPTR)String_val(subject), subject_length,
+                                           offset, options, match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (num_captures == PCRE2_ERROR_NOMATCH || num_captures == PCRE2_ERROR_PARTIAL) {
