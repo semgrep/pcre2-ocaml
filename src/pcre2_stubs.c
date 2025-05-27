@@ -233,7 +233,7 @@ CAMLprim value jit_compile_unboxed(
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
-                Field(0, result) = Val_int(res);
+                Field(result, 0) = Val_int(res);
                 CAMLreturn(result);
         }
 
@@ -247,7 +247,7 @@ CAMLprim value jit_compile_unboxed(
         // call pcre2_jit_compile multiple times on the same pcer2_code*
         // safely. Since pcre2_match permits jit, and while {interp regex} is
         // "really" interpreted OR JIT, {jit regex} is definitely JIT.
-        Field(0, result) = ocaml_re;
+        Field(result, 0) = ocaml_re;
         CAMLreturn(result);
 }
 
