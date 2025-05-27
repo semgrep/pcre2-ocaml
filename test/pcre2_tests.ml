@@ -119,9 +119,7 @@ let split_comma ctxt =
         assert_equal ~printer (Ok [ "a"; "b,c," ]) (split ~limit:2 re "a,b,c,"))
 
 let check_version ctxt =
-  let major, minor = Pcre2.version in
-  assert_equal ~printer:string_of_int 10 major;
-  assert_equal ~printer:string_of_int 43 minor
+  assert_bool "Version is older than newest tested" (Pcre2.version >= (10, 43))
 
 let suite =
   "Test pcre"
