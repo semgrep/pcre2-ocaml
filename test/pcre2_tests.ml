@@ -118,6 +118,23 @@ let split_comma ctxt =
         assert_equal ~printer (Ok [ "a"; "b"; "c"; "" ]) (split re "a,b,c,");
         assert_equal ~printer (Ok [ "a"; "b,c," ]) (split ~limit:2 re "a,b,c,"))
 
+let capture_group_names ctxt =
+  Interp.(
+    (match compile "(?<A>a)(?<B>b)(?<C>c)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal ~printer:[%show: (string * int) list]
+          (* 0 is the whole match *)
+          [ ("A", 1); ("B", 2); ("C", 3) ]
+          (capture_groups re));
+    match compile "(?<A>a)(b)(?<C>c)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal ~printer:[%show: (string * int) list]
+          (* 0 is the whole match *)
+          [ ("A", 1); ("C", 3) ]
+          (capture_groups re))
+
 let check_version ctxt =
   assert_bool "Version is older than newest tested" (Pcre2.version >= (10, 43))
 
@@ -132,6 +149,7 @@ let suite =
          "bad_pattern" >:: bad_pattern;
          "bad_offset" >:: bad_offset;
          "version" >:: check_version;
+         "capture_group_names" >:: capture_group_names;
        ]
 
 let _ = if not !Sys.interactive then run_test_tt_main suite else ()
