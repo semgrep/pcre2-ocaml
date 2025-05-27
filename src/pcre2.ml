@@ -637,6 +637,8 @@ let config_depth_limit : int = -1
 (** Indicates use of stack recursion in matching function *)
 let config_stackrecurse : bool = true
 
+module type Matcher = Intf.Matcher
+
 module Interp = struct
   include Options.Interp
   include Match
