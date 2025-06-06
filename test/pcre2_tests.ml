@@ -276,6 +276,45 @@ end = struct
           (Ok [ "a,b,c"; "d" ])
           (split ~subject_offset:4 re "a,b,c,d")
 
+  let empty_pattern_test ctxt =
+    match compile "" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let printer = [%show: (range option, match_error) result] in
+        (* Empty pattern matches at every position *)
+        assert_equal ~printer
+          (Ok (Some { start = 0; end_ = 0 }))
+          (find re "abc" >+= range_of_match);
+        (* Test that is_match works with empty patterns *)
+        let bool_printer = [%show: (bool, match_error) result] in
+        assert_equal ~printer:bool_printer (Ok true) (is_match re "abc");
+        assert_equal ~printer:bool_printer (Ok true) (is_match re "")
+
+  let unicode_test ctxt =
+    match compile "café" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re -> (
+        let printer = [%show: (range option, match_error) result] in
+        assert_equal ~printer
+          (Ok (Some { start = 0; end_ = 5 })) (* café is 5 bytes in UTF-8 *)
+          (find re "café" >+= range_of_match);
+        match find re "café" with
+        | Ok (Some m) ->
+            assert_equal ~printer:[%show: string] "café" (substring_of_match m)
+        | Ok None -> assert_failure "Expected to find a match"
+        | Error e -> assert_failure ("Match error: " ^ show_match_error e))
+
+  let overlapping_matches_test ctxt =
+    match compile "aa" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let results = find_iter re "aaaa" |> List.of_seq in
+        let printer = [%show: (range, match_error) result list] in
+        (* Should find non-overlapping matches *)
+        assert_equal ~printer
+          [ Ok { start = 0; end_ = 2 }; Ok { start = 2; end_ = 4 } ]
+          (List.map (Result.map range_of_match) results)
+
   let tests =
     [
       "simple_test" >:: simple_test;
@@ -295,6 +334,9 @@ end = struct
       "captures_length" >:: captures_length_test;
       "split_advanced" >:: split_advanced_test;
       "split_with_offset" >:: split_with_offset_test;
+      "empty_pattern" >:: empty_pattern_test;
+      "unicode" >:: unicode_test;
+      "overlapping_matches" >:: overlapping_matches_test;
     ]
 end
 
