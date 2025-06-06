@@ -198,6 +198,57 @@ end = struct
           ]
           (List.map get_whole_and_first results)
 
+  let is_match_test ctxt =
+    match compile "a+" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let printer = [%show: (bool, match_error) result] in
+        assert_equal ~printer (Ok true) (is_match re "aaa bb");
+        assert_equal ~printer (Ok false) (is_match re "bbb cc");
+        assert_equal ~printer (Ok true)
+          (is_match ~subject_offset:7 re "bbb cc aaaa");
+        assert_equal ~printer (Ok false)
+          (is_match ~subject_offset:11 re "bbb cc aaaa")
+
+  let substring_of_match_test ctxt =
+    match compile "a+" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re -> (
+        (match find re "bbb aaa ccc" with
+        | Ok (Some m) ->
+            assert_equal ~printer:[%show: string] "aaa" (substring_of_match m)
+        | Ok None -> assert_failure "Expected to find a match"
+        | Error e -> assert_failure ("Match error: " ^ show_match_error e));
+        match find re "bbb ccc" with
+        | Ok None -> () (* Expected *)
+        | Ok (Some _) -> assert_failure "Unexpected match found"
+        | Error e -> assert_failure ("Match error: " ^ show_match_error e))
+
+  let captures_length_test ctxt =
+    match compile "(a+)(b+)(c+)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re -> (
+        (match captures re "aaabbbccc" with
+        | Ok (Some c) ->
+            assert_equal ~printer:[%show: int] 4 (captures_length c)
+            (* whole match + 3 groups *)
+        | Ok None -> assert_failure "Expected to find captures"
+        | Error e -> assert_failure ("Match error: " ^ show_match_error e));
+        (* NB: here, the second capture group is optional *)
+        match compile "(a+)(b+)?(c+)" with
+        | Error e ->
+            assert_failure ("failed to compile: " ^ show_compile_error e)
+        | Ok re -> (
+            match captures re "aaaccc" with
+            | Ok (Some c) ->
+                assert_equal ~printer:[%show: int] 4 (captures_length c);
+                (* still 4, even with unmatched group *)
+                let m = match_of_captures c 2 in
+                assert_equal ~printer:[%show: range option] None
+                  (Option.map range_of_match m)
+            | Ok None -> assert_failure "Expected to find captures"
+            | Error e -> assert_failure ("Match error: " ^ show_match_error e)))
+
   let tests =
     [
       "simple_test" >:: simple_test;
@@ -212,6 +263,9 @@ end = struct
       "find_iter_empty" >:: find_iter_empty;
       "find_iter_with_offset" >:: find_iter_with_offset;
       "captures_iter" >:: captures_iter_test;
+      "is_match" >:: is_match_test;
+      "substring_of_match" >:: substring_of_match_test;
+      "captures_length" >:: captures_length_test;
     ]
 end
 
