@@ -249,6 +249,33 @@ end = struct
             | Ok None -> assert_failure "Expected to find captures"
             | Error e -> assert_failure ("Match error: " ^ show_match_error e)))
 
+  let split_advanced_test ctxt =
+    match compile {|\s+|} with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let printer = [%show: (string list, match_error) result] in
+        assert_equal ~printer
+          (Ok [ "hello"; "world"; "test" ])
+          (split re "hello   world\t\ntest");
+        assert_equal ~printer
+          (Ok [ ""; "hello"; "world"; "" ])
+          (split re " hello world ");
+        assert_equal ~printer
+          (Ok [ "hello"; "world\t\ntest" ])
+          (split ~limit:2 re "hello   world\t\ntest")
+
+  let split_with_offset_test ctxt =
+    match compile "," with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let printer = [%show: (string list, match_error) result] in
+        assert_equal ~printer
+          (Ok [ "a,b"; "c"; "d" ])
+          (split ~subject_offset:2 re "a,b,c,d");
+        assert_equal ~printer
+          (Ok [ "a,b,c"; "d" ])
+          (split ~subject_offset:4 re "a,b,c,d")
+
   let tests =
     [
       "simple_test" >:: simple_test;
@@ -266,6 +293,8 @@ end = struct
       "is_match" >:: is_match_test;
       "substring_of_match" >:: substring_of_match_test;
       "captures_length" >:: captures_length_test;
+      "split_advanced" >:: split_advanced_test;
+      "split_with_offset" >:: split_with_offset_test;
     ]
 end
 
