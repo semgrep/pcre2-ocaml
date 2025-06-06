@@ -136,6 +136,68 @@ end = struct
           [ ("A", 1); ("C", 3) ]
           (capture_groups re)
 
+  let find_iter_test ctxt =
+    match compile "a+" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let results = find_iter re "aaa bb aaaa cc a" |> List.of_seq in
+        let printer = [%show: (range, match_error) result list] in
+        assert_equal ~printer
+          [
+            Ok { start = 0; end_ = 3 };
+            Ok { start = 7; end_ = 11 };
+            Ok { start = 15; end_ = 16 };
+          ]
+          (List.map (Result.map range_of_match) results)
+
+  let find_iter_empty ctxt =
+    match compile "x+" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let results = find_iter re "aaa bb aaaa cc a" |> List.of_seq in
+        assert_equal ~printer:[%show: (range, match_error) result list] []
+          (List.map (Result.map range_of_match) results)
+
+  let find_iter_with_offset ctxt =
+    match compile "a+" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let results =
+          find_iter ~subject_offset:5 re "aaa bb aaaa cc a" |> List.of_seq
+        in
+        let printer = [%show: (range, match_error) result list] in
+        assert_equal ~printer
+          [ Ok { start = 7; end_ = 11 }; Ok { start = 15; end_ = 16 } ]
+          (List.map (Result.map range_of_match) results)
+
+  let captures_iter_test ctxt =
+    match compile "(a+)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let results = captures_iter re "aaa bb aaaa cc a" |> List.of_seq in
+        let get_whole_and_first c =
+          match c with
+          | Ok c ->
+              let whole = range_of_captures c in
+              let first =
+                match match_of_captures c 1 with
+                | Some m -> Some (range_of_match m)
+                | None -> None
+              in
+              Ok (whole, first)
+          | Error e -> Error e
+        in
+        let printer =
+          [%show: (range * range option, match_error) result list]
+        in
+        assert_equal ~printer
+          [
+            Ok ({ start = 0; end_ = 3 }, Some { start = 0; end_ = 3 });
+            Ok ({ start = 7; end_ = 11 }, Some { start = 7; end_ = 11 });
+            Ok ({ start = 15; end_ = 16 }, Some { start = 15; end_ = 16 });
+          ]
+          (List.map get_whole_and_first results)
+
   let tests =
     [
       "simple_test" >:: simple_test;
@@ -146,6 +208,10 @@ end = struct
       "bad_pattern" >:: bad_pattern;
       "bad_offset" >:: bad_offset;
       "capture_group_names" >:: capture_group_names;
+      "find_iter" >:: find_iter_test;
+      "find_iter_empty" >:: find_iter_empty;
+      "find_iter_with_offset" >:: find_iter_with_offset;
+      "captures_iter" >:: captures_iter_test;
     ]
 end
 
