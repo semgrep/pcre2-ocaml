@@ -1,0 +1,4 @@
+(library
+ (public_name pcre2-bin-prot)
+ (name pcre2_bin_prot)
+ (libraries pcre2 bin_prot))

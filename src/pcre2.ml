@@ -728,6 +728,25 @@ module Interp = struct
   let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (bool, match_error) Result.t =
     find ~options ~subject_offset re subject |> Result.map Option.is_some
+
+  type serialize_error =
+    | Contains_jit
+    | Empty_buffer
+    | Pcre2_decode_failed
+  [@@deriving show, eq]
+
+  let to_bytes (re : t) : (bytes, serialize_error) Result.t =
+    (* Defensive: the phantom type rules out a JIT pattern reaching us, but a
+       caller could still construct one via the [_ regex] external. Catch the
+       Failure raised by the C side and surface it as a typed error. *)
+    try Ok (Bindings.pcre2_to_bytes re)
+    with Failure _ -> Error Contains_jit
+
+  let of_bytes (b : bytes) : (t, serialize_error) Result.t =
+    match Bindings.pcre2_of_bytes b with
+    | Ok re -> Ok re
+    | Error -2 -> Error Empty_buffer
+    | Error _ -> Error Pcre2_decode_failed
 end
 
 (* Fastpath to JIT match for perf *)

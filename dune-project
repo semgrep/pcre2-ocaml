@@ -28,3 +28,18 @@ substitution, similar to the functionality offered by the Perl language.")
     (ounit2 :with-test)
   )
 )
+
+(package
+  (name pcre2-bin-prot)
+  (synopsis "Bin_prot serializers for pcre2 compiled patterns")
+  (description "\
+Provides Bin_prot.Binable.S over Pcre2.Interp.t, implemented on top of
+Pcre2.Interp.to_bytes / of_bytes. JIT-compiled patterns are not
+supported; serialize before JIT-compiling.")
+  (depends
+    (ocaml (>= 4.12))
+    (pcre2 (= :version))
+    bin_prot
+    (ounit2 :with-test)
+  )
+)

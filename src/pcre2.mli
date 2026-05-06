@@ -504,6 +504,38 @@ module Interp : sig
        and type compile_error = compile_error
        and type match_option = Options.Interp.match_option
        and type match_error = match_error
+
+  (** {1 Serialization}
+
+      Compiled patterns can be serialized through [Marshal] (the custom
+      block provides [serialize] / [deserialize] callbacks) or through
+      the explicit [to_bytes] / [of_bytes] primitives below.
+
+      Serialized blobs are tied to the host {b PCRE2 version},
+      {b platform endianness}, and {b code-unit width}. PCRE2 itself
+      rejects mismatches; you cannot move a serialized regex between
+      platforms or PCRE2 versions.
+
+      JIT-compiled state is {b not} preserved by PCRE2's serialization.
+      Serialize the [Interp.t] {i before} JIT-compiling. After
+      deserializing, call [Jit.of_interp] again if you want JIT. *)
+
+  type serialize_error =
+    | Contains_jit
+        (** The pattern is JIT-compiled and PCRE2 would silently drop the
+            JIT state. Serialize before JIT-compiling. *)
+    | Empty_buffer
+    | Pcre2_decode_failed
+        (** PCRE2 rejected the buffer; usually corruption, cross-version,
+            or cross-platform mismatch. *)
+  [@@deriving show, eq]
+
+  val to_bytes : t -> (bytes, serialize_error) Result.t
+  (** [to_bytes re] is the PCRE2-serialized form of [re]. *)
+
+  val of_bytes : bytes -> (t, serialize_error) Result.t
+  (** [of_bytes b] is the compiled pattern previously written by
+      [to_bytes]. *)
 end
 
 module Jit : sig

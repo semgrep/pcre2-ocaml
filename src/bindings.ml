@@ -50,3 +50,12 @@ external get_version : unit -> int * int = "get_version"
 
 external get_capture_groups : _ regex -> (string * int) array
   = "get_capture_groups"
+
+external pcre2_to_bytes : _ regex -> bytes = "pcre2_to_bytes"
+(** May raise [Failure] if called on a JIT-compiled pattern; PCRE2 cannot
+    serialize JIT state. *)
+
+external pcre2_of_bytes : bytes -> (interp regex, int) Result.t
+  = "pcre2_of_bytes"
+(** Negative integer error codes: -1 = decode failed (corruption,
+    cross-version, cross-platform), -2 = empty buffer. *)

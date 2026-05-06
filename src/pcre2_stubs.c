@@ -1,10 +1,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "caml/alloc.h"
 #include "caml/config.h"
 #include "caml/custom.h"
+#include "caml/fail.h"
+#include "caml/intext.h"
 #include "caml/memory.h"
 #include "caml/misc.h"
 #include "caml/mlvalues.h"
@@ -41,18 +44,116 @@ static void ocaml_regex_free(value ocaml_regex) {
         pcre2_code_free(re->regex);
 }
 
+// Header bytes written to the marshal stream. The PCRE2 buffer carries its
+// own magic, version, code-unit width, and endianness; we add a small wrapper
+// so an OCaml-side mismatch (corruption, schema bump) fails before we ever
+// hand bytes to PCRE2.
+#define PCRE2_OCAML_MAGIC                                                                          \
+        (((uint32_t)'P' << 24) | ((uint32_t)'2' << 16) | ((uint32_t)'O' << 8) | (uint32_t)'C')
+#define PCRE2_OCAML_SCHEMA_V0 0
+// 8 MiB. Real-world serialized patterns sit in the tens of KB; this caps a
+// hostile blob from driving a giant alloc inside an unmarshal.
+#define PCRE2_OCAML_MAX_BLOB ((size_t)(8 * 1024 * 1024))
+
+// Serialize a single pcre2_code* into a freshly malloc'd buffer. Caller must
+// pcre2_serialize_free the result. Returns NULL on failure.
+static uint8_t *pcre2_ocaml_encode(const pcre2_code *re, PCRE2_SIZE *out_len) {
+        uint8_t *buf = NULL;
+        PCRE2_SIZE buf_len = 0;
+        int n = pcre2_serialize_encode(&re, 1, &buf, &buf_len, NULL);
+        if (n < 1 || buf == NULL) {
+                return NULL;
+        }
+        *out_len = buf_len;
+        return buf;
+}
+
+// Common JIT-refusal check used by both Marshal and to_bytes.
+static int pcre2_ocaml_is_jit_compiled(const pcre2_code *re) {
+        size_t jit_size = 0;
+        // PCRE2_INFO_JITSIZE returns 0 if not JIT-compiled. Ignore the return
+        // code: any error here is treated as "not JIT", which is the safe default
+        // (the encode below would still succeed, just without JIT state).
+        pcre2_pattern_info(re, PCRE2_INFO_JITSIZE, &jit_size);
+        return jit_size > 0;
+}
+
+static void ocaml_regex_serialize(value v, uintnat *bsize_32, uintnat *bsize_64) {
+        const pcre2_code *re = ((struct ocaml_regex *)Data_custom_val(v))->regex;
+
+        if (pcre2_ocaml_is_jit_compiled(re)) {
+                caml_failwith("Pcre2: cannot serialize a JIT-compiled pattern; "
+                              "serialize before calling Jit.of_interp / Jit.compile");
+        }
+
+        PCRE2_SIZE buf_len = 0;
+        uint8_t *buf = pcre2_ocaml_encode(re, &buf_len);
+        if (buf == NULL) {
+                caml_failwith("Pcre2: pcre2_serialize_encode failed");
+        }
+
+        caml_serialize_int_4((int32_t)PCRE2_OCAML_MAGIC);
+        caml_serialize_int_1(PCRE2_OCAML_SCHEMA_V0);
+        caml_serialize_int_8((int64_t)buf_len);
+        caml_serialize_block_1(buf, (intnat)buf_len);
+        pcre2_serialize_free(buf);
+
+        *bsize_32 = sizeof(struct ocaml_regex);
+        *bsize_64 = sizeof(struct ocaml_regex);
+}
+
+static uintnat ocaml_regex_deserialize(void *dst) {
+        if (caml_deserialize_uint_4() != PCRE2_OCAML_MAGIC) {
+                caml_deserialize_error("Pcre2: bad magic in serialized regex");
+        }
+        if (caml_deserialize_uint_1() != PCRE2_OCAML_SCHEMA_V0) {
+                caml_deserialize_error("Pcre2: unsupported schema version");
+        }
+
+        int64_t buf_len = caml_deserialize_sint_8();
+        if (buf_len <= 0 || (uint64_t)buf_len > PCRE2_OCAML_MAX_BLOB) {
+                caml_deserialize_error("Pcre2: bad serialized length");
+        }
+
+        uint8_t *buf = caml_stat_alloc((size_t)buf_len);
+        caml_deserialize_block_1(buf, (intnat)buf_len);
+
+        pcre2_code *re = NULL;
+        int n = pcre2_serialize_decode(&re, 1, buf, NULL);
+        caml_stat_free(buf);
+        if (n != 1 || re == NULL) {
+                caml_deserialize_error("Pcre2: pcre2_serialize_decode failed");
+        }
+
+        ((struct ocaml_regex *)dst)->regex = re;
+
+        // Mirror the GC-pressure hint compile_unboxed gives via
+        // caml_alloc_custom_mem (line ~115). The runtime preallocated `dst`
+        // for us with only sizeof(struct ocaml_regex) accounted; tell it
+        // about the off-heap PCRE2 buffer separately.
+        size_t pcre2_allocated_mem = 0;
+        pcre2_pattern_info(re, PCRE2_INFO_SIZE, &pcre2_allocated_mem);
+        caml_alloc_dependent_memory((mlsize_t)pcre2_allocated_mem);
+
+        return sizeof(struct ocaml_regex);
+}
+
 static struct custom_operations regex_ops = {.identifier = "pcre2_ocaml_regexp",
                                              .finalize = ocaml_regex_free,
                                              .compare = NULL,
                                              .hash = NULL,
-                                             .serialize = NULL,
-                                             .deserialize = NULL,
+                                             .serialize = ocaml_regex_serialize,
+                                             .deserialize = ocaml_regex_deserialize,
                                              .compare_ext = NULL,
                                              .fixed_length = NULL};
 
-CAMLprim void pcre2_ocaml_init(void) {
+CAMLprim value pcre2_ocaml_init(void) {
         CAMLparam0();
-        CAMLreturn0;
+        // Required so deserialize-by-identifier ("pcre2_ocaml_regexp") works
+        // when unmarshalling in a process that hasn't yet called any other
+        // pcre2 stub.
+        caml_register_custom_operations(&regex_ops);
+        CAMLreturn(Val_unit);
 }
 
 /// Returns the PCRE2 version the library was compiled with.
@@ -652,4 +753,75 @@ CAMLprim value jit_capture_unboxed(
 /// Boxed argument version of [capture_unboxed] (for bytecode).
 CAMLprim value jit_capture(value *argv, int argc UNUSED) {
         return jit_capture_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
+}
+
+// Error codes returned to OCaml for pcre2_of_bytes. Kept distinct from
+// PCRE2's match/compile error namespaces.
+const int PCRE2_OCAML_BYTES_ERR_DECODE_FAILED = -1;
+const int PCRE2_OCAML_BYTES_ERR_EMPTY = -2;
+
+/// Encode a compiled pattern to a fresh OCaml [bytes] via PCRE2's
+/// serialization. Raises [Failure] for JIT-compiled patterns, since PCRE2
+/// drops JIT state on encode.
+CAMLprim value pcre2_to_bytes(value ocaml_re /* : _ regex */) /* : -> bytes */ {
+        CAMLparam1(ocaml_re);
+        CAMLlocal1(out);
+
+        const pcre2_code *re = ((struct ocaml_regex *)Data_custom_val(ocaml_re))->regex;
+        if (pcre2_ocaml_is_jit_compiled(re)) {
+                caml_failwith("Pcre2.Interp.to_bytes: cannot serialize a JIT-compiled "
+                              "pattern; serialize before calling Jit.of_interp / Jit.compile");
+        }
+
+        PCRE2_SIZE buf_len = 0;
+        uint8_t *buf = pcre2_ocaml_encode(re, &buf_len);
+        if (buf == NULL) {
+                caml_failwith("Pcre2.Interp.to_bytes: pcre2_serialize_encode failed");
+        }
+
+        out = caml_alloc_initialized_string((mlsize_t)buf_len, (const char *)buf);
+        pcre2_serialize_free(buf);
+        CAMLreturn(out);
+}
+
+/// Decode an OCaml [bytes] back into an [interp regex]. Returns
+/// [Error code] for an empty buffer or a PCRE2 decode failure (cross-version,
+/// cross-platform, corrupted data, etc.).
+CAMLprim value pcre2_of_bytes(value ocaml_buf /* : bytes */) /* : -> (interp regex, int) Result.t */
+{
+        CAMLparam1(ocaml_buf);
+        CAMLlocal2(result, regex_value);
+
+        size_t buf_len = caml_string_length(ocaml_buf);
+        if (buf_len == 0) {
+                result = caml_alloc_small(1, RESULT_ERROR_TAG);
+                Field(result, 0) = Val_int(PCRE2_OCAML_BYTES_ERR_EMPTY);
+                CAMLreturn(result);
+        }
+
+        // Copy out of the GC-managed bytes into a stable buffer; PCRE2's decode
+        // doesn't move the GC, but defensively isolating the buffer is cheap and
+        // matches how compile() treats its input.
+        uint8_t *buf = caml_stat_alloc(buf_len);
+        memcpy(buf, String_val(ocaml_buf), buf_len);
+
+        pcre2_code *re = NULL;
+        int n = pcre2_serialize_decode(&re, 1, buf, NULL);
+        caml_stat_free(buf);
+
+        if (n != 1 || re == NULL) {
+                result = caml_alloc_small(1, RESULT_ERROR_TAG);
+                Field(result, 0) = Val_int(PCRE2_OCAML_BYTES_ERR_DECODE_FAILED);
+                CAMLreturn(result);
+        }
+
+        size_t pcre2_allocated_mem = 0;
+        pcre2_pattern_info(re, PCRE2_INFO_SIZE, &pcre2_allocated_mem);
+        regex_value =
+            caml_alloc_custom_mem(&regex_ops, sizeof(struct ocaml_regex), pcre2_allocated_mem);
+        ((struct ocaml_regex *)Data_custom_val(regex_value))->regex = re;
+
+        result = caml_alloc_small(1, RESULT_OK_TAG);
+        Field(result, 0) = regex_value;
+        CAMLreturn(result);
 }

@@ -26,6 +26,9 @@
           ocamlformat = "*";
           earlybird = "*";
           merlin = "*";
+          # Required by the pcre2-bin-prot sub-package; opam-nix needs it
+          # named explicitly here to land in the dev shell.
+          bin_prot = "*";
         };
         opamQuery = devOpamPackagesQuery // {
           ## You can force versions of certain packages here

@@ -343,6 +343,148 @@ end
 let check_version ctxt =
   assert_bool "Version is older than newest tested" (Pcre2.version >= (10, 43))
 
+(* --- Serialization tests (Interp only; PCRE2 doesn't preserve JIT state) --- *)
+
+let compile_interp_exn pattern =
+  match Interp.compile pattern with
+  | Ok re -> re
+  | Error e ->
+      assert_failure
+        ("failed to compile: " ^ Interp.show_compile_error e)
+
+let assert_same_interp_match ~pattern ~subject re =
+  let printer = [%show: (Interp.range option, Interp.match_error) result] in
+  assert_equal ~printer ~msg:("pattern=" ^ pattern ^ " subject=" ^ subject)
+    (Interp.find (compile_interp_exn pattern) subject
+    >+= Interp.range_of_match)
+    (Interp.find re subject >+= Interp.range_of_match)
+
+let marshal_roundtrip_simple ctxt =
+  let re = compile_interp_exn "abc" in
+  let s = Marshal.to_string re [] in
+  let re' : Interp.t = Marshal.from_string s 0 in
+  assert_same_interp_match ~pattern:"abc" ~subject:"123abc456" re';
+  assert_same_interp_match ~pattern:"abc" ~subject:"123ac" re'
+
+let marshal_roundtrip_captures ctxt =
+  let re = compile_interp_exn "(a)(b)(c)" in
+  let s = Marshal.to_string re [] in
+  let re' : Interp.t = Marshal.from_string s 0 in
+  let printer =
+    [%show: (Interp.range option, Interp.match_error) result]
+  in
+  let c = Interp.captures re' "abc" in
+  assert_equal ~printer
+    (Ok (Some { Interp.start = 0; end_ = 3 }))
+    (c >+= Interp.range_of_captures);
+  assert_equal ~printer
+    (Ok (Some { Interp.start = 1; end_ = 2 }))
+    (c
+    >>= (fun c -> Interp.match_of_captures c 2)
+    >+= Interp.range_of_match)
+
+let marshal_roundtrip_named_groups ctxt =
+  let pattern = "(?<word>\\w+)-(?<num>\\d+)" in
+  let re = compile_interp_exn pattern in
+  let original_names = Interp.capture_groups re in
+  let s = Marshal.to_string re [] in
+  let re' : Interp.t = Marshal.from_string s 0 in
+  assert_equal ~printer:[%show: (string * int) list]
+    original_names (Interp.capture_groups re');
+  let c = Interp.captures re' "hello-42" in
+  let m =
+    c >>= fun c -> Interp.named_match_of_captures c "num"
+  in
+  assert_equal ~printer:[%show: (Interp.range option, Interp.match_error) result]
+    (Ok (Some { Interp.start = 6; end_ = 8 }))
+    (m >+= Interp.range_of_match)
+
+let to_bytes_roundtrip ctxt =
+  let re = compile_interp_exn "(\\d+)-(\\d+)" in
+  match Interp.to_bytes re with
+  | Error e ->
+      assert_failure ("to_bytes failed: " ^ Interp.show_serialize_error e)
+  | Ok b -> (
+      match Interp.of_bytes b with
+      | Error e ->
+          assert_failure ("of_bytes failed: " ^ Interp.show_serialize_error e)
+      | Ok re' ->
+          let printer =
+            [%show: (Interp.range option, Interp.match_error) result]
+          in
+          assert_equal ~printer
+            (Ok (Some { Interp.start = 4; end_ = 9 }))
+            (Interp.find re' "abc 12-34 def" >+= Interp.range_of_match))
+
+let jit_marshal_refused ctxt =
+  match Jit.compile "abc" with
+  | Error e ->
+      assert_failure ("failed to compile: " ^ Jit.show_compile_error e)
+  | Ok jit ->
+      assert_raises
+        ~msg:"Marshal.to_string on JIT pattern should raise Failure"
+        (Failure
+           "Pcre2: cannot serialize a JIT-compiled pattern; serialize before \
+            calling Jit.of_interp / Jit.compile")
+        (fun () -> Marshal.to_string jit [])
+
+let of_bytes_empty_buffer ctxt =
+  match Interp.of_bytes Bytes.empty with
+  | Error Interp.Empty_buffer -> ()
+  | Error e ->
+      assert_failure
+        ("expected Empty_buffer, got " ^ Interp.show_serialize_error e)
+  | Ok _ -> assert_failure "expected Empty_buffer error"
+
+let of_bytes_corrupted ctxt =
+  let re = compile_interp_exn "abc" in
+  match Interp.to_bytes re with
+  | Error _ -> assert_failure "to_bytes failed"
+  | Ok b ->
+      let b = Bytes.copy b in
+      (* Flip the first byte to invalidate PCRE2's magic. *)
+      Bytes.set b 0 (Char.chr (Char.code (Bytes.get b 0) lxor 0xff));
+      (match Interp.of_bytes b with
+      | Error Interp.Pcre2_decode_failed -> ()
+      | Error e ->
+          assert_failure
+            ("expected Pcre2_decode_failed, got "
+            ^ Interp.show_serialize_error e)
+      | Ok _ -> assert_failure "expected decode failure")
+
+(* OUnit2 has no built-in "raises any exception"; tiny shim. *)
+let assert_raises_any f =
+  match
+    try
+      f ();
+      None
+    with e -> Some e
+  with
+  | Some _ -> ()
+  | None -> assert_failure "expected an exception, none raised"
+
+let marshal_corrupted_blob ctxt =
+  let re = compile_interp_exn "abc" in
+  let s = Marshal.to_string re [] in
+  (* Marshal blobs prefix the custom-block payload with bookkeeping. We can't
+     trivially locate the embedded PCRE2 buffer, so just truncate from the
+     middle to force either "bad magic", "unsupported schema", "bad length",
+     or "decode failed" — any of which should raise rather than crash. *)
+  let truncated = String.sub s 0 (max 1 (String.length s - 16)) in
+  assert_raises_any (fun () -> ignore (Marshal.from_string truncated 0))
+
+let serialization_tests =
+  [
+    "marshal_roundtrip_simple" >:: marshal_roundtrip_simple;
+    "marshal_roundtrip_captures" >:: marshal_roundtrip_captures;
+    "marshal_roundtrip_named_groups" >:: marshal_roundtrip_named_groups;
+    "to_bytes_roundtrip" >:: to_bytes_roundtrip;
+    "jit_marshal_refused" >:: jit_marshal_refused;
+    "of_bytes_empty_buffer" >:: of_bytes_empty_buffer;
+    "of_bytes_corrupted" >:: of_bytes_corrupted;
+    "marshal_corrupted_blob" >:: marshal_corrupted_blob;
+  ]
+
 let suite =
   let module Interp_Tests = MakeTests (Interp) in
   let module Jit_Tests = MakeTests (Jit) in
@@ -351,6 +493,7 @@ let suite =
          "version" >:: check_version;
          "Interp" >::: Interp_Tests.tests;
          "JIT" >::: Jit_Tests.tests;
+         "Serialization" >::: serialization_tests;
        ]
 
 let _ = if not !Sys.interactive then run_test_tt_main suite else ()
