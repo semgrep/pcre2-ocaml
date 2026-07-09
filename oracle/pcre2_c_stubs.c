@@ -548,8 +548,14 @@ CAMLprim value oracle_capture_unboxed(
                 CAMLreturn(result);
         }
 
-        matches /* : (int * int) array */ = caml_alloc_tuple(num_captures);
-        for (int i = 0; i < num_captures; ++i) {
+        // Marshal the FULL ovector (capturecount + 1 pairs), padding pairs
+        // beyond the highest-set one (num_captures) with (-1, -1). The pure
+        // engine returns full-length capture arrays; truncating here made the
+        // oracle drift from that seam (visible to full_split's NoGroup
+        // emission and $n template validation in the convenience layer).
+        uint32_t ovec_count = pcre2_get_ovector_count(match_data);
+        matches /* : (int * int) array */ = caml_alloc_tuple(ovec_count);
+        for (uint32_t i = 0; i < ovec_count; ++i) {
                 // SAFETY: This block must be filled with well-formed values
                 // before the next allocation. The next allocation is no
                 // earlier than the end of this loop iteration. All fields of
@@ -557,10 +563,13 @@ CAMLprim value oracle_capture_unboxed(
                 oracle_match /* : int * int */ = caml_alloc_small(2, oracle_TUPLE_TAG);
                 // The i-th oracle_capture group (the 0-th being the full oracle_match) is at
                 // [2i, 2i+1] in ovec.
-                int start = 2 * i;
-                int end = 2 * i + 1;
-                Field(oracle_match, 0) = Val_int(ovec[start]);
-                Field(oracle_match, 1) = Val_int(ovec[end]);
+                if (i < (uint32_t)num_captures) {
+                        Field(oracle_match, 0) = Val_int(ovec[2 * i]);
+                        Field(oracle_match, 1) = Val_int(ovec[2 * i + 1]);
+                } else {
+                        Field(oracle_match, 0) = Val_int(-1);
+                        Field(oracle_match, 1) = Val_int(-1);
+                }
                 caml_modify(&Field(matches, i), oracle_match);
         }
 
@@ -664,8 +673,14 @@ CAMLprim value oracle_jit_capture_unboxed(
                 CAMLreturn(result);
         }
 
-        matches /* : (int * int) array */ = caml_alloc_tuple(num_captures);
-        for (int i = 0; i < num_captures; ++i) {
+        // Marshal the FULL ovector (capturecount + 1 pairs), padding pairs
+        // beyond the highest-set one (num_captures) with (-1, -1). The pure
+        // engine returns full-length capture arrays; truncating here made the
+        // oracle drift from that seam (visible to full_split's NoGroup
+        // emission and $n template validation in the convenience layer).
+        uint32_t ovec_count = pcre2_get_ovector_count(match_data);
+        matches /* : (int * int) array */ = caml_alloc_tuple(ovec_count);
+        for (uint32_t i = 0; i < ovec_count; ++i) {
                 // SAFETY: This block must be filled with well-formed values
                 // before the next allocation. The next allocation is no
                 // earlier than the end of this loop iteration. All fields of
@@ -673,10 +688,13 @@ CAMLprim value oracle_jit_capture_unboxed(
                 oracle_match /* : int * int */ = caml_alloc_small(2, oracle_TUPLE_TAG);
                 // The i-th oracle_capture group (the 0-th being the full oracle_match) is at
                 // [2i, 2i+1] in ovec.
-                int start = 2 * i;
-                int end = 2 * i + 1;
-                Field(oracle_match, 0) = Val_int(ovec[start]);
-                Field(oracle_match, 1) = Val_int(ovec[end]);
+                if (i < (uint32_t)num_captures) {
+                        Field(oracle_match, 0) = Val_int(ovec[2 * i]);
+                        Field(oracle_match, 1) = Val_int(ovec[2 * i + 1]);
+                } else {
+                        Field(oracle_match, 0) = Val_int(-1);
+                        Field(oracle_match, 1) = Val_int(-1);
+                }
                 caml_modify(&Field(matches, i), oracle_match);
         }
 

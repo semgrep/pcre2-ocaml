@@ -490,6 +490,44 @@ module Options : sig
   end
 end
 
+(** {6 String utilities and substitution templates (from pcre-ocaml)} *)
+
+val quote : string -> string
+(** [quote s] is the quoted string of [s]: every character that is special
+    in a pattern ([\ ^ $ . [ | ( ) ? * + {]) is escaped with a backslash, so
+    that compiling the result matches [s] literally. *)
+
+type substitution = Intf.substitution
+(** Information on substitution templates, as parsed by {!subst}. *)
+
+val subst : string -> substitution
+(** [subst str] converts the string [str] representing a substitution
+    template to the internal representation, usable as the [?itempl] argument
+    of [replace]/[replace_first].
+
+    The contents of the substitution template [str] can be normal text mixed
+    with any of the following (mostly as in Perl):
+
+    - {e $\[0-9\]+} - a "$" immediately followed by an arbitrary number.
+      "$0" stands for the name of the executable, any other number for the
+      n-th backreference.
+    - {e $&} - the whole matched pattern
+    - {e $`} - the text before the match
+    - {e $'} - the text after the match
+    - {e $+} - the last group that matched
+    - {e $$} - a single "$"
+    - {e $!} - delimiter which does not appear in the substitution. Can be
+      used to part "$\[0-9\]+" from an immediately following other number. *)
+
+(** The result elements of [full_split]. *)
+type split_result = Intf.split_result =
+  | Text of string  (** Text part of split string *)
+  | Delim of string  (** Delimiter part of split string *)
+  | Group of int * string
+      (** Subgroup of matched delimiter (subgroup_nr, subgroup_str) *)
+  | NoGroup  (** Unmatched subgroup *)
+[@@deriving show, eq]
+
 module type Matcher = Intf.Matcher
 (** Module type for matchers. *)
 

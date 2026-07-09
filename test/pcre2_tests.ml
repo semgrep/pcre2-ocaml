@@ -27,6 +27,11 @@ module MakeTests
 end = struct
   open M
 
+  let compile_exn pat =
+    match compile pat with
+    | Ok re -> re
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
+
   let simple_test () =
     match compile "abc" with
     | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
@@ -387,6 +392,212 @@ end = struct
              delta)
           (delta < 2000.)
 
+  (* --- Convenience layer re-added from tag 7.5.3 --- *)
+
+  let full_split_basic () =
+    (* Ported from the 7.5.3 test suite (test/pcre2_tests.ml, simple_test). *)
+    let re = compile_exn "(x)|(u)" in
+    let printer = [%show: (split_result list, match_error) result] in
+    check_eq printer ""
+      (Ok [ Text "ab"; Delim "x"; Group (1, "x"); NoGroup; Text "cd" ])
+      (full_split re "abxcd");
+    check_eq printer ""
+      (Ok
+         [
+           Text "ab";
+           Delim "x";
+           Group (1, "x");
+           NoGroup;
+           Text "cd";
+           Delim "u";
+           NoGroup;
+           Group (2, "u");
+           Text "ef";
+         ])
+      (full_split re "abxcduef")
+
+  let full_split_max_and_strip () =
+    let re = compile_exn "," in
+    let printer = [%show: (split_result list, match_error) result] in
+    check_eq printer "max=1 keeps the whole subject" (Ok [ Text "a,b," ])
+      (full_split ~max:1 re "a,b,");
+    check_eq printer "default max=0 strips trailing delimiters"
+      (Ok [ Text "a"; Delim ","; Text "b" ])
+      (full_split re "a,b,");
+    check_eq printer "negative max keeps trailing delimiters"
+      (Ok [ Text "a"; Delim ","; Text "b"; Delim "," ])
+      (full_split ~max:(-1) re "a,b,");
+    check_eq printer "empty subject" (Ok []) (full_split re "")
+
+  let full_split_empty_match () =
+    (* Empty delimiters follow the 7.5.3 loop: an ANCHORED|NOTEMPTY retry at
+       the same position, else a one-char Text and an advance by one. *)
+    let re = compile_exn "x*" in
+    let printer = [%show: (split_result list, match_error) result] in
+    check_eq printer ""
+      (Ok [ Delim ""; Text "a"; Delim "x"; Delim ""; Text "b" ])
+      (full_split re "axb");
+    check_eq printer "trailing empty delimiter kept with negative max"
+      (Ok [ Delim ""; Text "a"; Delim "x"; Delim ""; Text "b"; Delim "" ])
+      (full_split ~max:(-1) re "axb")
+
+  let replace_basic () =
+    let re = compile_exn "a" in
+    let printer = [%show: (string, match_error) result] in
+    check_eq printer "" (Ok "bbb") (replace ~templ:"b" re "aaa");
+    check_eq printer "no match returns the subject" (Ok "xyz")
+      (replace ~templ:"b" re "xyz");
+    check_eq printer "prefix before subject_offset is preserved" (Ok "aaXX")
+      (replace ~subject_offset:2 ~templ:"X" re "aaaa");
+    check_eq printer "default template deletes matches" (Ok "bc")
+      (replace re "abca")
+
+  let replace_templates () =
+    let printer = [%show: (string, match_error) result] in
+    let re = compile_exn "(a+)(b+)?" in
+    check_eq printer "backreference; unset group expands to nothing"
+      (Ok "<aa|>")
+      (replace ~templ:"<$1|$2>" re "aa");
+    let re_b = compile_exn "b+" in
+    check_eq printer "whole match, pre-match and post-match"
+      (Ok "aa[aa|bb|cc]cc")
+      (replace_first ~templ:"[$`|$&|$']" re_b "aabbcc");
+    let re_a = compile_exn "a" in
+    check_eq printer "$$ is a literal dollar" (Ok "$")
+      (replace ~templ:"$$" re_a "a");
+    let re_g = compile_exn "(a)" in
+    check_eq printer "$! separates a backref from following digits" (Ok "a1")
+      (replace ~templ:"$1$!1" re_g "a");
+    let re_alt = compile_exn "(x)|(u)" in
+    check_eq printer "$+ is the last group that matched" (Ok "a<u>")
+      (replace ~templ:"<$+>" re_alt "au");
+    let re_10 = compile_exn "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)" in
+    check_eq printer "multi-digit backreference" (Ok "j")
+      (replace ~templ:"$10" re_10 "abcdefghij");
+    check_eq printer "precompiled itempl" (Ok "<aa>")
+      (replace ~itempl:(Pcre2.subst "<$1>") re "aa");
+    check_eq printer "templ wins over itempl" (Ok "X")
+      (replace ~itempl:(Pcre2.subst "<$1>") ~templ:"X" re "aa")
+
+  let replace_empty_match () =
+    (* 7.5.3 empty-match rule: append the expansion, keep one subject char,
+       resume one past the match start. *)
+    let re = compile_exn "x*" in
+    let printer = [%show: (string, match_error) result] in
+    check_eq printer "" (Ok "-a-b-c-") (replace ~templ:"-" re "abc");
+    check_eq printer "" (Ok "--a--b-") (replace ~templ:"-" re "xaxb")
+
+  let replace_template_failures () =
+    let re = compile_exn "(a)" in
+    Alcotest.check_raises "nonexistent backreference"
+      (Failure "Pcre2.replace: backreference denotes nonexistent subpattern")
+      (fun () -> ignore (replace ~templ:"$3" re "aaa"));
+    Alcotest.check_raises "replace_first message prefix"
+      (Failure
+         "Pcre2.replace_first: backreference denotes nonexistent subpattern")
+      (fun () -> ignore (replace_first ~templ:"$3" re "aaa"));
+    let re0 = compile_exn "a" in
+    Alcotest.check_raises "$+ with no capture groups"
+      (Failure "Pcre2.replace: no backreferences") (fun () ->
+        ignore (replace ~templ:"$+" re0 "a"));
+    (* Deviation from 7.5.3: validation happens per match (no capturecount
+       accessor), so a bad template on a non-matching subject is not an
+       error. *)
+    let printer = [%show: (string, match_error) result] in
+    check_eq printer "no match, no validation" (Ok "zzz")
+      (replace ~templ:"$3" re "zzz")
+
+  let replace_first_test () =
+    let re = compile_exn "a+" in
+    let printer = [%show: (string, match_error) result] in
+    check_eq printer "" (Ok "X bb aa") (replace_first ~templ:"X" re "aa bb aa");
+    check_eq printer "no match returns the subject" (Ok "bb")
+      (replace_first ~templ:"X" re "bb")
+
+  let qreplace_tests () =
+    let re = compile_exn "a+" in
+    let printer = [%show: (string, match_error) result] in
+    check_eq printer "" (Ok "x<>y<>") (qreplace ~templ:"<>" re "xaayaaa");
+    check_eq printer "default template deletes matches" (Ok "xy")
+      (qreplace re "xaay");
+    check_eq printer "no $-parsing in qreplace" (Ok "$1")
+      (qreplace ~templ:"$1" re "aa");
+    check_eq printer "first only" (Ok "x<>yaaa")
+      (qreplace_first ~templ:"<>" re "xaayaaa")
+
+  let substitute_tests () =
+    let printer = [%show: (string, match_error) result] in
+    let re = compile_exn "[a-z]+" in
+    check_eq printer "" (Ok "HELLO WORLD")
+      (substitute ~subst:String.uppercase_ascii re "hello world");
+    check_eq printer "first only" (Ok "HELLO world")
+      (substitute_first ~subst:String.uppercase_ascii re "hello world");
+    let re2 = compile_exn "(a+)(b+)" in
+    let swap c =
+      let get i =
+        match match_of_captures c i with
+        | Some m -> substring_of_match m
+        | None -> ""
+      in
+      get 2 ^ get 1
+    in
+    check_eq printer "captures callback" (Ok "x bbaa y")
+      (substitute_substrings ~subst:swap re2 "x aabb y");
+    check_eq printer "captures callback, first only" (Ok "ba ab")
+      (substitute_substrings_first ~subst:swap re2 "ab ab")
+
+  let extract_tests () =
+    let re = compile_exn "(a+)(b+)?" in
+    let printer = [%show: (string array option, match_error) result] in
+    check_eq printer "unset group is the empty string"
+      (Ok (Some [| "aa"; "aa"; "" |]))
+      (extract re "aa");
+    check_eq printer "without the full match"
+      (Ok (Some [| "aa"; "" |]))
+      (extract ~full_match:false re "aa");
+    check_eq printer "no match" (Ok None) (extract re "zz");
+    let opt_printer =
+      [%show: (string option array option, match_error) result]
+    in
+    check_eq opt_printer "unset group is None"
+      (Ok (Some [| Some "aa"; Some "aa"; None |]))
+      (extract_opt re "aa");
+    check_eq opt_printer "no match" (Ok None) (extract_opt re "zz")
+
+  let extract_all_tests () =
+    let re = compile_exn "([a-z])([0-9])" in
+    let printer = [%show: (string array array, match_error) result] in
+    check_eq printer ""
+      (Ok [| [| "a1"; "a"; "1" |]; [| "b2"; "b"; "2" |] |])
+      (extract_all re "a1 b2");
+    check_eq printer "no match" (Ok [||]) (extract_all re "999");
+    (* Empty-match iteration follows 7.5.3 exec_all: after an empty match the
+       next attempt is at the SAME position with NOTEMPTY, and iteration
+       stops if that fails — hence no row for the final position 3. *)
+    let re_x = compile_exn "x*" in
+    check_eq printer ""
+      (Ok [| [| "" |]; [| "x" |]; [| "" |] |])
+      (extract_all re_x "axb");
+    let opt_printer =
+      [%show: (string option array array, match_error) result]
+    in
+    let re2 = compile_exn "(a)|(b)" in
+    check_eq opt_printer ""
+      (Ok [| [| Some "a"; Some "a"; None |]; [| Some "b"; None; Some "b" |] |])
+      (extract_all_opt re2 "ab")
+
+  let convenience_bad_offset () =
+    let re = compile_exn "a" in
+    let printer = [%show: (string, match_error) result] in
+    check_eq printer "replace, negative offset" (Error BADOFFSET)
+      (replace ~subject_offset:(-1) ~templ:"b" re "aaa");
+    let fs_printer = [%show: (split_result list, match_error) result] in
+    check_eq fs_printer "full_split, offset past the end" (Error BADOFFSET)
+      (full_split ~subject_offset:99 re "aaa");
+    let ex_printer = [%show: (string array option, match_error) result] in
+    check_eq ex_printer "extract, negative offset" (Error BADOFFSET)
+      (extract ~subject_offset:(-1) re "aaa")
+
   let tests =
     [
       Alcotest.test_case "simple_test" `Quick simple_test;
@@ -412,6 +623,21 @@ end = struct
       Alcotest.test_case "overlapping_matches" `Quick overlapping_matches_test;
       Alcotest.test_case "alloc_per_attempt" `Quick alloc_per_attempt_test;
       Alcotest.test_case "alloc_per_exec_major" `Quick alloc_per_exec_major_test;
+      Alcotest.test_case "full_split_basic" `Quick full_split_basic;
+      Alcotest.test_case "full_split_max_and_strip" `Quick
+        full_split_max_and_strip;
+      Alcotest.test_case "full_split_empty_match" `Quick full_split_empty_match;
+      Alcotest.test_case "replace_basic" `Quick replace_basic;
+      Alcotest.test_case "replace_templates" `Quick replace_templates;
+      Alcotest.test_case "replace_empty_match" `Quick replace_empty_match;
+      Alcotest.test_case "replace_template_failures" `Quick
+        replace_template_failures;
+      Alcotest.test_case "replace_first" `Quick replace_first_test;
+      Alcotest.test_case "qreplace" `Quick qreplace_tests;
+      Alcotest.test_case "substitute" `Quick substitute_tests;
+      Alcotest.test_case "extract" `Quick extract_tests;
+      Alcotest.test_case "extract_all" `Quick extract_all_tests;
+      Alcotest.test_case "convenience_bad_offset" `Quick convenience_bad_offset;
     ]
 end
 
@@ -460,6 +686,21 @@ let alloc_per_exec_minor () =
        delta)
     (delta < 40.)
 
+let quote_test () =
+  check_eq [%show: string] "escapes every special character"
+    {|\\\^\$\.\[\|\(\)\?\*\+\{|}
+    (Pcre2.quote {|\^$.[|()?*+{|});
+  check_eq [%show: string] "leaves ordinary text alone" "a-b]c}d"
+    (Pcre2.quote "a-b]c}d");
+  (* Round trip: the quoted pattern matches the original string literally. *)
+  let specials = {|a\b^c$d.e[f|g(h)i?j*k+l{m}n]o|} in
+  match Pcre2.Interp.compile (Pcre2.quote specials) with
+  | Error _ -> Alcotest.fail "failed to compile quoted pattern"
+  | Ok re -> (
+      match Pcre2.Interp.is_match re specials with
+      | Ok true -> ()
+      | _ -> Alcotest.fail "quoted pattern did not match the literal string")
+
 let suite =
   let module Interp_Tests = MakeTests (Interp) in
   let module Jit_Tests = MakeTests (Jit) in
@@ -468,6 +709,7 @@ let suite =
       [
         Alcotest.test_case "version" `Quick check_version;
         Alcotest.test_case "alloc_per_exec_minor" `Quick alloc_per_exec_minor;
+        Alcotest.test_case "quote" `Quick quote_test;
       ] );
     ("Interp", Interp_Tests.tests);
     ("JIT", Jit_Tests.tests);
