@@ -1,0 +1,13 @@
+; pcre2test-compatible harness (dev-only). The library is a functor over the
+; DRIVER seam (driver.ml); the executable instantiates it with the C oracle.
+(library
+ (name pcre2test_harness)
+ (public_name pcre2-dev.pcre2test-harness)
+ (modules flags ctl cstr pchars scan modifiers subject driver harness))
+
+(executable
+ (name pcre2test_ml)
+ (public_name pcre2test_ml)
+ (package pcre2-dev)
+ (modules pcre2test_ml)
+ (libraries pcre2test_harness pcre2-dev.test-driver))

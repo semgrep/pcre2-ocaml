@@ -1,0 +1,38 @@
+; Conformance runner: replays vendor/pcre2/testdata corpora through the
+; pcre2test-compatible harness and compares against the vendored testoutput
+; files. Dev-only (package pcre2-dev).
+
+(library
+ (name conformance_lib)
+ (public_name pcre2-dev.conformance-lib)
+ (modules units sexp_lite)
+ (libraries pcre2test_harness))
+
+(executable
+ (name runner)
+ (public_name pcre2-conformance-runner)
+ (package pcre2-dev)
+ (modules runner)
+ (libraries conformance_lib pcre2test_harness pcre2-dev.test-driver))
+
+(test
+ (name harness_tests)
+ (package pcre2-dev)
+ (modules harness_tests)
+ (libraries conformance_lib pcre2test_harness))
+
+; `dune build @conformance` = default runner mode (report + baseline check +
+; skiplist staleness). Deliberately NOT attached to @runtest yet.
+(rule
+ (alias conformance)
+ (deps
+  runner.exe
+  testdata-order
+  skiplist.sexp
+  (glob_files baseline_counts.sexp)
+  (glob_files %{workspace_root}/vendor/pcre2/testdata/testinput*)
+  (glob_files %{workspace_root}/vendor/pcre2/testdata/testoutput*))
+ (action
+  (chdir
+   %{workspace_root}
+   (run test/conformance/runner.exe))))

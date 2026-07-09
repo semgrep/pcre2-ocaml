@@ -26,14 +26,14 @@ byte-identically outside the skip-list; oracle OUnit green.
   `pcre2_chartables.c.dist` (196 l), `pcre2_ucd.c` (5460 l), `pcre2_ucptables.c` (1533 l)
   → emits committed `chartables.ml`, `ucd_tables.ml`, `ucptables.ml`; dune rule + CI check
   assert in-sync. Hand-port `tables.ml` (pcre2_tables.c:1-234). (~800 LOC gen + ~6.5k generated)
-- [ ] **harness**: `test/pcre2test/pcre2test_ml.exe` — pcre2test-compatible: `#` command
+- [x] **harness**: (this commit) `test/pcre2test/pcre2test_ml.exe` — pcre2test-compatible: `#` command
   lines, arbitrary delimiters + modifier lists (full list in plan §Testing), subject escape
   processing, `\=` subject modifiers, byte-identical output (` 0: text`, `<unset>`,
   `No match`, `Partial match:`, `MK:`, `Failed: error NNN at offset N: <message>`); `/g`
   implements pcre2test's own empty-match advance (NOTEMPTY_ATSTART retry then CRLF/UTF-aware
   char bump) — independent of the library's frozen `find_iter`. Runs against any
   `Pcre2.Matcher` (oracle now, engine later). (~1,500 LOC)
-- [ ] **runner**: `test/conformance/runner.exe` — executes the harness over the curated
+- [x] **runner**: (this commit) `test/conformance/runner.exe` — executes the harness over the curated
   order, diffing against vendored testoutput files; `--frontier` (first failing in-scope
   test in curated order + tallies), `--only file:ordinal`, `--write-baseline`; pin
   `test/conformance/testdata-order` (machine file; see `testdata-order.md`); initial
