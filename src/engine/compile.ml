@@ -894,15 +894,17 @@ let opcode_possessify =
                       +1 Success, this branch must match at least one char
                       -1 Success, this branch may match an empty string
 
-   Chunk boundary (M1 chunks "compile_branch A".."D"): chars/escapes,
-   classes, repeats and plain capture/non-capture groups (with bracket
-   repeats) are live. The arms for conditionals/lookarounds (M4/M5),
-   verbs, backrefs, recursion and string callouts are deferred — they fail
-   loudly with Parse.err_deferred (identically in both phases, before any
+   Chunk boundary (M1 chunks "compile_branch A".."D" + the M2 backref
+   chunk): chars/escapes, classes, repeats, plain capture/non-capture
+   groups (with bracket repeats) and back references (numeric and by
+   name) are live. The arms for conditionals/lookarounds (M4/M5), verbs,
+   recursion and string callouts are deferred — they fail loudly with
+   Parse.err_deferred (identically in both phases, before any
    phase-dependent work); within the repeat arm, an OP_RECURSE previous
-   item likewise defers (M5). The C local `offset`
-   (pcre2_compile.c:5658), owned by the still-deferred conditional arms,
-   arrives with them. The class locals (negate_class, should_flip_negation,
+   item likewise defers (M5). The C local `offset` (pcre2_compile.c:5658)
+   becomes a per-arm let binding in the backref arms; the still-deferred
+   conditional arms bring their own uses with them. The class locals
+   (negate_class, should_flip_negation,
    match_all_or_no_wide_chars, class_has_8bitchar, xclass, xclass_has_prop,
    class_uchardata, classbits; pcre2_compile.c:5672,5690-5693,5725-5733)
    live in the class arm, which is where the C first assigns them each
@@ -1262,6 +1264,32 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
             reqcu := !subreqcu;
             reqcuflags := !subreqcuflags))
     (* pcre2_compile.c:7015 — break: end of nested group handling *)
+  in
+
+  (* pcre2_compile.c:8040-8058 — HANDLE_SINGLE_REFERENCE: reached by
+     falling through from META_BACKREF, and by goto from named backref
+     handling when the reference is to a single group (that is, not to a
+     duplicated name). The back reference data will have already been
+     updated. We must disable firstcu if not set, to cope with cases like
+     (?=(\w+))\1: which would otherwise set ':' later. *)
+  let handle_single_reference (meta_arg : int) : unit =
+    if Int.equal !firstcuflags req_unset then (
+      zerofirstcuflags := req_none;
+      firstcuflags := req_none);
+    emit_cu
+      (if not (Int.equal (!options land Options.caseless) 0) then
+         Opcodes.op_refi
+       else Opcodes.op_ref);
+    put2inc cb.start_code code meta_arg;
+
+    (* pcre2_compile.c:8051-8057 — update the map of back references, and
+       keep the highest one. We could do this in parse_regex() for
+       numerical back references, but not for named back references,
+       because we don't know the numbers to which named back references
+       refer. So we do it all in this function. *)
+    cb.backref_map <-
+      (cb.backref_map lor if meta_arg < 32 then 1 lsl meta_arg else 1);
+    if meta_arg > cb.top_backref then cb.top_backref <- meta_arg
   in
 
   (* pcre2_compile.c:5721-5723 — switch on next META item until the end of
@@ -2016,12 +2044,95 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
         Int.equal meta Parse.meta_backref_byname
         || Int.equal meta Parse.meta_recurse_byname
       then (
-        (* pcre2_compile.c:7021-7098 — named backreferences
-           (docs/ocaml-engine/03-backreferences.md) and named recursion
-           (docs/ocaml-engine/05-conditionals-recursion.md). Deferred
-           loudly. *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+        (* pcre2_compile.c:7018-7031 — handle named backreferences and
+           recursions. The C's name pointer (cb->start_pattern + offset)
+           becomes the pattern offset itself; GETPLUSOFFSET reads one extra
+           parsed-pattern word (SIZEOFFSET 1, pcre2_compile.c:91-97). *)
+        let is_dupname = ref false in
+        pptr := !pptr + 1;
+        let length = cb.parsed_pattern.(!pptr) in
+        pptr := !pptr + 1;
+        let offset = cb.parsed_pattern.(!pptr) in
+        let name = offset in
+
+        (* pcre2_compile.c:7033-7064 — in the first pass, the names
+           generated in the pre-pass are available, but the main name
+           table has not yet been created. Scan the list of names
+           generated in the pre-pass in order to get a number and whether
+           or not this name is duplicated. The PRIV(strncmp)
+           (pcre2_string_utils.c:156-167) becomes a code-unit loop over
+           the pattern; only its equality result is used. *)
+        let groupnumber = ref 0 in
+        for i = 0 to cb.names_found - 1 do
+          let ng = cb.named_groups.(i) in
+          let name_eq =
+            Int.equal length ng.Parse.length
+            &&
+            let rec cmp j =
+              if j >= length then true
+              else if
+                Char.equal cb.pattern.[name + j] cb.pattern.[ng.Parse.name + j]
+              then (cmp [@tailcall]) (j + 1)
+              else false
+            in
+            cmp 0
+          in
+          if name_eq then (
+            is_dupname := ng.Parse.isdup;
+            groupnumber := ng.Parse.number;
+
+            (* pcre2_compile.c:7047-7055 — for a recursion, that's all
+               that is needed: goto HANDLE_NUMERICAL_RECURSION, applying
+               it to the first group with the given name. The target
+               label lives in the META_RECURSE arm (pcre2_compile.c:8078)
+               — M5, docs/ocaml-engine/05-conditionals-recursion.md —
+               and is unreachable here until parse_regex stops deferring
+               META_RECURSE_BYNAME emission. Deferred loudly. *)
+            if Int.equal meta Parse.meta_recurse_byname then (
+              errorcodeptr := Parse.err_deferred;
+              return_from_branch 0);
+
+            (* pcre2_compile.c:7057-7062 — for a back reference, update
+               the back reference map and the maximum back reference. *)
+            cb.backref_map <-
+              (cb.backref_map
+              lor if !groupnumber < 32 then 1 lsl !groupnumber else 1);
+            if !groupnumber > cb.top_backref then cb.top_backref <- !groupnumber)
+        done;
+
+        (* pcre2_compile.c:7066-7073 — if the name was not found we have a
+           bad reference. *)
+        if Int.equal !groupnumber 0 then (
+          errorcodeptr := Errors.err15;
+          cb.erroroffset <- offset;
+          return_from_branch 0);
+
+        (* pcre2_compile.c:7075-7082 — if a back reference name is not
+           duplicated, we can handle it as a numerical reference: goto
+           HANDLE_SINGLE_REFERENCE. *)
+        if not !is_dupname then handle_single_reference !groupnumber
+        else
+          (* pcre2_compile.c:7084-7096 — if a back reference name is
+             duplicated, we generate a different opcode to a numerical
+             back reference. In the second pass we must search for the
+             index and count in the final name table. *)
+          let count = ref 0 (* Values for first pass *) in
+          let index = ref 0 in
+          (match lengthptr with
+          | None ->
+              if
+                not
+                  (find_dupname_details ~name ~length index count errorcodeptr
+                     cb)
+              then return_from_branch 0
+          | Some _ -> ());
+          if Int.equal !firstcuflags req_unset then firstcuflags := req_none;
+          emit_cu
+            (if not (Int.equal (!options land Options.caseless) 0) then
+               Opcodes.op_dnrefi
+             else Opcodes.op_dnref);
+          put2inc cb.start_code code !index;
+          put2inc cb.start_code code !count)
       else if Int.equal meta Parse.meta_callout_number then (
         (* pcre2_compile.c:7101-7111 — handle a numerical callout. *)
         Bytes.set cb.start_code !code (Char.chr Opcodes.op_callout);
@@ -2871,10 +2982,26 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
         (* goto NORMAL_CHAR *)
         normal_char ())
       else if Int.equal meta Parse.meta_backref then (
-        (* pcre2_compile.c:8022-8058 — back reference by number:
-           docs/ocaml-engine/03-backreferences.md. Deferred loudly. *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+        (* pcre2_compile.c:8022-8038 — handle a back reference by number,
+           which is the meta argument. The pattern offsets for back
+           references to group numbers less than 10 are held in a special
+           vector, to avoid using more than two parsed pattern elements in
+           64-bit environments. We only need the offset to the first
+           occurrence, because if that doesn't fail, subsequent ones will
+           also be OK. *)
+        let offset =
+          if meta_arg < 10 then cb.small_ref_offset.(meta_arg)
+          else (
+            (* GETPLUSOFFSET(offset, pptr) *)
+            pptr := !pptr + 1;
+            cb.parsed_pattern.(!pptr))
+        in
+        if meta_arg > cb.bracount then (
+          cb.erroroffset <- offset;
+          errorcodeptr := Errors.err15 (* Non-existent subpattern *);
+          return_from_branch 0);
+        (* fallthrough to HANDLE_SINGLE_REFERENCE in C *)
+        handle_single_reference meta_arg)
       else if Int.equal meta Parse.meta_recurse then (
         (* pcre2_compile.c:8061-8087 — recursion:
            docs/ocaml-engine/05-conditionals-recursion.md. Deferred
@@ -5823,10 +5950,9 @@ let () =
   assert (Int.equal rcuf 0);
   assert (Int.equal (Bytes.length cb.start_code) 24);
 
-  (* Deferred arms fail loudly in both phases: backrefs (M2), Unicode
-     property classes (M7), and the Unicode caseless-literal path (M6/M7
-     DEVIATION in compile_branch). *)
-  expect_deferred "\\1()" (* META_BACKREF comes first in this stream *);
+  (* Deferred arms fail loudly in both phases: Unicode property classes
+     (M7), and the Unicode caseless-literal path (M6/M7 DEVIATION in
+     compile_branch). *)
   expect_deferred ~options:(Options.ucp lor Options.caseless) "k";
   expect_deferred ~options:Options.ucp "[\\d]"
   (* parse substitutes \p{Nd} under UCP: ESC_p in a class = XCL_PROP (M7) *);
@@ -5988,3 +6114,164 @@ let () =
   assert_entry 0 "ww" 3;
   assert_entry 1 "xx" 1;
   assert_entry 2 "yy" 2
+
+(* Backreference compilation (M2 compile chunk, pcre2_compile.c:7018-7098
+   and 8022-8058, docs/ocaml-engine/03-backreferences.md): bytecode,
+   top_backref and error numbers/offsets pinned with `pcre2test -q` +
+   fullbincode/-I on the real 10.44 library. *)
+let () =
+  let ok ?(options = 0) pat =
+    match pcre2_compile pat ~options with
+    | Ok re -> re
+    | Error (e, o) ->
+        failwith
+          (Printf.sprintf "pcre2_compile %S: error %d at offset %d" pat e o)
+  in
+  let expect_err pat options e o =
+    match pcre2_compile pat ~options with
+    | Ok _ -> assert false
+    | Error (e', o') ->
+        assert (Int.equal e e');
+        assert (Int.equal o o')
+  in
+  let assert_code (re : re) (expected : int list) =
+    assert (Int.equal (Bytes.length re.code) (List.length expected));
+    List.iteri
+      (fun i v -> assert (Int.equal (Char.code (Bytes.get re.code i)) v))
+      expected
+  in
+  let byte (re : re) i = Char.code (Bytes.get re.code i) in
+  (* /(a)\1/: [BRA 16][CBRA 7 1][CHAR a][KET 7][REF 1][KET 16][END];
+     Max back reference = 1. *)
+  let re = ok "(a)\\1" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      16;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_ref;
+      0;
+      1;
+      Opcodes.op_ket;
+      0;
+      16;
+      Opcodes.op_end;
+    ];
+  assert (Int.equal re.top_backref 1);
+  (* Caseless: /i \1 = OP_REFI. *)
+  let re = ok "(?i)(a)\\1" in
+  assert (Int.equal (byte re 13) Opcodes.op_refi);
+  assert (Int.equal (get2 re.code 14) 1);
+  (* /(?P<n>a)\k<n>/: a non-duplicated name resolves to the numerical
+     reference \1 (HANDLE_SINGLE_REFERENCE via META_BACKREF_BYNAME). *)
+  let re = ok "(?P<n>a)\\k<n>" in
+  assert (Int.equal (byte re 13) Opcodes.op_ref);
+  assert (Int.equal (get2 re.code 14) 1);
+  assert (Int.equal re.top_backref 1);
+  (* /((a)|(b))\k<A>(?<A>c)/dupnames: single-entry name, forward
+     reference — resolves numerically to \4. *)
+  let re = ok ~options:Options.dupnames "((a)|(b))\\k<A>(?<A>c)" in
+  assert (Int.equal (byte re 34) Opcodes.op_ref);
+  assert (Int.equal (get2 re.code 35) 4);
+  assert (Int.equal re.top_backref 4);
+  (* /(?P<zz>a)(?P<zz>b)\k<zz>/dupnames: OP_DNREF with name-table index 0
+     and duplicate count 2 (pcre2test: "23 \k<zz>2"); Max back
+     reference = 2. Caseless flavour is OP_DNREFI. *)
+  let re = ok ~options:Options.dupnames "(?P<zz>a)(?P<zz>b)\\k<zz>" in
+  assert (Int.equal (Bytes.length re.code) 32);
+  assert (Int.equal (byte re 23) Opcodes.op_dnref);
+  assert (Int.equal (get2 re.code 24) 0 (* index *));
+  assert (Int.equal (get2 re.code 26) 2 (* count *));
+  assert (Int.equal (byte re 28) Opcodes.op_ket);
+  assert (Int.equal re.top_backref 2);
+  let re =
+    ok
+      ~options:(Options.dupnames lor Options.caseless)
+      "(?P<zz>a)(?P<zz>b)\\k<zz>"
+  in
+  assert (Int.equal (byte re 23) Opcodes.op_dnrefi);
+  (* /(?|(a)|(b))\1/: duplicate group numbers from (?| — \1 is numeric. *)
+  let re = ok "(?|(a)|(b))\\1" in
+  assert (Int.equal (byte re 32) Opcodes.op_ref);
+  assert (Int.equal (get2 re.code 33) 1);
+  assert (Int.equal re.top_backref 1);
+  (* Group >= 10 takes the GETPLUSOFFSET parsed-pattern word
+     (pcre2_compile.c:8030-8031): /(a)..(l)\12/ ends [123 REF 12][126 KET]
+     [129 END]. *)
+  let re = ok "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)\\12" in
+  assert (Int.equal (Bytes.length re.code) 130);
+  assert (Int.equal (byte re 123) Opcodes.op_ref);
+  assert (Int.equal (get2 re.code 124) 12);
+  assert (Int.equal (byte re 126) Opcodes.op_ket);
+  assert (Int.equal (byte re 129) Opcodes.op_end);
+  assert (Int.equal re.top_backref 12);
+  (* Repeats after a backref (pcre2_compile.c:7311-7344): {2} = CRRANGE,
+     {0,3}? = CRMINRANGE, {0} drops the item, *+ wraps in ONCE. *)
+  let re = ok "(a|b)\\1{2}" in
+  assert (Int.equal (byte re 18) Opcodes.op_ref);
+  assert (Int.equal (byte re 21) Opcodes.op_crrange);
+  assert (Int.equal (get2 re.code 22) 2);
+  assert (Int.equal (get2 re.code 24) 2);
+  let re = ok "(a)\\1{0,3}?" in
+  assert (Int.equal (byte re 13) Opcodes.op_ref);
+  assert (Int.equal (byte re 16) Opcodes.op_crminrange);
+  assert (Int.equal (get2 re.code 17) 0);
+  assert (Int.equal (get2 re.code 19) 3);
+  (* {0} drops the backref entirely (code = previous,
+     pcre2_compile.c:7324-7328): [BRA 13][CBRA 7 1][CHAR a][KET 7][KET 13]
+     [END]. The pre-pass deliberately never reduces the length
+     (pcre2_compile.c:5761-5767), so re.code keeps 3 units of zeroed slack
+     after OP_END (usedlength < length, pcre2_compile.c:10712-10725). *)
+  let re = ok "(a)\\1{0}" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      13;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_ket;
+      0;
+      13;
+      Opcodes.op_end;
+      0;
+      0;
+      0;
+    ];
+  let re = ok "(a)\\1*+" in
+  assert (Int.equal (byte re 13) Opcodes.op_once);
+  assert (Int.equal (byte re 16) Opcodes.op_ref);
+  assert (Int.equal (byte re 19) Opcodes.op_crstar);
+  assert (Int.equal (byte re 20) Opcodes.op_ket);
+  assert (Int.equal (get re.code 21) 7);
+  (* PCRE2_MATCH_UNSET_BACKREF has no compile-time effect outside the
+     lookbehind-length machinery (pcre2_compile.c:9621,9668 — M4). *)
+  let re = ok ~options:Options.match_unset_backref "(a)\\1" in
+  assert (Int.equal (byte re 13) Opcodes.op_ref);
+  (* ERR15 (115) reference to non-existent subpattern, with the parse-
+     recorded offsets: named at the name (pcre2_compile.c:7068-7073),
+     numeric at small_ref_offset / GETPLUSOFFSET (8033-8038). *)
+  expect_err "(?P=zz)" 0 Errors.err15 4;
+  expect_err "(a)\\2" 0 Errors.err15 4;
+  expect_err "\\2()" 0 Errors.err15 1;
+  expect_err "abc\\1" 0 Errors.err15 4;
+  expect_err "\\g{12}abc" 0 Errors.err15 5;
+  expect_err "\\g{2}()" 0 Errors.err15 4
