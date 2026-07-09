@@ -27,7 +27,22 @@ let err2 = compile_error_base + 2 (* \c at end of pattern *)
 let err3 = compile_error_base + 3 (* unrecognized character follows \ *)
 let err4 = compile_error_base + 4 (* numbers out of order in {} quantifier *)
 let err5 = compile_error_base + 5 (* number too big in {} quantifier *)
+
+let err6 =
+  compile_error_base + 6 (* missing terminating ] for character class *)
+
+let err7 =
+  compile_error_base + 7 (* escape sequence is invalid in character class *)
+
+let err8 = compile_error_base + 8 (* range out of order in character class *)
 let err11 = compile_error_base + 11 (* unrecognized character after (? or (?- *)
+
+let err12 =
+  compile_error_base + 12 (* POSIX named classes only within a class *)
+
+let err13 =
+  compile_error_base + 13 (* POSIX collating elements are not supported *)
+
 let err14 = compile_error_base + 14 (* missing closing parenthesis *)
 let err15 = compile_error_base + 15 (* reference to non-existent subpattern *)
 let err18 = compile_error_base + 18 (* missing ) after (?# comment *)
@@ -35,6 +50,7 @@ let err19 = compile_error_base + 19 (* parentheses are too deeply nested *)
 let err22 = compile_error_base + 22 (* unmatched closing parenthesis *)
 let err26 = compile_error_base + 26 (* a relative value of zero not allowed *)
 let err28 = compile_error_base + 28 (* assertion expected after (?( or (?(?C) *)
+let err30 = compile_error_base + 30 (* unknown POSIX class name *)
 let err34 = compile_error_base + 34 (* code point in \x{} or \o{} too large *)
 
 let err37 =
@@ -43,6 +59,7 @@ let err37 =
 let err42 = compile_error_base + 42 (* syntax error in subpattern name *)
 let err44 = compile_error_base + 44 (* name must start with a non-digit *)
 let err48 = compile_error_base + 48 (* subpattern name is too long *)
+let err50 = compile_error_base + 50 (* invalid range in character class *)
 
 let err51 =
   compile_error_base + 51 (* octal value > \377 in 8-bit non-UTF mode *)
@@ -62,6 +79,8 @@ let err68 = compile_error_base + 68 (* \c must be followed by printable ASCII *)
 
 let err69 =
   compile_error_base + 69 (* \k not followed by braced/bracketed name *)
+
+let err71 = compile_error_base + 71 (* \N is not supported in a class *)
 
 let err73 =
   compile_error_base + 73 (* disallowed Unicode code point (surrogate) *)

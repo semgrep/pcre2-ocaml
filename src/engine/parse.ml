@@ -2,10 +2,11 @@
 
    Ported from the front half of vendor/pcre2/src/pcre2_compile.c. This
    module currently holds the parsed-pattern encoding scheme (META_* codes,
-   meta_extra_lengths) and the parse-phase helper functions read_number,
-   read_repeat_counts, check_posix_syntax, check_posix_name and read_name,
-   plus the minimal parse_context they thread state through. parse_regex
-   itself lands in later chunks.
+   meta_extra_lengths), the parse-phase helpers (read_number,
+   read_repeat_counts, check_posix_syntax, check_posix_name, read_name,
+   check_escape, handle_escdsw, manage_callouts), parse_context, and
+   parse_regex itself (quantifier/group/assertion/verb arms still deferred
+   per docs/ocaml-engine/02-core-compile-match.md).
 
    The pattern is a `string` of 8-bit code units (this port is the 8-bit
    library); pointers become int indices into that string. *)
@@ -702,6 +703,67 @@ let posix_names =
 
 let posix_name_lengths = [| 5; 5; 5; 5; 5; 5; 5; 5; 5; 5; 5; 5; 4; 6; 0 |]
 
+(* pcre2_compile.c:709-713 — indices into the POSIX class list needed by the
+   parse phase (PC_DIGIT and PC_XDIGIT; PC_GRAPH/PC_PRINT/PC_PUNCT are used
+   only by the compile-phase class code and arrive with it). *)
+let pc_digit = 7
+let pc_xdigit = 13
+
+(* pcre2_compile.c:742-763 — the POSIX class Unicode property substitutes
+   that are used in UCP mode must be in the order of the POSIX class names,
+   defined above. Two values per class: the type and value of a \p or \P
+   item. The special cases are specified with a negative type: a non-zero
+   value causes \h or \H to be used, and a zero value falls through to
+   behave like a non-UCP POSIX class. *)
+let posix_substitutes =
+  [|
+    Opcodes.pt_gc;
+    Ucp.ucp_l;
+    (* alpha *)
+    Opcodes.pt_pc;
+    Ucp.ucp_ll;
+    (* lower *)
+    Opcodes.pt_pc;
+    Ucp.ucp_lu;
+    (* upper *)
+    Opcodes.pt_alnum;
+    0;
+    (* alnum *)
+    -1;
+    0;
+    (* ascii, treat as non-UCP *)
+    -1;
+    1;
+    (* blank, treat as \h *)
+    Opcodes.pt_pc;
+    Ucp.ucp_cc;
+    (* cntrl *)
+    Opcodes.pt_pc;
+    Ucp.ucp_nd;
+    (* digit *)
+    Opcodes.pt_pxgraph;
+    0;
+    (* graph *)
+    Opcodes.pt_pxprint;
+    0;
+    (* print *)
+    Opcodes.pt_pxpunct;
+    0;
+    (* punct *)
+    Opcodes.pt_pxspace;
+    0;
+    (* space *)
+    (* Xps is POSIX space, but from 8.34 *)
+    Opcodes.pt_word;
+    0;
+    (* word *)
+    (* Perl and POSIX space are the same *)
+    Opcodes.pt_pxxdigit;
+    0;
+    (* xdigit *)
+    (* Perl has additional hex digits *)
+  |]
+
 (* ---------- Parse context ---------- *)
 
 (* pcre2_internal.h:490-492 — newline-convention types. NLTYPE_ANY/ANYCRLF
@@ -736,6 +798,12 @@ type parse_context = {
      the parse phase touches (pcre2_intmodedep.h:735,743 and neighbours): *)
   mutable bracount : int; (* cb->bracount: capturing groups seen so far *)
   mutable external_flags : int; (* cb->external_flags: hasbkporx etc. *)
+  (* cb->external_options (pcre2_intmodedep.h:742): the external (initial)
+     options, set from the pcre2_compile() options argument
+     (pcre2_compile.c:10254) and updated only by ( *UTF)-style
+     start-of-pattern settings — unlike parse_regex's local [options], which
+     tracks in-pattern (?i)-style changes. *)
+  mutable external_options : int;
   mutable extra_options : int; (* cb->cx->extra_options *)
   mutable parens_nest_limit : int; (* cb->cx->parens_nest_limit *)
   (* cb->nltype/nllen/nl (pcre2_intmodedep.h:751-755). Defaults are the
@@ -765,6 +833,7 @@ let make_context (pattern : string) : parse_context =
     erroroffset = 0;
     bracount = 0;
     external_flags = 0;
+    external_options = 0;
     extra_options = 0;
     parens_nest_limit = Limits.parens_nest_limit;
     nltype = nltype_fixed;
@@ -2023,6 +2092,13 @@ let nsf_reset = 0x0001
 let nsf_condassert = 0x0002
 let nsf_atomicsr = 0x0004
 
+(* pcre2_compile.c:2751-2754 — states used for analyzing ranges in character
+   classes. The two OK values must be last. *)
+let range_no = 0
+let range_started = 1
+let range_ok_escaped = 2
+let range_ok_literal = 3
+
 (* pcre2_compile.c:2738-2749 — options that are changeable within the
    pattern must be tracked during parsing. Some (e.g. PCRE2_EXTENDED) are
    implemented entirely during parsing, but all must be tracked so that
@@ -2039,10 +2115,10 @@ let parse_tracked_extra_options =
   lor Options.extra_ascii_digit lor Options.extra_ascii_posix
 
 (* DEVIATION: distinctive placeholder error code for parse_regex arms that
-   are deferred to later chunks (character classes -> parse_regex B;
-   quantifiers, groups and named-group definitions -> parse_regex C; named
-   references -> M3; lookarounds/atomic groups -> M4; conditionals,
-   recursion, verbs and callouts -> M5; \p and \P -> M7). PCRE2 compile
+   are deferred to later chunks (quantifiers, groups and named-group
+   definitions -> parse_regex C; named references -> M3; lookarounds/atomic
+   groups -> M4; conditionals, recursion, verbs and callouts -> M5; \p and
+   \P -> M7). PCRE2 compile
    errors occupy 100..201, so 299 can never collide with a real result;
    deferred constructs fail loudly instead of misparsing. Every use site
    below carries a comment naming its chunk. *)
@@ -2062,11 +2138,13 @@ exception Goto_failed
    (2) writes a parsed version of the pattern with comments omitted and
    escapes processed into the parsed_pattern vector.
 
-   This chunk ports the main-loop skeleton: literals, \Q..\E, extended-mode
+   Ported so far: the main-loop skeleton (literals, \Q..\E, extended-mode
    white space and # comments, (?# comments, the escape dispatch (numeric
    backrefs included), inline option settings (?imnrsxJUa..) / (?^) / (?|,
    bare capturing/non-capturing parentheses, alternation, group close, and
-   the end-of-pattern epilogue. Arms marked "deferred" fail loudly with
+   the end-of-pattern epilogue) and character classes (parse_regex B:
+   POSIX class items with their UCP substitutions, literals, ranges and
+   in-class escapes). Arms marked "deferred" fail loudly with
    err_deferred until their chunks land; the named-group table, verb-name
    locals (verblengthptr/verbstartptr/verbnamestart, add_after_mark) and
    the inverbname accumulator block (pcre2_compile.c:2941-3039) are
@@ -2078,14 +2156,12 @@ exception Goto_failed
                      sizes with allocate_parsed_pattern, as pcre2_compile()
                      does)
      options         compiling dynamic options (may change during the scan)
-     has_lookbehind  set true if a lookbehind is found (only by deferred
-                     arms, so untouched in this chunk)
+     has_lookbehind  set true if a lookbehind is found
 
    Returns: zero on success or a non-zero error code, with the error offset
             placed in cx.erroroffset. *)
 let parse_regex (cx : parse_context) ~(options : int)
     (has_lookbehind : bool ref) : int =
-  ignore (has_lookbehind : bool ref);
   let pat = cx.pattern in
   let buf = cx.parsed_pattern in
 
@@ -2689,10 +2765,435 @@ let parse_regex (cx : parse_context) ~(options : int)
                  cx.errorcode <- err_deferred;
                  raise_notrace Goto_failed)
            | '[' ->
-               (* pcre2_compile.c:3493-3915 — character classes: deferred to
-                  the classes chunk (parse_regex B). *)
-               cx.errorcode <- err_deferred;
-               raise_notrace Goto_failed
+               (* ---- Character class ---- pcre2_compile.c:3493-3496 *)
+               okquantifier := true;
+
+               (* pcre2_compile.c:3498-3535 — in another (POSIX) regex
+                  library, the ugly syntax [[:<:]] and [[:>:]] is used for
+                  "start of word" and "end of word". As these are otherwise
+                  illegal sequences, we don't break anything by recognizing
+                  them. They are replaced by \b(?=\w) and \b(?<=\w)
+                  respectively. Sequences like [a[:<:]] are erroneous and
+                  are handled by the normal code below. *)
+               if
+                 cx.ptrend - !ptr >= 6
+                 && (strncmp_c8_eq pat !ptr "[:<:]]" 6
+                    || strncmp_c8_eq pat !ptr "[:>:]]" 6)
+               then (
+                 buf.(!pp) <- meta_escape + esc_b;
+                 incr pp;
+                 if Char.equal pat.[!ptr + 2] '<' then (
+                   buf.(!pp) <- meta_lookahead;
+                   incr pp)
+                 else (
+                   buf.(!pp) <- meta_lookbehind;
+                   incr pp;
+                   has_lookbehind := true;
+                   (* The offset is used only for the "non-fixed length"
+                      error; this won't occur here, so just store zero. *)
+                   putoffset buf pp 0);
+                 if Int.equal (!options land Options.ucp) 0 then (
+                   buf.(!pp) <- meta_escape + esc_w;
+                   incr pp)
+                 else (
+                   buf.(!pp) <- meta_escape + esc_p;
+                   incr pp;
+                   buf.(!pp) <- Opcodes.pt_word lsl 16;
+                   incr pp);
+                 buf.(!pp) <- meta_ket;
+                 incr pp;
+                 ptr := !ptr + 6 (* C: break — end of the class item *))
+               else
+                 (* pcre2_compile.c:3537-3546 — PCRE supports POSIX class
+                    stuff inside a class. Perl gives an error if they are
+                    encountered at the top level, so we'll do that too. *)
+                 let tempptr = ref 0 in
+                 if
+                   !ptr < cx.ptrend
+                   && (Char.equal pat.[!ptr] ':'
+                      || Char.equal pat.[!ptr] '.'
+                      || Char.equal pat.[!ptr] '=')
+                   && check_posix_syntax cx !ptr tempptr
+                 then (
+                   (* C: errorcode = ( *ptr-- == CHAR_COLON)? ERR12 : ERR13
+                      — the test reads the old value, then ptr backs up to
+                      the '['. *)
+                   cx.errorcode <-
+                     (if Char.equal pat.[!ptr] ':' then Errors.err12
+                      else Errors.err13);
+                   decr ptr;
+                   raise_notrace Goto_failed);
+
+                 (* pcre2_compile.c:3548-3572 — process a regular character
+                    class. If the first character is '^', set the negation
+                    flag. If the first few characters (either before or
+                    after ^) are \Q\E or \E or space or tab in extended-more
+                    mode, we skip them too. This makes for compatibility
+                    with Perl. *)
+                 let negate_class = ref false in
+                 let broke = ref false in
+                 while (not !broke) && !ptr < cx.ptrend do
+                   c := getcharinctest ();
+                   if Int.equal !c 0x5c (* CHAR_BACKSLASH *) then
+                     if !ptr < cx.ptrend && Char.equal pat.[!ptr] 'E' then
+                       incr ptr
+                     else if
+                       cx.ptrend - !ptr >= 3 && strncmp_c8_eq pat !ptr "Q\\E" 3
+                     then ptr := !ptr + 3
+                     else broke := true
+                   else if
+                     (not (Int.equal (!options land Options.extended_more) 0))
+                     && (Int.equal !c 0x20 || Int.equal !c 0x09)
+                     (* Note: just these two *)
+                   then ()
+                   else if (not !negate_class) && Int.equal !c (Char.code '^')
+                   then negate_class := true
+                   else broke := true
+                 done;
+
+                 (* pcre2_compile.c:3574-3582 — now the real contents of the
+                    class; c has the first "real" character. Empty classes
+                    are permitted only if the option is set. Note the C
+                    tests cb->external_options, not the (?i)-tracked local
+                    options. *)
+                 if
+                   Int.equal !c (Char.code ']')
+                   && not
+                        (Int.equal
+                           (cx.external_options land Options.allow_empty_class)
+                           0)
+                 then (
+                   buf.(!pp) <-
+                     (if !negate_class then meta_class_empty_not
+                      else meta_class_empty);
+                   incr pp (* C: break — end of class processing *))
+                 else (
+                   (* Process a non-empty class
+                      (pcre2_compile.c:3584-3587). *)
+                   buf.(!pp) <-
+                     (if !negate_class then meta_class_not else meta_class);
+                   incr pp;
+                   let class_range_state = ref range_no in
+
+                   (* pcre2_compile.c:3743-3766 — the CLASS_LITERAL label:
+                      handle a literal character, tracking whether values
+                      are literal or escaped for range handling (the
+                      EBCDIC-motivated state machine described at
+                      pcre2_compile.c:3589-3595). *)
+                   let class_literal ~char_is_literal =
+                     if Int.equal !class_range_state range_started then (
+                       if Int.equal !c buf.(!pp - 2) then
+                         decr pp (* Optimize one-char range *)
+                       else if buf.(!pp - 2) > !c then (
+                         (* Check range is in order *)
+                         cx.errorcode <- Errors.err8;
+                         failed_back ())
+                       else (
+                         if
+                           (not char_is_literal)
+                           && Int.equal buf.(!pp - 1) meta_range_literal
+                         then buf.(!pp - 1) <- meta_range_escaped;
+                         parsed_literal !c);
+                       class_range_state := range_no)
+                     else (
+                       (* Potential start of range *)
+                       class_range_state :=
+                         if char_is_literal then range_ok_literal
+                         else range_ok_escaped;
+                       parsed_literal !c)
+                   in
+
+                   (* pcre2_compile.c:3597-3904 — loop for the contents of
+                      the class. Every non-failing path through the body
+                      falls through to the shared CLASS_CONTINUE tail at the
+                      bottom of the loop. *)
+                   let class_break = ref false in
+                   while not !class_break do
+                     if !inescq then
+                       if
+                         (* pcre2_compile.c:3601-3614 — inside \Q...\E
+                            everything is literal except \E. char_is_literal
+                            is TRUE here (set at the C loop head). *)
+                         Int.equal !c 0x5c (* CHAR_BACKSLASH *)
+                         && !ptr < cx.ptrend
+                         && Char.equal pat.[!ptr] 'E'
+                       then (
+                         inescq := false (* Reset literal state *);
+                         incr ptr (* Skip the 'E'; goto CLASS_CONTINUE *))
+                       else class_literal ~char_is_literal:true
+                         (* goto CLASS_LITERAL *)
+                     else if
+                       (* pcre2_compile.c:3616-3620 — skip over space and
+                          tab (only) in extended-more mode. *)
+                       (not (Int.equal (!options land Options.extended_more) 0))
+                       && (Int.equal !c 0x20 || Int.equal !c 0x09)
+                     then () (* goto CLASS_CONTINUE *)
+                     else if
+                       (* pcre2_compile.c:3622-3632 — handle POSIX class
+                          names. Perl allows a negation extension of the
+                          form [:^name:]. A square bracket that doesn't
+                          match the syntax is treated as a literal. We also
+                          recognize the POSIX constructions [.ch.] and
+                          [=ch=] ("collating elements") and fault them, as
+                          Perl 5.6 and 5.8 do. *)
+                       Int.equal !c (Char.code '[')
+                       && cx.ptrend - !ptr >= 3
+                       && (Char.equal pat.[!ptr] ':'
+                          || Char.equal pat.[!ptr] '.'
+                          || Char.equal pat.[!ptr] '=')
+                       && check_posix_syntax cx !ptr tempptr
+                     then (
+                       let posix_negate = ref false in
+
+                       (* pcre2_compile.c:3637-3646 — Perl treats a hyphen
+                          before a POSIX class as a literal, not the start
+                          of a range. However, it gives a warning in its
+                          warning mode. PCRE does not have a warning mode,
+                          so we give an error, because this is likely an
+                          error on the user's part. *)
+                       if Int.equal !class_range_state range_started then (
+                         cx.errorcode <- Errors.err50;
+                         raise_notrace Goto_failed);
+
+                       (* pcre2_compile.c:3648-3652 *)
+                       if not (Char.equal pat.[!ptr] ':') then (
+                         cx.errorcode <- Errors.err13;
+                         failed_back ());
+
+                       (* pcre2_compile.c:3654-3658 — if ( *(++ptr) == '^').
+                          Safe: check_posix_syntax proved a terminator
+                          sequence at tempptr >= ptr + 1, so ptr + 1 is in
+                          bounds. *)
+                       incr ptr;
+                       if Char.equal pat.[!ptr] '^' then (
+                         posix_negate := true;
+                         incr ptr);
+
+                       (* pcre2_compile.c:3660-3666 *)
+                       let posix_class =
+                         check_posix_name cx !ptr (!tempptr - !ptr)
+                       in
+                       if posix_class < 0 then (
+                         cx.errorcode <- Errors.err30;
+                         raise_notrace Goto_failed);
+                       ptr := !tempptr + 2;
+
+                       (* pcre2_compile.c:3668-3679 — Perl treats a hyphen
+                          after a POSIX class as a literal, not the start
+                          of a range, warning unless the hyphen is the last
+                          character in the class. PCRE gives an error. *)
+                       if
+                         !ptr < cx.ptrend - 1
+                         && Char.equal pat.[!ptr] '-'
+                         && not (Char.equal pat.[!ptr + 1] ']')
+                       then (
+                         cx.errorcode <- Errors.err50;
+                         raise_notrace Goto_failed);
+
+                       (* pcre2_compile.c:3681-3687 — set "a hyphen is not
+                          the start of a range" for the -] case, and also
+                          in case the POSIX class is followed by \E or \Q\E
+                          (possibly repeated) and *then* a hyphen. *)
+                       class_range_state := range_no;
+
+                       (* pcre2_compile.c:3689-3722 — when PCRE2_UCP is
+                          set, unless PCRE2_EXTRA_ASCII_POSIX is set, some
+                          of the POSIX classes are converted to use Unicode
+                          properties \p or \P or, in one case, \h or \H
+                          (via posix_substitutes). A negative type with a
+                          zero value falls through to behave like a non-UCP
+                          POSIX class. SUPPORT_UNICODE is defined in the
+                          reference configuration, so this block is always
+                          compiled. *)
+                       let ucp_done =
+                         if
+                           (not (Int.equal (!options land Options.ucp) 0))
+                           && Int.equal
+                                (!xoptions land Options.extra_ascii_posix)
+                                0
+                           && not
+                                ((not
+                                    (Int.equal
+                                       (!xoptions land Options.extra_ascii_digit)
+                                       0))
+                                && (Int.equal posix_class pc_digit
+                                   || Int.equal posix_class pc_xdigit))
+                         then
+                           let ptype = posix_substitutes.(2 * posix_class) in
+                           let pvalue =
+                             posix_substitutes.((2 * posix_class) + 1)
+                           in
+                           if ptype >= 0 then (
+                             buf.(!pp) <-
+                               (meta_escape
+                               + if !posix_negate then esc_big_p else esc_p);
+                             incr pp;
+                             buf.(!pp) <- (ptype lsl 16) lor pvalue;
+                             incr pp;
+                             true (* goto CLASS_CONTINUE *))
+                           else if not (Int.equal pvalue 0) then (
+                             buf.(!pp) <-
+                               (meta_escape
+                               + if !posix_negate then esc_big_h else esc_h);
+                             incr pp;
+                             true (* goto CLASS_CONTINUE *))
+                           else false (* Fall through *)
+                         else false
+                       in
+
+                       (* pcre2_compile.c:3724-3727 — non-UCP POSIX
+                          class. *)
+                       if not ucp_done then (
+                         buf.(!pp) <-
+                           (if !posix_negate then meta_posix_neg else meta_posix);
+                         incr pp;
+                         buf.(!pp) <- posix_class;
+                         incr pp))
+                     else if
+                       (* pcre2_compile.c:3730-3737 — handle potential
+                          start of range. *)
+                       Int.equal !c (Char.code '-')
+                       && !class_range_state >= range_ok_escaped
+                     then (
+                       buf.(!pp) <-
+                         (if Int.equal !class_range_state range_ok_literal then
+                            meta_range_literal
+                          else meta_range_escaped);
+                       incr pp;
+                       class_range_state := range_started)
+                     else if not (Int.equal !c 0x5c (* CHAR_BACKSLASH *)) then
+                       (* pcre2_compile.c:3739-3741 — handle a literal
+                          character. *)
+                       class_literal ~char_is_literal:true
+                     else (
+                       (* pcre2_compile.c:3769-3787 — handle escapes in a
+                          class. *)
+                       tempptr := !ptr;
+                       let escape =
+                         ref
+                           (check_escape cx ptr c ~options:!options
+                              ~xoptions:!xoptions ~isclass:true (Some cx))
+                       in
+                       if not (Int.equal cx.errorcode 0) then (
+                         if
+                           Int.equal
+                             (!xoptions land Options.extra_bad_escape_is_literal)
+                             0
+                         then raise_notrace Goto_failed;
+                         ptr := !tempptr;
+                         if !ptr >= cx.ptrend then
+                           c := 0x5c (* CHAR_BACKSLASH *)
+                         else c := getcharinctest ()
+                           (* Get character value, increment pointer *);
+                         escape := 0 (* Treat as literal character *));
+
+                       (* pcre2_compile.c:3789-3813 — first switch on the
+                          escape value. *)
+                       if Int.equal !escape 0 then
+                         (* Escaped character code point is in c *)
+                         class_literal ~char_is_literal:false
+                         (* goto CLASS_LITERAL *)
+                       else if Int.equal !escape esc_b then (
+                         c := 0x08 (* CHAR_BS: \b is backspace in a class *);
+                         class_literal ~char_is_literal:false)
+                       else if Int.equal !escape esc_big_q then inescq := true
+                         (* Enter literal mode; goto CLASS_CONTINUE *)
+                       else if Int.equal !escape esc_big_e then ()
+                         (* Ignore orphan \E; goto CLASS_CONTINUE *)
+                       else if
+                         Int.equal !escape esc_big_b
+                         || Int.equal !escape esc_big_r
+                         || Int.equal !escape esc_big_x
+                       then (
+                         (* Always an error in a class *)
+                         cx.errorcode <- Errors.err7;
+                         decr ptr;
+                         raise_notrace Goto_failed)
+                       else (
+                         (* pcre2_compile.c:3815-3825 — the second part of
+                            a range can be a single-character escape
+                            sequence (detected above), but not any of the
+                            other escapes. Perl treats a hyphen as a
+                            literal in such circumstances but warns; PCRE
+                            faults it. *)
+                         if Int.equal !class_range_state range_started then (
+                           cx.errorcode <- Errors.err50;
+                           raise_notrace Goto_failed (* Always an error here *));
+
+                         (* pcre2_compile.c:3827-3881 — of the remaining
+                            escapes, only those that define characters are
+                            allowed in a class. None may start a range. *)
+                         class_range_state := range_no;
+                         if Int.equal !escape esc_big_n then (
+                           cx.errorcode <- Errors.err71;
+                           raise_notrace Goto_failed)
+                         else if
+                           Int.equal !escape esc_big_h
+                           || Int.equal !escape esc_h
+                           || Int.equal !escape esc_big_v
+                           || Int.equal !escape esc_v
+                         then (
+                           buf.(!pp) <- meta_escape + !escape;
+                           incr pp)
+                         else if
+                           Int.equal !escape esc_d
+                           || Int.equal !escape esc_big_d
+                           || Int.equal !escape esc_s
+                           || Int.equal !escape esc_big_s
+                           || Int.equal !escape esc_w
+                           || Int.equal !escape esc_big_w
+                         then
+                           (* These escapes may be converted to Unicode
+                              property tests when PCRE2_UCP is set. *)
+                           pp :=
+                             handle_escdsw cx !escape !pp ~options:!options
+                               ~xoptions:!xoptions
+                         else if
+                           Int.equal !escape esc_big_p
+                           || Int.equal !escape esc_p
+                         then (
+                           (* pcre2_compile.c:3857-3875 — explicit Unicode
+                              property matching needs get_ucp(): deferred
+                              to M7 with the freestanding \p arm
+                              (pcre2_compile.c:3327-3346). *)
+                           cx.errorcode <- err_deferred;
+                           raise_notrace Goto_failed)
+                         else (
+                           (* All others are not allowed in a class *)
+                           cx.errorcode <- Errors.err7;
+                           decr ptr;
+                           raise_notrace Goto_failed);
+
+                         (* pcre2_compile.c:3883-3891 — Perl gives a
+                            warning unless a following hyphen is the last
+                            character in the class. PCRE throws an
+                            error. *)
+                         if
+                           !ptr < cx.ptrend - 1
+                           && Char.equal pat.[!ptr] '-'
+                           && not (Char.equal pat.[!ptr + 1] ']')
+                         then (
+                           cx.errorcode <- Errors.err50;
+                           raise_notrace Goto_failed)));
+
+                     (* CLASS_CONTINUE: pcre2_compile.c:3894-3903 — proceed
+                        to next thing in the class. *)
+                     if !ptr >= cx.ptrend then (
+                       cx.errorcode <- Errors.err6;
+                       (* Missing terminating ']' *)
+                       raise_notrace Goto_failed);
+                     c := getcharinctest ();
+                     if Int.equal !c (Char.code ']') && not !inescq then
+                       class_break := true
+                   done;
+
+                   (* pcre2_compile.c:3906-3915 — -] at the end of a class
+                      is a literal '-'. *)
+                   if Int.equal !class_range_state range_started then (
+                     buf.(!pp - 1) <- Char.code '-';
+                     class_range_state := range_no);
+                   buf.(!pp) <- meta_class_end;
+                   incr pp)
            | '(' ->
                (* ---- Opening parenthesis ---- pcre2_compile.c:3918-3921 *)
                if !ptr >= cx.ptrend then unclosed_parenthesis ();
@@ -3420,6 +3921,7 @@ let () =
 let () =
   let run_parse ?(options = 0) ?(extra = 0) pat =
     let cx = make_context pat in
+    cx.external_options <- options (* pcre2_compile.c:10254 *);
     cx.extra_options <- extra;
     allocate_parsed_pattern cx ~options;
     let hlb = ref false in
@@ -3617,12 +4119,125 @@ let () =
       meta_end;
     |];
 
+  (* Character classes (parse_regex B). Each expected stream / error
+     offset below was traced against pcre2_compile.c:3493-3915. *)
+  expect "[abc]" [| meta_class; 0x61; 0x62; 0x63; meta_class_end; meta_end |];
+  expect "[^a-z]"
+    [|
+      meta_class_not; 0x61; meta_range_literal; 0x7a; meta_class_end; meta_end;
+    |];
+  (* ]-as-first-char literal rule vs PCRE2_ALLOW_EMPTY_CLASS (the check is
+     on cb->external_options). *)
+  expect "[]a]" [| meta_class; 0x5d; 0x61; meta_class_end; meta_end |];
+  expect ~options:Options.allow_empty_class "[]a]"
+    [| meta_class_empty; 0x61; 0x5d; meta_end |];
+  expect ~options:Options.allow_empty_class "[^]"
+    [| meta_class_empty_not; meta_end |];
+  (* -] at the end of a class is a literal '-'; [a-a] optimizes to a single
+     character; extended-more skips spaces inside classes. *)
+  expect "[a-]" [| meta_class; 0x61; 0x2d; meta_class_end; meta_end |];
+  expect "[a-a]" [| meta_class; 0x61; meta_class_end; meta_end |];
+  expect ~options:Options.extended_more "[ a b]"
+    [| meta_class; 0x61; 0x62; meta_class_end; meta_end |];
+  (* \Q..\E inside a class; \b is backspace in a class. *)
+  expect "[\\Qa]\\E]" [| meta_class; 0x61; 0x5d; meta_class_end; meta_end |];
+  expect "[\\b]" [| meta_class; 0x08; meta_class_end; meta_end |];
+  (* Escaped range endpoints use META_RANGE_ESCAPED, whether the escape is
+     the start or (converting META_RANGE_LITERAL) the end. *)
+  expect "[\\x41-\\x5a]"
+    [| meta_class; 0x41; meta_range_escaped; 0x5a; meta_class_end; meta_end |];
+  expect "[A-\\x5a]"
+    [| meta_class; 0x41; meta_range_escaped; 0x5a; meta_class_end; meta_end |];
+  (* Class-specific escapes: \d via handle_escdsw; \h emitted directly. *)
+  expect "[\\d\\h]"
+    [|
+      meta_class;
+      meta_escape + esc_d;
+      meta_escape + esc_h;
+      meta_class_end;
+      meta_end;
+    |];
+  (* POSIX class items, plain and negated; the UCP substitutions from
+     posix_substitutes ([:alpha:] -> \p{L}, [:blank:] -> \h, [:ascii:]
+     falls through) and the ASCII-forcing extra options. *)
+  expect "[[:alpha:]]" [| meta_class; meta_posix; 0; meta_class_end; meta_end |];
+  expect "[[:^digit:]]"
+    [| meta_class; meta_posix_neg; pc_digit; meta_class_end; meta_end |];
+  expect ~options:Options.ucp "[[:alpha:]]"
+    [|
+      meta_class;
+      meta_escape + esc_p;
+      (Opcodes.pt_gc lsl 16) lor Ucp.ucp_l;
+      meta_class_end;
+      meta_end;
+    |];
+  expect ~options:Options.ucp "[[:^alpha:]]"
+    [|
+      meta_class;
+      meta_escape + esc_big_p;
+      (Opcodes.pt_gc lsl 16) lor Ucp.ucp_l;
+      meta_class_end;
+      meta_end;
+    |];
+  expect ~options:Options.ucp "[[:blank:]]"
+    [| meta_class; meta_escape + esc_h; meta_class_end; meta_end |];
+  expect ~options:Options.ucp "[[:ascii:]]"
+    [| meta_class; meta_posix; 4; meta_class_end; meta_end |];
+  expect ~options:Options.ucp ~extra:Options.extra_ascii_digit "[[:digit:]]"
+    [| meta_class; meta_posix; pc_digit; meta_class_end; meta_end |];
+  (* [[:<:]] and [[:>:]] become \b(?=\w) and \b(?<=\w). *)
+  expect "[[:<:]]"
+    [|
+      meta_escape + esc_b;
+      meta_lookahead;
+      meta_escape + esc_w;
+      meta_ket;
+      meta_end;
+    |];
+  (* Class error sites: ERR6 missing ], ERR8 range out of order, ERR7 bad
+     escape in class, ERR71 \N, ERR12/ERR13 top-level POSIX items, ERR13
+     collating elements, ERR30 unknown POSIX name, ERR50 invalid ranges
+     around POSIX items and type escapes. *)
+  expect_err "[" Errors.err6 1;
+  expect_err "[abc" Errors.err6 4;
+  expect_err "[z-a]" Errors.err8 3;
+  expect_err "[\\B]" Errors.err7 2;
+  expect_err "[\\A]" Errors.err7 2;
+  expect_err "[\\N]" Errors.err71 3;
+  expect_err "[:alpha:]" Errors.err12 0;
+  expect_err "[=ch=]" Errors.err13 0;
+  expect_err "[a[.ch.]]" Errors.err13 2;
+  expect_err "[[:foo:]]" Errors.err30 3;
+  expect_err "[a-[:alpha:]]" Errors.err50 4;
+  expect_err "[[:alpha:]-a]" Errors.err50 10;
+  expect_err "[\\d-x]" Errors.err50 3;
+  expect_err "[a-\\d]" Errors.err50 5;
+  (* \p inside a class defers to M7 like the freestanding arm. *)
+  expect_err "[\\p{L}]" err_deferred 3;
+
+  (* [[:>:]] also sets the has_lookbehind flag and stores a zero offset. *)
+  (let cx = make_context "[[:>:]]" in
+   allocate_parsed_pattern cx ~options:0;
+   let hlb = ref false in
+   let rc = parse_regex cx ~options:0 hlb in
+   assert (Int.equal rc 0);
+   assert !hlb;
+   Array.iteri
+     (fun i v -> assert (Int.equal cx.parsed_pattern.(i) v))
+     [|
+       meta_escape + esc_b;
+       meta_lookbehind;
+       0;
+       meta_escape + esc_w;
+       meta_ket;
+       meta_end;
+     |]);
+
   (* Deferred arms fail loudly with the placeholder code (never a real
      PCRE2 error number). *)
   assert (err_deferred > 201);
   expect_err "a*" err_deferred 2 (* quantifiers: parse_regex C *);
   expect_err "a{2,3}" err_deferred 6 (* quantifiers: parse_regex C *);
-  expect_err "[a]" err_deferred 1 (* classes: parse_regex B *);
   expect_err "(?<n>a)" err_deferred 2 (* named groups: parse_regex C *);
   expect_err "(?=a)" err_deferred 2 (* lookaheads: M4 *);
   expect_err "(?>a)" err_deferred 2 (* atomic groups: M4 *);
