@@ -781,12 +781,12 @@ type named_group = {
    fills up; see the DEFINE_NAME code in parse_regex). *)
 let named_group_list_size = 20
 
-(* pcre2_internal.h:490-492 — newline-convention types. NLTYPE_ANY/ANYCRLF
-   dispatch to PRIV(is_newline) (pcre2_newline.c), which is the newline.ml
-   chunk; the constants live here until that module lands. *)
-let nltype_fixed = 0 (* Newline is a fixed length string *)
-let nltype_any = 1 (* Newline is any Unicode line ending *)
-let nltype_anycrlf = 2 (* Newline is CR, LF, or CRLF *)
+(* pcre2_internal.h:490-492 — newline-convention types, owned by Newline
+   (the pcre2_newline.c module); re-exported here for the parse/compile
+   users of cb->nltype. *)
+let nltype_fixed = Newline.nltype_fixed (* Newline is a fixed length string *)
+let nltype_any = Newline.nltype_any (* Newline is any Unicode line ending *)
+let nltype_anycrlf = Newline.nltype_anycrlf (* Newline is CR, LF, or CRLF *)
 
 (* pcre2.h.generic:482 — PCRE2_UNSET is ~(PCRE2_SIZE)0.
    DEVIATION: pattern offsets are OCaml ints here; max_int plays the same
@@ -884,56 +884,21 @@ let make_context (pattern : string) : parse_context =
 (* pcre2_internal.h:494-506 — IS_NEWLINE(p), with NLBLOCK = cb and
    PSEND = end_pattern as pcre2_compile.c sets them up. The non-FIXED arm
    is the macro's `(p) < PSEND && PRIV(is_newline)(p, nltype, PSEND,
-   &nllen, utf)` with PRIV(is_newline) (pcre2_newline.c:78-145) inlined
-   for this parse-time check; like the C, it writes the matched newline's
-   length into cx.nllen (the caller advances by it). This is the 8-bit
-   NON-UTF instantiation: parse cannot run in UTF mode until M6 (the
-   pcre2_compile driver defers UTF before parse_regex), so c is always a
-   single code unit — the GETCHAR decode (pcre2_newline.c:85) and the
-   utf-dependent arms (NEL length 2, U+2028/U+2029 length 3,
-   pcre2_newline.c:123-131) are unreachable until utf.ml lands. The
-   match-phase newline.ml chunk (pcre2_newline.c over subjects) should
-   consolidate is_newline/was_newline; this stays the compile-side view. *)
+   &nllen, utf)`, delegating to Newline.is_newline
+   (pcre2_newline.c:78-145); like the C, which passes &(cb->nllen), the
+   matched newline's length is written into cx.nllen only on a TRUE return
+   (the caller advances by it). utf is false: parse cannot run in UTF mode
+   until M6 (the pcre2_compile driver defers UTF before parse_regex). The
+   FIXED arm is compared inline by the macro itself — PRIV(is_newline)
+   never sees NLTYPE_FIXED — so it stays here, below. *)
 let is_newline_at (cx : parse_context) (p : int) : bool =
   if not (Int.equal cx.nltype nltype_fixed) then
     p < cx.ptrend
     &&
-    let c = Char.code cx.pattern.[p] in
-    if Int.equal cx.nltype nltype_anycrlf then
-      (* pcre2_newline.c:91-103 — NLTYPE_ANYCRLF *)
-      if Int.equal c 0x0a (* CHAR_LF *) then (
-        cx.nllen <- 1;
-        true)
-      else if Int.equal c 0x0d (* CHAR_CR *) then (
-        (* pcre2_newline.c:98 — ptr < endptr - 1 && ptr[1] == CHAR_LF *)
-        cx.nllen <-
-          (if
-             p < cx.ptrend - 1 && Int.equal (Char.code cx.pattern.[p + 1]) 0x0a
-           then 2
-           else 1);
-        true)
-      else false
-    else if
-      (* pcre2_newline.c:107-144 — NLTYPE_ANY. Non-UTF 8-bit: LF, VT, FF,
-         CR(LF) and NEL (0x85, length 1); 0x2028/0x2029 cannot match a
-         single code unit. *)
-      Int.equal c 0x0a (* CHAR_LF *)
-      || Int.equal c 0x0b (* CHAR_VT *)
-      || Int.equal c 0x0c (* CHAR_FF *)
-    then (
-      cx.nllen <- 1;
-      true)
-    else if Int.equal c 0x0d (* CHAR_CR *) then (
-      (* pcre2_newline.c:119 *)
-      cx.nllen <-
-        (if p < cx.ptrend - 1 && Int.equal (Char.code cx.pattern.[p + 1]) 0x0a
-         then 2
-         else 1);
-      true)
-    else if Int.equal c 0x85 (* CHAR_NEL *) then (
-      cx.nllen <- 1 (* pcre2_newline.c:125 — utf? 2 : 1, and utf is false *);
-      true)
-    else false
+    let len = ref 0 in
+    let hit = Newline.is_newline cx.pattern cx.nltype p cx.ptrend len false in
+    if hit then cx.nllen <- !len;
+    hit
   else
     p <= cx.ptrend - cx.nllen
     && Int.equal (Char.code cx.pattern.[p]) cx.nl0
