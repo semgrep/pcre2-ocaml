@@ -444,7 +444,13 @@ let grow (a : t) ~(n : int) : int =
       let new_frames =
         Array.make (newsize / a.frame_size_bytes * a.frame_size_ints) 0
       in
-      Array.blit a.frames 0 new_frames 0 (n * a.frame_size_ints);
+      (* pcre2_match.c:703 — memcpy(new, match_data->heapframes,
+         usedsize): copy the used prefix. Manual int loop rather than
+         Array.blit to skip the per-element caml_modify barrier (§8);
+         bounds-checked accesses — this path is cold. *)
+      for i = 0 to (n * a.frame_size_ints) - 1 do
+        new_frames.(i) <- a.frames.(i)
+      done;
       a.frames <- new_frames;
       a.heapframes_size <- newsize;
       0
@@ -472,19 +478,36 @@ let push (a : t) (f : int) : int =
     if (n + 1) * a.frame_size_bytes >= a.heapframes_size then grow a ~n else 0
   in
   if rc < 0 then rc
-  else (
+  else
     (* pcre2_match.c:749-751 — memcpy of frame_copy_size bytes from F's
        eptr field to N's eptr field, where frame_copy_size = frame_size -
-       offsetof(heapframe, eptr) (:642). *)
-    Array.blit a.frames
-      ((f * a.frame_size_ints) + slot_eptr)
-      a.frames
-      ((n * a.frame_size_ints) + slot_eptr)
-      (a.frame_size_ints - slot_eptr);
+       offsetof(heapframe, eptr) (:642). A manual int-copy loop, NOT
+       Array.blit: blit into a major-heap array runs the caml_modify
+       write barrier per element even for immediates, and this copy is
+       the matcher's hottest write site (§8; measured 20-35% of hot
+       benches). safe: both spans lie inside frames f and n = f + 1, and
+       (n + 1) * frame_size_ints <= Array.length a.frames — if the guard
+       above was false, (n + 1) * frame_size_bytes < heapframes_size, so
+       n + 1 <= heapframes_size / frame_size_bytes; if it was true, grow
+       succeeded, and its `newsize - usedsize < frame_size_bytes` check
+       guarantees (n + 1) * frame_size_bytes <= the new heapframes_size,
+       so again n + 1 <= heapframes_size / frame_size_bytes. In every
+       arena state Array.length a.frames >= (heapframes_size /
+       frame_size_bytes) * frame_size_ints: create sizes fresh arenas
+       exactly so and reuses only longer ones; grow allocates exactly so.
+       f >= 0 by the caller contract (an existing frame index: 0 or a
+       value previously returned by push). *)
+    let fr = a.frames in
+    let src = (f * a.frame_size_ints) + slot_eptr in
+    let dst = (n * a.frame_size_ints) + slot_eptr in
+    let len = a.frame_size_ints - slot_eptr in
+    for i = 0 to len - 1 do
+      Array.unsafe_set fr (dst + i) (Array.unsafe_get fr (src + i))
+    done;
     (* pcre2_match.c:753 — N->rdepth = Frdepth + 1 *)
     a.frames.((n * a.frame_size_ints) + slot_rdepth) <-
       a.frames.((f * a.frame_size_ints) + slot_rdepth) + 1;
-    n)
+    n
 
 (* ---------- Inline sanity checks (module-initialization asserts) ---------- *)
 

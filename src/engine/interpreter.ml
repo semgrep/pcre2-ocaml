@@ -983,13 +983,46 @@ let rec rmatch (st : match_state) (f : int) (ra : int) (rb : int)
      group_frame_type local is an explicit parameter here: RMATCH sites
      that do not set it pass 0 (the C resets it to 0 in NEW_FRAME,
      772). *)
-  a.Frames.frames.(Frames.base a f + Frames.slot_return_id) <- rb;
-  (* pcre2_match.c:662-754 — MATCH_RECURSE: Frames.push grows the
-     vector under the heap limit (667-712, returning
-     error_heaplimit/error_nomemory as values), copies the eptr..ovector
-     region (749-751) and sets N->rdepth = Frdepth + 1 (753). *)
-  let n = Frames.push a f in
-  if n < 0 then n else (new_frame [@tailcall]) st n ra group_frame_type
+  (* safe: f is a valid frame index — 0 (match_ entry) or an index
+     produced by Frames.push / walked back by [backtrack], all satisfying
+     (f + 1) * frame_size_ints <= Array.length frames (the arena-capacity
+     bound proven at Frames.push's copy loop). *)
+  Array.unsafe_set a.Frames.frames (Frames.base a f + Frames.slot_return_id) rb;
+  (* pcre2_match.c:662-754 — MATCH_RECURSE: set up the new frame N just
+     above F. The full-vector test (667-668, the C's `N + frame_size >=
+     frames_top` in simulated bytes) is Frames.push's guard, inlined here
+     so the overwhelmingly common has-room case runs without a call (§8);
+     the copy loop below transcribes the same pcre2_match.c:749-753 as
+     Frames.push, which stays the canonical implementation and handles
+     the cold grow path (667-712, returning error_heaplimit /
+     error_nomemory as values). *)
+  let n = f + 1 in
+  if (n + 1) * a.Frames.frame_size_bytes >= a.Frames.heapframes_size then
+    (* Cold path: vector full — Frames.push re-evaluates the same guard,
+       grows under the heap limit and copies. *)
+    let n2 = Frames.push a f in
+    if n2 < 0 then n2 else (new_frame [@tailcall]) st n2 ra group_frame_type
+  else
+    (* pcre2_match.c:749-751 — memcpy of frame_copy_size bytes from F's
+       eptr field to N's eptr field (frames.ml push, fast path). safe:
+       the guard above is false, so (n + 1) * frame_size_bytes <
+       heapframes_size, hence n + 1 <= heapframes_size / frame_size_bytes
+       and (n + 1) * frame_size_ints <= Array.length fr (the arena-
+       capacity bound proven at Frames.push's copy loop); both spans lie
+       inside frames f = n - 1 >= 0 and n. *)
+    let fr = a.Frames.frames in
+    let fsz = a.Frames.frame_size_ints in
+    let src = (f * fsz) + Frames.slot_eptr in
+    let dst = (n * fsz) + Frames.slot_eptr in
+    let len = fsz - Frames.slot_eptr in
+    for i = 0 to len - 1 do
+      Array.unsafe_set fr (dst + i) (Array.unsafe_get fr (src + i))
+    done;
+    (* pcre2_match.c:753 — N->rdepth = Frdepth + 1 (same bound). *)
+    Array.unsafe_set fr
+      ((n * fsz) + Frames.slot_rdepth)
+      (Array.unsafe_get fr ((f * fsz) + Frames.slot_rdepth) + 1);
+    (new_frame [@tailcall]) st n ra group_frame_type
 
 and new_frame (st : match_state) (f : int) (ecode : int)
     (group_frame_type : int) : int =
@@ -997,22 +1030,28 @@ and new_frame (st : match_state) (f : int) (ecode : int)
   let a = st.arena in
   let fr = a.Frames.frames in
   let fb = Frames.base a f in
+  (* safe (every unsafe_get/set on fr below): f is 0 (match_ entry) or
+     the index just produced by Frames.push / rmatch's inlined fast path,
+     so fb + slot < (f + 1) * frame_size_ints <= Array.length fr for
+     every header slot (the arena-capacity bound proven at Frames.push's
+     copy loop). *)
   (* pcre2_match.c:758-761 — NEW_FRAME: type, starting code pointer,
      and the default backtrack of one frame (Fback_frame = frame_size in
      C bytes; frame units here, frames.ml DEVIATION). *)
-  fr.(fb + Frames.slot_group_frame_type) <- group_frame_type;
-  fr.(fb + Frames.slot_ecode) <- ecode;
-  fr.(fb + Frames.slot_back_frame) <- 1;
+  Array.unsafe_set fr (fb + Frames.slot_group_frame_type) group_frame_type;
+  Array.unsafe_set fr (fb + Frames.slot_ecode) ecode;
+  Array.unsafe_set fr (fb + Frames.slot_back_frame) 1;
   (* pcre2_match.c:763-773 — if this is a special type of group frame,
      remember its offset (frame index here, frames.ml DEVIATION) for
      quick access at the end of the group; if a recursion, set a new
      current recursion value. The C's group_frame_type = 0 reset is
      implicit: the local is per-call. *)
   if not (Int.equal group_frame_type 0) then (
-    fr.(fb + Frames.slot_last_group_offset) <- f;
+    Array.unsafe_set fr (fb + Frames.slot_last_group_offset) f;
     if Int.equal (Frames.gf_idmask group_frame_type) Frames.gf_recurse then
-      fr.(fb + Frames.slot_current_recurse) <-
-        Frames.gf_datamask group_frame_type);
+      Array.unsafe_set fr
+        (fb + Frames.slot_current_recurse)
+        (Frames.gf_datamask group_frame_type));
   (* pcre2_match.c:776-783 — first check that we haven't recorded too
      many backtracks (search tree too large), or exceeded the recursive
      depth limit (used too many backtracking frames). The C's
@@ -1020,8 +1059,8 @@ and new_frame (st : match_state) (f : int) (ecode : int)
   let count = mb.match_call_count in
   mb.match_call_count <- count + 1;
   if count >= mb.match_limit then Errors.error_matchlimit
-  else if fr.(fb + Frames.slot_rdepth) >= mb.match_limit_depth then
-    Errors.error_depthlimit
+  else if Array.unsafe_get fr (fb + Frames.slot_rdepth) >= mb.match_limit_depth
+  then Errors.error_depthlimit
   else (dispatch [@tailcall]) st f
 
 and dispatch (st : match_state) (f : int) : int =
@@ -1034,12 +1073,21 @@ and dispatch (st : match_state) (f : int) : int =
   (* pcre2_match.c:790-798 — the main processing loop: Fop =
      (uint8_t)( *Fecode); switch (Fop). Arms that `break` in the C set
      slot_ecode and tail-call [dispatch]; RRETURN(x) is
-     (backtrack [@tailcall]) st f x. Reading the code unit is in bounds:
-     the program is OP_END-terminated (mb invariant) and the OP_END arm
-     returns without advancing. *)
-  let ecode = fr.(fb + Frames.slot_ecode) in
-  let op = Char.code (Bytes.get mb.start_code ecode) in
-  fr.(fb + Frames.slot_op) <- op;
+     (backtrack [@tailcall]) st f x. *)
+  (* safe: f is a valid frame index — [dispatch] is entered from
+     [new_frame] (same bound: f from Frames.push / rmatch's fast path or
+     0), from arms on the same f, or from [backtrack]-resumed arms on a
+     backtracked-to index (>= 0, below the failing frame; see the proof
+     at [backtrack]) — so fb + slot_ecode/slot_op < (f + 1) *
+     frame_size_ints <= Array.length fr (the arena-capacity bound proven
+     at Frames.push's copy loop). The code-unit read is in bounds:
+     compiled programs are OP_END-terminated, every arm advances ecode to
+     another opcode inside the block (mb.start_code invariant, see the
+     match_block field), and the OP_END arm returns without advancing, so
+     0 <= ecode < Bytes.length mb.start_code. *)
+  let ecode = Array.unsafe_get fr (fb + Frames.slot_ecode) in
+  let op = Char.code (Bytes.unsafe_get mb.start_code ecode) in
+  Array.unsafe_set fr (fb + Frames.slot_op) op;
   (* Arms follow the C switch's source order (port-conventions §2); the
      int literals are pinned against Opcodes constants by the
      module-initialization asserts below. Every STUB is replaced by its
@@ -6440,15 +6488,25 @@ and backtrack (st : match_state) (f : int) (rrc : int) : int =
   let ref_length = st.ref_length in
   let fr = a.Frames.frames in
   let fb = Frames.base a f in
+  (* safe (the unsafe_gets on fr here and at the scrutinee below): f is
+     the valid frame index the failing dispatch ran on ((f + 1) *
+     frame_size_ints <= Array.length fr, the arena-capacity bound proven
+     at Frames.push's copy loop), and the backtracked-to index
+     f - back_frame is >= 0 and < f: rdepth equals the frame index
+     (frame 0 starts at 0, push increments by 1 per frame), so the
+     rdepth-0 exit below guarantees f >= 1, and back_frame is either 1
+     (the [new_frame] default) or f - p for a group frame p on f's chain
+     with 0 <= p < f (the two Fback_frame = F - P seams,
+     pcre2_match.c:5946 and 6024). *)
   (* pcre2_match.c:6470 *)
-  if fr.(fb + Frames.slot_eptr) > mb.last_used_ptr then
-    mb.last_used_ptr <- fr.(fb + Frames.slot_eptr);
+  let bk_eptr = Array.unsafe_get fr (fb + Frames.slot_eptr) in
+  if bk_eptr > mb.last_used_ptr then mb.last_used_ptr <- bk_eptr;
   (* pcre2_match.c:6471 — exit from the top level. *)
-  if Int.equal fr.(fb + Frames.slot_rdepth) 0 then rrc
+  if Int.equal (Array.unsafe_get fr (fb + Frames.slot_rdepth)) 0 then rrc
   else
     (* pcre2_match.c:6472 — backtrack: F = F - Fback_frame (frame units
        here, frames.ml DEVIATION). *)
-    let f = f - fr.(fb + Frames.slot_back_frame) in
+    let f = f - Array.unsafe_get fr (fb + Frames.slot_back_frame) in
     (* pcre2_match.c:6473 — mb->cb->callout_flags |=
        PCRE2_CALLOUT_BACKTRACK: no callout block exists in this port
        (callout_flags is only ever read by an installed callout function,
@@ -6490,7 +6548,9 @@ and backtrack (st : match_state) (f : int) (rrc : int) : int =
          RM222 : 4394 property max    RM223 : 3781 PT_BOOL min
          RM224 : 3762 PT_BIDICL min   RM225 : 3612 PT_SCX min *)
     let fb = Frames.base a f in
-    match fr.(fb + Frames.slot_return_id) with
+    (* safe: 0 <= f < the failing frame's index (proof at this function's
+       head), so fb + slot_return_id is within Array.length fr. *)
+    match Array.unsafe_get fr (fb + Frames.slot_return_id) with
     | 1 ->
         (* L_RM1 (pcre2_match.c:5365-5366) — OP_BRA optimized branch
            walk: the branch failed; move Fecode to the next branch
