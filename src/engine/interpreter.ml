@@ -12,7 +12,10 @@
    family OP_CLASS/OP_NCLASS with resume labels RM23/RM24 (1919-2172),
    the character-type singles OP_ANY..OP_VSPACE (943-989, 2305-2476) and
    the TYPE repeat machinery REPEATTYPE with resume labels RM33/RM34
-   (2651-5005) (all non-UTF/non-UCP arms), the anchors and simple
+   (2651-5005) (all non-UTF/non-UCP arms), the backreference family
+   match_ref and OP_REF/OP_REFI/OP_DNREF/OP_DNREFI with the repeat
+   machinery and resume labels RM20-RM22 (338-481, 4980-5194; non-UTF/
+   non-UCP arms), the anchors and simple
    assertions OP_CIRC(M)/OP_DOLL(M)/OP_SOD/OP_SOM/OP_SET_SOM/OP_EOD/
    OP_EODN/word boundaries (6132-6338, non-UTF/non-UCP arms), the
    bracket/alternation/ket family OP_BRAZERO/OP_BRAMINZERO/OP_SKIPZERO
@@ -451,6 +454,14 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
      >= 0). Preallocated once per match, like [nl_scratch], so the
      dispatch loop stays allocation-free. *)
   let branch_end = ref (-1) in
+  (* pcre2_match.c:613 + 353 — PCRE2_SIZE length: the match()-local that
+     the backreference arms pass to match_ref() as its lengthptr
+     out-parameter (both the C's `length` at 5047 and the block-local
+     `slength`s at 5080/5101/5128/5179 land here). Preallocated once per
+     match, like [nl_scratch], so the dispatch loop stays allocation-free;
+     a single cell suffices because match_ref never re-enters the
+     dispatch loop, so at most one call's result is ever pending. *)
+  let ref_length = ref 0 in
   (* pcre2_match.c:1930 + 2014 — Lbyte_map[fc/8] & (1u << (fc&7)): probe
      the 32-byte class bitmap saved at Lbyte_map_address (temp_sptr[1]).
      In bounds: the map is part of the OP_CLASS/OP_NCLASS item in the
@@ -461,6 +472,124 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
     Char.code
       (Bytes.get mb.start_code (fr.(fb + Frames.slot_temp_sptr_1) + (fc lsr 3)))
     land (1 lsl (fc land 7))
+  in
+  (* Bounds contract shared by the three match_ref compare loops below
+     ([match_ref] establishes it): [p] ranges over the captured substring
+     — p0 = start_subject + Fovector[Loffset] up to (exclusive)
+     start_subject + Fovector[Loffset+1] — whose bounds are former eptr
+     values recorded as eptr - start_subject by the capturing-ket writes
+     (pcre2_match.c:6077-6084), so 0 <= start_subject <= p and, while
+     length > 0, p < start_subject + Fovector[Loffset+1] <= end_subject
+     <= String.length mb.subject. [eptr] starts at Feptr >= 0 (mb
+     invariant). *)
+  (* pcre2_match.c:438-451 — match_ref()'s caseless compare loop, not in
+     UTF or UCP mode: fold both code units through the lcc table.
+     Returns 0 all matched / -1 no match / 1 partial. *)
+  let rec match_ref_ci (p : int) (eptr : int) (length : int) : int =
+    if length <= 0 then 0
+    else if eptr >= mb.end_subject then 1 (* partial match, 443 *)
+    else
+      (* safe: eptr < mb.end_subject <= String.length mb.subject (checked
+         above), eptr >= 0; p in the captured substring (contract above) *)
+      let cc = Char.code (String.unsafe_get mb.subject eptr) in
+      let cp = Char.code (String.unsafe_get mb.subject p) in
+      if not (Int.equal (Chartables.lcc cp) (Chartables.lcc cc)) then -1
+        (* no match, 446-447 *)
+      else (match_ref_ci [@tailcall]) (p + 1) (eptr + 1) (length - 1)
+  in
+  (* pcre2_match.c:460-467 — match_ref()'s caseful compare loop for
+     partial matching: unit by unit, checking the subject end before each
+     unit. *)
+  let rec match_ref_cs_partial (p : int) (eptr : int) (length : int) : int =
+    if length <= 0 then 0
+    else if eptr >= mb.end_subject then 1 (* partial match, 464 *)
+    else if
+      not
+        (Int.equal
+           (* safe: eptr < mb.end_subject <= String.length mb.subject
+              (checked above), eptr >= 0; p in the captured substring
+              (contract above) *)
+           (Char.code (String.unsafe_get mb.subject p))
+           (Char.code (String.unsafe_get mb.subject eptr)))
+    then -1 (* no match, 465 *)
+    else (match_ref_cs_partial [@tailcall]) (p + 1) (eptr + 1) (length - 1)
+  in
+  (* pcre2_match.c:474 — memcmp(p, eptr, CU2BYTES(length)) != 0 as an
+     equality scan (only equality is consulted). Caller checked
+     end_subject - eptr >= length. *)
+  let rec match_ref_memcmp (p : int) (eptr : int) (length : int) : bool =
+    length <= 0
+    || Int.equal
+         (* safe: eptr + length <= mb.end_subject <= String.length
+            mb.subject (caller's 473 check), eptr >= 0; p in the captured
+            substring (contract above) *)
+         (Char.code (String.unsafe_get mb.subject p))
+         (Char.code (String.unsafe_get mb.subject eptr))
+       && (match_ref_memcmp [@tailcall]) (p + 1) (eptr + 1) (length - 1)
+  in
+  (* pcre2_match.c:338-481 — match_ref(): match a back-reference at frame
+     [f]'s Feptr. Called only when it is known that the offset lies
+     within the offsets that have so far been used in the match (or for
+     the unset-group entry check).
+
+     Arguments (360-362): offset = Loffset, the index into the frame
+     ovector; caseless = Lcaseless; f = the frame (the C's F); lengthptr
+     = the out-parameter for the length matched (the per-match
+     [ref_length] cell).
+
+     Returns (355-357): = 0 successful match, number of code units
+     matched written to [lengthptr]; < 0 no match; > 0 partial match. *)
+  let match_ref (f : int) (offset : int) (caseless : bool) (lengthptr : int ref)
+      : int =
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    (* pcre2_match.c:369-380 — deal with an unset group: the default is
+       no match, but there is an option to match an empty string. *)
+    if
+      offset >= fr.(fb + Frames.slot_offset_top)
+      || Int.equal fr.(fb + Frames.slot_ovector + offset) Frames.unset
+    then
+      if not (Int.equal (mb.poptions land Options.match_unset_backref) 0) then (
+        lengthptr := 0;
+        0 (* match *))
+      else -1 (* no match *)
+    else
+      (* pcre2_match.c:382-386 — separate the caseless and UTF cases for
+         speed. *)
+      let eptr = fr.(fb + Frames.slot_eptr) in
+      let p = mb.start_subject + fr.(fb + Frames.slot_ovector + offset) in
+      let length =
+        fr.(fb + Frames.slot_ovector + offset + 1)
+        - fr.(fb + Frames.slot_ovector + offset)
+      in
+      if caseless then (
+        (* pcre2_match.c:390-434 — the SUPPORT_UNICODE utf/ucp fold arm
+           is M6/M7: the OP_REFI/OP_DNREFI dispatch arms return
+           [error_unported] before any match_ref call when utf or ucp is
+           set, so only the non-UTF/UCP arm (438-451) is reachable
+           here. *)
+        let rc = match_ref_ci p eptr length in
+        (* pcre2_match.c:479 — *lengthptr = eptr - eptr_start: the loop
+           advanced eptr one unit per reference unit, so this is exactly
+           [length] in the non-UTF arm. *)
+        if Int.equal rc 0 then lengthptr := length;
+        rc)
+      else if not (Int.equal mb.partial 0) then (
+        (* pcre2_match.c:454-467 — in the caseful case, just compare the
+           code units; when partial matching, do it unit by unit. *)
+        let rc = match_ref_cs_partial p eptr length in
+        if Int.equal rc 0 then lengthptr := length (* 479, as above *);
+        rc)
+      else if
+        (* pcre2_match.c:469-476 — not partial matching. *)
+        mb.end_subject - eptr < length
+      then 1 (* partial, 473 *)
+      else if not (match_ref_memcmp p eptr length) then -1 (* no match, 474 *)
+      else (
+        (* pcre2_match.c:475-480 — eptr += length;
+           *lengthptr = eptr - eptr_start. *)
+        lengthptr := length;
+        0)
   in
 
   (* pcre2_match.c:550-556 + 662-773 + 790-798 + 6462-6501 — the goto
@@ -1188,13 +1317,54 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         (repeattype [@tailcall]) f rep_min.(idx) rep_max.(idx) rep_typ.(idx)
           (ecode + 1)
     | 115 | 116 ->
-        (* OP_DNREF, OP_DNREFI (pcre2_match.c:4994-5008) — STUB: M2
-           backreferences. *)
-        error_unported
+        (* OP_DNREF, OP_DNREFI (pcre2_match.c:4980-5009) — match a back
+           reference, possibly repeatedly, for a duplicated named group:
+           scan the list of groups to which the name refers, and use the
+           first one that is set. Frame temporaries (pcre2_match.c:
+           4988-4992): Lmin = temp_32[0], Lmax = temp_32[1], Lcaseless =
+           temp_32[2], Lstart = temp_sptr[0], Loffset = temp_size. *)
+        let caseless = Int.equal op Opcodes.op_dnrefi in
+        if caseless && (utf || ucp) then
+          (* match_ref's caseless utf/ucp fold (pcre2_match.c:390-434):
+             M6/M7 — gate the whole arm before any state is written, as
+             at OP_CHARI. *)
+          error_unported
+        else (
+          fr.(fb + Frames.slot_temp_32_2) <- (if caseless then 1 else 0)
+          (* Lcaseless, 4996 *);
+          (* pcre2_match.c:4998-5000 *)
+          let count =
+            Compile.get2 mb.start_code (ecode + 1 + Limits.imm2_size)
+          in
+          let slot =
+            Compile.get2 mb.start_code (ecode + 1) * mb.name_entry_size
+          in
+          (* pcre2_match.c:5002-5007 — while (count-- > 0): Loffset for
+             the first set group, or the last examined entry when none is
+             set. The C writes Loffset every iteration; [dnref_scan]
+             returns the same final value, written once. count >= 1 in a
+             compiled program (the reference names at least one group). *)
+          fr.(fb + Frames.slot_temp_size) <-
+            dnref_scan f count slot (* Loffset *);
+          (* goto REF_REPEAT (5009) with Fecode past the item (5000). *)
+          (ref_repeat [@tailcall]) f (ecode + 1 + (2 * Limits.imm2_size)))
     | 113 | 114 ->
-        (* OP_REF, OP_REFI (pcre2_match.c:5011-5220) — STUB: M2
-           backreferences. *)
-        error_unported
+        (* OP_REF, OP_REFI (pcre2_match.c:5011-5015) — match a back
+           reference, possibly repeatedly: a reference to a numbered
+           group or a non-duplicated named group. Frame temporaries as at
+           OP_DNREF (pcre2_match.c:4988-4992). *)
+        let caseless = Int.equal op Opcodes.op_refi in
+        if caseless && (utf || ucp) then
+          (* match_ref's caseless utf/ucp fold: M6/M7 — gate as at
+             OP_DNREFI. *)
+          error_unported
+        else (
+          fr.(fb + Frames.slot_temp_32_2) <- (if caseless then 1 else 0)
+          (* Lcaseless, 5013 *);
+          fr.(fb + Frames.slot_temp_size) <-
+            (Compile.get2 mb.start_code (ecode + 1) lsl 1) - 2
+          (* Loffset, 5014 *);
+          (ref_repeat [@tailcall]) f (ecode + 1 + Limits.imm2_size))
     | 151 ->
         (* OP_BRAZERO (pcre2_match.c:5224-5230) — a possibly-zero repeat
            of a bracket group: try to take the group first. Lnext_ecode =
@@ -2506,6 +2676,236 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
     if Int.equal fr.(fb + Frames.slot_eptr) fr.(fb + Frames.slot_temp_sptr_0)
     then (dispatch [@tailcall]) f
     else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm34 0
+  (* pcre2_match.c:5002-5007 — the OP_DNREF group-list walk: return
+     Loffset for the first group in the list that is set, or for the last
+     examined entry when none is set (the C's while (count-- > 0) loop
+     leaves Loffset on whichever entry it stopped at). GET2(slot, 0) is
+     the group number at the head of a name-table entry. *)
+  and dnref_scan (f : int) (count : int) (slot : int) : int =
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    let loffset = (Compile.get2 mb.name_table slot lsl 1) - 2 (* 5004 *) in
+    if
+      count > 1
+      && not
+           (loffset < fr.(fb + Frames.slot_offset_top)
+           && not
+                (Int.equal fr.(fb + Frames.slot_ovector + loffset) Frames.unset)
+           )
+    then (dnref_scan [@tailcall]) f (count - 1) (slot + mb.name_entry_size)
+    else loffset
+  (* pcre2_match.c:5017-5057 — REF_REPEAT: set up for repetition, or
+     handle the non-repeated case. The repeat opcodes are read from the
+     code FOLLOWING the item, as for the class repeats; [ecode] is the
+     position past the OP_REF/OP_DNREF item (the C's advanced Fecode).
+     The maximum and minimum are kept in the frame temporaries Lmin/Lmax
+     (temp_32[0..1]). *)
+  and ref_repeat (f : int) (ecode : int) : int =
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    let next = Char.code (Bytes.get mb.start_code ecode) in
+    if next >= Opcodes.op_crstar && next <= Opcodes.op_crminquery then (
+      (* pcre2_match.c:5024-5034 — OP_CRSTAR..OP_CRMINQUERY: fc =
+         *Fecode++ - OP_CRSTAR indexes the rep tables. (Unlike the class
+         repeats, no OP_CRPOS forms appear here: possessive ref repeats
+         are compiled as atomic groups.) *)
+      let idx = next - Opcodes.op_crstar in
+      fr.(fb + Frames.slot_temp_32_0) <- rep_min.(idx) (* Lmin *);
+      fr.(fb + Frames.slot_temp_32_1) <- rep_max.(idx) (* Lmax *);
+      fr.(fb + Frames.slot_ecode) <- ecode + 1;
+      (ref_repeat_head [@tailcall]) f rep_typ.(idx))
+    else if
+      Int.equal next Opcodes.op_crrange || Int.equal next Opcodes.op_crminrange
+    then (
+      (* pcre2_match.c:5036-5043 — Lmin = GET2(Fecode, 1); Lmax =
+         GET2(Fecode, 1 + IMM2_SIZE); max 0 => infinity. *)
+      let lmax = Compile.get2 mb.start_code (ecode + 1 + Limits.imm2_size) in
+      fr.(fb + Frames.slot_temp_32_0) <- Compile.get2 mb.start_code (ecode + 1);
+      fr.(fb + Frames.slot_temp_32_1) <-
+        (if Int.equal lmax 0 then uint32_max else lmax);
+      fr.(fb + Frames.slot_ecode) <- ecode + 1 + (2 * Limits.imm2_size);
+      (ref_repeat_head [@tailcall]) f rep_typ.(next - Opcodes.op_crstar))
+    else (
+      (* pcre2_match.c:5045-5056 — default: no repeat follows; match the
+         reference once and continue with the main loop. *)
+      fr.(fb + Frames.slot_ecode) <- ecode;
+      let rrc =
+        match_ref f
+          fr.(fb + Frames.slot_temp_size)
+          (not (Int.equal fr.(fb + Frames.slot_temp_32_2) 0))
+          ref_length
+      in
+      if not (Int.equal rrc 0) then (
+        if rrc > 0 then
+          fr.(fb + Frames.slot_eptr) <- mb.end_subject (* partial, 5050 *);
+        (* CHECK_PARTIAL() (pcre2_match.c:531-535, site 5051) *)
+        let feptr = fr.(fb + Frames.slot_eptr) in
+        let rc =
+          if feptr >= mb.end_subject then scheck_partial mb feptr else 0
+        in
+        if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch)
+      else (
+        fr.(fb + Frames.slot_eptr) <- fr.(fb + Frames.slot_eptr) + !ref_length;
+        (dispatch [@tailcall]) f (* continue, 5055-5056 *)))
+  (* pcre2_match.c:5059-5074 — handle repeated back references. If a set
+     group has length zero, just continue with the main loop, because it
+     matches however many times. For an unset reference, if the minimum
+     is zero, we can also just continue. We can also continue if
+     PCRE2_MATCH_UNSET_BACKREF is set, because this makes unset groups
+     behave as a zero-length group. For any other unset cases, carrying
+     on will result in NOMATCH (the min loop's match_ref fails). *)
+  and ref_repeat_head (f : int) (reptype : int) : int =
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    let loffset = fr.(fb + Frames.slot_temp_size) in
+    if
+      loffset < fr.(fb + Frames.slot_offset_top)
+      && not (Int.equal fr.(fb + Frames.slot_ovector + loffset) Frames.unset)
+    then
+      if
+        Int.equal
+          fr.(fb + Frames.slot_ovector + loffset)
+          fr.(fb + Frames.slot_ovector + loffset + 1)
+      then (dispatch [@tailcall]) f (* zero-length group: continue, 5068 *)
+      else (ref_min [@tailcall]) f 1 reptype
+    else if
+      (* pcre2_match.c:5070-5074 — group is not set. *)
+      Int.equal fr.(fb + Frames.slot_temp_32_0) 0
+      || not (Int.equal (mb.poptions land Options.match_unset_backref) 0)
+    then (dispatch [@tailcall]) f
+    else (ref_min [@tailcall]) f 1 reptype
+  (* pcre2_match.c:5076-5124 — first, ensure the minimum number of
+     matches are present: for (i = 1; i <= Lmin; i++); then dispatch on
+     the repeat strategy. *)
+  and ref_min (f : int) (i : int) (reptype : int) : int =
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if i <= fr.(fb + Frames.slot_temp_32_0) then
+      let rrc =
+        match_ref f
+          fr.(fb + Frames.slot_temp_size)
+          (not (Int.equal fr.(fb + Frames.slot_temp_32_2) 0))
+          ref_length
+      in
+      if not (Int.equal rrc 0) then (
+        if rrc > 0 then
+          fr.(fb + Frames.slot_eptr) <- mb.end_subject (* partial, 5084 *);
+        (* CHECK_PARTIAL() (pcre2_match.c:531-535, site 5085) *)
+        let feptr = fr.(fb + Frames.slot_eptr) in
+        let rc =
+          if feptr >= mb.end_subject then scheck_partial mb feptr else 0
+        in
+        if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch)
+      else (
+        fr.(fb + Frames.slot_eptr) <- fr.(fb + Frames.slot_eptr) + !ref_length;
+        (ref_min [@tailcall]) f (i + 1) reptype)
+    else if
+      (* pcre2_match.c:5091-5093 — if min = max, we are done; they are
+         not both allowed to be zero. *)
+      Int.equal fr.(fb + Frames.slot_temp_32_0) fr.(fb + Frames.slot_temp_32_1)
+    then (dispatch [@tailcall]) f
+    else if Int.equal reptype reptype_min then
+      (* pcre2_match.c:5095-5115 — if minimizing, keep trying and
+         advancing the pointer: the for(;;) starts with RMATCH(Fecode,
+         RM20); the rest of the loop body is the RM20 resume arm in
+         [backtrack]. *)
+      (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm20 0
+    else
+      (* pcre2_match.c:5117-5124 — if maximizing, find the longest string
+         and work backwards, as long as the matched lengths for each
+         iteration are the same: Lstart = Feptr; Flength =
+         Fovector[Loffset+1] - Fovector[Loffset]. In bounds: the maximize
+         phase is only reached for a SET group — [ref_repeat_head]
+         continues past unset groups when Lmin = 0 or under
+         MATCH_UNSET_BACKREF, and otherwise the min loop above NOMATCHes
+         on the unset reference first (Lmin >= 1 there). *)
+      let loffset = fr.(fb + Frames.slot_temp_size) in
+      fr.(fb + Frames.slot_temp_sptr_0) <- fr.(fb + Frames.slot_eptr)
+      (* Lstart *);
+      fr.(fb + Frames.slot_length) <-
+        fr.(fb + Frames.slot_ovector + loffset + 1)
+        - fr.(fb + Frames.slot_ovector + loffset);
+      (ref_max_scan [@tailcall]) f fr.(fb + Frames.slot_temp_32_0) true
+  (* pcre2_match.c:5126-5146 — the maximize scan: for (i = Lmin; i <
+     Lmax; i++), tracking whether every iteration matched the same number
+     of code units. [samelengths] is the C's local BOOL (5122): constant
+     across the scan — no RMATCH intervenes — so a parameter suffices. *)
+  and ref_max_scan (f : int) (i : int) (samelengths : bool) : int =
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if i < fr.(fb + Frames.slot_temp_32_1) then (
+      let rrc =
+        match_ref f
+          fr.(fb + Frames.slot_temp_size)
+          (not (Int.equal fr.(fb + Frames.slot_temp_32_2) 0))
+          ref_length
+      in
+      if not (Int.equal rrc 0) then
+        (* pcre2_match.c:5130-5142 — can't use CHECK_PARTIAL because we
+           don't want to update Feptr in the soft partial matching
+           case. *)
+        if
+          rrc > 0
+          && (not (Int.equal mb.partial 0))
+          && mb.end_subject > mb.start_used_ptr
+        then (
+          mb.hitend <- true;
+          if mb.partial > 1 then Errors.error_partial (* return, 5139 *)
+          else (ref_max_end [@tailcall]) f i samelengths (* break, 5141 *))
+        else (ref_max_end [@tailcall]) f i samelengths (* break, 5141 *)
+      else
+        (* pcre2_match.c:5144-5145 *)
+        let samelengths =
+          if not (Int.equal !ref_length fr.(fb + Frames.slot_length)) then false
+          else samelengths
+        in
+        fr.(fb + Frames.slot_eptr) <- fr.(fb + Frames.slot_eptr) + !ref_length;
+        (ref_max_scan [@tailcall]) f (i + 1) samelengths)
+    else (ref_max_end [@tailcall]) f i samelengths
+  (* pcre2_match.c:5148-5186 — after the scan: if the length matched for
+     each repetition is the same as the length of the captured group, we
+     can easily work backwards (the normal case); the rare non-matching
+     lengths case (caseless UTF pairs of case-equivalent characters with
+     different unit counts) re-matches fewer and fewer times. *)
+  and ref_max_end (f : int) (i : int) (samelengths : bool) : int =
+    if samelengths then (ref_max_same_bt [@tailcall]) f
+    else
+      (* pcre2_match.c:5167-5172 — Lmax = i; the for(;;) starts with
+         RMATCH(Fecode, RM22); the rest of the loop body is the RM22
+         resume arm in [backtrack]. *)
+      let fr = a.Frames.frames in
+      let fb = Frames.base a f in
+      fr.(fb + Frames.slot_temp_32_1) <- i (* Lmax *);
+      (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm22 0
+  (* pcre2_match.c:5154-5162 + 5186 — the samelengths backtracking while
+     head: while (Feptr >= Lstart) try the rest of the pattern via
+     RMATCH(Fecode, RM21), stepping Feptr back by Flength per failure
+     (the RM21 resume arm); when Feptr falls below Lstart,
+     RRETURN(MATCH_NOMATCH). *)
+  and ref_max_same_bt (f : int) : int =
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if fr.(fb + Frames.slot_eptr) >= fr.(fb + Frames.slot_temp_sptr_0) then
+      (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm21 0
+    else (backtrack [@tailcall]) f match_nomatch
+  (* pcre2_match.c:5177-5182 — the non-samelengths re-scan: for (i =
+     Lmin; i < Lmax; i++) re-match the reference — match_ref is known to
+     succeed every time (5164-5165), so its return code is discarded,
+     exactly as the C's (void) cast — then try the rest of the pattern
+     again (RM22). *)
+  and ref_max_rescan (f : int) (i : int) : int =
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if i < fr.(fb + Frames.slot_temp_32_1) then (
+      let (_ : int) =
+        match_ref f
+          fr.(fb + Frames.slot_temp_size)
+          (not (Int.equal fr.(fb + Frames.slot_temp_32_2) 0))
+          ref_length
+      in
+      fr.(fb + Frames.slot_eptr) <- fr.(fb + Frames.slot_eptr) + !ref_length;
+      (ref_max_rescan [@tailcall]) f (i + 1))
+    else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm22 0
   and word_boundary_tail (f : int) (prev_is_word : bool) (cur_is_word : bool) :
       int =
     (* pcre2_match.c:6330-6333 — now see if the situation is what we want:
@@ -3176,9 +3576,67 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                    Newline.char_cr
             then fr.(fb + Frames.slot_eptr) <- eptr - 1;
             (typemax_bt [@tailcall]) f
-      | 20 | 21 | 22 ->
-          (* RM20 RM21 RM22 — STUB: M2 backreferences. *)
-          error_unported
+      | 20 ->
+          (* L_RM20 (pcre2_match.c:5102-5112) — backref repeat, minimize:
+             the tail failed; unless the maximum is reached, take one
+             more copy of the reference and try again. Lmin++ compares
+             the OLD count and bumps it regardless (5104). *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else
+            let lmin = fr.(fb + Frames.slot_temp_32_0) in
+            fr.(fb + Frames.slot_temp_32_0) <- lmin + 1 (* Lmin++ *);
+            if lmin >= fr.(fb + Frames.slot_temp_32_1) then
+              (backtrack [@tailcall]) f match_nomatch
+            else
+              let rrc2 =
+                match_ref f
+                  fr.(fb + Frames.slot_temp_size)
+                  (not (Int.equal fr.(fb + Frames.slot_temp_32_2) 0))
+                  ref_length
+              in
+              if not (Int.equal rrc2 0) then (
+                if rrc2 > 0 then fr.(fb + Frames.slot_eptr) <- mb.end_subject
+                  (* partial, 5108 *);
+                (* CHECK_PARTIAL() (pcre2_match.c:531-535, site 5109) *)
+                let feptr = fr.(fb + Frames.slot_eptr) in
+                let rc =
+                  if feptr >= mb.end_subject then scheck_partial mb feptr else 0
+                in
+                if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch)
+              else (
+                fr.(fb + Frames.slot_eptr) <-
+                  fr.(fb + Frames.slot_eptr) + !ref_length;
+                (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm20 0)
+      | 21 ->
+          (* L_RM21 (pcre2_match.c:5158-5160) — backref repeat, maximize,
+             same lengths: rrc test, then Feptr -= Flength, then back to
+             the while head. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (
+            fr.(fb + Frames.slot_eptr) <-
+              fr.(fb + Frames.slot_eptr) - fr.(fb + Frames.slot_length);
+            (ref_max_same_bt [@tailcall]) f)
+      | 22 ->
+          (* L_RM22 (pcre2_match.c:5172-5182) — backref repeat, maximize,
+             differing lengths: fail after the minimal repetition when
+             Feptr is back at Lstart (break -> RRETURN(MATCH_NOMATCH),
+             5174/5186); otherwise re-scan one fewer repetition from
+             Lstart. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else if
+            Int.equal
+              fr.(fb + Frames.slot_eptr)
+              fr.(fb + Frames.slot_temp_sptr_0)
+          then (backtrack [@tailcall]) f match_nomatch
+          else (
+            fr.(fb + Frames.slot_eptr) <- fr.(fb + Frames.slot_temp_sptr_0)
+            (* Feptr = Lstart, 5175 *);
+            fr.(fb + Frames.slot_temp_32_1) <-
+              fr.(fb + Frames.slot_temp_32_1) - 1 (* Lmax--, 5176 *);
+            (ref_max_rescan [@tailcall]) f fr.(fb + Frames.slot_temp_32_0))
       | 37 ->
           (* RM37 — STUB: M3 lookbehind chunk. *)
           error_unported
@@ -4257,6 +4715,12 @@ let () =
   assert (Int.equal Opcodes.op_crposquery 108);
   assert (Int.equal Opcodes.op_class 110);
   assert (Int.equal Opcodes.op_nclass 111);
+  (* Backreference opcodes now guarding live behavior (backreferences
+     chunk). *)
+  assert (Int.equal Opcodes.op_ref 113);
+  assert (Int.equal Opcodes.op_refi 114);
+  assert (Int.equal Opcodes.op_dnref 115);
+  assert (Int.equal Opcodes.op_dnrefi 116);
   assert (Int.equal Opcodes.op_not_ucp_word_boundary 169);
   assert (Int.equal Opcodes.op_ucp_word_boundary 170);
   (* Bracket / alternation / ket opcodes now guarding live behavior
@@ -5377,3 +5841,133 @@ let () =
       assert (Int.equal rc 1);
       assert (Int.equal m.ovector.(0) 1);
       assert (Int.equal m.ovector.(1) 1)
+
+(* Backreferences (this chunk): match_ref + the OP_REF/OP_REFI/OP_DNREF/
+   OP_DNREFI arms with their repeat strategies (min-only, minimize RM20,
+   maximize RM21/RM22), the unset-reference rules with and without
+   PCRE2_MATCH_UNSET_BACKREF, the zero-length-reference loop break, and
+   the partial sites. Whole compiled patterns through the [pcre2_match]
+   driver; EVERY expected value below is pinned against the C oracle
+   (pcre2test on the real 10.44 library). *)
+let () =
+  let compile ?(options = 0) pat =
+    match Compile.pcre2_compile pat ~options with
+    | Error _ -> assert false
+    | Ok re -> re
+  in
+  let run ?(options = 0) (re : Compile.re) subj =
+    let oveccount = re.Compile.top_bracket + 1 in
+    let m =
+      {
+        ovector = Array.make (2 * oveccount) Frames.unset;
+        oveccount;
+        rc = 0;
+        startchar = 0;
+        leftchar = 0;
+        rightchar = 0;
+        mark = Frames.unset;
+      }
+    in
+    let rc = pcre2_match re ~subject:subj ~start_offset:0 ~options m in
+    (rc, m)
+  in
+  let expect_ov ?options re subj expected =
+    match run ?options re subj with
+    | rc, m ->
+        assert (rc > 0);
+        assert (Int.equal (Array.length m.ovector) (Array.length expected));
+        Array.iteri (fun i e -> assert (Int.equal m.ovector.(i) e)) expected
+  in
+  let expect_nomatch ?options re subj =
+    match run ?options re subj with
+    | rc, _ -> assert (Int.equal rc Errors.error_nomatch)
+  in
+  let expect_partial ?options re subj s e =
+    match run ?options re subj with
+    | rc, m ->
+        assert (Int.equal rc Errors.error_partial);
+        assert (Int.equal m.ovector.(0) s);
+        assert (Int.equal m.ovector.(1) e)
+  in
+  (* Single copy, no repeat — oracle: 0: aa, 1: a / no match. *)
+  (let re = compile "(a)\\1" in
+   expect_ov re "aa" [| 0; 2; 0; 1 |];
+   expect_nomatch re "ab");
+  (* Greedy range OP_CRRANGE (RM21 back-off): {2,4} takes the maximum
+     available then backs off in reference-length steps — oracle: aaa /
+     aaaa / aaaaa (of "aaaaaa": 1 + 4 copies) / no match on aa. *)
+  (let re = compile "(a)\\1{2,4}" in
+   expect_ov re "aaa" [| 0; 3; 0; 1 |];
+   expect_ov re "aaaa" [| 0; 4; 0; 1 |];
+   expect_ov re "aaaaaa" [| 0; 5; 0; 1 |];
+   expect_nomatch re "aa");
+  (* Minimize OP_CRMINRANGE (RM20): grows one copy at a time up to the
+     bound — oracle: aaab -> 0: aaab; aaaaab -> 0: aaaaab. *)
+  (let re = compile "(a)\\1{2,4}?b" in
+   expect_ov re "aaab" [| 0; 4; 0; 1 |];
+   expect_ov re "aaaaab" [| 0; 6; 0; 1 |]);
+  (* Caseless reference (OP_REFI, the lcc fold in match_ref) — oracle:
+     0: abAB, 1: ab. *)
+  (let re = compile "(?i)(ab)\\1" in
+   expect_ov re "abAB" [| 0; 4; 0; 2 |];
+   expect_ov re "abab" [| 0; 4; 0; 2 |]);
+  (* Unset reference, single copy: default no match; with
+     PCRE2_MATCH_UNSET_BACKREF (a compile option, read from poptions) it
+     matches empty — oracle: no match / 0: "" with 1: <unset>. *)
+  expect_nomatch (compile "(a)?\\1") "b";
+  expect_ov
+    (compile ~options:Options.match_unset_backref "(a)?\\1")
+    "b" [| 0; 0; -1; -1 |];
+  (* Zero-length reference under * must break the repeat loop instead of
+     looping forever (the set-group length-0 continue, 5068) — oracle:
+     0: x, 1: "". *)
+  expect_ov (compile "()\\1*x") "x" [| 0; 1; 0; 0 |];
+  (* Greedy star over a set reference with RM21 back-off releasing one
+     copy — oracle: 0: aaa, 1: a. *)
+  expect_ov (compile "(a)\\1*a") "aaa" [| 0; 3; 0; 1 |];
+  (* OP_CRRANGE max 0 => infinity ({2,}) — oracle: 0: aaab / no match. *)
+  (let re = compile "(a)\\1{2,}b" in
+   expect_ov re "aaab" [| 0; 4; 0; 1 |];
+   expect_nomatch re "aab");
+  (* OP_CRPLUS / OP_CRQUERY forms — oracle: aab/ab both match for ?,
+     + needs one copy. *)
+  (let re = compile "(a)\\1?b" in
+   expect_ov re "aab" [| 0; 3; 0; 1 |];
+   expect_ov re "ab" [| 0; 2; 0; 1 |]);
+  (let re = compile "(a)\\1+b" in
+   expect_ov re "aab" [| 0; 3; 0; 1 |];
+   expect_nomatch re "ab");
+  (* Unset reference under a repeat: Lmin = 0 continues (5072-5073) —
+     oracle: 0: b; Lmin > 0 fails in the min loop — oracle: no match —
+     unless MATCH_UNSET_BACKREF also continues — oracle: 0: b. *)
+  expect_ov (compile "(a)?\\1{0,3}b") "b" [| 0; 1; -1; -1 |];
+  expect_nomatch (compile "(a)?\\1{2,3}b") "b";
+  expect_ov
+    (compile ~options:Options.match_unset_backref "(a)?\\1{2,3}b")
+    "b" [| 0; 1; -1; -1 |];
+  (* Duplicate names (OP_DNREF): the group-list scan uses the first SET
+     group — oracle: aa -> 1: a (group 2 unset); bb -> 1: <unset>, 2: b;
+     ab -> no match. *)
+  (let re = compile "(?J)(?:(?<n>a)|(?<n>b))\\k<n>" in
+   expect_ov re "aa" [| 0; 2; 0; 1; -1; -1 |];
+   expect_ov re "bb" [| 0; 2; -1; -1; 0; 1 |];
+   expect_nomatch re "ab");
+  (* Partial sites. Single copy (CHECK_PARTIAL after Feptr = end_subject,
+     5050-5051) — oracle: Partial match: aba (hard and soft) and ab. *)
+  (let re = compile "(ab)\\1" in
+   expect_partial ~options:Options.partial_hard re "aba" 0 3;
+   expect_partial ~options:Options.partial_soft re "aba" 0 3;
+   expect_partial ~options:Options.partial_hard re "ab" 0 2);
+  (* The min loop's CHECK_PARTIAL (5084-5085) — oracle: Partial match:
+     aaa. *)
+  expect_partial ~options:Options.partial_hard (compile "(a)\\1{3}") "aaa" 0 3;
+  (* Caseless repeat, fixed count: {2} = CRRANGE(2,2), so Lmin = Lmax and
+     the arm exits at the Lmin == Lmax continue (5093); the partial fires
+     in the min loop's CHECK_PARTIAL (5084-5085) — oracle: 0: abABab then
+     Partial match: abABa. COVERAGE TODO: the maximize scan's hard-partial
+     branch (5135-5139) needs Lmin < Lmax hitting subject end, e.g.
+     (?i)(ab)\\1{2,4} on "abABa"-class input — pin via oracle when the M4
+     possessive-ref work touches this region. *)
+  let re = compile "(?i)(ab)\\1{2}" in
+  expect_ov re "abABab" [| 0; 6; 0; 2 |];
+  expect_partial ~options:Options.partial_hard re "abABa" 0 5
