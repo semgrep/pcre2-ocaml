@@ -22,7 +22,7 @@ byte-identically outside the skip-list; oracle OUnit green.
   ints), `limits.ml` (pcre2_internal.h), `opcodes.ml` (OP_* enum + OP_lengths,
   pcre2_internal.h), `errors.ml` (verbatim message strings, pcre2_error.c:1-345),
   `ucp.ml` (pcre2_ucp.h:1-396). (~900 LOC)
-- [ ] **generators + tables**: `gen/gen_tables.exe` (pcre2-dev) parses
+- [x] **generators + tables**: (this commit; incl. ucp.ml) `gen/gen_tables.exe` (pcre2-dev) parses
   `pcre2_chartables.c.dist` (196 l), `pcre2_ucd.c` (5460 l), `pcre2_ucptables.c` (1533 l)
   → emits committed `chartables.ml`, `ucd_tables.ml`, `ucptables.ml`; dune rule + CI check
   assert in-sync. Hand-port `tables.ml` (pcre2_tables.c:1-234). (~800 LOC gen + ~6.5k generated)

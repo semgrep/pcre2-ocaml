@@ -1,0 +1,36 @@
+; Table generator for the pure-OCaml PCRE2 port (dev-only, package pcre2-dev
+; via the rules below; the executable itself is not installed).
+;
+; Regenerate the committed tables (run from the repo root):
+;
+;   dune exec gen/gen_tables.exe -- --check --out src/engine vendor/pcre2/src
+;
+; Sync check (CI): dune build @gen-check
+
+(executable
+ (name gen_tables)
+ (modules gen_tables))
+
+; Regenerate into the build directory (with sanity checks) so @gen-check can
+; diff against the committed src/engine files. This rule must live here, not
+; in src/ (src/ is a library with include_subdirs; the generated files are
+; committed there as normal sources).
+(rule
+ (targets chartables.ml ucd_tables.ml ucptables.ml)
+ (deps
+  ../vendor/pcre2/src/pcre2_chartables.c.dist
+  ../vendor/pcre2/src/pcre2_ucd.c
+  ../vendor/pcre2/src/pcre2_ucptables.c
+  ../vendor/pcre2/src/pcre2_ucp.h
+  ../vendor/pcre2/src/pcre2_internal.h)
+ (action
+  (run ./gen_tables.exe --check --out . ../vendor/pcre2/src)))
+
+(rule
+ (alias gen-check)
+ (package pcre2-dev)
+ (action
+  (progn
+   (diff ../src/engine/chartables.ml chartables.ml)
+   (diff ../src/engine/ucd_tables.ml ucd_tables.ml)
+   (diff ../src/engine/ucptables.ml ucptables.ml))))
