@@ -12,13 +12,13 @@ byte-identically outside the skip-list; oracle OUnit green.
 
 - [x] **vendor**: pin PCRE2 10.44 sources + testdata under `vendor/pcre2/` with
   provenance/license README — commit 9b1ab09. DONE.
-- [ ] **build restructure**: `dune-project` — package `pcre2` drops `dune-configurator` +
+- [x] **build restructure**: (done: 4f8f03f + oracle test driver 38ecb9e; used include_subdirs unqualified) `dune-project` — package `pcre2` drops `dune-configurator` +
   `conf-libpcre2-8`, bump `ocaml >= 4.14`; add unpublished package `pcre2-dev`; move
   `pcre2_stubs.c` + current `bindings.ml` + a copy of the `pcre2.ml` front-end to `oracle/`
   as `Pcre2_c` (satisfies `Pcre2.Matcher`); `config/discover.ml` moves there; delete
   `old_stubs.c`; `src/dune` drops foreign_stubs/c_flags, adds `(include_subdirs qualified)`.
   Proof: `nix develop -c dune build -p pcre2` needs no libpcre2. (~150 LOC dune/opam)
-- [ ] **constants**: `src/engine/options.ml` (pcre2.h.in option bits + PUBLIC masks + error
+- [x] **constants**: (this commit; ucp.ml rides with generators chunk) `src/engine/options.ml` (pcre2.h.in option bits + PUBLIC masks + error
   ints), `limits.ml` (pcre2_internal.h), `opcodes.ml` (OP_* enum + OP_lengths,
   pcre2_internal.h), `errors.ml` (verbatim message strings, pcre2_error.c:1-345),
   `ucp.ml` (pcre2_ucp.h:1-396). (~900 LOC)
@@ -39,7 +39,7 @@ byte-identically outside the skip-list; oracle OUnit green.
   `test/conformance/testdata-order` (machine file; see `testdata-order.md`); initial
   `skiplist.sexp` (see `skip-list.md`) and `baseline_counts.sexp`. Enforces skip staleness
   + deferred expiry; replays `fuzz/corpus/regressions/`. (~800 LOC)
-- [ ] **oracle suite**: `test/oracle/` (pcre2-dev) instantiates the existing OUnit functor
+- [x] **oracle suite**: (done in 4f8f03f) `test/oracle/` (pcre2-dev) instantiates the existing OUnit functor
   over `Pcre2_c`; guards against suite drift. Existing pure suite unchanged. (~100 LOC)
 - [ ] **engine skeleton + swap**: `src/engine/engine.ml/.mli` per the signature in
   `00-architecture.md`, all paths returning not-implemented errors; `frames.ml`,
