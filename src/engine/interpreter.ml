@@ -14,8 +14,15 @@
    the TYPE repeat machinery REPEATTYPE with resume labels RM33/RM34
    (2651-5005) (all non-UTF/non-UCP arms), the anchors and simple
    assertions OP_CIRC(M)/OP_DOLL(M)/OP_SOD/OP_SOM/OP_SET_SOM/OP_EOD/
-   OP_EODN/word boundaries (6132-6338, non-UTF/non-UCP arms), and the
-   match_block structure (pcre2_intmodedep.h:864-906). Every other opcode
+   OP_EODN/word boundaries (6132-6338, non-UTF/non-UCP arms), the
+   bracket/alternation/ket family OP_BRAZERO/OP_BRAMINZERO/OP_SKIPZERO
+   (5224-5246), OP_BRA/OP_CBRA/OP_SCBRA and the shared GROUPLOOP
+   (5349-5411; the OP_ONCE/OP_SCRIPT_RUN/OP_SBRA head at 5391-5394 is
+   live, their ket actions defer to M4/M7), OP_ALT and OP_KET/OP_KETRMIN/
+   OP_KETRMAX with resume labels RM1/RM2/RM6/RM7/RM9/RM10 (5893-6127;
+   OP_KETRPOS and the condassert/assertion/recursion ket actions defer to
+   M4/M5), and the match_block structure (pcre2_intmodedep.h:864-906).
+   Every other opcode
    that the C switch handles gets an exhaustive STUB arm returning the
    distinctive [error_unported] marker; the following M1-M8 chunks
    REPLACE arm bodies only.
@@ -418,6 +425,13 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
               (Char.code (String.unsafe_get mb.subject (p - mb.nllen + 1)))
               mb.nl1)
   in
+  (* pcre2_match.c:609 — PCRE2_SPTR branch_end = NULL: a match()-local
+     that is NOT preserved over RMATCH (607). OP_ALT records the end of
+     the matched branch in it (5895); the OP_KET branch_start scan
+     consumes and resets it (5913-5917). -1 = NULL (code offsets are
+     >= 0). Preallocated once per match, like [nl_scratch], so the
+     dispatch loop stays allocation-free. *)
+  let branch_end = ref (-1) in
   (* pcre2_match.c:1930 + 2014 — Lbyte_map[fc/8] & (1u << (fc&7)): probe
      the 32-byte class bitmap saved at Lbyte_map_address (temp_sptr[1]).
      In bounds: the map is part of the OP_CLASS/OP_NCLASS item in the
@@ -1163,15 +1177,26 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            backreferences. *)
         error_unported
     | 151 ->
-        (* OP_BRAZERO (pcre2_match.c:5223-5229) — STUB: brackets chunk. *)
-        error_unported
+        (* OP_BRAZERO (pcre2_match.c:5224-5230) — a possibly-zero repeat
+           of a bracket group: try to take the group first. Lnext_ecode =
+           temp_sptr[0] (5222) holds the bracket position for the RM9
+           resume, which skips to after the group on NOMATCH. *)
+        fr.(fb + Frames.slot_temp_sptr_0) <- ecode + 1 (* Lnext_ecode *);
+        (rmatch [@tailcall]) f (ecode + 1) rm9 0
     | 152 ->
-        (* OP_BRAMINZERO (pcre2_match.c:5232-5239) — STUB: brackets
-           chunk. *)
-        error_unported
+        (* OP_BRAMINZERO (pcre2_match.c:5232-5238) — the minimizing form:
+           try the rest of the pattern WITHOUT the group first. Lnext_ecode
+           walks from the bracket to its final ket before the RMATCH. *)
+        let next = skip_alts (ecode + 1) in
+        fr.(fb + Frames.slot_temp_sptr_0) <- next (* Lnext_ecode, post-walk *);
+        (rmatch [@tailcall]) f (next + 1 + Limits.link_size) rm10 0
     | 167 ->
-        (* OP_SKIPZERO (pcre2_match.c:5242-5245) — STUB: M5 verbs chunk. *)
-        error_unported
+        (* OP_SKIPZERO (pcre2_match.c:5242-5246) — a group with a {0}
+           quantifier: skip it entirely. Fecode++; walk to the final ket;
+           Fecode += 1 + LINK_SIZE. *)
+        fr.(fb + Frames.slot_ecode) <-
+          skip_alts (ecode + 1) + 1 + Limits.link_size;
+        (dispatch [@tailcall]) f
     | 153 ->
         (* OP_BRAPOSZERO (pcre2_match.c:5257-5263) — STUB: M4 possessive
            chunk. *)
@@ -1181,17 +1206,33 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            (pcre2_match.c:5266-5346) — STUB: M4 possessive chunk. *)
         error_unported
     | 135 ->
-        (* OP_BRA (pcre2_match.c:5349-5378) — STUB: brackets chunk. *)
-        error_unported
+        (* OP_BRA (pcre2_match.c:5349-5372) — non-capturing brackets that
+           cannot match an empty string. When we get to the final
+           alternative within the brackets, as long as there are no THENs
+           in the pattern, we can optimize by not recording a new
+           backtracking point — but not at the very top level, where there
+           would be nothing to go back to. *)
+        if mb.hasthen || Int.equal fr.(fb + Frames.slot_rdepth) 0 then (
+          fr.(fb + Frames.slot_temp_32_0) <- 0 (* Lframe_type *);
+          (grouploop [@tailcall]) f)
+        else (bra_loop [@tailcall]) f
     | 137 | 142 ->
-        (* OP_CBRA, OP_SCBRA (pcre2_match.c:5381-5389) — STUB: brackets
-           chunk. *)
-        error_unported
+        (* OP_CBRA, OP_SCBRA (pcre2_match.c:5381-5384) — a capturing
+           bracket, other than those that are possessive with an unlimited
+           repeat: Lframe_type = GF_CAPTURE | GET2(Fecode, 1+LINK_SIZE). *)
+        fr.(fb + Frames.slot_temp_32_0) <-
+          Frames.gf_capture
+          lor Compile.get2 mb.start_code (ecode + 1 + Limits.link_size);
+        (grouploop [@tailcall]) f
     | 133 | 134 | 140 ->
-        (* OP_ONCE, OP_SCRIPT_RUN, OP_SBRA (pcre2_match.c:5391-5424) —
-           OP_SBRA: brackets chunk; OP_ONCE: M4; OP_SCRIPT_RUN: M7.
-           STUB. *)
-        error_unported
+        (* OP_ONCE, OP_SCRIPT_RUN, OP_SBRA (pcre2_match.c:5391-5394) —
+           atomic groups and non-capturing brackets that can match an
+           empty string must record a backtracking point and set up a
+           chained frame: Lframe_type = GF_NOCAPTURE | Fop. The shared
+           GROUPLOOP is fully live; OP_ONCE and OP_SCRIPT_RUN differ only
+           in their ket actions, stubbed there for M4 / M7. *)
+        fr.(fb + Frames.slot_temp_32_0) <- Frames.gf_nocapture lor op;
+        (grouploop [@tailcall]) f
     | 117 ->
         (* OP_RECURSE (pcre2_match.c:5427-5508) — STUB: M5 recursion
            chunk. *)
@@ -1223,13 +1264,132 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            chunk. *)
         error_unported
     | 120 ->
-        (* OP_ALT (pcre2_match.c:5893-5903) — STUB: brackets chunk. *)
-        error_unported
-    | 121 | 123 | 122 | 124 ->
+        (* OP_ALT (pcre2_match.c:5894-5897) — an alternation is the end of
+           a branch: record it in branch_end, then scan along to the end
+           of the bracketed group. *)
+        branch_end := ecode;
+        fr.(fb + Frames.slot_ecode) <- skip_alts ecode;
+        (dispatch [@tailcall]) f
+    | 121 | 123 | 122 | 124 -> (
         (* OP_KET, OP_KETRMIN, OP_KETRMAX, OP_KETRPOS
-           (pcre2_match.c:5906-6128) — KET/KETRMIN/KETRMAX: brackets
-           chunk; KETRPOS: M4 possessive chunk. STUB. *)
-        error_unported
+           (pcre2_match.c:5906-6127) — the end of a parenthesized group.
+           For all but OP_BRA and OP_COND, the starting frame was added to
+           the chained frames in order to remember the starting subject
+           position for the group. *)
+        (* pcre2_match.c:5911 *)
+        let bracode = ecode - Compile.get mb.start_code (ecode + 1) in
+        (* pcre2_match.c:5913-5917 — identify the start of the branch that
+           ends at this ket: OP_ALT recorded branch_end (5895) when the
+           matched branch ended at an alternation, otherwise the branch
+           ends here. branch_start is consumed only by the OP_ASSERTBACK*
+           VREVERSE checks (M3/M4): the walk is kept for parity, its
+           result unused until those ket actions land. *)
+        let _branch_start =
+          ket_branch_start bracode
+            (if Int.equal !branch_end (-1) then ecode else !branch_end)
+        in
+        branch_end := -1;
+        let bra_op = Char.code (Bytes.get mb.start_code bracode) in
+        (* pcre2_match.c:5919-5950 — point N (= p + 1 here) to the frame
+           at the start of the most recent group (Flast_group_offset is a
+           frame index, frames.ml DEVIATION), and P to its predecessor —
+           the frame that dispatched the bracket, whose eptr is the
+           subject position at the start of the group — then unchain it.
+           P stays NULL (-1) for OP_BRA and OP_COND: their starting frame
+           was not recorded. In bounds: every non-BRA/COND bracket arm
+           passes a nonzero group_frame_type to RMATCH, so NEW_FRAME
+           recorded a valid frame index >= 1 (pcre2_match.c:763-771) that
+           the frame copies carried here (complete-program mb
+           invariant). *)
+        let p =
+          if
+            (not (Int.equal bra_op Opcodes.op_bra))
+            && not (Int.equal bra_op Opcodes.op_cond)
+          then (
+            let n = fr.(fb + Frames.slot_last_group_offset) in
+            fr.(fb + Frames.slot_last_group_offset) <-
+              fr.(Frames.base a (n - 1) + Frames.slot_last_group_offset);
+            n - 1)
+          else -1
+        in
+        if
+          p >= 0
+          && Int.equal
+               (Frames.gf_idmask
+                  fr.(Frames.base a (p + 1) + Frames.slot_group_frame_type))
+               Frames.gf_condassert
+        then
+          (* pcre2_match.c:5934-5948 — the end of an assertion that is a
+             condition — STUB: M5 conditionals chunk (GF_CONDASSERT frames
+             are only created by OP_COND's assertion conditions,
+             5711-5717). *)
+          error_unported
+        else
+          (* pcre2_match.c:5952-6085 — actions relating to the starting
+             opcode: switch ( *bracode). *)
+          match bra_op with
+          | 135 ->
+              (* OP_BRA (pcre2_match.c:5964-5984) — nothing to be done
+                 unless this is the end of a whole-pattern recursion
+                 (recursing in group 0 with OP_END immediately following
+                 this ket). *)
+              if
+                Int.equal fr.(fb + Frames.slot_current_recurse) 0
+                && Int.equal
+                     (Char.code
+                        (Bytes.get mb.start_code (ecode + 1 + Limits.link_size)))
+                     Opcodes.op_end
+              then
+                (* pcre2_match.c:5967-5984 — STUB: M5 recursion chunk
+                   (Fcurrent_recurse stays RECURSE_UNSET until OP_RECURSE
+                   lands, so this is unreachable now). *)
+                error_unported
+              else (op_ket_tail [@tailcall]) f p bracode
+          | 139 | 144 ->
+              (* OP_COND, OP_SCOND (pcre2_match.c:5986-5988) — no need to
+                 do anything for these. *)
+              (op_ket_tail [@tailcall]) f p bracode
+          | 132 | 131 | 129 | 127 | 133 | 130 | 128 | 134 ->
+              (* OP_ASSERTBACK_NA, OP_ASSERT_NA, OP_ASSERTBACK, OP_ASSERT,
+                 OP_ONCE (pcre2_match.c:5994-6031), OP_ASSERTBACK_NOT,
+                 OP_ASSERT_NOT (6037-6043), OP_SCRIPT_RUN (6049-6051) —
+                 STUB: M3/M4 lookaround and atomic chunks, M7 script runs
+                 (unreachable now: those bracket arms are stubs, except
+                 the live OP_ONCE/OP_SCRIPT_RUN heads whose deferral is
+                 exactly here). *)
+              error_unported
+          | 137 | 138 | 142 | 143 ->
+              (* OP_CBRA, OP_CBRAPOS, OP_SCBRA, OP_SCBRAPOS
+                 (pcre2_match.c:6056-6084). *)
+              let number =
+                Compile.get2 mb.start_code (bracode + 1 + Limits.link_size)
+              in
+              if Int.equal fr.(fb + Frames.slot_current_recurse) number then
+                (* pcre2_match.c:6062-6075 — a recursively called group:
+                   reinstate the previous captures and carry on after the
+                   recursion call — STUB: M5 recursion chunk
+                   (Fcurrent_recurse stays RECURSE_UNSET until OP_RECURSE
+                   lands, so this is unreachable now). *)
+                error_unported
+              else
+                (* pcre2_match.c:6077-6084 — deal with actual capturing.
+                   In bounds: 1 <= number <= top_bracket in a compiled
+                   program (mb invariant), so offset + 1 <=
+                   2 * top_bracket - 1, within the frame's ovector
+                   region. *)
+                let offset = (number lsl 1) - 2 in
+                fr.(fb + Frames.slot_capture_last) <- number;
+                fr.(fb + Frames.slot_ovector + offset) <-
+                  fr.(Frames.base a p + Frames.slot_eptr) - mb.start_subject;
+                fr.(fb + Frames.slot_ovector + offset + 1) <-
+                  fr.(fb + Frames.slot_eptr) - mb.start_subject;
+                if offset >= fr.(fb + Frames.slot_offset_top) then
+                  fr.(fb + Frames.slot_offset_top) <- offset + 2;
+                (op_ket_tail [@tailcall]) f p bracode
+          | _ ->
+              (* OP_SBRA, OP_BRAPOS, OP_SBRAPOS have no case in the C
+                 switch: no action relating to the starting opcode. *)
+              (op_ket_tail [@tailcall]) f p bracode)
     | 27 ->
         (* OP_CIRC (pcre2_match.c:6133-6137) — start of line, unless
            PCRE2_NOTBOL is set; not multiline mode. *)
@@ -2405,6 +2565,112 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
     else (
       fr.(fb + Frames.slot_ecode) <- fr.(fb + Frames.slot_ecode) + 1;
       (dispatch [@tailcall]) f)
+  and skip_alts (e : int) : int =
+    (* The branch-chain walk `do Fecode += GET(Fecode, 1); while ( *Fecode
+       == OP_ALT)` shared by OP_BRAZERO (pcre2_match.c:5228), OP_BRAMINZERO
+       (5234), OP_SKIPZERO (5244) and OP_ALT (5896): step at least once,
+       then keep following links while sitting on an OP_ALT; returns the
+       final ket's offset. Terminates: branch links in a complete compiled
+       program chain from the bracket to its ket (mb invariant). *)
+    let e = e + Compile.get mb.start_code (e + 1) in
+    if Int.equal (Char.code (Bytes.get mb.start_code e)) Opcodes.op_alt then
+      (skip_alts [@tailcall]) e
+    else e
+  and ket_branch_start (bs : int) (be : int) : int =
+    (* pcre2_match.c:5914-5916 — branch_start = bracode; while
+       (branch_start + GET(branch_start, 1) != branch_end) branch_start +=
+       GET(branch_start, 1). Terminates: [be] is either this group's ket
+       or an OP_ALT recorded by the just-executed OP_ALT arm of the same
+       group, both on the bracket's branch chain (mb invariant). *)
+    let nx = bs + Compile.get mb.start_code (bs + 1) in
+    if Int.equal nx be then bs else (ket_branch_start [@tailcall]) nx be
+  and bra_loop (f : int) : int =
+    (* pcre2_match.c:5356-5372 — the OP_BRA branch loop (no THEN in the
+       pattern, not at the top level): remember the next branch in
+       Lnext_branch (temp_sptr[0], 5347); if this is not the final branch,
+       record a backtracking point for it (RM1), otherwise run the final
+       branch at this level without a new frame. Entered with Fecode at
+       the bracket (first call) or at an OP_ALT (RM1 resume);
+       OP_lengths[*Fecode] steps over either item. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    let ecode = fr.(fb + Frames.slot_ecode) in
+    let next_branch = ecode + Compile.get mb.start_code (ecode + 1) in
+    fr.(fb + Frames.slot_temp_sptr_0) <- next_branch (* Lnext_branch *);
+    if
+      not
+        (Int.equal
+           (Char.code (Bytes.get mb.start_code next_branch))
+           Opcodes.op_alt)
+    then (
+      (* pcre2_match.c:5369-5371 — hit the start of the final branch:
+         continue at this level. *)
+      fr.(fb + Frames.slot_ecode) <-
+        ecode + Opcodes.op_lengths.(Char.code (Bytes.get mb.start_code ecode));
+      (dispatch [@tailcall]) f)
+    else
+      (* pcre2_match.c:5361-5364 — never the final branch; no MATCH_THEN
+         test needed because this code is not used when there is a THEN in
+         the pattern. *)
+      (rmatch [@tailcall]) f
+        (ecode + Opcodes.op_lengths.(Char.code (Bytes.get mb.start_code ecode)))
+        rm1 0
+  and grouploop (f : int) : int =
+    (* pcre2_match.c:5396-5400 — the GROUPLOOP head shared by OP_BRA (top
+       level / THEN present), OP_CBRA/OP_SCBRA and OP_ONCE/OP_SCRIPT_RUN/
+       OP_SBRA: record a backtracking point for the branch, passing the
+       group frame type saved in Lframe_type (temp_32[0], 5346). Entered
+       with Fecode at the bracket (first call) or at an OP_ALT (RM2
+       resume); OP_lengths[*Fecode] steps over either item. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    let ecode = fr.(fb + Frames.slot_ecode) in
+    (rmatch [@tailcall]) f
+      (ecode + Opcodes.op_lengths.(Char.code (Bytes.get mb.start_code ecode)))
+      rm2
+      fr.(fb + Frames.slot_temp_32_0)
+  and op_ket_tail (f : int) (p : int) (bracode : int) : int =
+    (* pcre2_match.c:6087-6127 — the common ket tail after the *bracode
+       switch. [p] is the C's P as a frame index, -1 = NULL. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    let ecode = fr.(fb + Frames.slot_ecode) in
+    if Int.equal (Char.code (Bytes.get mb.start_code ecode)) Opcodes.op_ketrpos
+    then
+      (* pcre2_match.c:6092-6098 — OP_KETRPOS: copy the frame data back to
+         P and return MATCH_KETRPOS so the repeats are done one at a time
+         from the outer level — STUB: M4 possessive chunk (OP_KETRPOS is
+         only compiled for the BRAPOS groups, whose bracket arms are
+         stubs). *)
+      error_unported
+    else if
+      (* pcre2_match.c:6100-6121 — a non-repeating ket needs no special
+         action, just continuing at this level. This also happens for the
+         repeating kets if the group matched no characters, in order to
+         forcibly break infinite loops. Otherwise, the repeating kets try
+         the rest of the pattern or restart from the preceding bracket, in
+         the appropriate order. *)
+      (not (Int.equal fr.(fb + Frames.slot_op) Opcodes.op_ket))
+      && (Int.equal p (-1)
+         || not
+              (Int.equal
+                 fr.(fb + Frames.slot_eptr)
+                 fr.(Frames.base a p + Frames.slot_eptr)))
+    then
+      if Int.equal fr.(fb + Frames.slot_op) Opcodes.op_ketrmin then
+        (* pcre2_match.c:6109-6111 — try the rest of the pattern first
+           (minimizing). *)
+        (rmatch [@tailcall]) f (ecode + 1 + Limits.link_size) rm6 0
+      else
+        (* pcre2_match.c:6117-6119 — repeat the maximum number of times
+           (KETRMAX): restart from the preceding bracket first. *)
+        (rmatch [@tailcall]) f bracode rm7 0
+    else (
+      (* pcre2_match.c:6123-6126 — carry on at this level for a
+         non-repeating ket, or after matching an empty string, or after
+         repeating for a maximum number of times. *)
+      fr.(fb + Frames.slot_ecode) <- ecode + 1 + Limits.link_size;
+      (dispatch [@tailcall]) f)
   and backtrack (f : int) (rrc : int) : int =
     (* pcre2_match.c:6461-6501 — RETURN_SWITCH: the RRETURN() macro jumps
        here with the return value in rrc; Freturn_id says which L_RM##
@@ -2459,9 +2725,80 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
              UTF/UCP arms *)
       let fb = Frames.base a f in
       match fr.(fb + Frames.slot_return_id) with
-      | 1 | 2 | 9 | 10 | 6 | 7 ->
-          (* RM1 RM2 RM9 RM10 RM6 RM7 — STUB: brackets chunk. *)
-          error_unported
+      | 1 ->
+          (* L_RM1 (pcre2_match.c:5365-5366) — OP_BRA optimized branch
+             walk: the branch failed; move Fecode to the next branch
+             (saved in Lnext_branch) and loop. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (
+            fr.(fb + Frames.slot_ecode) <- fr.(fb + Frames.slot_temp_sptr_0);
+            (bra_loop [@tailcall]) f)
+      | 2 ->
+          (* L_RM2 (pcre2_match.c:5401-5410) — GROUPLOOP: the branch
+             failed. The MATCH_THEN handling (5401-5407) consults
+             mb->verb_ecode_ptr: M5 verbs chunk — no opcode can return
+             MATCH_THEN until then; site kept for evaluation order. Then
+             advance to the next alternative, failing the group when there
+             is none. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else
+            let ecode =
+              fr.(fb + Frames.slot_ecode)
+              + Compile.get mb.start_code (fr.(fb + Frames.slot_ecode) + 1)
+            in
+            fr.(fb + Frames.slot_ecode) <- ecode;
+            if
+              not
+                (Int.equal
+                   (Char.code (Bytes.get mb.start_code ecode))
+                   Opcodes.op_alt)
+            then (backtrack [@tailcall]) f match_nomatch
+            else (grouploop [@tailcall]) f
+      | 6 ->
+          (* L_RM6 (pcre2_match.c:6112-6114) — KETRMIN: the rest of the
+             pattern failed; go back to the preceding bracket and iterate
+             the group once more in this frame (Fecode -= GET(Fecode, 1)),
+             then break out of the ket processing. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else
+            let ecode = fr.(fb + Frames.slot_ecode) in
+            fr.(fb + Frames.slot_ecode) <-
+              ecode - Compile.get mb.start_code (ecode + 1);
+            (dispatch [@tailcall]) f
+      | 7 ->
+          (* L_RM7 (pcre2_match.c:6120-6126) — KETRMAX: the re-iteration
+             failed; carry on at this level after the group
+             (Fecode += 1 + LINK_SIZE). *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (
+            fr.(fb + Frames.slot_ecode) <-
+              fr.(fb + Frames.slot_ecode) + 1 + Limits.link_size;
+            (dispatch [@tailcall]) f)
+      | 9 ->
+          (* L_RM9 (pcre2_match.c:5227-5229) — BRAZERO: taking the group
+             failed; walk Lnext_ecode from the bracket to its final ket
+             and continue after the group (zero repeat). *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else
+            let next = skip_alts fr.(fb + Frames.slot_temp_sptr_0) in
+            fr.(fb + Frames.slot_temp_sptr_0) <- next
+            (* Lnext_ecode, post-walk *);
+            fr.(fb + Frames.slot_ecode) <- next + 1 + Limits.link_size;
+            (dispatch [@tailcall]) f
+      | 10 ->
+          (* L_RM10 (pcre2_match.c:5236-5237) — BRAMINZERO: the rest of
+             the pattern without the group failed; step into the group
+             (Fecode++). *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (
+            fr.(fb + Frames.slot_ecode) <- fr.(fb + Frames.slot_ecode) + 1;
+            (dispatch [@tailcall]) f)
       | 25 ->
           (* L_RM25 (pcre2_match.c:1421-1431) — caseless char repeat,
              minimize: the tail failed; take one more matching character
@@ -3075,6 +3412,52 @@ let () =
   assert (Int.equal Opcodes.op_nclass 111);
   assert (Int.equal Opcodes.op_not_ucp_word_boundary 169);
   assert (Int.equal Opcodes.op_ucp_word_boundary 170);
+  (* Bracket / alternation / ket opcodes now guarding live behavior
+     (brackets chunk), including the *bracode switch literals inside the
+     OP_KET arm. *)
+  assert (Int.equal Opcodes.op_alt 120);
+  assert (Int.equal Opcodes.op_ket 121);
+  assert (Int.equal Opcodes.op_ketrmax 122);
+  assert (Int.equal Opcodes.op_ketrmin 123);
+  assert (Int.equal Opcodes.op_ketrpos 124);
+  assert (Int.equal Opcodes.op_assert 127);
+  assert (Int.equal Opcodes.op_assert_not 128);
+  assert (Int.equal Opcodes.op_assertback 129);
+  assert (Int.equal Opcodes.op_assertback_not 130);
+  assert (Int.equal Opcodes.op_assert_na 131);
+  assert (Int.equal Opcodes.op_assertback_na 132);
+  assert (Int.equal Opcodes.op_once 133);
+  assert (Int.equal Opcodes.op_script_run 134);
+  assert (Int.equal Opcodes.op_bra 135);
+  assert (Int.equal Opcodes.op_brapos 136);
+  assert (Int.equal Opcodes.op_cbra 137);
+  assert (Int.equal Opcodes.op_cbrapos 138);
+  assert (Int.equal Opcodes.op_cond 139);
+  assert (Int.equal Opcodes.op_sbra 140);
+  assert (Int.equal Opcodes.op_sbrapos 141);
+  assert (Int.equal Opcodes.op_scbra 142);
+  assert (Int.equal Opcodes.op_scbrapos 143);
+  assert (Int.equal Opcodes.op_scond 144);
+  assert (Int.equal Opcodes.op_brazero 151);
+  assert (Int.equal Opcodes.op_braminzero 152);
+  assert (Int.equal Opcodes.op_skipzero 167);
+  (* OP_lengths entries the bracket arms step by (pcre2_tables.c OP_lengths
+     via Opcodes.op_lengths): 1+LINK_SIZE for BRA/ALT-class items,
+     1+LINK_SIZE+IMM2_SIZE for the capturing brackets. *)
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_bra) (1 + Limits.link_size));
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_alt) (1 + Limits.link_size));
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_sbra) (1 + Limits.link_size));
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_once) (1 + Limits.link_size));
+  assert (
+    Int.equal Opcodes.op_lengths.(Opcodes.op_script_run) (1 + Limits.link_size));
+  assert (
+    Int.equal
+      Opcodes.op_lengths.(Opcodes.op_cbra)
+      (1 + Limits.link_size + Limits.imm2_size));
+  assert (
+    Int.equal
+      Opcodes.op_lengths.(Opcodes.op_scbra)
+      (1 + Limits.link_size + Limits.imm2_size));
   (* Newline character constants consumed by the ANY/ANYNL/EODN arms
      (pcre2_internal.h:678-699). *)
   assert (Int.equal Newline.char_lf 0x0a);
@@ -3131,9 +3514,10 @@ let () =
   (* The unported marker collides with nothing it can meet. *)
   assert (error_unported < -66 && error_unported > match_then)
 
-(* Hand-assembled programs: OP_BRA belongs to a later chunk, so these
-   exercise OP_CHAR / OP_END directly (the compiler always wraps patterns
-   in OP_BRA..OP_KET, pcre2_compile.c:10570-10604). *)
+(* Hand-assembled programs: these predate the brackets chunk and exercise
+   OP_CHAR / OP_END directly, without the OP_BRA..OP_KET wrapper the
+   compiler always emits (pcre2_compile.c:10570-10604) — still valid
+   programs, kept as the minimal drivers of those arms. *)
 let mk_code (units : int list) : Bytes.t =
   let b = Bytes.create (List.length units) in
   List.iteri (fun i u -> Bytes.set b i (Char.chr u)) units;
@@ -3293,7 +3677,8 @@ let () =
 
 (* Malformed / not-yet-ported programs: OP_DEFINE has no case in the C
    switch -> PCRE2_ERROR_INTERNAL; a stubbed opcode returns the
-   scaffolding marker (this last check is removed with the stub). *)
+   scaffolding marker (this last check is removed with the stub —
+   OP_ASSERT belongs to the M4 lookaround chunk). *)
 let () =
   (match
      match_internal ~code:(mk_code [ Opcodes.op_define ]) ~top_bracket:0 "a" 0
@@ -3301,7 +3686,7 @@ let () =
   | rc, _ -> assert (Int.equal rc Errors.error_internal));
   match
     match_internal
-      ~code:(mk_code [ Opcodes.op_bra; 0; 3; Opcodes.op_end ])
+      ~code:(mk_code [ Opcodes.op_assert; 0; 3; Opcodes.op_end ])
       ~top_bracket:0 "a" 0
   with
   | rc, _ -> assert (Int.equal rc error_unported)
@@ -3451,11 +3836,12 @@ let () =
   with
   | rc, _ -> assert (Int.equal rc match_nomatch)
 
-(* TEST-ONLY: real compiled programs for the repeat arms. The compiler
-   always wraps the pattern in OP_BRA .. OP_KET (pcre2_compile.c:
-   10570-10604); the bracket opcodes belong to a later chunk, so strip the
-   wrapper — asserting its exact shape — and terminate the body with
-   OP_END. Returns (body code, top_bracket). *)
+(* TEST-ONLY: real compiled programs for the repeat arms, predating the
+   brackets chunk. The compiler always wraps the pattern in OP_BRA ..
+   OP_KET (pcre2_compile.c:10570-10604); these asserts strip the wrapper —
+   asserting its exact shape — and terminate the body with OP_END, so
+   they exercise the repeat arms without any bracket opcode in the
+   program. Returns (body code, top_bracket). *)
 let compile_body (pattern : string) : Bytes.t * int =
   match Compile.pcre2_compile pattern ~options:0 with
   | Error _ -> assert false
@@ -3838,3 +4224,114 @@ let () =
       assert (Int.equal ov.(1) 1));
   match match_internal ~code:anyb ~top_bracket:0 "" 0 with
   | rc, _ -> assert (Int.equal rc match_nomatch)
+
+(* TEST-ONLY (brackets chunk): whole compiled programs — the OP_BRA ..
+   OP_KET wrapper and every inner bracket now run for real. Returns
+   (code, top_bracket). *)
+let compile_whole (pattern : string) : Bytes.t * int =
+  match Compile.pcre2_compile pattern ~options:0 with
+  | Error _ -> assert false
+  | Ok re -> (re.Compile.code, re.Compile.top_bracket)
+
+(* The backtracking gauntlet: brackets, alternation, kets and the
+   zero-repeat wrappers over whole compiled programs. EVERY expected
+   ovector below is pinned against the C oracle (pcre2test_ml with the
+   allcaptures/allaftertext modifiers); anchored attempts at offset 0
+   (match_internal has no bump-along loop). *)
+let () =
+  let run ?moptions ?oveccount pat subj =
+    let code, top_bracket = compile_whole pat in
+    let oveccount =
+      match oveccount with Some c -> c | None -> top_bracket + 1
+    in
+    match_internal ?moptions ~oveccount ~code ~top_bracket subj 0
+  in
+  (* Every pair of the (top_bracket + 1)-pair ovector must equal the
+     oracle's, including unset (-1, -1) pairs. *)
+  let expect_ov pat subj expected =
+    match run pat subj with
+    | rc, ov ->
+        assert (Int.equal rc match_match);
+        assert (Int.equal (Array.length ov) (Array.length expected));
+        Array.iteri (fun i e -> assert (Int.equal ov.(i) e)) expected
+  in
+  let expect_nomatch pat subj =
+    match run pat subj with rc, _ -> assert (Int.equal rc match_nomatch)
+  in
+  (* Alternative walk + capture — oracle: 0: bc, 1: b. *)
+  expect_ov "(a|b)c" "bc" [| 0; 2; 0; 1 |];
+  (* Backtrack across a group boundary — oracle: 0: aaab, 1: aa, 2: a
+     (the first greedy a+ backs off from 3 to 2; the capture is rewritten
+     at each ket pass). *)
+  expect_ov "(a+)(a+)b" "aaab" [| 0; 4; 0; 2; 2; 3 |];
+  (* Empty-loop protection at KETRMAX — oracle: 0: aaab, 1: "" before b
+     (i.e. (3,3)): the second iteration matches empty at 3, its ket
+     writes the capture, and the Feptr == P->eptr test then carries on at
+     this level instead of looping forever. *)
+  expect_ov "(a*)*b" "aaab" [| 0; 4; 3; 3 |];
+  (* Same protection through a bounded inner repeat — oracle: 1: ""
+     before b. *)
+  expect_ov "(a{0,2})*b" "aaab" [| 0; 4; 3; 3 |];
+  (* Leftmost-first alternation semantics — oracle: 1: a, 2: bcd. *)
+  expect_ov "(a|ab)(c|bcd)" "abcd" [| 0; 4; 0; 1; 1; 4 |];
+  (* Unset optional group — oracle: 0: y, 1: <unset>. *)
+  expect_ov "(x)?y" "y" [| 0; 1; -1; -1 |];
+  (* Bounded group repeat — oracle: 0: aa, 1: a with nothing after
+     (the last taken iteration, (1,2)). *)
+  expect_ov "(a){0,3}" "aa" [| 0; 2; 1; 2 |];
+  (* Zero iterations of the same — oracle: empty match, 1: <unset>. *)
+  expect_ov "(a){0,3}" "b" [| 0; 0; -1; -1 |];
+  (* Per-iteration capture semantics — oracle: 0: ab, 1: b, 2: a: the
+     second iteration overwrites group 1, while group 2 survives from the
+     first iteration (frame ovector copies carry it forward). *)
+  expect_ov "((a)|b)+" "ab" [| 0; 2; 1; 2; 0; 1 |];
+  (* Nested alternated captures — oracle: 1: a, 2: b. *)
+  expect_ov "(?:(a)|(b))+" "ab" [| 0; 2; 0; 1; 1; 2 |];
+  (* KETRMIN lazy group repeat with a capture — oracle: 0: aab, 1: a
+     with only b after (i.e. (1,2)). *)
+  expect_ov "(a+?)+?b" "aab" [| 0; 3; 1; 2 |];
+  (* KETRMIN empty-match protection — oracle: 0: b, 1: "" at 0: the lazy
+     group matches empty once and the Feptr == P->eptr test carries on at
+     this level. *)
+  expect_ov "(a*?)+?b" "b" [| 0; 1; 0; 0 |];
+  (* BRAZERO: with and without the group — oracle: 0: d / 0: abcd. *)
+  expect_ov "(?:abc)?d" "d" [| 0; 1 |];
+  expect_ov "(?:abc)?d" "abcd" [| 0; 4 |];
+  (* BRAMINZERO: the skip-the-group try succeeds on "d"; on "abcd" the
+     RM10 resume steps into the group — oracle: 0: d / 0: abcd. *)
+  expect_ov "(?:abc)??d" "d" [| 0; 1 |];
+  expect_ov "(?:abc)??d" "abcd" [| 0; 4 |];
+  (* SKIPZERO: a {0} group is skipped entirely — oracle: 0: b,
+     1: <unset>. *)
+  expect_ov "(a){0}b" "b" [| 0; 1; -1; -1 |];
+  (* KETRMIN re-iteration (RM6: back to the bracket in the same frame) —
+     oracle: 0: ababc. *)
+  expect_ov "(?:ab)+?c" "ababc" [| 0; 5 |];
+  (* KETRMAX releasing an iteration (RM7 NOMATCH resume): three
+     iterations fail the tail, two match — oracle: 0: aaaaab. *)
+  expect_ov "(?:aa)+ab" "aaaaab" [| 0; 6 |];
+  (* Inner non-capturing alternation at depth > 0: the OP_BRA optimized
+     branch walk (RM1) twice, then the final branch running in place —
+     oracle: 0: xcd. *)
+  expect_ov "x(?:a|b|c)d" "xcd" [| 0; 3 |];
+  (* GROUPLOOP: no alternative left fails the group
+     (pcre2_match.c:5410). *)
+  expect_nomatch "(?:a|b)" "c";
+  expect_nomatch "(a|b)c" "bd";
+  (* Top-level alternation with captures on distinct branches — oracle:
+     1: <unset>, 2: b: a dynamic "gap" below offset_top stays unset. *)
+  expect_ov "(a)|(b)" "b" [| 0; 1; -1; -1; 0; 1 |];
+  (* Nested captures — oracle: 0: abc, 1: ab, 2: a. *)
+  expect_ov "((a)b)c" "abc" [| 0; 3; 0; 2; 0; 1 |];
+  (* Adjacent captures — oracle: 1: a, 2: b. *)
+  expect_ov "(a)(b)" "ab" [| 0; 2; 0; 1; 1; 2 |];
+  (* Oveccount clipping with real captures (pcre2_match.c:934-939):
+     oveccount 2 keeps group 1 and clips group 2. *)
+  match run ~oveccount:2 "(a)(b)" "ab" with
+  | rc, ov ->
+      assert (Int.equal rc match_match);
+      assert (Int.equal (Array.length ov) 4);
+      assert (Int.equal ov.(0) 0);
+      assert (Int.equal ov.(1) 2);
+      assert (Int.equal ov.(2) 0);
+      assert (Int.equal ov.(3) 1)

@@ -81,8 +81,12 @@ Match phase (`interpreter.ml`, `frames.ml`, `newline.ml`):
 - [x] anchors & simple assertions: (this commit) OP_CIRC(M)/OP_DOLL(M)/OP_SOD/SOM/
   SET_SOM/EOD/EODN/\b/\B (pcre2_match.c:6133-6338 + IS_NEWLINE/WAS_NEWLINE,
   pcre2_internal.h:496-521; UCP boundaries stubbed for M7)
-- [ ] brackets: OP_BRA/OP_CBRA/OP_SBRA/SCBRA, OP_ALT, OP_KET/KETRMIN/KETRMAX, BRAZERO/
-  BRAMINZERO (pcre2_match.c:5224-5265, 5906-6335)
+- [x] brackets: (this commit) OP_BRA/OP_CBRA/OP_SBRA/SCBRA (+ the shared GROUPLOOP head
+  for OP_ONCE/OP_SCRIPT_RUN), OP_ALT, OP_KET/KETRMIN/KETRMAX with the CBRA capture
+  write, group-frame chain pop and empty-match loop break, BRAZERO/BRAMINZERO/
+  SKIPZERO, resume labels RM1/RM2/RM6/RM7/RM9/RM10
+  (pcre2_match.c:5224-5246, 5349-5411, 5893-6127; OP_KETRPOS and the condassert/
+  assertion/ONCE/script-run/recursion ket actions stubbed loudly for M3/M4/M5/M7)
 - [ ] pcre2_match driver: arg validation, BADOFFSET, option masking (−34), anchored/
   startline logic, start-of-match bump loop, NOTEMPTY/FIRSTLINE handling
   (pcre2_match.c:6530-7777, JIT/start-optimization branches reduced per M5/M9 notes)
