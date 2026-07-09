@@ -276,6 +276,73 @@ let first_diff expected actual =
   in
   go 0 (expected, actual)
 
+(* ---------------- fuzz regressions (differential replay) ----------------
+
+   The differential fuzzer (fuzz/fuzz_diff.exe) writes minimized repros as
+   pcre2test-format units into fuzz/corpus/regressions/. There is no vendored
+   "expected" output for these (the whole point is engine != oracle at
+   discovery), so they are replayed DIFFERENTIALLY: each file is run through
+   BOTH the oracle and the engine harness and the two outputs are compared.
+   Once a repro's underlying bug is fixed the two agree and it stays green
+   forever; while a bug is open the file diverges and the run fails. An empty
+   / absent directory is a no-op, so this never interferes with a clean tree. *)
+
+let list_regression_files () =
+  let dir = path "fuzz/corpus/regressions" in
+  if not (Sys.file_exists dir) then []
+  else
+    Sys.readdir dir |> Array.to_list
+    |> List.filter (fun f -> Filename.check_suffix f ".txt")
+    |> List.sort String.compare
+    |> List.map (fun f -> (f, Filename.concat dir f))
+
+let replay_lines (module H : HARNESS) lines =
+  let t = H.create () in
+  let out = List.concat_map (fun l -> H.process_line t l) lines in
+  out @ H.finish t
+
+let first_diff_generic expected actual =
+  let rec go i = function
+    | [], [] -> None
+    | e :: _, [] -> Some (i, Some e, None)
+    | [], a :: _ -> Some (i, None, Some a)
+    | e :: es, a :: as_ ->
+        if String.equal e a then go (i + 1) (es, as_)
+        else Some (i, Some e, Some a)
+  in
+  go 0 (expected, actual)
+
+(* Returns true if any regression file diverges (engine != oracle). *)
+let replay_regressions () : bool =
+  let files = list_regression_files () in
+  if files = [] then false
+  else (
+    Printf.printf
+      "regressions: replaying %d fuzz repro(s) from fuzz/corpus/regressions \
+       (engine vs oracle)\n"
+      (List.length files);
+    let bad = ref false in
+    List.iter
+      (fun (name, pathf) ->
+        let lines = read_raw_lines pathf in
+        let o = replay_lines (module Oracle_harness) lines in
+        let e = replay_lines (module Engine_harness) lines in
+        if List.length o = List.length e && List.for_all2 String.equal o e then
+          Printf.printf "  OK       %s\n" name
+        else (
+          bad := true;
+          Printf.printf "  DIVERGE  %s\n" name;
+          match first_diff_generic o e with
+          | Some (i, eo, ea) ->
+              Printf.printf "    line %d\n" (i + 1);
+              Printf.printf "    oracle: %s\n"
+                (match eo with Some l -> l | None -> "<end of output>");
+              Printf.printf "    engine: %s\n"
+                (match ea with Some l -> l | None -> "<end of output>")
+          | None -> ()))
+      files;
+    !bad)
+
 let print_report r =
   let skips =
     r.n_skip_by_cat
@@ -313,6 +380,7 @@ let () =
     | [] -> `Default
     | [ "--frontier" ] -> `Frontier
     | [ "--failures" ] -> `Failures
+    | [ "--regressions" ] -> `Regressions
     | [ "--update-baseline" ] -> `Update
     | [ "--only"; spec ] -> (
         match String.index_opt spec ':' with
@@ -327,7 +395,7 @@ let () =
     | _ ->
         prerr_endline
           "usage: runner [--driver=oracle|engine] [--frontier | --failures | \
-           --only <file>:<ordinal> | --update-baseline]";
+           --regressions | --only <file>:<ordinal> | --update-baseline]";
         exit 2
   in
   (* Everything driver-specific in one place: the harness instantiation, the
@@ -348,6 +416,7 @@ let () =
   let skiplist = load_skiplist () in
   let files = load_order () in
   match mode with
+  | `Regressions -> exit (if replay_regressions () then 1 else 0)
   | `Only (file, ord) -> (
       let r = run_file skiplist file in
       match List.find_opt (fun o -> o.ordinal = ord) r.outcomes with
@@ -458,6 +527,8 @@ let () =
         (fun (f, ord) ->
           Printf.printf "STALE-SKIP: %s:%d passes but is skiplisted\n" f ord)
         stale;
+      (* Replay any fuzz-minimized regressions (no-op when the dir is empty). *)
+      let regr_bad = replay_regressions () in
       match mode with
       | `Update ->
           let oc = open_out (path baseline_rel) in
@@ -479,9 +550,10 @@ let () =
           output_string oc ")\n";
           close_out oc;
           Printf.printf "%s updated\n" (Filename.basename baseline_rel);
-          if stale <> [] then exit 1
+          if stale <> [] || regr_bad then exit 1
       | _ -> (
           if stale <> [] then exit 1;
+          if regr_bad then exit 1;
           match load_baseline baseline_rel with
           | None -> ()
           | Some baseline ->

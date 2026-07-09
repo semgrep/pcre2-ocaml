@@ -1,0 +1,13 @@
+; Differential fuzzer (dev-only, package pcre2-dev): drives a grammar-based
+; pattern/subject/option generator through BOTH the pure OCaml engine
+; (pcre2.engine: Pcre2_engine.Engine) and the C oracle
+; (pcre2-dev.test-driver: Pcre2_test_driver.Test_driver) and reports every
+; divergence, auto-minimized into a pcre2test-format repro under
+; fuzz/corpus/regressions/. Stdlib only otherwise.
+
+(executable
+ (name fuzz_diff)
+ (public_name pcre2-fuzz-diff)
+ (package pcre2-dev)
+ (modules fuzz_diff)
+ (libraries pcre2.engine pcre2-dev.test-driver))

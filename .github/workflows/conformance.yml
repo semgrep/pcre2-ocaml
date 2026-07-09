@@ -24,7 +24,12 @@ jobs:
         run: nix develop -c dune exec test/conformance/runner.exe
       - name: Engine conformance vs engine baseline (the port frontier)
         run: nix develop -c dune exec test/conformance/runner.exe -- --driver=engine
-      # Differential fuzz smoke lands with the fuzzer (per-milestone feature
-      # masks; see docs/ocaml-engine plan docs):
-      # - run: nix develop -c dune exec fuzz/fuzz_diff.exe -- --cases 10000
+      # Replay any committed fuzz-minimized regressions differentially
+      # (engine vs oracle). No-op while fuzz/corpus/regressions/ is empty.
+      - name: Fuzz regressions replay (engine vs oracle)
+        run: nix develop -c dune exec test/conformance/runner.exe -- --regressions
+      # Differential fuzz smoke: grammar-based generator vs the C oracle over
+      # the full ported feature space (NO_UTF_CHECK excluded from the pool).
+      - name: Differential fuzz smoke (10k cases)
+        run: nix develop -c dune exec fuzz/fuzz_diff.exe -- --cases 10000
       # Bench gate (geomean <= 2.0 vs oracle) is a nightly job from M9 on.
