@@ -406,6 +406,39 @@ type match_block = {
          Compile.compile_block *)
 }
 
+(* DEVIATION (perf): the C keeps match()'s locals on its stack frame and
+   passes mb explicitly; OCaml closes over them, which allocated the whole
+   function nest per attempt. This record is that environment, allocated
+   once per pcre2_match/match_internal call and threaded explicitly.
+   Field order: the hottest pointers (mb, arena) come first for the
+   smallest load offsets. The mutable fields are ints only — stores are
+   setfield_imm, no caml_modify write barrier after construction — and
+   every heap-pointing field is immutable. The frames int array is
+   deliberately NOT cached here: Frames growth re-points arena.frames
+   (frames.ml:350), so it must be re-read through [arena] at function
+   heads. *)
+type match_state = {
+  mb : match_block;
+  arena : Frames.t;
+  match_data : match_data;
+  top_bracket : int;
+  utf : bool; (* pcre2_match.c:630-637 *)
+  ucp : bool;
+  nl_scratch : int ref;
+      (* out-parameter scratch for IS_NEWLINE/WAS_NEWLINE
+         (pcre2_internal.h:496-521); write-before-read, never reset *)
+  ref_length : int ref;
+      (* pcre2_match.c:613 + 353 — PCRE2_SIZE length: the match()-local
+         that the backreference arms pass to match_ref() as its lengthptr
+         out-parameter (both the C's `length` at 5047 and the block-local
+         `slength`s at 5080/5101/5128/5179 land here); write-before-read
+         (the C's uninitialized local), never reset. A single cell
+         suffices because match_ref never re-enters the dispatch loop, so
+         at most one call's result is ever pending. *)
+  mutable branch_end : int; (* pcre2_match.c:609; -1 = NULL *)
+  mutable assert_accept_frame : int; (* pcre2_match.c:604; -1 = NULL *)
+}
+
 (* pcre2_internal.h:424-427 — HSPACE_BYTE_CASES: HT, SPACE, NBSP. The
    8-bit code-unit switches in pcre2_match.c use only these (the
    HSPACE_MULTIBYTE_CASES arms are compiled out at
@@ -606,32 +639,60 @@ let scheck_partial (mb : match_block) (feptr : int) : int =
 (* pcre2_match.c:566-6502 — match(): run one match attempt at a single
    starting point in the subject.
 
-   Arguments (pcre2_match.c:578-584; frame_size lives inside [a]):
+   Arguments (pcre2_match.c:578-584; frame_size lives inside the arena):
      start_eptr   starting character in subject (offset)
      start_ecode  starting position in compiled code (offset)
-     top_bracket  number of capturing parentheses in the pattern
-     a            the backtracking-frame arena (match_data->heapframes)
-     match_data   where to write the resulting ovector
-     mb           the "static" variables block
+     st           the per-exec [match_state]: top_bracket (number of
+                  capturing parentheses), the backtracking-frame arena
+                  (match_data->heapframes), match_data (where to write
+                  the resulting ovector) and mb (the "static" variables
+                  block)
 
    Returns (pcre2_match.c:586-591): MATCH_MATCH (1) if matched,
    MATCH_NOMATCH (0) if failed to match, a negative MATCH_xxx value for
    PRUNE, SKIP, etc, or a negative PCRE2_ERROR_xxx value if aborted by an
    error condition. *)
-let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
-    (a : Frames.t) (match_data : match_data) (mb : match_block) : int =
-  (* pcre2_match.c:630-637 — UTF and UCP flags. *)
-  let utf = not (Int.equal (mb.poptions land Options.utf) 0) in
-  let ucp = not (Int.equal (mb.poptions land Options.ucp) 0) in
+let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
+  (* pcre2_match.c:630-637 — UTF and UCP flags (computed per exec into
+     [st] from mb.poptions). Field punning keeps every downstream name
+     unchanged; the arena field reintroduces its local name [a]. *)
+  let {
+    mb;
+    arena = a;
+    match_data;
+    top_bracket;
+    utf;
+    ucp;
+    nl_scratch;
+    ref_length;
+    _;
+  } =
+    st
+  in
+  (* pcre2_match.c:609 — PCRE2_SPTR branch_end = NULL: a match()-local;
+     C:607 says such locals do not NEED to survive RMATCH, but this one in
+     fact persists for the whole match() invocation — and must (the
+     ALT->KET adjacency protocol reads it after resumes). OP_ALT records
+     the end of the matched branch in it (5895); the OP_KET branch_start
+     scan consumes and resets it (5913-5917). -1 = NULL (code offsets are
+     >= 0). Lives in [st] (per exec) so the dispatch loop stays
+     allocation-free; reset here, at every match() entry. *)
+  st.branch_end <- -1;
+  (* pcre2_match.c:604 — heapframe *assert_accept_frame = NULL: for
+     passing back a frame with captures. Set by OP_ASSERT_ACCEPT (839),
+     consumed by the MATCH_ACCEPT handling in the assertion resume code
+     (RM3 5520-5528; RM5 is M5). A frame index here (-1 = NULL); like
+     [branch_end], a match()-local that persists across RMATCH, living in
+     [st] and reset at every match() entry. *)
+  st.assert_accept_frame <- -1;
 
   (* pcre2_internal.h:496-507 — IS_NEWLINE(p): NLBLOCK is mb, PSEND is
      end_subject (pcre2_match.c:60-66). For the non-fixed conventions
      PRIV(is_newline) writes the length of the newline it found through
      &mb->nllen; [nl_scratch] is that out-parameter, preallocated once per
-     match so the dispatch loop stays allocation-free, and copied to
-     mb.nllen exactly when the C writes it (TRUE returns only —
+     exec in [match_state] so the dispatch loop stays allocation-free, and
+     copied to mb.nllen exactly when the C writes it (TRUE returns only —
      Newline.is_newline leaves the ref untouched on FALSE). *)
-  let nl_scratch = ref 0 in
   let is_newline_at (p : int) : bool =
     if not (Int.equal mb.nltype Newline.nltype_fixed) then (
       p < mb.end_subject
@@ -678,31 +739,6 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
               (Char.code (String.unsafe_get mb.subject (p - mb.nllen + 1)))
               mb.nl1)
   in
-  (* pcre2_match.c:609 — PCRE2_SPTR branch_end = NULL: a match()-local;
-     C:607 says such locals do not NEED to survive RMATCH, but this one in
-     fact persists for the whole match() invocation — and must (the
-     ALT->KET adjacency protocol reads it after resumes). OP_ALT records the end of
-     the matched branch in it (5895); the OP_KET branch_start scan
-     consumes and resets it (5913-5917). -1 = NULL (code offsets are
-     >= 0). Preallocated once per match, like [nl_scratch], so the
-     dispatch loop stays allocation-free. *)
-  let branch_end = ref (-1) in
-  (* pcre2_match.c:604 — heapframe *assert_accept_frame = NULL: for
-     passing back a frame with captures. Set by OP_ASSERT_ACCEPT (839),
-     consumed by the MATCH_ACCEPT handling in the assertion resume code
-     (RM3 5520-5528; RM5 is M5). A frame index here (-1 = NULL); like
-     [branch_end], a match()-local that persists across RMATCH,
-     preallocated once per match so the dispatch loop stays
-     allocation-free. *)
-  let assert_accept_frame = ref (-1) in
-  (* pcre2_match.c:613 + 353 — PCRE2_SIZE length: the match()-local that
-     the backreference arms pass to match_ref() as its lengthptr
-     out-parameter (both the C's `length` at 5047 and the block-local
-     `slength`s at 5080/5101/5128/5179 land here). Preallocated once per
-     match, like [nl_scratch], so the dispatch loop stays allocation-free;
-     a single cell suffices because match_ref never re-enters the
-     dispatch loop, so at most one call's result is ever pending. *)
-  let ref_length = ref 0 in
   (* pcre2_match.c:1930 + 2014 — Lbyte_map[fc/8] & (1u << (fc&7)): probe
      the 32-byte class bitmap saved at Lbyte_map_address (temp_sptr[1]).
      In bounds: the map is part of the OP_CLASS/OP_NCLASS item in the
@@ -1067,7 +1103,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            that the captures and mark can be fished out of it. *)
         if fr.(fb + Frames.slot_eptr) > mb.last_used_ptr then
           mb.last_used_ptr <- fr.(fb + Frames.slot_eptr);
-        assert_accept_frame := f;
+        st.assert_accept_frame <- f;
         (backtrack [@tailcall]) f match_accept
     | 164 ->
         (* OP_ACCEPT (pcre2_match.c:842-874) — for ACCEPT within a
@@ -2376,7 +2412,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         (* OP_ALT (pcre2_match.c:5894-5897) — an alternation is the end of
            a branch: record it in branch_end, then scan along to the end
            of the bracketed group. *)
-        branch_end := ecode;
+        st.branch_end <- ecode;
         fr.(fb + Frames.slot_ecode) <- skip_alts ecode;
         (dispatch [@tailcall]) f
     | 121 | 123 | 122 | 124 -> (
@@ -2394,9 +2430,9 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            VREVERSE end-point checks below (5995, 6009, 6038). *)
         let branch_start =
           ket_branch_start bracode
-            (if Int.equal !branch_end (-1) then ecode else !branch_end)
+            (if Int.equal st.branch_end (-1) then ecode else st.branch_end)
         in
-        branch_end := -1;
+        st.branch_end <- -1;
         let bra_op = Char.code (Bytes.get mb.start_code bracode) in
         (* pcre2_match.c:5919-5950 — point N (= p + 1 here) to the frame
            at the start of the most recent group (Flast_group_offset is a
@@ -5699,9 +5735,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         if
           (* safe: 0 <= p <= eptr - 1 < eptr <= mb.end_subject <=
              String.length mb.subject *)
-          Int.equal
-            (Char.code (String.unsafe_get mb.subject p) land 0xc0)
-            0x80
+          Int.equal (Char.code (String.unsafe_get mb.subject p) land 0xc0) 0x80
         then
           (* pin: the bounded walk landed on a continuation byte, so C's
              unbounded BACKCHAR would cross below the subject — the step
@@ -6694,7 +6728,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                [assert_accept_frame] is a valid frame index (MATCH_ACCEPT
                is only produced by the OP_ASSERT_ACCEPT arm, which sets
                it) and offset_top <= 2 * top_bracket in both frames. *)
-            let ab = Frames.base a !assert_accept_frame in
+            let ab = Frames.base a st.assert_accept_frame in
             Array.blit fr (ab + Frames.slot_ovector) fr
               (fb + Frames.slot_ovector)
               fr.(ab + Frames.slot_offset_top);
@@ -6839,7 +6873,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                the frame remembered by OP_ASSERT_ACCEPT. In bounds: as at
                the RM3 resume ([assert_accept_frame] is a valid frame
                index and offset_top <= 2 * top_bracket in both frames). *)
-            let ab = Frames.base a !assert_accept_frame in
+            let ab = Frames.base a st.assert_accept_frame in
             Array.blit fr (ab + Frames.slot_ovector) fr
               (fb + Frames.slot_ovector)
               fr.(ab + Frames.slot_offset_top);
@@ -7945,6 +7979,25 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                   nl1 = !nl1;
                 }
               in
+              (* The per-exec [match_state] threaded through [match_]
+                 (DEVIATION (perf) — see the type). utf/ucp: mb.poptions =
+                 re->overall_options (pcre2_match.c:6969), so the values
+                 computed above (6648-6654) equal match()'s own derivation
+                 from mb->poptions (630-637). *)
+              let st =
+                {
+                  mb;
+                  arena = a;
+                  match_data;
+                  top_bracket = re.Compile.top_bracket;
+                  utf;
+                  ucp;
+                  nl_scratch = ref 0;
+                  ref_length = ref 0;
+                  branch_end = -1;
+                  assert_accept_frame = -1;
+                }
+              in
               (* pcre2_internal.h:496-521 — IS_NEWLINE(p) / WAS_NEWLINE(p)
                  for the driver's own scan sites (7176/7184, 7328/7336,
                  7588): the same transcription as inside [match_] (NLBLOCK is
@@ -8383,10 +8436,7 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                   mb.end_offset_top <- 0;
                   mb.skip_arg_count <- 0;
                   (* pcre2_match.c:7514-7515 — run the match. *)
-                  let rc =
-                    match_ ~start_eptr:start_match ~start_ecode:0
-                      ~top_bracket:re.Compile.top_bracket a match_data mb
-                  in
+                  let rc = match_ st ~start_eptr:start_match ~start_ecode:0 in
                   (* pcre2_match.c:7521-7525 — if "hitend" is set, remember
                      the first starting point for which a partial match was
                      found. *)
@@ -8737,9 +8787,24 @@ let match_internal ?(moptions = 0) ?(poptions = 0) ?start_offset
     match Frames.create ~top_bracket ~heap_limit with
     | Error e -> (e, match_data.ovector)
     | Ok a ->
-        let rc =
-          match_ ~start_eptr:start ~start_ecode:0 ~top_bracket a match_data mb
+        (* The per-exec [match_state] (DEVIATION (perf) — see the type).
+           utf/ucp: mb.poptions = poptions here, so this equals match()'s
+           derivation from mb->poptions (pcre2_match.c:630-637). *)
+        let st =
+          {
+            mb;
+            arena = a;
+            match_data;
+            top_bracket;
+            utf = not (Int.equal (poptions land Options.utf) 0);
+            ucp = not (Int.equal (poptions land Options.ucp) 0);
+            nl_scratch = ref 0;
+            ref_length = ref 0;
+            branch_end = -1;
+            assert_accept_frame = -1;
+          }
         in
+        let rc = match_ st ~start_eptr:start ~start_ecode:0 in
         (rc, match_data.ovector)
 
 (* ---------- Inline sanity checks (module-initialization asserts) ---------- *)
@@ -9291,17 +9356,32 @@ let () =
     match Frames.create ~top_bracket:0 ~heap_limit:Limits.heap_limit with
     | Error _ -> assert false
     | Ok a ->
-        match_ ~start_eptr:mb.start_used_ptr ~start_ecode:0 ~top_bracket:0 a
+        (* The per-exec [match_state]; utf/ucp from mb.poptions = 0 here
+           (pcre2_match.c:630-637). *)
+        let st =
           {
-            ovector = Array.make 2 Frames.unset;
-            oveccount = 1;
-            rc = 0;
-            startchar = 0;
-            leftchar = 0;
-            rightchar = 0;
-            mark = Frames.unset;
+            mb;
+            arena = a;
+            match_data =
+              {
+                ovector = Array.make 2 Frames.unset;
+                oveccount = 1;
+                rc = 0;
+                startchar = 0;
+                leftchar = 0;
+                rightchar = 0;
+                mark = Frames.unset;
+              };
+            top_bracket = 0;
+            utf = false;
+            ucp = false;
+            nl_scratch = ref 0;
+            ref_length = ref 0;
+            branch_end = -1;
+            assert_accept_frame = -1;
           }
-          mb
+        in
+        match_ st ~start_eptr:mb.start_used_ptr ~start_ecode:0
   in
   (* Soft partial on "ab": rc NOMATCH but hitend set (SCHECK_PARTIAL,
      540-541: eptr 2 > start_used_ptr 0); last_used_ptr updated to the
@@ -10664,11 +10744,11 @@ let () =
      and the nomatch mark is passed back — oracle: No match, mark = z.
      (Without the verb the [ab] bitmap would suppress the attempts; see
      the compile.ml study asserts.) *)
-  (let re = compile "(*MARK:z)[ab]c" in
-   match run re "xc" with
-   | rc, m ->
-       assert (Int.equal rc Errors.error_nomatch);
-       assert (String.equal (mark_name re m) "z"))
+  let re = compile "(*MARK:z)[ab]c" in
+  match run re "xc" with
+  | rc, m ->
+      assert (Int.equal rc Errors.error_nomatch);
+      assert (String.equal (mark_name re m) "z")
 
 (* UTF-8 match arms (this chunk): whole compiled UTF patterns through the
    [pcre2_match] driver — literal/CHARI/NOT decodes, wide char repeats
