@@ -53,9 +53,9 @@ Compile phase (`compile.ml` ← pcre2_compile.c back half):
   + chartypeoffset 687-691, opcode_possessify 861-917. The repeated-bracket
   region 7424-7751 and repeated-recursion 7354-7422 defer loudly with err 299:
   no bracket/OP_RECURSE previous item exists until chunk D / M5)
-- [ ] compile_branch D — group emission OP_BRA/OP_CBRA, name table entries
+- [x] compile_branch D — (this commit; name-table finalization moved to driver chunk — add_name_to_table is driver-owned at 9181-9240) group emission OP_BRA/OP_CBRA, name table entries
   (pcre2_compile.c:8050-8370, minus backref/recursion arms → M2/M4)
-- [ ] compile_regex + branch linking, OP_ALT/OP_KET chains, first/req cu seed
+- [x] compile_regex + branch linking (core 8345-8646 absorbed by chunk D; tail 8650-9390 rides with the driver chunk), OP_ALT/OP_KET chains, first/req cu seed
   (pcre2_compile.c:8378-9390)
 - [ ] pcre2_compile top-level: two-pass driver, workspace, error offset tracking,
   anchoring flags, name-table finalization (pcre2_compile.c:10126-11001)

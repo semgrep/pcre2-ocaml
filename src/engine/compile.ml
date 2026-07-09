@@ -8,9 +8,11 @@
    compile_block records with their pcre2_compile() defaults, and the
    small helpers compile_branch and its callers need early
    (check_workspace_overflow, first_significant_code,
-   find_dupname_details), plus compile_branch (chars/escapes, classes, and
-   repeats live; bracket/group arms next). compile_regex and the
-   pcre2_compile() driver are the remaining M1 compile chunks
+   find_dupname_details), plus compile_branch (chars/escapes, classes,
+   repeats, and plain capture/non-capture groups with their bracket
+   repeats live) and compile_regex (branch linking, OP_ALT/OP_KET chains;
+   mutually recursive with compile_branch exactly as in the C). The
+   pcre2_compile() driver is the remaining M1 compile chunk
    (docs/ocaml-engine/02-core-compile-match.md).
 
    The compiled pattern is a Bytes.t of 8-bit code units (this port is the
@@ -873,26 +875,25 @@ let opcode_possessify =
                       +1 Success, this branch must match at least one char
                       -1 Success, this branch may match an empty string
 
-   Chunk boundary (M1 chunks "compile_branch A" + "compile_branch B" +
-   "compile_branch C — repeats"): the arms for
-   groups/conditionals/lookarounds (chunk D and later milestones), verbs,
-   backrefs, recursion and string callouts are deferred — they fail loudly
-   with Parse.err_deferred (identically in both phases, before any
-   phase-dependent work); within the repeat arm, a bracket or OP_RECURSE
-   previous item likewise defers (chunk D / M5). The C locals owned by the
-   still-deferred arms (bravalue, group_return, offset, length_prevgroup,
-   groupsetfirstcu, pcre2_compile.c:5642-5694) arrive with their arms. The
-   class locals (negate_class, should_flip_negation,
+   Chunk boundary (M1 chunks "compile_branch A".."D"): chars/escapes,
+   classes, repeats and plain capture/non-capture groups (with bracket
+   repeats) are live. The arms for conditionals/lookarounds (M4/M5),
+   verbs, backrefs, recursion and string callouts are deferred — they fail
+   loudly with Parse.err_deferred (identically in both phases, before any
+   phase-dependent work); within the repeat arm, an OP_RECURSE previous
+   item likewise defers (M5). The C local `offset`
+   (pcre2_compile.c:5658), owned by the still-deferred conditional arms,
+   arrives with them. The class locals (negate_class, should_flip_negation,
    match_all_or_no_wide_chars, class_has_8bitchar, xclass, xclass_has_prop,
    class_uchardata, classbits; pcre2_compile.c:5672,5690-5693,5725-5733)
    live in the class arm, which is where the C first assigns them each
    iteration; the per-branch classbits[32] buffer (5672) becomes a fresh
    32-byte Bytes per class, standing in for the C's memset (6026). *)
-let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
+let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
     (codeptr : int ref) (pptrptr : int ref) (errorcodeptr : int ref)
     (firstcuptr : int ref) (firstcuflagsptr : int ref) (reqcuptr : int ref)
-    (reqcuflagsptr : int ref) (_bcptr : branch_chain option)
-    (_open_caps : open_capitem option) (cb : compile_block)
+    (reqcuflagsptr : int ref) (bcptr : branch_chain option)
+    (open_caps : open_capitem option) (cb : compile_block)
     (lengthptr : int ref option) : int =
   (* pcre2_compile.c:5642-5670 — locals (see the chunk-boundary note above
      for the ones deferred with their arms). *)
@@ -913,6 +914,13 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
   let previous = ref (-1) in
   (* PCRE2_UCHAR *previous = NULL; set for non-quantifier items
      (pcre2_compile.c:5800-5804), read by the repeat arms (chunk C) *)
+  (* pcre2_compile.c:5644,5659,5666 — group_return, length_prevgroup and
+     groupsetfirstcu are function-level: the group arm writes them and the
+     bracket-repeat arm (7554,7569,7604,7705) reads them on a later
+     iteration. *)
+  let group_return = ref 0 in
+  let length_prevgroup = ref 0 in
+  let groupsetfirstcu = ref false in
   let matched_char = ref false in
   let previous_matched_char = ref false in
   let had_accept = ref false in
@@ -1074,6 +1082,169 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
      literals). *)
   let normal_char () : unit = normal_char_set cb.parsed_pattern.(!pptr) in
 
+  (* pcre2_compile.c:6810-7015 — the GROUP_PROCESS_NOTE_EMPTY /
+     GROUP_PROCESS labels: process a nested bracketed regex. The nesting
+     depth is maintained for the benefit of the stackguard function. The
+     test for too deep nesting is now done in parse_regex(). Assertion and
+     DEFINE groups come to GROUP_PROCESS; others come to
+     GROUP_PROCESS_NOTE_EMPTY, to indicate that we need to take note of
+     whether or not they may match an empty string. The C's per-iteration
+     note_group_empty (reset FALSE at 5808, set TRUE at 6817) and skipunits
+     (reset 0 at 5809, set by META_CAPTURE at 8095) become parameters:
+     each goto site passes the values in force when it jumps. bravalue
+     (pcre2_compile.c:5642) is set by every jumping arm, so it is a
+     parameter too. In M1 only META_NOCAPTURE (OP_BRA) and META_CAPTURE
+     (OP_CBRA) reach here; the lookaround/conditional/script-run callers
+     arrive with M4/M5. *)
+  let group_process ~(note_group_empty : bool) ~(bravalue : int)
+      ~(skipunits : int) : unit =
+    (* pcre2_compile.c:6819-6825 *)
+    cb.parens_depth <- cb.parens_depth + 1;
+    Bytes.set cb.start_code !code (Char.chr (bravalue land 0xff));
+    pptr := !pptr + 1;
+    let tempcode = ref !code in
+    let tempreqvary = cb.req_varyopt (* Save value before group *) in
+    length_prevgroup := 0 (* Initialize for pre-compile phase *);
+
+    (* pcre2_compile.c:5736,5739 — the sub* out-cells for compile_regex. *)
+    let subfirstcu = ref 0 and subreqcu = ref 0 in
+    let subfirstcuflags = ref 0 and subreqcuflags = ref 0 in
+
+    (* pcre2_compile.c:6827-6845 *)
+    group_return :=
+      compile_regex !options !xoptions tempcode pptr errorcodeptr ~skipunits
+        subfirstcu subfirstcuflags subreqcu subreqcuflags bcptr open_caps cb
+        (match lengthptr with
+        | None -> None (* Actual compile phase *)
+        | Some _ -> Some length_prevgroup (* Pre-compile phase *));
+    if Int.equal !group_return 0 then return_from_branch 0 (* Error *);
+
+    (* pcre2_compile.c:6847 *)
+    cb.parens_depth <- cb.parens_depth - 1;
+
+    (* pcre2_compile.c:6849-6854 — if that was a non-conditional
+       significant group (not an assertion, not a DEFINE) that matches at
+       least one character, then the current item matches a character.
+       Conditionals are handled below. *)
+    if
+      note_group_empty
+      && (not (Int.equal bravalue Opcodes.op_cond))
+      && !group_return > 0
+    then matched_char := true;
+
+    (* pcre2_compile.c:6856-6859 — if we've just compiled an assertion,
+       pop the assert depth. *)
+    if bravalue >= Opcodes.op_assert && bravalue <= Opcodes.op_assertback_na
+    then cb.assert_depth <- cb.assert_depth - 1;
+
+    (* pcre2_compile.c:6861-6913 — for a conditional bracket, check that
+       there are no more than two branches in the group (ERR27), or just
+       one if it's a DEFINE group (ERR54, then the OP_DEFINE-to-OP_FALSE
+       rewrite and bravalue = OP_DEFINE). M5 owns conditionals
+       (docs/ocaml-engine/05-conditionals-recursion.md); unreachable here
+       until the META_COND arms stop deferring, kept loud (both phases,
+       where the C checks only in the real phase) so M5 cannot silently
+       miss it. *)
+    if Int.equal bravalue Opcodes.op_cond then (
+      errorcodeptr := Parse.err_deferred;
+      return_from_branch 0);
+
+    match lengthptr with
+    | Some length ->
+        (* pcre2_compile.c:6915-6933 — in the pre-compile phase, update
+           the length by the length of the group, less the brackets at
+           either end. Then reduce the compiled code to just a set of
+           non-capturing brackets so that it doesn't use much memory if it
+           is duplicated by a quantifier. *)
+        if oflow_max - !length < !length_prevgroup - 2 - (2 * Limits.link_size)
+        then (
+          errorcodeptr := Errors.err20;
+          return_from_branch 0);
+        length := !length + !length_prevgroup - 2 - (2 * Limits.link_size);
+        incr code (* This already contains bravalue *);
+        putinc cb.start_code code (1 + Limits.link_size);
+        emit_cu Opcodes.op_ket;
+        putinc cb.start_code code (1 + Limits.link_size)
+        (* break: no need to waste time with special character handling *)
+    | None ->
+        (* pcre2_compile.c:6935-6937 — otherwise update the main code
+           pointer to the end of the group. *)
+        code := !tempcode;
+
+        (* pcre2_compile.c:6939-6942 — for a DEFINE group, required and
+           first character settings are not relevant. bravalue only
+           becomes OP_DEFINE inside the conditional block above (M5). *)
+        if not (Int.equal bravalue Opcodes.op_define) then (
+          (* pcre2_compile.c:6944-6955 — handle updating of the required
+             and first code units for other types of group. Update for
+             normal brackets of all kinds, and conditions with two
+             branches (see code above). If the bracket is followed by a
+             quantifier with zero repeat, we have to back off. Hence the
+             definition of zeroreqcu and zerofirstcu outside the main loop
+             so that they can be accessed for the back off. *)
+          zeroreqcu := !reqcu;
+          zeroreqcuflags := !reqcuflags;
+          zerofirstcu := !firstcu;
+          zerofirstcuflags := !firstcuflags;
+          groupsetfirstcu := false;
+
+          if bravalue >= Opcodes.op_once (* Not an assertion *) then (
+            (* pcre2_compile.c:6959-6975 — if we have not yet set a
+               firstcu in this branch, take it from the subpattern,
+               remembering that it was set here so that a repeat of more
+               than one can replicate it as reqcu if necessary. If the
+               subpattern has no firstcu, set "none" for the whole branch.
+               In both cases, a zero repeat forces firstcu to "none". *)
+            if
+              Int.equal !firstcuflags req_unset
+              && not (Int.equal !subfirstcuflags req_unset)
+            then (
+              if !subfirstcuflags < req_none then (
+                firstcu := !subfirstcu;
+                firstcuflags := !subfirstcuflags;
+                groupsetfirstcu := true)
+              else firstcuflags := req_none;
+              zerofirstcuflags := req_none)
+            else if
+              (* pcre2_compile.c:6977-6985 — if firstcu was previously
+                 set, convert the subpattern's firstcu into reqcu if there
+                 wasn't one, using the vary flag that was in existence
+                 beforehand. *)
+              !subfirstcuflags < req_none && !subreqcuflags >= req_none
+            then (
+              subreqcu := !subfirstcu;
+              subreqcuflags := !subfirstcuflags lor tempreqvary);
+
+            (* pcre2_compile.c:6987-6994 — if the subpattern set a
+               required code unit (or set a first code unit that isn't
+               really the first code unit - see above), set it. *)
+            if !subreqcuflags < req_none then (
+              reqcu := !subreqcu;
+              reqcuflags := !subreqcuflags))
+          else if
+            (* pcre2_compile.c:6997-7013 — for a forward assertion, we
+               take the reqcu, if set, provided that the group has also
+               set a firstcu. This can be helpful if the pattern that
+               follows the assertion doesn't set a different char. For
+               example, it's useful for /(?=abcde).+/. We can't set
+               firstcu for an assertion, however because it leads to
+               incorrect effect for patterns such as /(?=a)a.+/ when the
+               "real" "a" would then become a reqcu instead of a firstcu.
+               This is overcome by a scan at the end if there's no
+               firstcu, looking for an asserted first char. A similar
+               effect for patterns like /(?=.*X)X$/ means we must only
+               take the reqcu when the group also set a firstcu.
+               Otherwise, in that example, 'X' ends up set for both. *)
+            (Int.equal bravalue Opcodes.op_assert
+            || Int.equal bravalue Opcodes.op_assert_na)
+            && !subreqcuflags < req_none
+            && !subfirstcuflags < req_none
+          then (
+            reqcu := !subreqcu;
+            reqcuflags := !subreqcuflags))
+    (* pcre2_compile.c:7015 — break: end of nested group handling *)
+  in
+
   (* pcre2_compile.c:5721-5723 — switch on next META item until the end of
      the branch: for (;; pptr++). *)
   try
@@ -1132,8 +1303,10 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
         previous := !code;
         if !matched_char && not !had_accept then okreturn := 1);
 
-      (* pcre2_compile.c:5806-5809. note_group_empty = FALSE and
-         skipunits = 0 join with the group arms (chunk D). *)
+      (* pcre2_compile.c:5806-5809. The C's per-iteration resets
+         note_group_empty = FALSE and skipunits = 0 are the default
+         parameter values the group_process call sites pass (see its
+         header note). *)
       previous_matched_char := !matched_char;
       matched_char := false;
 
@@ -1815,12 +1988,11 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
            loudly. *)
         errorcodeptr := Parse.err_deferred;
         return_from_branch 0)
-      else if Int.equal meta Parse.meta_nocapture then (
-        (* pcre2_compile.c:6806-7018 — non-capturing bracket and the
-           GROUP_PROCESS machinery: M1 chunk compile_branch D. Deferred
-           loudly. *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+      else if Int.equal meta Parse.meta_nocapture then
+        (* pcre2_compile.c:6806-6808 — bravalue = OP_BRA; fall through to
+           GROUP_PROCESS_NOTE_EMPTY. *)
+        group_process ~note_group_empty:true ~bravalue:Opcodes.op_bra
+          ~skipunits:0
       else if
         Int.equal meta Parse.meta_backref_byname
         || Int.equal meta Parse.meta_recurse_byname
@@ -1861,9 +2033,10 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
            pcre2_compile.c:5645,5647,5657; tempcode, op_previous:
            5663,5665; possessive_quantifier, mclength, mcbuffer:
            5731,5734,5741) are declared here — this arm is their only
-           reader. The locals of the bracket-repeat region (group_return,
-           length_prevgroup, groupsetfirstcu, bralink, brazeroptr) arrive
-           with chunk D. *)
+           reader, except group_return/length_prevgroup/groupsetfirstcu,
+           which the group arm writes (function-level refs above); the
+           bracket-repeat case owns bralink and brazeroptr
+           (pcre2_compile.c:7444-7445). *)
         let repeat_min = ref 0
         and repeat_max = ref 0 in
         if
@@ -2165,17 +2338,371 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
              || Int.equal op_previous Opcodes.op_cbra
              || Int.equal op_previous Opcodes.op_cond
            then (
-             (* pcre2_compile.c:7424-7751 — if previous was a bracket
-                group, we may have to replicate it in certain cases:
-                OP_BRAZERO/OP_SKIPZERO insertion for a zero minimum,
-                nested replication for a limited maximum,
-                OP_KETRMAX/OP_KETRMIN/OP_KETRPOS conversion and the
-                possessive BRAPOS transform for an unlimited one. M1 chunk
-                compile_branch D owns this region together with bracket
-                emission itself (no bracket opcode can be a previous item
-                until that chunk lands). Deferred loudly. *)
-             errorcodeptr := Parse.err_deferred;
-             return_from_branch 0)
+             (* pcre2_compile.c:7424-7446 — if previous was a bracket
+                group, we may have to replicate it in certain cases. Note
+                that at this point we can encounter only the "basic"
+                bracket opcodes such as BRA and CBRA, as this is the place
+                where they get converted into the more special varieties
+                such as BRAPOS and SBRA. Originally, PCRE did not allow
+                repetition of assertions, but now it does, for Perl
+                compatibility. The C's PCRE2_UCHAR *bralink / *brazeroptr
+                NULL pointers become offset -1 (0 is a valid code
+                offset). *)
+             let len = !code - !previous in
+             let bralink = ref (-1) in
+             let brazeroptr = ref (-1) in
+
+             if
+               Int.equal !repeat_max 1
+               && Int.equal !repeat_min 1
+               && not !possessive_quantifier
+             then raise_notrace End_repeat;
+
+             (* pcre2_compile.c:7450-7456 — repeating a DEFINE group (or
+                any group where the condition is always FALSE and there is
+                only one branch) is pointless, but Perl allows the syntax,
+                so we just ignore the repeat. *)
+             if
+               Int.equal op_previous Opcodes.op_cond
+               && Int.equal
+                    (Char.code
+                       (Bytes.get cb.start_code
+                          (!previous + Limits.link_size + 1)))
+                    Opcodes.op_false
+               && not
+                    (Int.equal
+                       (Char.code
+                          (Bytes.get cb.start_code
+                             (!previous + get cb.start_code (!previous + 1))))
+                       Opcodes.op_alt)
+             then raise_notrace End_repeat;
+
+             (* pcre2_compile.c:7458-7470 — Perl allows all assertions to
+                be quantified, and when they contain capturing parentheses
+                and/or are optional there are potential uses for this
+                feature. ... General repetition is now permitted, but if
+                the maximum is unlimited it is set to one more than the
+                minimum. *)
+             if op_previous < Opcodes.op_once (* Assertion *) then
+               if Int.equal !repeat_max Limits.repeat_unlimited then
+                 repeat_max := !repeat_min + 1;
+
+             (* pcre2_compile.c:7472-7536 — the case of a zero minimum is
+                special because of the need to stick OP_BRAZERO in front of
+                it, and because the group appears once in the data, whereas
+                in other cases it appears the minimum number of times. For
+                this reason, it is simplest to treat this case separately,
+                as otherwise the code gets far too messy. There are several
+                special subcases when the minimum is zero. *)
+             if Int.equal !repeat_min 0 then (
+               (* pcre2_compile.c:7481-7510 — if the maximum is also zero,
+                  we used to just omit the group from the output
+                  altogether. However, that fails when a group or a
+                  subgroup within it is referenced as a subroutine from
+                  elsewhere in the pattern, so now we stick in OP_SKIPZERO
+                  in front of it so that it is skipped on execution. As we
+                  don't have a list of which groups are referenced, we
+                  cannot do this selectively.
+
+                  If the maximum is 1 or unlimited, we just have to stick
+                  in the BRAZERO and do no more at this point. *)
+               if
+                 !repeat_max <= 1
+                 || Int.equal !repeat_max Limits.repeat_unlimited
+               then (
+                 (* Bytes.blit = the C's memmove (overlap-safe). *)
+                 Bytes.blit cb.start_code !previous cb.start_code
+                   (!previous + 1) len;
+                 incr code;
+                 if Int.equal !repeat_max 0 then (
+                   Bytes.set cb.start_code !previous
+                     (Char.chr Opcodes.op_skipzero);
+                   previous := !previous + 1;
+                   raise_notrace End_repeat);
+                 brazeroptr := !previous (* Save for possessive optimizing *);
+                 Bytes.set cb.start_code !previous
+                   (Char.chr (Opcodes.op_brazero + !repeat_type));
+                 previous := !previous + 1)
+               else (
+                 (* pcre2_compile.c:7512-7533 — if the maximum is greater
+                    than 1 and limited, we have to replicate in a nested
+                    fashion, sticking OP_BRAZERO before each set of
+                    brackets. The first one has to be handled carefully
+                    because it's the original copy, which has to be moved
+                    up. The remainder can be handled by code that is common
+                    with the non-zero minimum case below. We have to adjust
+                    the value or repeat_max, since one less copy is
+                    required. *)
+                 Bytes.blit cb.start_code !previous cb.start_code
+                   (!previous + 2 + Limits.link_size)
+                   len;
+                 code := !code + 2 + Limits.link_size;
+                 Bytes.set cb.start_code !previous
+                   (Char.chr (Opcodes.op_brazero + !repeat_type));
+                 previous := !previous + 1;
+                 Bytes.set cb.start_code !previous (Char.chr Opcodes.op_bra);
+                 previous := !previous + 1;
+
+                 (* pcre2_compile.c:7527-7532 — we chain together the
+                    bracket link offset fields that have to be filled in
+                    later when the ends of the brackets are reached. *)
+                 let linkoffset =
+                   if Int.equal !bralink (-1) then 0 else !previous - !bralink
+                 in
+                 bralink := !previous;
+                 putinc cb.start_code previous linkoffset);
+
+               if not (Int.equal !repeat_max Limits.repeat_unlimited) then
+                 repeat_max := !repeat_max - 1)
+             else (
+               (* pcre2_compile.c:7538-7583 — if the minimum is greater
+                  than zero, replicate the group as many times as
+                  necessary, and adjust the maximum to the number of
+                  subsequent copies that we need. *)
+               (if !repeat_min > 1 then
+                  match lengthptr with
+                  | Some length ->
+                      (* pcre2_compile.c:7546-7561 — in the pre-compile
+                         phase, we don't actually do the replication. We
+                         just adjust the length as if we had. Do some
+                         paranoid checks for potential integer overflow.
+                         DEVIATION: PRIV(ckd_smul)'s overflow cannot occur
+                         in 63-bit OCaml int arithmetic (repeat_min <=
+                         65535 and length_prevgroup was bounded by the
+                         OFLOW/MAX_PATTERN_SIZE checks), so only the
+                         OFLOW_MAX comparison is ported. *)
+                      let delta = (!repeat_min - 1) * !length_prevgroup in
+                      if oflow_max - !length < delta then (
+                        errorcodeptr := Errors.err20;
+                        return_from_branch 0);
+                      length := !length + delta
+                  | None ->
+                      (* pcre2_compile.c:7563-7579 — this is compiling for
+                         real. If there is a set first code unit for the
+                         group, and we have not yet set a "required code
+                         unit", set it. *)
+                      if !groupsetfirstcu && !reqcuflags >= req_none then (
+                        reqcu := !firstcu;
+                        reqcuflags := !firstcuflags);
+                      for _i = 1 to !repeat_min - 1 do
+                        Bytes.blit cb.start_code !previous cb.start_code !code
+                          len;
+                        code := !code + len
+                      done);
+               if not (Int.equal !repeat_max Limits.repeat_unlimited) then
+                 repeat_max := !repeat_max - !repeat_min);
+
+             (* pcre2_compile.c:7585-7650 — this code is common to both the
+                zero and non-zero minimum cases. If the maximum is limited,
+                it replicates the group in a nested fashion, remembering
+                the bracket starts on a stack. In the case of a zero
+                minimum, the first one was set up above. In all cases the
+                repeat_max now specifies the number of additional copies
+                needed. *)
+             if not (Int.equal !repeat_max Limits.repeat_unlimited) then (
+               (match lengthptr with
+               | Some length when !repeat_max > 0 ->
+                   (* pcre2_compile.c:7594-7612 — in the pre-compile phase,
+                      we don't actually do the replication. We just adjust
+                      the length as if we had. For each repetition we must
+                      add 1 to the length for BRAZERO and for all but the
+                      last repetition we must add 2 + 2*LINKSIZE to allow
+                      for the nesting that occurs. DEVIATION: ckd_smul as
+                      in the repeat_min block above. *)
+                   let delta =
+                     !repeat_max
+                     * (!length_prevgroup + 1 + 2 + (2 * Limits.link_size))
+                   in
+                   if oflow_max + (2 + (2 * Limits.link_size)) - !length < delta
+                   then (
+                     errorcodeptr := Errors.err20;
+                     return_from_branch 0);
+                   let delta =
+                     delta - (2 + (2 * Limits.link_size))
+                     (* Last one doesn't nest *)
+                   in
+                   length := !length + delta
+               | _ ->
+                   (* pcre2_compile.c:7614-7634 — this is compiling for
+                      real (or the pre-compile phase with repeat_max = 0,
+                      when the C's loop body never runs). *)
+                   for i = !repeat_max downto 1 do
+                     emit_cu (Opcodes.op_brazero + !repeat_type);
+
+                     (* All but the final copy start a new nesting,
+                        maintaining the chain of brackets outstanding. *)
+                     if not (Int.equal i 1) then (
+                       emit_cu Opcodes.op_bra;
+                       let linkoffset =
+                         if Int.equal !bralink (-1) then 0
+                         else !code - !bralink
+                       in
+                       bralink := !code;
+                       putinc cb.start_code code linkoffset);
+
+                     Bytes.blit cb.start_code !previous cb.start_code !code
+                       len;
+                     code := !code + len
+                   done);
+
+               (* pcre2_compile.c:7636-7649 — now chain through the pending
+                  brackets, and fill in their length fields (which are
+                  holding the chain links pro tem). *)
+               while not (Int.equal !bralink (-1)) do
+                 let linkoffset = !code - !bralink + 1 in
+                 let bra = !code - linkoffset in
+                 let oldlinkoffset = get cb.start_code (bra + 1) in
+                 bralink :=
+                   if Int.equal oldlinkoffset 0 then -1
+                   else !bralink - oldlinkoffset;
+                 emit_cu Opcodes.op_ket;
+                 putinc cb.start_code code linkoffset;
+                 put cb.start_code (bra + 1) linkoffset
+               done)
+             else (
+               (* pcre2_compile.c:7652-7749 — if the maximum is unlimited,
+                  set a repeater in the final copy. For SCRIPT_RUN and ONCE
+                  brackets, that's all we need to do. However, possessively
+                  repeated ONCE brackets can be converted into
+                  non-capturing brackets, as the behaviour of (?:xx)++ is
+                  the same as (?>xx)++ and this saves having to deal with
+                  possessive ONCEs specially.
+
+                  Otherwise, when we are doing the actual compile phase,
+                  check to see whether this group is one that could match
+                  an empty string. If so, convert the initial operator to
+                  the S form (e.g. OP_BRA -> OP_SBRA) so that runtime
+                  checking can be done. [This check is also applied to ONCE
+                  and SCRIPT_RUN groups at runtime, but in a different
+                  way.]
+
+                  Then, if the quantifier was possessive and the bracket is
+                  not a conditional, we convert the BRA code to the POS
+                  form, and the KET code to KETRPOS. (It turns out to be
+                  convenient at runtime to detect this kind of subpattern
+                  at both the start and at the end.) The use of special
+                  opcodes makes it possible to reduce greatly the stack
+                  usage in pcre2_match(). If the group is preceded by
+                  OP_BRAZERO, convert this to OP_BRAPOSZERO.
+
+                  Then, if the minimum number of matches is 1 or 0, cancel
+                  the possessive flag so that the default action below, of
+                  wrapping everything inside atomic brackets, does not
+                  happen. When the minimum is greater than 1, there will be
+                  earlier copies of the group, and so we still have to wrap
+                  the whole thing. *)
+               let ketcode = !code - 1 - Limits.link_size in
+               let bracode = ketcode - get cb.start_code (ketcode + 1) in
+
+               (* pcre2_compile.c:7683-7685 — convert possessive ONCE
+                  brackets to non-capturing. *)
+               if
+                 Int.equal
+                   (Char.code (Bytes.get cb.start_code bracode))
+                   Opcodes.op_once
+                 && !possessive_quantifier
+               then Bytes.set cb.start_code bracode (Char.chr Opcodes.op_bra);
+
+               (* pcre2_compile.c:7687-7691 — for non-possessive ONCE and
+                  for SCRIPT_RUN brackets, all we need to do is to set the
+                  KET. *)
+               if
+                 Int.equal
+                   (Char.code (Bytes.get cb.start_code bracode))
+                   Opcodes.op_once
+                 || Int.equal
+                      (Char.code (Bytes.get cb.start_code bracode))
+                      Opcodes.op_script_run
+               then
+                 Bytes.set cb.start_code ketcode
+                   (Char.chr (Opcodes.op_ketrmax + !repeat_type))
+               else (
+                 (* pcre2_compile.c:7693-7708 — handle non-SCRIPT_RUN and
+                    non-ONCE brackets and possessive ONCEs (which have been
+                    converted to non-capturing above). In the compile
+                    phase, adjust the opcode if the group can match an
+                    empty string. For a conditional group with only one
+                    branch, the value of group_return will not show "could
+                    be empty", so we must check that separately. *)
+                 (match lengthptr with
+                 | None ->
+                     if !group_return < 0 then
+                       Bytes.set cb.start_code bracode
+                         (Char.chr
+                            (Char.code (Bytes.get cb.start_code bracode)
+                            + Opcodes.op_sbra - Opcodes.op_bra));
+                     if
+                       Int.equal
+                         (Char.code (Bytes.get cb.start_code bracode))
+                         Opcodes.op_cond
+                       && not
+                            (Int.equal
+                               (Char.code
+                                  (Bytes.get cb.start_code
+                                     (bracode + get cb.start_code (bracode + 1))))
+                               Opcodes.op_alt)
+                     then
+                       Bytes.set cb.start_code bracode
+                         (Char.chr Opcodes.op_scond)
+                 | Some _ -> ());
+
+                 (* pcre2_compile.c:7710-7743 — handle possessive
+                    quantifiers. *)
+                 if !possessive_quantifier then (
+                   (* pcre2_compile.c:7714-7728 — for COND brackets, we
+                      wrap the whole thing in a possessively repeated
+                      non-capturing bracket, because we have not invented
+                      POS versions of the COND opcodes. *)
+                   (if
+                      Int.equal
+                        (Char.code (Bytes.get cb.start_code bracode))
+                        Opcodes.op_cond
+                      || Int.equal
+                           (Char.code (Bytes.get cb.start_code bracode))
+                           Opcodes.op_scond
+                    then (
+                      let nlen = !code - bracode in
+                      (* Bytes.blit = memmove; the cell at bracode is below
+                         the destination range, so it still holds the
+                         original opcode afterwards, as in the C. *)
+                      Bytes.blit cb.start_code bracode cb.start_code
+                        (bracode + 1 + Limits.link_size)
+                        nlen;
+                      code := !code + 1 + Limits.link_size;
+                      let nlen = nlen + 1 + Limits.link_size in
+                      Bytes.set cb.start_code bracode
+                        (Char.chr
+                           (if
+                              Int.equal
+                                (Char.code (Bytes.get cb.start_code bracode))
+                                Opcodes.op_cond
+                            then Opcodes.op_brapos
+                            else Opcodes.op_sbrapos));
+                      emit_cu Opcodes.op_ketrpos;
+                      putinc cb.start_code code nlen;
+                      put cb.start_code (bracode + 1) nlen)
+                    else (
+                      (* pcre2_compile.c:7730-7736 — for non-COND brackets,
+                         we modify the BRA code and use KETRPOS. *)
+                      Bytes.set cb.start_code bracode
+                        (Char.chr
+                           (Char.code (Bytes.get cb.start_code bracode) + 1))
+                      (* Switch to xxxPOS opcodes *);
+                      Bytes.set cb.start_code ketcode
+                        (Char.chr Opcodes.op_ketrpos)));
+
+                   (* pcre2_compile.c:7738-7742 — if the minimum is zero,
+                      mark it as possessive, then unset the possessive flag
+                      when the minimum is 0 or 1. *)
+                   if not (Int.equal !brazeroptr (-1)) then
+                     Bytes.set cb.start_code !brazeroptr
+                       (Char.chr Opcodes.op_braposzero);
+                   if !repeat_min < 2 then possessive_quantifier := false)
+                 else
+                   (* pcre2_compile.c:7745-7747 — non-possessive
+                      quantifier. *)
+                   Bytes.set cb.start_code ketcode
+                     (Char.chr (Opcodes.op_ketrmax + !repeat_type)))))
            else if op_previous >= Opcodes.op_eodn then (
              (* pcre2_compile.c:7760-7765 — default case: not a character
                 type - internal error. *)
@@ -2339,10 +2866,14 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
         errorcodeptr := Parse.err_deferred;
         return_from_branch 0)
       else if Int.equal meta Parse.meta_capture then (
-        (* pcre2_compile.c:8090-8098 — capturing parentheses: M1 chunk
-           compile_branch D. Deferred loudly. *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+        (* pcre2_compile.c:8090-8098 — handle capturing parentheses; the
+           number is the meta argument. *)
+        put2 cb.start_code (!code + 1 + Limits.link_size) meta_arg;
+        cb.lastcapture <- meta_arg;
+        (* goto GROUP_PROCESS_NOTE_EMPTY, with bravalue = OP_CBRA and
+           skipunits = IMM2_SIZE (pcre2_compile.c:8094-8095,8098) *)
+        group_process ~note_group_empty:true ~bravalue:Opcodes.op_cbra
+          ~skipunits:Limits.imm2_size)
       else if Int.equal meta Parse.meta_escape then (
         (* pcre2_compile.c:8101-8206 — handle escape sequence items. For
            ones like \d, the ESC_values are arranged to be the same as the
@@ -2452,6 +2983,285 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
     (* Control never reaches here (pcre2_compile.c:8340). *)
     assert false
   with Return rc -> rc
+
+(* pcre2_compile.c:8345-8646 — compile_regex: compile a sequence of
+   alternatives. On entry, pptr is pointing past the bracket meta, but on
+   return it points to the closing bracket or META_END. The code variable
+   is pointing at the code unit into which the BRA operator has been
+   stored. This function is used during the pre-compile phase when we are
+   trying to find out the amount of memory needed, as well as during the
+   real compile phase. The value of lengthptr distinguishes the two
+   phases.
+
+   Arguments (same out-parameter mapping as compile_branch; options and
+   xoptions are BY VALUE in the C — updates compile_branch makes to them
+   propagate across this group's branches but not to the caller):
+     options           option bits, including any changes for this subpattern
+     xoptions          extra option bits, ditto
+     codeptr           -> the address of the current code pointer
+     pptrptr           -> the address of the current parsed pattern pointer
+     errorcodeptr      -> pointer to error code variable
+     skipunits         skip this many code units at start (for brackets and
+                       OP_COND)
+     firstcuptr        place to put the first required code unit
+     firstcuflagsptr   place to put the first code unit flags
+     reqcuptr          place to put the last required code unit
+     reqcuflagsptr     place to put the last required code unit flags
+     bcptr             pointer to the chain of currently open branches
+     open_caps         pointer to the chain of currently open captures
+     cb                points to the data block with tables pointers etc.
+     lengthptr         None during the real compile phase (C: NULL)
+                       Some length-accumulator ref during pre-compile phase
+
+   Returns:            0 There has been an error
+                      +1 Success, this group must match at least one char
+                      -1 Success, this group may match an empty string *)
+and compile_regex (options : int) (xoptions : int) (codeptr : int ref)
+    (pptrptr : int ref) (errorcodeptr : int ref) ~(skipunits : int)
+    (firstcuptr : int ref) (firstcuflagsptr : int ref) (reqcuptr : int ref)
+    (reqcuflagsptr : int ref) (bcptr : branch_chain option)
+    (open_caps : open_capitem option) (cb : compile_block)
+    (lengthptr : int ref option) : int =
+  (* pcre2_compile.c:8384-8399 — locals. *)
+  let code = ref !codeptr in
+  let last_branch = ref !code in
+  let start_bracket = !code in
+  let options = ref options in
+  let xoptions = ref xoptions in
+  let okreturn = ref 1 in
+  let pptr = ref !pptrptr in
+  let firstcu = ref 0 and reqcu = ref 0 in
+  let firstcuflags = ref req_unset and reqcuflags = ref req_unset in
+  let branchfirstcu = ref 0 and branchreqcu = ref 0 in
+  let branchfirstcuflags = ref 0 and branchreqcuflags = ref 0 in
+
+  (* pcre2_compile.c:8401-8408 — "if set, call the external function that
+     checks for stack availability" (ERR33). DEVIATION: the compile
+     context's stack_guard callback was dropped with the allocator fields
+     (see the compile_context record note); the guard is never set, so the
+     check reduces to nothing. *)
+
+  (* pcre2_compile.c:8410-8413 — miscellaneous initialization. *)
+  let bc = { outer = bcptr; current_branch = !code } in
+
+  (* pcre2_compile.c:8418-8425 — accumulate the length for use in the
+     pre-compile phase. Start with the length of the BRA and KET and any
+     extra code units that are required at the beginning. We accumulate in
+     a local variable to save frequent testing of lengthptr for NULL. We
+     cannot do this by looking at the value of 'code' at the start and end
+     of each alternative, because compiled items are discarded during the
+     pre-compile phase so that the workspace is not exceeded. *)
+  let length = ref (2 + (2 * Limits.link_size) + skipunits) in
+
+  (* pcre2_compile.c:8427-8440 — remember if this is a lookbehind
+     assertion, and if it is, save its length and skip over the pattern
+     offset. DEVIATION: the lookbehind machinery — the length/min-length
+     bookkeeping here (8434-8440), the OP_REVERSE/OP_VREVERSE insertion per
+     branch (8467-8491) and the per-alternative lookbehindlength update
+     (8639-8642) — lands with the lookaround chunks (M3/M4,
+     docs/ocaml-engine/04-lookaround-atomic-possessive.md). It is
+     unreachable until then, because compile_branch defers every lookbehind
+     META before an ASSERTBACK bravalue can reach this function; deferred
+     loudly, both phases, so those chunks cannot silently miss it. *)
+  let op0 = Char.code (Bytes.get cb.start_code !code) in
+  let lookbehind =
+    Int.equal op0 Opcodes.op_assertback
+    || Int.equal op0 Opcodes.op_assertback_not
+    || Int.equal op0 Opcodes.op_assertback_na
+  in
+  if lookbehind then (
+    errorcodeptr := Parse.err_deferred;
+    0)
+  else (
+    (* pcre2_compile.c:8442-8454 — if this is a capturing subpattern, add
+       to the chain of open capturing items so that we can detect them if
+       ( *ACCEPT) is encountered. Note that only OP_CBRA need be tested
+       here; changing this opcode to one of its variants, e.g.
+       OP_SCBRAPOS, happens later, after the group has been compiled. *)
+    let open_caps =
+      if Int.equal op0 Opcodes.op_cbra then
+        Some
+          {
+            next = open_caps;
+            number = get2 cb.start_code (!code + 1 + Limits.link_size);
+            assert_depth = cb.assert_depth;
+          }
+      else open_caps
+    in
+
+    (* pcre2_compile.c:8456-8459 — offset is set zero to mark that this
+       bracket is still open. *)
+    put cb.start_code (!code + 1) 0;
+    code := !code + 1 + Limits.link_size + skipunits;
+
+    (* The C's `return okreturn` / `return 0` exits from inside the branch
+       loop. Local exception, never escapes this function
+       (port-conventions §2; compile phase only). *)
+    let exception Return_regex of int in
+    (* pcre2_compile.c:8461-8644 — loop for each alternative branch. *)
+    try
+      while true do
+        (* pcre2_compile.c:8467-8491 — insert OP_REVERSE or OP_VREVERSE if
+           this is a lookbehind assertion: with the lookbehind machinery
+           above (M3/M4; lookbehind is always false here). *)
+
+        (* pcre2_compile.c:8493-8500 — now compile the branch; in the
+           pre-compile phase its length gets added into the length. *)
+        let branch_return =
+          compile_branch options xoptions code pptr errorcodeptr branchfirstcu
+            branchfirstcuflags branchreqcu branchreqcuflags (Some bc) open_caps
+            cb
+            (match lengthptr with None -> None | Some _ -> Some length)
+        in
+        if Int.equal branch_return 0 then raise_notrace (Return_regex 0);
+
+        (* pcre2_compile.c:8502-8504 — if a branch can match an empty
+           string, so can the whole group. *)
+        if branch_return < 0 then okreturn := -1;
+
+        (* pcre2_compile.c:8506-8566 — in the real compile phase, there is
+           some post-processing to be done. *)
+        (match lengthptr with
+        | None ->
+            if
+              not
+                (Int.equal
+                   (Char.code (Bytes.get cb.start_code !last_branch))
+                   Opcodes.op_alt)
+            then (
+              (* pcre2_compile.c:8510-8519 — if this is the first branch,
+                 the firstcu and reqcu values for the branch become the
+                 values for the regex. *)
+              firstcu := !branchfirstcu;
+              firstcuflags := !branchfirstcuflags;
+              reqcu := !branchreqcu;
+              reqcuflags := !branchreqcuflags)
+            else (
+              (* pcre2_compile.c:8521-8543 — if this is not the first
+                 branch, the first char and reqcu have to match the values
+                 from all the previous branches, except that if the
+                 previous value for reqcu didn't have REQ_VARY set, it can
+                 still match, and we set REQ_VARY for the group from this
+                 branch's value.
+
+                 If we previously had a firstcu, but it doesn't match the
+                 new branch, we have to abandon the firstcu for the regex,
+                 but if there was previously no reqcu, it takes on the
+                 value of the old firstcu. *)
+              if
+                (not (Int.equal !firstcuflags !branchfirstcuflags))
+                || not (Int.equal !firstcu !branchfirstcu)
+              then (
+                if !firstcuflags < req_none && !reqcuflags >= req_none then (
+                  reqcu := !firstcu;
+                  reqcuflags := !firstcuflags);
+                firstcuflags := req_none);
+
+              (* pcre2_compile.c:8545-8553 — if we (now or from before)
+                 have no firstcu, a firstcu from the branch becomes a reqcu
+                 if there isn't a branch reqcu. *)
+              if
+                !firstcuflags >= req_none
+                && !branchfirstcuflags < req_none
+                && !branchreqcuflags >= req_none
+              then (
+                branchreqcu := !branchfirstcu;
+                branchreqcuflags := !branchfirstcuflags);
+
+              (* pcre2_compile.c:8555-8564 — now ensure that the reqcus
+                 match. *)
+              if
+                (not
+                   (Int.equal
+                      (!reqcuflags land lnot req_vary)
+                      (!branchreqcuflags land lnot req_vary)))
+                || not (Int.equal !reqcu !branchreqcu)
+              then reqcuflags := req_none
+              else (
+                reqcu := !branchreqcu;
+                reqcuflags := !reqcuflags lor !branchreqcuflags
+                (* To "or" REQ_VARY if present *)))
+        | Some _ -> ());
+
+        (* pcre2_compile.c:8568-8615 — handle reaching the end of the
+           expression, either ')' or end of pattern. In the real compile
+           phase, go back through the alternative branches and reverse the
+           chain of offsets, with the field in the BRA item now becoming an
+           offset to the first alternative. If there are no alternatives,
+           it points to the end of the group. The length in the terminating
+           ket is always the length of the whole bracketed item. Return
+           leaving the pointer at the terminating char. *)
+        if
+          not
+            (Int.equal
+               (Parse.meta_code cb.parsed_pattern.(!pptr))
+               Parse.meta_alt)
+        then (
+          (match lengthptr with
+          | None ->
+              (* pcre2_compile.c:8578-8589 — do { ... } while
+                 (branch_length > 0). *)
+              let branch_length = ref (!code - !last_branch) in
+              let continue_ = ref true in
+              while !continue_ do
+                let prev_length = get cb.start_code (!last_branch + 1) in
+                put cb.start_code (!last_branch + 1) !branch_length;
+                branch_length := prev_length;
+                last_branch := !last_branch - !branch_length;
+                if not (!branch_length > 0) then continue_ := false
+              done
+          | Some _ -> ());
+
+          (* pcre2_compile.c:8591-8595 — fill in the ket. *)
+          Bytes.set cb.start_code !code (Char.chr Opcodes.op_ket);
+          put cb.start_code (!code + 1) (!code - start_bracket);
+          code := !code + 1 + Limits.link_size;
+
+          (* pcre2_compile.c:8597-8614 — set values to pass back. *)
+          codeptr := !code;
+          pptrptr := !pptr;
+          firstcuptr := !firstcu;
+          firstcuflagsptr := !firstcuflags;
+          reqcuptr := !reqcu;
+          reqcuflagsptr := !reqcuflags;
+          (match lengthptr with
+          | Some lp ->
+              if oflow_max - !lp < !length then (
+                errorcodeptr := Errors.err20;
+                raise_notrace (Return_regex 0));
+              lp := !lp + !length
+          | None -> ());
+          raise_notrace (Return_regex !okreturn));
+
+        (* pcre2_compile.c:8617-8637 — another branch follows. In the
+           pre-compile phase, we can move the code pointer back to where it
+           was for the start of the first branch. (That is, pretend that
+           each branch is the only one.)
+
+           In the real compile phase, insert an ALT node. Its length field
+           points back to the previous branch while the bracket remains
+           open. At the end the chain is reversed. It's done like this so
+           that the start of the bracket has a zero offset until it is
+           closed, making it possible to detect recursion. *)
+        (match lengthptr with
+        | Some _ ->
+            code := !codeptr + 1 + Limits.link_size + skipunits;
+            length := !length + 1 + Limits.link_size
+        | None ->
+            Bytes.set cb.start_code !code (Char.chr Opcodes.op_alt);
+            put cb.start_code (!code + 1) (!code - !last_branch);
+            last_branch := !code;
+            bc.current_branch <- !code;
+            code := !code + 1 + Limits.link_size);
+
+        (* pcre2_compile.c:8639-8643 — set the maximum lookbehind length
+           for the next branch (deferred with the lookbehind machinery
+           above) and then advance past the vertical bar. *)
+        pptr := !pptr + 1
+      done;
+      (* Control never reaches here (pcre2_compile.c:8645). *)
+      assert false
+    with Return_regex rc -> rc)
 
 (* ---------- Inline sanity checks (module-initialization asserts) ---------- *)
 
@@ -3398,11 +4208,583 @@ let () =
   compile2_shrink "a{0}b" [ Opcodes.op_char; 0x62 ];
   compile2_shrink "[ab]{0}c" [ Opcodes.op_char; 0x63 ];
 
-  (* Deferred arms fail loudly in both phases: groups (chunk D), backrefs
-     (M2), Unicode property classes (M7), and the Unicode caseless-literal
-     path (M6/M7 DEVIATION in compile_branch). *)
-  expect_deferred "(a)";
-  expect_deferred "(?:a)";
+  (* --- Groups (compile_branch D + compile_regex,
+     pcre2_compile.c:6806-7015, 8090-8098, 8345-8646) and bracket repeats
+     (pcre2_compile.c:7424-7751). Every byte sequence below was verified
+     against `pcre2test -q` with the fullbincode modifier on the real
+     10.44 library (offsets shifted by the driver's 3-unit outer Bra,
+     which is not part of compile_branch output). *)
+
+  (* "(a)": OP_CBRA + link + IMM2 group number, closed by compile_regex's
+     OP_KET whose link equals the whole bracketed length
+     (pcre2_compile.c:8093-8098, 8458, 8591-8595). The group sets firstcu
+     = 'a' (6965-6971) but no reqcu: the subfirstcu-to-subreqcu conversion
+     (6981-6985) applies only when firstcu was already set, and the
+     subpattern itself set none (verified: pcre2test -I shows no "Last
+     code unit"). *)
+  let cb, rc, endpptr, _, fcu, fcuf, _, rcuf = compile2 "(a)" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [ Opcodes.op_cbra; 0; 7; 0; 1; Opcodes.op_char; 0x61; Opcodes.op_ket; 0; 7 ];
+  assert (Int.equal cb.parsed_pattern.(endpptr) Parse.meta_end);
+  assert (Int.equal cb.lastcapture 1) (* pcre2_compile.c:8097 *);
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal fcuf 0);
+  assert (Int.equal rcuf req_unset);
+
+  (* "(?:ab)": non-capturing OP_BRA, no IMM2 (pcre2_compile.c:6806-6808). *)
+  let cb, rc, _, _, fcu, fcuf, rcu, rcuf = compile2 "(?:ab)" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_bra;
+      0;
+      7;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_ket;
+      0;
+      7;
+    ];
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal fcuf 0);
+  assert (Int.equal rcu 0x62);
+  assert (Int.equal rcuf 0);
+
+  (* "(a)(b)": sequential capture numbers; the second group's firstcu
+     becomes the branch reqcu via the subfirstcu-to-subreqcu conversion
+     (pcre2_compile.c:6977-6994). *)
+  let cb, rc, _, _, fcu, fcuf, rcu, rcuf = compile2 "(a)(b)" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      2;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_ket;
+      0;
+      7;
+    ];
+  assert (Int.equal cb.lastcapture 2);
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal fcuf 0);
+  assert (Int.equal rcu 0x62);
+  assert (Int.equal rcuf 0);
+
+  (* "((a))": nested groups; each KET link spans its own bracket
+     (pcre2_compile.c:8594). *)
+  let cb, rc, _, _, fcu, _, _, _ = compile2 "((a))" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_cbra;
+      0;
+      15;
+      0;
+      1;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      2;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_ket;
+      0;
+      15;
+    ];
+  assert (Int.equal fcu 0x61);
+
+  (* "(a|b)": OP_ALT chain. While open, each ALT's link points back to the
+     previous branch (pcre2_compile.c:8633-8636); at the close the chain
+     is reversed so the BRA/ALT links point forward (8578-8589). Differing
+     branch firstcus abandon the group's firstcu (8528-8543) and the
+     differing reqcus then abandon its reqcu (8555-8559): the group
+     reports REQ_NONE for both, so the outer branch takes firstcuflags =
+     REQ_NONE (6973) and leaves reqcuflags REQ_UNSET (6990 needs
+     subreqcuflags < REQ_NONE). *)
+  let cb, rc, _, _, _, fcuf, _, rcuf = compile2 "(a|b)" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_alt;
+      0;
+      5;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_ket;
+      0;
+      12;
+    ];
+  assert (Int.equal fcuf req_none);
+  assert (Int.equal rcuf req_unset);
+
+  (* "()": an empty group may match empty (group_return -1, so no
+     matched_char at 6853) and leaves firstcu unset (6965 requires
+     subfirstcuflags != REQ_UNSET). *)
+  let cb, rc, _, _, _, fcuf, _, rcuf = compile2 "()" in
+  assert (Int.equal rc (-1));
+  assert_code cb [ Opcodes.op_cbra; 0; 5; 0; 1; Opcodes.op_ket; 0; 5 ];
+  assert (Int.equal fcuf req_unset);
+  assert (Int.equal rcuf req_unset);
+
+  (* Option changes inside a group do not escape it: compile_regex takes
+     options by value (pcre2_compile.c:8378,8497), so (?-i) inside the
+     group leaves the outer caseless setting intact. *)
+  let cb, _, _, opts_out, _, _, _, _ = compile2 "(?i)((?-i)a)b" in
+  assert_code cb
+    [
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_chari;
+      0x62;
+    ];
+  assert (Int.equal opts_out Options.caseless);
+
+  (* --- Bracket repeats (pcre2_compile.c:7424-7751). *)
+
+  (* Hand-verified trace 6 — "(a)*" (pcre2_compile.c:7479-7510,
+     7678-7691, 7745-7747): min 0/max unlimited moves the 10-unit group up
+     by one (memmove, 7501), emits OP_BRAZERO + repeat_type(0) at the old
+     start (7509), and the unlimited-max branch locates ketcode = code-3
+     and bracode = ketcode - GET(ketcode,1) = the CBRA (7680-7681);
+     group_return = +1 means no SBRA conversion (7705), non-possessive so
+     *ketcode = OP_KETRMAX + 0 (7747). Zero minimum backs firstcu off to
+     REQ_NONE (7220-7226 via the group's zerofirstcuflags from 6974). *)
+  let cb, rc, _, _, _, fcuf, _, _ = compile2 "(a)*" in
+  assert (Int.equal rc (-1));
+  assert_code cb
+    [
+      Opcodes.op_brazero;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ketrmax;
+      0;
+      7;
+    ];
+  assert (Int.equal fcuf req_none);
+
+  (* "(a)*?": lazy repeat_type(1) selects OP_BRAMINZERO (7509) and
+     OP_KETRMIN (7747). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "(a)*?" in
+  assert_code cb
+    [
+      Opcodes.op_braminzero;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ketrmin;
+      0;
+      7;
+    ];
+
+  (* "(a)+": min 1 needs no BRAZERO and no replication; just the KETRMAX
+     conversion (7544 false, 7592 false, 7747). Like "(a)", firstcu only
+     (min 1 does not reach the 7569 promotion, which needs min > 1). *)
+  let cb, rc, _, _, fcu, fcuf, _, rcuf = compile2 "(a)+" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ketrmax;
+      0;
+      7;
+    ];
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal fcuf 0);
+  assert (Int.equal rcuf req_unset);
+
+  (* "(a)?" = {0,1}: BRAZERO inserted, repeat_max-- -> 0, so the common
+     limited-max code adds no copies and the KET stays OP_KET
+     (7499-7510, 7535, 7616 zero iterations). *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "(a)?" in
+  assert (Int.equal rc (-1));
+  assert_code cb
+    [
+      Opcodes.op_brazero;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+    ];
+
+  (* "(?:a)?": same shape over a non-capturing bracket. *)
+  let cb, _, _, _, _, _, _, _ = compile2 "(?:a)?" in
+  assert_code cb
+    [
+      Opcodes.op_brazero;
+      Opcodes.op_bra;
+      0;
+      5;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      5;
+    ];
+
+  (* Hand-verified trace 7 — "(a){2}" (pcre2_compile.c:7544-7583): min 2
+     replicates the group once via memcpy (7574-7578); repeat_max -=
+     repeat_min leaves 0, so nothing further. In the pre-compile phase the
+     replication is pure length arithmetic: delta = (repeat_min-1) *
+     length_prevgroup (7550-7561); compile2 checks the two phases agree. *)
+  let cb, rc, _, _, fcu, _, rcu, _ = compile2 "(a){2}" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+    ];
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal rcu 0x61);
+
+  (* Hand-verified trace 8 — "(a){2,4}" (pcre2_compile.c:7574-7583,
+     7616-7649): two mandatory copies (offsets 0,10), then repeat_max = 2
+     optional copies compiled countdown: i=2 emits BRAZERO(20) + BRA(21)
+     with its link field (22-23) holding the chain link pro tem (0 =
+     chain end) + copy(24); i=1 emits BRAZERO(34) + copy(35). The
+     chain-through pass then walks bralink: linkoffset = code(45) -
+     bralink(22) + 1 = 24, bra = 21, emits OP_KET(45) with link 24 and
+     back-fills PUT(bra+1, 24) (7639-7649). Pre-compile counts delta =
+     repeat_max*(length_prevgroup + 1 + 2 + 2*LINK_SIZE) - (2+2*LINK_SIZE)
+     (7600-7611): 2*17 - 6 = 28 = the 28 units emitted after the two
+     mandatory copies. *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "(a){2,4}" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_brazero;
+      Opcodes.op_bra;
+      0;
+      24;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_brazero;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_ket;
+      0;
+      24;
+    ];
+
+  (* "(a){0,2}": the zero-minimum nested case (pcre2_compile.c:7519-7533)
+     moves the original copy up by 2+LINK_SIZE, emits BRAZERO + OP_BRA
+     with the chain link, and repeat_max-- = 1 more copy from the common
+     code; the chain-through pass closes the nesting bracket: KET(25)
+     link 24 -> BRA(1). *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "(a){0,2}" in
+  assert (Int.equal rc (-1));
+  assert_code cb
+    [
+      Opcodes.op_brazero;
+      Opcodes.op_bra;
+      0;
+      24;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_brazero;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_ket;
+      0;
+      24;
+    ];
+
+  (* "(a){0}b": {0,0} sticks OP_SKIPZERO in front of the group so it is
+     skipped on execution (pcre2_compile.c:7481-7507); unlike the
+     char/class {0} cases, code does not go backwards, so compile2's
+     exact-length check applies. *)
+  let cb, rc, _, _, _, _, rcu, rcuf = compile2 "(a){0}b" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_skipzero;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_char;
+      0x62;
+    ];
+  assert (Int.equal rcu 0x62);
+  assert (Int.equal rcuf 0) (* {0,0}: reqvary = 0 (pcre2_compile.c:7215) *);
+
+  (* Hand-verified trace 9 — "(a)*+" (pcre2_compile.c:7712-7742): the
+     possessive unlimited repeat switches the CBRA to OP_CBRAPOS
+     ( *bracode += 1, 7734), the KET to OP_KETRPOS (7735), and the saved
+     brazeroptr to OP_BRAPOSZERO (7741); repeat_min(0) < 2 then cancels
+     possessive_quantifier so no ONCE wrapping happens (7742). *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "(a)*+" in
+  assert (Int.equal rc (-1));
+  assert_code cb
+    [
+      Opcodes.op_braposzero;
+      Opcodes.op_cbrapos;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ketrpos;
+      0;
+      7;
+    ];
+
+  (* "(?:a)++": OP_BRA + 1 = OP_BRAPOS, no BRAZERO for min 1. *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "(?:a)++" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_brapos;
+      0;
+      5;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ketrpos;
+      0;
+      5;
+    ];
+
+  (* "(a|)*": the group may match empty (group_return -1), so the real
+     phase converts OP_CBRA to OP_SCBRA ( *bracode += OP_SBRA - OP_BRA,
+     pcre2_compile.c:7703-7705) before setting KETRMAX. *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "(a|)*" in
+  assert (Int.equal rc (-1));
+  assert_code cb
+    [
+      Opcodes.op_brazero;
+      Opcodes.op_scbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_alt;
+      0;
+      3;
+      Opcodes.op_ketrmax;
+      0;
+      10;
+    ];
+
+  (* "(a){2,}+": with repeat_min 2 the possessive flag survives (7742), so
+     after the last copy becomes CBRAPOS/KETRPOS the generic possessive
+     pass wraps the whole repeated item in ONCE brackets
+     (pcre2_compile.c:7989-8001): [ONCE [CBRA a KET] [CBRAPOS a KETRPOS]
+     KET]. *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "(a){2,}+" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_once;
+      0;
+      23;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_cbrapos;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ketrpos;
+      0;
+      7;
+      Opcodes.op_ket;
+      0;
+      23;
+    ];
+
+  (* "(a){1}+": a possessive {1,1} is NOT ignored (7447 requires
+     !possessive_quantifier); nothing in the bracket arm changes the
+     group, and the generic possessive pass wraps it in ONCE
+     (opcode_possessify[OP_CBRA] does not apply — OP_CBRA > OP_CALLOUT). *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "(a){1}+" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_once;
+      0;
+      13;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_ket;
+      0;
+      13;
+    ];
+
+  (* "(a){1}": a non-possessive {1,1} bracket repeat is ignored (7447). *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "(a){1}" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [ Opcodes.op_cbra; 0; 7; 0; 1; Opcodes.op_char; 0x61; Opcodes.op_ket; 0; 7 ];
+
+  (* groupsetfirstcu (pcre2_compile.c:6971, 7569-7573): in "(a){2}c" the
+     group set firstcu = 'a' and the min > 1 replication promotes it to
+     reqcu before 'c' overrides — reqcu ends as 'c' with REQ_VARY. In
+     "(ab){2}" the 7569 promotion guard is false (the group itself already
+     set reqcu = 'b' via pcre2_compile.c:6990-6994); firstcu 'a', reqcu 'b'
+     come from the group's own values. *)
+  let cb, _, _, _, fcu, fcuf, rcu, rcuf = compile2 "(ab){2}" in
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal fcuf 0);
+  assert (Int.equal rcu 0x62);
+  assert (Int.equal rcuf 0);
+  assert (Int.equal (Bytes.length cb.start_code) 24);
+
+  (* Deferred arms fail loudly in both phases: backrefs (M2), Unicode
+     property classes (M7), and the Unicode caseless-literal path (M6/M7
+     DEVIATION in compile_branch). *)
   expect_deferred "\\1()" (* META_BACKREF comes first in this stream *);
   expect_deferred ~options:(Options.ucp lor Options.caseless) "k";
   expect_deferred ~options:Options.ucp "[\\d]"
