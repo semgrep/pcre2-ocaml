@@ -273,6 +273,18 @@ let pt_pxprint = 15 (* [:print:] - [:graph:] plus non-control spaces *)
 let pt_pxpunct = 16 (* [:punct:] - punctuation characters *)
 let pt_pxxdigit = 17 (* [:xdigit:] - hex digits *)
 
+(* pcre2_internal.h:1325-1336 — flag bits and data types for the extended
+   class (OP_XCLASS) for classes that contain characters with values
+   greater than 255. *)
+let xcl_not = 0x01 (* Flag: this is a negative class *)
+let xcl_map = 0x02 (* Flag: a 32-byte map is present *)
+let xcl_hasprop = 0x04 (* Flag: property checks are present *)
+let xcl_end = 0 (* Marks end of individual items *)
+let xcl_single = 1 (* Single item (one multibyte char) follows *)
+let xcl_range = 2 (* A range (two multibyte chars) follows *)
+let xcl_prop = 3 (* Unicode property (2-byte property code follows) *)
+let xcl_notprop = 4 (* Unicode inverted property (ditto) *)
+
 (* pcre2_internal.h:1674-1714 — OP_NAME_LIST: textual names for all the
    opcodes, used only for debugging (pcre2_printint.c fills out the full
    names in many cases). Indexed by opcode. *)

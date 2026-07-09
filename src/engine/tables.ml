@@ -1,8 +1,6 @@
 (* pcre2_tables.c - fixed tables used by more than one module (PCRE2 10.44).
    Hand-ported: only the non-generated parts. Skipped here:
    - OP_LENGTHS / PRIV(OP_lengths) (pcre2_tables.c:60) -> belongs to opcodes.ml;
-   - callout string delimiters (pcre2_tables.c:73-81) -> callouts are out of
-     scope (type-only, never implemented);
    - PRIV(ucp_typerange) (pcre2_tables.c:216-224) -> JIT-only;
    - the #included generated UCD/UCP tables (pcre2_tables.c:230) -> emitted by
      gen/gen_tables.exe into ucd_tables.ml / ucptables.ml. *)
@@ -94,6 +92,19 @@ let utf8_table4 =
     5;
     5;
   |]
+
+(* pcre2_tables.c:73-81 - PRIV(callout_start_delims)/PRIV(callout_end_delims):
+   the pairs of delimiters that are valid for callout string arguments,
+   zero-terminated; the ending delimiter differs only for bracket-like
+   delimiters. CHAR_GRAVE_ACCENT = 0x60, CHAR_APOSTROPHE = 0x27,
+   CHAR_QUOTATION_MARK = 0x22, CHAR_CIRCUMFLEX_ACCENT = 0x5e,
+   CHAR_PERCENT_SIGN = 0x25, CHAR_NUMBER_SIGN = 0x23, CHAR_DOLLAR_SIGN =
+   0x24, CHAR_{LEFT,RIGHT}_CURLY_BRACKET = 0x7b/0x7d
+   (pcre2_internal.h:705-710,765,767,794,796). *)
+let callout_start_delims =
+  [| 0x60; 0x27; 0x22; 0x5e; 0x25; 0x23; 0x24; 0x7b; 0 |]
+
+let callout_end_delims = [| 0x60; 0x27; 0x22; 0x5e; 0x25; 0x23; 0x24; 0x7d; 0 |]
 
 (* pcre2_tables.c:66 = HSPACE_LIST (pcre2_internal.h:400-404): horizontal
    whitespace, ascending, NOTACHAR-terminated. CHAR_HT = 0x09, CHAR_SPACE =

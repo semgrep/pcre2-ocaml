@@ -183,10 +183,15 @@ let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
 (* Port target is pinned to PCRE2 10.44 (vendor/pcre2/VERSION). *)
 let version = (10, 44)
 
-let print_code (_fmt : Format.formatter) (_re : t) : unit =
-  (* debug_printer.ml lands with the M1 match-phase chunks
-     (pcre2_printint.c). *)
-  ()
+(* pcre2_printint.c:337-884 via Debug_printer.pcre2_printint. pcre2test's
+   fullbincode/debug modifier calls pcre2_printint with print_lengths =
+   TRUE (pcre2test.c:4560-4564, CTL_FULLBINCODE); the opening rule of
+   dashes is pcre2test's own, not part of the dump. The dump is built in a
+   Buffer and emitted verbatim (Format must not reflow it). *)
+let print_code (fmt : Format.formatter) (re : t) : unit =
+  let buf = Buffer.create 256 in
+  Debug_printer.pcre2_printint buf re ~print_lengths:true;
+  Format.pp_print_string fmt (Buffer.contents buf)
 
 (* ---------- Inline sanity checks (module-initialization asserts) ---------- *)
 

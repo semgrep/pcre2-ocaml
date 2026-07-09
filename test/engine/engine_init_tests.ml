@@ -11,4 +11,5 @@ let () =
   ignore (Sys.opaque_identity Pcre2_engine.Ucd_tables.ucd_block_size);
   ignore (Sys.opaque_identity Pcre2_engine.Frames.frame_header_ints);
   ignore (Sys.opaque_identity Pcre2_engine.Interpreter.match_match);
+  ignore (Sys.opaque_identity (Pcre2_engine.Debug_printer.get_ucpname 0 0));
   print_endline "engine module-init asserts: OK"
