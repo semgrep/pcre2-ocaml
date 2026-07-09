@@ -79,7 +79,21 @@ Standing consequences:
 See §0. G8's fuzz half: 200k×{42,101,20260708} + 1M seed-42 all clean at
 `3417078`; gate marked in `09-long-tail.md`.
 
-### 2.2 THE PERF GAP (M10 — the main remaining engineering)
+### 2.2 THE PERF GAP — CLOSED 2026-07-09 (user sign-off)
+Final: **geomean 2.159** (release profile, full reps; 46.9 → 2.159 =
+21.7x total), 4 benchmarks under the ≤2.0 gate, 8 signed-off residuals
+(2.15–2.74; worst backref). Full table, campaign record, and the
+sign-off note in `10-performance.md` (G9 MET; G10 CLOSED by explicit
+user sign-off — the numeric criterion is NOT met, stated plainly
+there). Chunk history: chunk 1 = the closure-nest hoist (P0–P6,
+6d2be8e→e233089); chunk 2 = release gating, arena reuse, barrier kill,
+scan localization, driver hoist + scratch trio, targeted unsafe sweep,
+floor specials (6106082→b311b5a). Three permanent alloc pins guard the
+zero-alloc properties. The declined next step (recorded): fusing
+dispatch/backtrack into the merged rmatch — a large structural rewrite.
+
+The original section below is retained for the measurement history:
+
 **Gate: engine/oracle ≤ 2.0x, geomean AND per-benchmark** (user's hard
 requirement).
 
