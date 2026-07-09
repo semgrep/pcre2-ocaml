@@ -74,10 +74,13 @@ Match phase (`interpreter.ml`, `frames.ml`, `newline.ml`):
   return dispatch (pcre2_match.c:837-990, 6479-6527)
 - [x] chars + char repeats: (this commit) OP_CHAR/CHARI/NOT/NOTI + their STAR/PLUS/QUERY/UPTO arms
   (pcre2_match.c:995-1930)
-- [ ] classes + typed repeats: OP_CLASS/OP_NCLASS, OP_ANY/ALLANY, \d\w\s type ops and
-  repeat loops (ASCII arms; pcre2_match.c:1934-5005, UTF/UCP/extuni arms stubbed)
-- [ ] anchors & simple assertions: OP_CIRC(M)/OP_DOLL(M)/OP_SOD/SOM/EOD/EODN/
-  \b/\B/\A/\z/\Z (within pcre2_match.c:837-995 + scattered cases)
+- [x] classes + typed repeats: (this commit) OP_CLASS/OP_NCLASS, OP_ANY/ALLANY/ANYBYTE,
+  \d\w\s\h\v\R type ops and repeat loops with RM23/RM24/RM33/RM34 resumes
+  (ASCII arms; pcre2_match.c:943-989, 1933-2172, 2305-2476, 2651-5005;
+  UTF/UCP/extuni arms stubbed loudly)
+- [x] anchors & simple assertions: (this commit) OP_CIRC(M)/OP_DOLL(M)/OP_SOD/SOM/
+  SET_SOM/EOD/EODN/\b/\B (pcre2_match.c:6133-6338 + IS_NEWLINE/WAS_NEWLINE,
+  pcre2_internal.h:496-521; UCP boundaries stubbed for M7)
 - [ ] brackets: OP_BRA/OP_CBRA/OP_SBRA/SCBRA, OP_ALT, OP_KET/KETRMIN/KETRMAX, BRAZERO/
   BRAMINZERO (pcre2_match.c:5224-5265, 5906-6335)
 - [ ] pcre2_match driver: arg validation, BADOFFSET, option masking (−34), anchored/
