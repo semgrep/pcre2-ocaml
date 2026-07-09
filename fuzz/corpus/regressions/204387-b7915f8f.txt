@@ -1,0 +1,11 @@
+# fuzz-diff repro (differential: pure engine vs C oracle)
+# seed=42 case=204387 kind=exec
+# reason: engine raised: Invalid_argument("index out of bounds")
+# pattern (ascii): (*LIMIT_MATCH=80000)()()((()()))
+# compile: options=0x04000400 extra=0x00000008 newline=5 bsr=0
+# exec: subject="\185t" offset=0 mopts=0x00000000
+# engine: CRASH:Invalid_argument("index out of bounds")
+# oracle: rc=-1 ov=[-1;-1;-1;-1;-1;-1;-1;-1;-1;-1;-1;-1;-1;-1] mark=<none> sc=0
+/28 2a 4c 49 4d 49 54 5f 4d 41 54 43 48 3d 38 30 30 30 30 29 28 29 28 29 28 28 28 29 28 29 29 29/hex,multiline,match_invalid_utf,match_line,newline=ANYCRLF
+    \xb9\x74\=offset=0,mark,startchar
+

@@ -390,3 +390,23 @@ let () =
   match compile "\xc3(" (Int32.of_int Options.utf) with
   | Result.Error e -> assert (Int.equal e Errors.error_utf8_err6)
   | Ok _ -> assert false
+
+(* The fuzz repro pinned by fuzz/corpus/regressions/204387-b7915f8f.txt:
+   PCRE2_MATCH_INVALID_UTF's bad-start skip (pcre2_match.c:6829-6851)
+   moves matching past the invalid leading code unit, and the startline
+   bump-along scan (pcre2_match.c:7318-7349) then probes WAS_NEWLINE at
+   the first valid position — where C 10.44's BACKCHAR walks out of the
+   subject (see the DEVIATION note in Newline.was_newline). Expected
+   values are the real 10.44 oracle's recorded result: rc = -1 (NOMATCH),
+   all ovector slots unset, no mark. *)
+let () =
+  let copts = Int32.of_int (Options.match_invalid_utf lor Options.multiline) in
+  match
+    compile_ctx ~newline:Options.newline_anycrlf
+      ~extra:Options.extra_match_line "(*LIMIT_MATCH=80000)()()((()()))" copts
+  with
+  | Result.Error _ -> assert false
+  | Ok re -> (
+      match exec_full re "\xb9t" 0 0l with
+      | No_match { mark = None } -> ()
+      | _ -> assert false)

@@ -37,12 +37,12 @@ let char_ff = 0x0c (* pcre2_internal.h:698 — CHAR_FF *)
 let char_cr = 0x0d (* pcre2_internal.h:699 — CHAR_CR *)
 let char_nel = 0x85 (* pcre2_internal.h:680 — CHAR_NEL *)
 
-(* GETCHAR (pcre2_intmodedep.h:298-303) and BACKCHAR
-   (pcre2_intmodedep.h:341-345) — the GETCHAR macro family belongs to
-   module Utf (naming map); these aliases keep this module's existing
-   callers and asserts in the C's vocabulary. *)
+(* GETCHAR (pcre2_intmodedep.h:298-303) — the GETCHAR macro family belongs
+   to module Utf (naming map); this alias keeps this module's callers in
+   the C's vocabulary. BACKCHAR (pcre2_intmodedep.h:341-345) is not
+   aliased from Utf.backchar: its only use here, in was_newline, is
+   transcribed inline with a lower bound (see the DEVIATION note there). *)
 let getchar = Utf.getchar
-let backchar = Utf.backchar
 
 (* pcre2_newline.c:59-145 — PRIV(is_newline): check for a newline at the
    given position. Called only via the IS_NEWLINE macro, which does so only
@@ -105,9 +105,41 @@ let was_newline (subject : string) (type_ : int) (pos : int) (startptr : int)
   (* pcre2_newline.c:173 — ptr-- *)
   let ptr = pos - 1 in
   (* pcre2_newline.c:176-181 — if utf { BACKCHAR(ptr); GETCHAR(c, ptr); }
-     else c = *ptr *)
-  let ptr = if utf then backchar subject ptr else ptr in
-  let c = if utf then getchar subject ptr else Char.code subject.[ptr] in
+     else c = *ptr.
+     DEVIATION (defined behavior where the C is undefined — the Utf.peek /
+     Interpreter.backchar_subject precedent): when every code unit before
+     [pos] is a UTF-8 continuation byte, C 10.44's BACKCHAR
+     (pcre2_newline.c:178) walks PAST the start of the subject — an
+     out-of-bounds read, confirmed by ASan on the vendored sources and
+     still present upstream. It is reachable only with
+     PCRE2_MATCH_INVALID_UTF: the bad-start skip moves matching beyond
+     invalid leading code units (pcre2_match.c:6829-6851) while
+     WAS_NEWLINE's guard stays the true subject start, mb->start_subject
+     (pcre2_internal.h:510-521, pcre2_match.c:60-66 and 6962). The C
+     oracle receives the OCaml string data pointer directly, so the byte
+     it reads before the subject is the last byte of the OCaml block
+     header — on the little-endian oracle host in use, the header's high
+     size byte, deterministically 0x00 for any realistic length (a
+     big-endian host would expose the tag byte >= 0xc0 there instead, and
+     the C would decode garbage): BACKCHAR stops on the 0x00 (not a
+     continuation byte) and GETCHAR yields c = 0, which matches no arm of
+     either switch below. The pinned behavior — stop the walk at position
+     -1 and read the character there as 0 — is itself
+     platform-independent and matches the recorded oracle outcome. *)
+  let ptr =
+    if utf then (
+      let p = ref ptr in
+      while !p >= 0 && Int.equal (Char.code subject.[!p] land 0xc0) 0x80 do
+        decr p
+      done;
+      !p)
+    else ptr
+  in
+  let c =
+    if ptr < 0 then 0 (* the oracle's 0x00 header byte before the subject *)
+    else if utf then getchar subject ptr
+    else Char.code subject.[ptr]
+  in
   if Int.equal type_ nltype_anycrlf then
     (* pcre2_newline.c:187-199 — NLTYPE_ANYCRLF *)
     if Int.equal c char_lf then (
@@ -312,6 +344,21 @@ let () =
   | false, _ -> ()
   | _ -> assert false);
   (match probe_was nltype_anycrlf "a\xc2\x85" 3 true with
+  | false, _ -> ()
+  | _ -> assert false);
+  (* Every byte before [pos] a continuation byte (reachable only under
+     PCRE2_MATCH_INVALID_UTF): the pinned defined behavior for C 10.44's
+     out-of-bounds BACKCHAR walk (see the DEVIATION note in was_newline)
+     reads 0 at position -1 — never a newline. The "\x85t" case
+     distinguishes it from clamping the walk at position 0, which would
+     misread the NEL continuation byte as a newline under NLTYPE_ANY. *)
+  (match probe_was nltype_anycrlf "\xb9t" 1 true with
+  | false, _ -> ()
+  | _ -> assert false);
+  (match probe_was nltype_any "\x85t" 1 true with
+  | false, _ -> ()
+  | _ -> assert false);
+  (match probe_was nltype_any "\xb9\x85t" 2 true with
   | false, _ -> ()
   | _ -> assert false);
   (* FALSE leaves *lenptr untouched, like the C. *)
