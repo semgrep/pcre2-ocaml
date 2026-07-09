@@ -59,7 +59,11 @@ let exec ?(options = 0) ~subject ~offset code : exec_result =
         mark;
         startchar = start;
       }
-  | E.Error e -> { rc = e; ovector = [||]; mark = None; startchar = 0 }
+  | E.Error { code; start_char } ->
+      (* pcre2test reads PCRE2_GET_STARTCHAR after a failed match too: the
+         UTF error codes print " at offset <startchar>" (harness.ml:741 =
+         pcre2test.c's SUBJECT_FAILED output). *)
+      { rc = code; ovector = [||]; mark = None; startchar = start_char }
 
 type info = {
   argoptions : int;

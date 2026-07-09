@@ -24,7 +24,11 @@ type exec_result =
           return (pcre2_match.c:7741) — pcre2test's "No match, mark = X"
           line reads it. *)
   | Partial of { start : int; mark : string option }
-  | Error of int  (** negative PCRE2 error code *)
+  | Error of { code : int; start_char : int }
+      (** negative PCRE2 error code; [start_char] is pcre2_get_startchar —
+          for the UTF error codes the driver stores the offset of the
+          invalid code unit there (pcre2_match.c:6899-6903), and
+          pcre2test prints it as " at offset N". 0 otherwise. *)
 
 val compile : string -> int32 -> (t, int) result
 

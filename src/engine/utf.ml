@@ -112,6 +112,47 @@ let getchar (s : string) (pos : int) : int =
   let c = Char.code s.[pos] in
   if c >= 0xc0 then getutf8 c s pos else c
 
+(* GETUTF8 (pcre2_internal.h:280-300) over [Bytes.t] — the same macro read
+   from the COMPILED PATTERN instead of a subject string (pcre2_match.c
+   decodes pattern characters with the identical GETCHAR* macros, e.g.
+   GETCHARLEN(fc, Fecode, Flength) at pcre2_match.c:1001). Pattern
+   literals are complete ord2utf encodings emitted by the compiler
+   (pcre2_ord2utf.c:86-95 always deposits every continuation byte), so the
+   continuation reads use plain [Bytes.get] — in bounds in any complete
+   compiled program. Callers add GET_EXTRALEN themselves where the C macro
+   advances or accumulates a length. *)
+let getutf8_bytes (c : int) (b : Bytes.t) (pos : int) : int =
+  if Int.equal (c land 0x20) 0 then
+    (* pcre2_internal.h:285-286 — two-byte character *)
+    ((c land 0x1f) lsl 6) lor (Char.code (Bytes.get b (pos + 1)) land 0x3f)
+  else if Int.equal (c land 0x10) 0 then
+    (* pcre2_internal.h:287-288 — three-byte character *)
+    ((c land 0x0f) lsl 12)
+    lor ((Char.code (Bytes.get b (pos + 1)) land 0x3f) lsl 6)
+    lor (Char.code (Bytes.get b (pos + 2)) land 0x3f)
+  else if Int.equal (c land 0x08) 0 then
+    (* pcre2_internal.h:289-291 — four-byte character *)
+    ((c land 0x07) lsl 18)
+    lor ((Char.code (Bytes.get b (pos + 1)) land 0x3f) lsl 12)
+    lor ((Char.code (Bytes.get b (pos + 2)) land 0x3f) lsl 6)
+    lor (Char.code (Bytes.get b (pos + 3)) land 0x3f)
+  else if Int.equal (c land 0x04) 0 then
+    (* pcre2_internal.h:292-295 — five-byte character (invalid UTF-8, but
+       ord2utf-encodable under PCRE2_NO_UTF_CHECK garbage) *)
+    ((c land 0x03) lsl 24)
+    lor ((Char.code (Bytes.get b (pos + 1)) land 0x3f) lsl 18)
+    lor ((Char.code (Bytes.get b (pos + 2)) land 0x3f) lsl 12)
+    lor ((Char.code (Bytes.get b (pos + 3)) land 0x3f) lsl 6)
+    lor (Char.code (Bytes.get b (pos + 4)) land 0x3f)
+  else
+    (* pcre2_internal.h:296-299 — six-byte character (invalid UTF-8) *)
+    ((c land 0x01) lsl 30)
+    lor ((Char.code (Bytes.get b (pos + 1)) land 0x3f) lsl 24)
+    lor ((Char.code (Bytes.get b (pos + 2)) land 0x3f) lsl 18)
+    lor ((Char.code (Bytes.get b (pos + 3)) land 0x3f) lsl 12)
+    lor ((Char.code (Bytes.get b (pos + 4)) land 0x3f) lsl 6)
+    lor (Char.code (Bytes.get b (pos + 5)) land 0x3f)
+
 (* GETCHARINC (pcre2_intmodedep.h:312-317) + GETUTF8INC
    (pcre2_internal.h:302-334) — get the next UTF-8 character, advancing
    the position. Called when we know we are in UTF-8 mode. *)
@@ -346,4 +387,12 @@ let () =
    assert (Int.equal !pos 5));
   let l = ref 1 in
   assert (Int.equal (getcharlen "\xc3" 0 l) 0xc0);
-  assert (Int.equal !l 2)
+  assert (Int.equal !l 2);
+  (* getutf8_bytes decodes the same encodings from a Bytes program. *)
+  let buf = Bytes.make 8 '\000' in
+  List.iter
+    (fun c ->
+      let len = ord2utf c buf 0 in
+      assert (len >= 2 (* every case here is multi-byte: lead >= 0xc0 *));
+      assert (Int.equal (getutf8_bytes (Char.code (Bytes.get buf 0)) buf 0) c))
+    [ 0x80; 0xe9; 0x7ff; 0x800; 0x20ac; 0xffff; 0x10000; 0x10ffff; 0x200000 ]

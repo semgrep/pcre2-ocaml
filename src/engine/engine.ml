@@ -11,7 +11,7 @@ type exec_result =
   | Match of { ovector : int array; mark : string option; start_char : int }
   | No_match of { mark : string option }
   | Partial of { start : int; mark : string option }
-  | Error of int
+  | Error of { code : int; start_char : int }
 
 (* pcre2_compile.c:10096-10993 via Compile.pcre2_compile. Option bits cross
    the boundary as int32 and are widened exactly once here
@@ -123,7 +123,9 @@ let mark_of_offset (re : t) (off : int) : string option =
      stored mb->nomatch_mark in match_data->mark, pcre2_match.c:7741);
      -2 (PARTIAL) -> [Partial] with startchar = the partial start
      (= ovector[0], pcre2_match.c:7756-7758); any other negative code ->
-     [Error]. *)
+     [Error] carrying pcre2_get_startchar (the subject UTF-error offset
+     for the UTF error codes, pcre2_match.c:6899-6903; pcre2test prints
+     it as " at offset N"). *)
 let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
     exec_result =
   let oveccount = re.Compile.top_bracket + 1 in
@@ -157,14 +159,14 @@ let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
         start = md.Interpreter.startchar;
         mark = mark_of_offset re md.Interpreter.mark;
       }
-  else Error rc
+  else Error { code = rc; start_char = md.Interpreter.startchar }
 
 let exec (re : t) (subject : string) (offset : int) (options : int32) :
     ((int * int) option, int) result =
   match exec_full re subject offset options with
   | Match { ovector; _ } -> Ok (Some (ovector.(0), ovector.(1)))
   | No_match _ | Partial _ -> Ok None (* pcre2_stubs.c: PARTIAL -> Ok None *)
-  | Error e -> Result.Error e
+  | Error { code; _ } -> Result.Error code
 
 let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
     (((int * int) array * (string * int) array) option, int) result =
@@ -181,7 +183,7 @@ let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
       in
       Ok (Some (pairs, capture_groups re))
   | No_match _ | Partial _ -> Ok None
-  | Error e -> Result.Error e
+  | Error { code; _ } -> Result.Error code
 
 (* Port target is pinned to PCRE2 10.44 (vendor/pcre2/VERSION). *)
 let version = (10, 44)
