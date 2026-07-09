@@ -23,7 +23,9 @@ jobs:
         run: opam install . --deps-only --with-test --ignore-pin-depends
       - name: Build the published package
         run: opam exec -- dune build -p pcre2
-      # NOTE: the pure OUnit suite lives on @pure-tests and is re-enabled at
-      # gate G1 (docs/ocaml-engine/02-core-compile-match.md). Until then the
-      # engine skeleton intentionally fails every compile.
-      # - run: opam exec -- dune build @pure-tests
+      # The pure Alcotest suites (engine per-module module-init asserts +
+      # the pcre2 Interp/Jit functor suite) both build against pure deps
+      # only (pcre2, pcre2.engine, alcotest) — no libpcre2, no C oracle —
+      # so they run here. Building the @pure-tests alias runs the exes.
+      - name: Pure Alcotest suites (engine asserts + pcre2 functor)
+        run: opam exec -- dune build @pure-tests

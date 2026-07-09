@@ -90,6 +90,7 @@
           ocaml-base-compiler = "4.14.2";
           # FIXME: shouldn't be needed. doesn't pick up with-test deps?
           ounit2 = "*";
+          alcotest = "*";
         };
 
         # repos = opamRepos to force newest version of opam
@@ -99,8 +100,8 @@
           ${package} = prev.${package}.overrideAttrs (prev: {
             # Prevent the ocaml dependencies from leaking into dependent environments
             doNixSupport = false;
-            # add ounit2 since it's not pulled in for whatever reason
-            buildInputs = prev.buildInputs ++ [final.ounit2];
+            # add ounit2 and alcotest since they're not pulled in for whatever reason
+            buildInputs = prev.buildInputs ++ [final.ounit2 final.alcotest];
           });
         };
         scope' = scope.overrideScope' scopeOverlay;

@@ -20,11 +20,8 @@ pcre2-ocaml offers library functions for string pattern matching and
 substitution, similar to the functionality offered by the Perl language.")
   (depends
     (ocaml (>= 4.14))
-    ; NOTE: cannot be a test only dep since the ppx must be used to remove the
-    ; test code when _not_ in a test conf.
-    ppx_inline_test
     ppx_deriving
-    (ounit2 :with-test)
+    (alcotest :with-test)
   )
 )
 
@@ -38,9 +35,8 @@ substitution, similar to the functionality offered by the Perl language.")
     (ocaml (>= 4.14))
     pcre2
     dune-configurator
-    ppx_inline_test
     ppx_deriving
     (conf-libpcre2-8 :build)
-    ounit2
+    alcotest
   )
 )

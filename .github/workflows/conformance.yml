@@ -18,7 +18,11 @@ jobs:
         run: nix develop -c dune build @all
       - name: Generated tables in sync with vendored sources
         run: nix develop -c dune build @gen-check
-      - name: OUnit suites (oracle + harness unit tests)
+      # `dune runtest` now runs the Alcotest suites: the engine per-module
+      # module-init asserts, the pcre2 Interp/Jit functor suite, the same
+      # functor suite against the C oracle (drift detection), and the
+      # pcre2test harness unit tests.
+      - name: Alcotest suites (engine asserts + functor + oracle drift + harness)
         run: nix develop -c dune runtest --force
       - name: Conformance vs baselines (regressions or stale skips fail)
         run: nix develop -c dune exec test/conformance/runner.exe

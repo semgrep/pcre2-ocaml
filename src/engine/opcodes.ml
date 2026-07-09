@@ -734,9 +734,3 @@ let op_lengths =
     1;
     (* \B and \b in UCP mode                  *)
   |]
-
-(* Consistency checks mirroring the C's use of OP_TABLE_LENGTH to catch
-   updating errors in tables indexed by opcode. *)
-let () = assert (Int.equal op_ucp_word_boundary (op_table_length - 1))
-let () = assert (Int.equal (Array.length op_names) op_table_length)
-let () = assert (Int.equal (Array.length op_lengths) op_table_length)

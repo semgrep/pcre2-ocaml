@@ -1,4 +1,4 @@
-; Runs the exact same OUnit suite against the C oracle (Pcre2_c) to detect
+; Runs the exact same Alcotest suite against the C oracle (Pcre2_c) to detect
 ; drift between the pure engine's contract and real PCRE2 behavior.
 
 (rule
@@ -11,6 +11,6 @@
  (name pcre2_c_tests)
  (package pcre2-dev)
  (modules pcre2_c_tests pcre2)
- (libraries pcre2-dev.oracle pcre2.engine ounit2)
+ (libraries pcre2-dev.oracle pcre2.engine alcotest)
  (preprocess
   (pps ppx_deriving.show)))

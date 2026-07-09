@@ -1,10 +1,10 @@
-; Gate G1 (M1 core compile+match) reached: the pure engine passes the full
-; OUnit suite for both Interp and Jit, so this suite runs on the default
-; @runtest again (the @pure-tests alias is kept for targeted runs).
+; The pcre2 unit suite: an Alcotest functor (MakeTests) instantiated over both
+; Interp and Jit. Runs on the default @runtest (the @pure-tests alias is kept
+; for targeted / libpcre2-free runs).
 
 (executable
  (name pcre2_tests)
- (libraries pcre2 pcre2.engine ounit2)
+ (libraries pcre2 pcre2.engine alcotest)
  (preprocess
   (pps ppx_deriving.show)))
 

@@ -1,9 +1,24 @@
-; Force-links the engine modules that carry module-init assert suites
-; (parse.ml etc.) so `dune runtest` and CI actually execute them — dune does
-; not -linkall libraries, and nothing else references Parse until the
-; compile-phase chunks wire Engine.compile.
+; The pure-engine unit suites, migrated from the former src/engine/*.ml
+; module-initialization asserts (`let () = ... assert ...`) into Alcotest test
+; cases (one *_test.ml per engine module, aggregated by engine_tests.ml).
+; Test-only: alcotest never leaks into pcre2 / pcre2.engine.
+;
+; Warnings relaxed for the moved code: the added `open Pcre2_engine.<Module>`
+; can be unused (33) when a module's asserts only touch siblings, and moved
+; test helpers/values that were exported (no-.mli) in the engine now report
+; unused (32/26/27) in an executable module.
 
 (test
- (name engine_init_tests)
+ (name engine_tests)
  (package pcre2-dev)
- (libraries pcre2.engine))
+ (libraries pcre2.engine alcotest)
+ (flags
+  (:standard -w -26-27-32-33-35)))
+
+; Also expose the engine suite on @pure-tests so the libpcre2-free CI job
+; (build-pure.yml) runs it alongside the pcre2 functor suite — neither needs
+; the C oracle.
+(rule
+ (alias pure-tests)
+ (action
+  (run ./engine_tests.exe)))

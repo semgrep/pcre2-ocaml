@@ -1,5 +1,11 @@
-open OUnit2
 open! Pcre2
+
+let check_eq show msg expected actual =
+  Alcotest.check
+    (Alcotest.testable (fun fmt x -> Format.pp_print_string fmt (show x)) ( = ))
+    msg expected actual
+
+let check_true msg cond = Alcotest.(check bool) msg true cond
 
 let ( >+= ) x f =
   match x with
@@ -17,131 +23,131 @@ module MakeTests
     (M : Pcre2.Matcher
            with type compile_error = compile_error
             and type match_error = match_error) : sig
-  val tests : test list
+  val tests : unit Alcotest.test_case list
 end = struct
   open M
 
-  let simple_test ctxt =
+  let simple_test () =
     match compile "abc" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (range option, match_error) result] in
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 0; end_ = 3 }))
           (find re "abc" >+= range_of_match);
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 3; end_ = 6 }))
           (find re "123abc456" >+= range_of_match);
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 3; end_ = 6 }))
           (find re "123abc" >+= range_of_match);
-        assert_equal ~printer (Ok None) (find re "123ac" >+= range_of_match)
+        check_eq printer "" (Ok None) (find re "123ac" >+= range_of_match)
 
-  let simple_captures ctxt =
+  let simple_captures () =
     match compile "(a)(b)(c)" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (range option, match_error) result] in
         let c = captures re "abc" in
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 0; end_ = 3 }))
           (c >+= range_of_captures);
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 0; end_ = 1 }))
           (c >>= (fun c -> match_of_captures c 1) >+= range_of_match);
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 1; end_ = 2 }))
           (c >>= (fun c -> match_of_captures c 2) >+= range_of_match);
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 2; end_ = 3 }))
           (c >>= (fun c -> match_of_captures c 3) >+= range_of_match);
-        assert_equal ~printer (Ok None)
+        check_eq printer "" (Ok None)
           (c >>= (fun c -> match_of_captures c 4) >+= range_of_match)
 
-  let non_contiguous_capture ctxt =
+  let non_contiguous_capture () =
     match compile "(a)(?:(b)|(c))" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (range option, match_error) result] in
         let c = captures re "ac" in
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 0; end_ = 2 }))
           (c >>= (fun c -> match_of_captures c 0) >+= range_of_match);
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 0; end_ = 1 }))
           (c >>= (fun c -> match_of_captures c 1) >+= range_of_match);
-        assert_equal ~printer (Ok None)
+        check_eq printer "" (Ok None)
           (c >>= (fun c -> match_of_captures c 2) >+= range_of_match);
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 1; end_ = 2 }))
           (c >>= (fun c -> match_of_captures c 3) >+= range_of_match);
-        assert_equal ~printer (Ok None)
+        check_eq printer "" (Ok None)
           (c >>= (fun c -> match_of_captures c 4) >+= range_of_match)
 
-  let non_contiguous_named_capture ctxt =
+  let non_contiguous_named_capture () =
     match compile "(?<A>a)(?:(?<B>b)|(?<C>c))" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (range option, match_error) result] in
         let c = captures re "ac" in
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 0; end_ = 1 }))
           (c >>= (fun c -> named_match_of_captures c "A") >+= range_of_match);
-        assert_equal ~printer (Ok None)
+        check_eq printer "" (Ok None)
           (c >>= (fun c -> named_match_of_captures c "B") >+= range_of_match);
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 1; end_ = 2 }))
           (c >>= (fun c -> named_match_of_captures c "C") >+= range_of_match)
 
-  let bad_pattern ctxt =
+  let bad_pattern () =
     match compile "ab(" with
     | Error MISSING_CLOSING_PARENTHESIS -> ()
     | Error e ->
-        assert_failure ("Incorrectly error for pattern: " ^ show_compile_error e)
-    | Ok _ -> assert_failure "Incorrectly compiled invalid pattern"
+        Alcotest.fail ("Incorrectly error for pattern: " ^ show_compile_error e)
+    | Ok _ -> Alcotest.fail "Incorrectly compiled invalid pattern"
 
-  let bad_offset ctxt =
+  let bad_offset () =
     match compile "abc" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (range option, match_error) result] in
-        assert_equal ~printer ~msg:"Negative offset" (Error BADOFFSET)
+        check_eq printer "Negative offset" (Error BADOFFSET)
           (find ~subject_offset:(-1) re "ab" >+= range_of_match);
-        assert_equal ~printer ~msg:"Offset too large" (Error BADOFFSET)
+        check_eq printer "Offset too large" (Error BADOFFSET)
           (find ~subject_offset:10 re "123abc456" >+= range_of_match)
 
-  let split_comma ctxt =
+  let split_comma () =
     match compile "," with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (string list, match_error) result] in
-        assert_equal ~printer (Ok [ "a"; "b"; "c" ]) (split re "a,b,c");
-        assert_equal ~printer (Ok [ "a"; "b"; "c"; "" ]) (split re "a,b,c,");
-        assert_equal ~printer (Ok [ "a"; "b,c," ]) (split ~limit:2 re "a,b,c,")
+        check_eq printer "" (Ok [ "a"; "b"; "c" ]) (split re "a,b,c");
+        check_eq printer "" (Ok [ "a"; "b"; "c"; "" ]) (split re "a,b,c,");
+        check_eq printer "" (Ok [ "a"; "b,c," ]) (split ~limit:2 re "a,b,c,")
 
-  let capture_group_names ctxt =
+  let capture_group_names () =
     (match compile "(?<A>a)(?<B>b)(?<C>c)" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
-        assert_equal ~printer:[%show: (string * int) list]
+        check_eq [%show: (string * int) list] ""
           (* 0 is the whole match *)
           [ ("A", 1); ("B", 2); ("C", 3) ]
           (capture_groups re));
     match compile "(?<A>a)(b)(?<C>c)" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
-        assert_equal ~printer:[%show: (string * int) list]
+        check_eq [%show: (string * int) list] ""
           (* 0 is the whole match *)
           [ ("A", 1); ("C", 3) ]
           (capture_groups re)
 
-  let find_iter_test ctxt =
+  let find_iter_test () =
     match compile "a+" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let results = find_iter re "aaa bb aaaa cc a" |> List.of_seq in
         let printer = [%show: (range, match_error) result list] in
-        assert_equal ~printer
+        check_eq printer ""
           [
             Ok { start = 0; end_ = 3 };
             Ok { start = 7; end_ = 11 };
@@ -149,29 +155,29 @@ end = struct
           ]
           (List.map (Result.map range_of_match) results)
 
-  let find_iter_empty ctxt =
+  let find_iter_empty () =
     match compile "x+" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let results = find_iter re "aaa bb aaaa cc a" |> List.of_seq in
-        assert_equal ~printer:[%show: (range, match_error) result list] []
+        check_eq [%show: (range, match_error) result list] "" []
           (List.map (Result.map range_of_match) results)
 
-  let find_iter_with_offset ctxt =
+  let find_iter_with_offset () =
     match compile "a+" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let results =
           find_iter ~subject_offset:5 re "aaa bb aaaa cc a" |> List.of_seq
         in
         let printer = [%show: (range, match_error) result list] in
-        assert_equal ~printer
+        check_eq printer ""
           [ Ok { start = 7; end_ = 11 }; Ok { start = 15; end_ = 16 } ]
           (List.map (Result.map range_of_match) results)
 
-  let captures_iter_test ctxt =
+  let captures_iter_test () =
     match compile "(a+)" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let results = captures_iter re "aaa bb aaaa cc a" |> List.of_seq in
         let get_whole_and_first c =
@@ -189,7 +195,7 @@ end = struct
         let printer =
           [%show: (range * range option, match_error) result list]
         in
-        assert_equal ~printer
+        check_eq printer ""
           [
             Ok ({ start = 0; end_ = 3 }, Some { start = 0; end_ = 3 });
             Ok ({ start = 7; end_ = 11 }, Some { start = 7; end_ = 11 });
@@ -197,124 +203,123 @@ end = struct
           ]
           (List.map get_whole_and_first results)
 
-  let is_match_test ctxt =
+  let is_match_test () =
     match compile "a+" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (bool, match_error) result] in
-        assert_equal ~printer (Ok true) (is_match re "aaa bb");
-        assert_equal ~printer (Ok false) (is_match re "bbb cc");
-        assert_equal ~printer (Ok true)
+        check_eq printer "" (Ok true) (is_match re "aaa bb");
+        check_eq printer "" (Ok false) (is_match re "bbb cc");
+        check_eq printer "" (Ok true)
           (is_match ~subject_offset:7 re "bbb cc aaaa");
-        assert_equal ~printer (Ok false)
+        check_eq printer "" (Ok false)
           (is_match ~subject_offset:11 re "bbb cc aaaa")
 
-  let substring_of_match_test ctxt =
+  let substring_of_match_test () =
     match compile "a+" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re -> (
         (match find re "bbb aaa ccc" with
         | Ok (Some m) ->
-            assert_equal ~printer:[%show: string] "aaa" (substring_of_match m)
-        | Ok None -> assert_failure "Expected to find a match"
-        | Error e -> assert_failure ("Match error: " ^ show_match_error e));
+            check_eq [%show: string] "" "aaa" (substring_of_match m)
+        | Ok None -> Alcotest.fail "Expected to find a match"
+        | Error e -> Alcotest.fail ("Match error: " ^ show_match_error e));
         match find re "bbb ccc" with
         | Ok None -> () (* Expected *)
-        | Ok (Some _) -> assert_failure "Unexpected match found"
-        | Error e -> assert_failure ("Match error: " ^ show_match_error e))
+        | Ok (Some _) -> Alcotest.fail "Unexpected match found"
+        | Error e -> Alcotest.fail ("Match error: " ^ show_match_error e))
 
-  let captures_length_test ctxt =
+  let captures_length_test () =
     match compile "(a+)(b+)(c+)" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re -> (
         (match captures re "aaabbbccc" with
         | Ok (Some c) ->
-            assert_equal ~printer:[%show: int] 4 (captures_length c)
+            check_eq [%show: int] "" 4 (captures_length c)
             (* whole match + 3 groups *)
-        | Ok None -> assert_failure "Expected to find captures"
-        | Error e -> assert_failure ("Match error: " ^ show_match_error e));
+        | Ok None -> Alcotest.fail "Expected to find captures"
+        | Error e -> Alcotest.fail ("Match error: " ^ show_match_error e));
         (* NB: here, the second capture group is optional *)
         match compile "(a+)(b+)?(c+)" with
-        | Error e ->
-            assert_failure ("failed to compile: " ^ show_compile_error e)
+        | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
         | Ok re -> (
             match captures re "aaaccc" with
             | Ok (Some c) ->
-                assert_equal ~printer:[%show: int] 4 (captures_length c);
+                check_eq [%show: int] "" 4 (captures_length c);
                 (* still 4, even with unmatched group *)
                 let m = match_of_captures c 2 in
-                assert_equal ~printer:[%show: range option] None
+                check_eq [%show: range option] "" None
                   (Option.map range_of_match m)
-            | Ok None -> assert_failure "Expected to find captures"
-            | Error e -> assert_failure ("Match error: " ^ show_match_error e)))
+            | Ok None -> Alcotest.fail "Expected to find captures"
+            | Error e -> Alcotest.fail ("Match error: " ^ show_match_error e)))
 
-  let split_advanced_test ctxt =
+  let split_advanced_test () =
     match compile {|\s+|} with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (string list, match_error) result] in
-        assert_equal ~printer
+        check_eq printer ""
           (Ok [ "hello"; "world"; "test" ])
           (split re "hello   world\t\ntest");
-        assert_equal ~printer
+        check_eq printer ""
           (Ok [ ""; "hello"; "world"; "" ])
           (split re " hello world ");
-        assert_equal ~printer
+        check_eq printer ""
           (Ok [ "hello"; "world\t\ntest" ])
           (split ~limit:2 re "hello   world\t\ntest")
 
-  let split_with_offset_test ctxt =
+  let split_with_offset_test () =
     match compile "," with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (string list, match_error) result] in
-        assert_equal ~printer
+        check_eq printer ""
           (Ok [ "a,b"; "c"; "d" ])
           (split ~subject_offset:2 re "a,b,c,d");
-        assert_equal ~printer
+        check_eq printer ""
           (Ok [ "a,b,c"; "d" ])
           (split ~subject_offset:4 re "a,b,c,d")
 
-  let empty_pattern_test ctxt =
+  let empty_pattern_test () =
     match compile "" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (range option, match_error) result] in
         (* Empty pattern matches at every position *)
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 0; end_ = 0 }))
           (find re "abc" >+= range_of_match);
         (* Test that is_match works with empty patterns *)
         let bool_printer = [%show: (bool, match_error) result] in
-        assert_equal ~printer:bool_printer (Ok true) (is_match re "abc");
-        assert_equal ~printer:bool_printer (Ok true) (is_match re "")
+        check_eq bool_printer "" (Ok true) (is_match re "abc");
+        check_eq bool_printer "" (Ok true) (is_match re "")
 
-  let unicode_test ctxt =
+  let unicode_test () =
     match compile "café" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re -> (
         let printer = [%show: (range option, match_error) result] in
-        assert_equal ~printer
+        check_eq printer ""
           (Ok (Some { start = 0; end_ = 5 })) (* café is 5 bytes in UTF-8 *)
           (find re "café" >+= range_of_match);
         match find re "café" with
         | Ok (Some m) ->
-            assert_equal ~printer:[%show: string] "café" (substring_of_match m)
-        | Ok None -> assert_failure "Expected to find a match"
-        | Error e -> assert_failure ("Match error: " ^ show_match_error e))
+            check_eq [%show: string] "" "café" (substring_of_match m)
+        | Ok None -> Alcotest.fail "Expected to find a match"
+        | Error e -> Alcotest.fail ("Match error: " ^ show_match_error e))
 
-  let overlapping_matches_test ctxt =
+  let overlapping_matches_test () =
     match compile "aa" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let results = find_iter re "aaaa" |> List.of_seq in
         let printer = [%show: (range, match_error) result list] in
         (* Should find non-overlapping matches *)
-        assert_equal ~printer
+        check_eq printer ""
           [ Ok { start = 0; end_ = 2 }; Ok { start = 2; end_ = 4 } ]
           (List.map (Result.map range_of_match) results)
 
-  let alloc_per_attempt_test ctxt =
+  let alloc_per_attempt_test () =
     (* Perf chunk 1 (interpreter.ml DEVIATION (perf), match_state): the
        dispatch nest is module-level, so a match attempt allocates no
        minor words. Pattern "qz": the first code unit 'q' hits at every
@@ -326,24 +331,24 @@ end = struct
        setup (mb/match_state/driver closures) and the float boxing of
        Gc.minor_words itself. *)
     match compile "qz" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let subject = String.make 100_000 'q' in
         let bool_printer = [%show: (bool, match_error) result] in
         (* warm-up exec: one-time lazy initialization out of the way *)
-        assert_equal ~printer:bool_printer (Ok false) (is_match re subject);
+        check_eq bool_printer "" (Ok false) (is_match re subject);
         let before = Gc.minor_words () in
         let result = is_match re subject in
         let delta = Gc.minor_words () -. before in
-        assert_equal ~printer:bool_printer (Ok false) result;
-        assert_bool
+        check_eq bool_printer "" (Ok false) result;
+        check_true
           (Printf.sprintf
              "expected O(1) minor allocation for ~100k attempts in one exec, \
               measured %.0f words"
              delta)
           (delta < 1000.)
 
-  let alloc_per_exec_major_test ctxt =
+  let alloc_per_exec_major_test () =
     (* Perf chunk 2 P1 (frames.ml scratch arena — the C's keep-if-big-
        enough frames-vector reuse, pcre2_match.c:7062-7077): the
        backtracking-frame arena is retained across execs in a module
@@ -356,12 +361,12 @@ end = struct
        2,000-word slack covers minor-to-major promotions of live per-exec
        setup data at minor-GC boundaries. *)
     match compile "(q)z" with
-    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Error e -> Alcotest.fail ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let subject = "qqqq" in
         let bool_printer = [%show: (bool, match_error) result] in
         (* warm-up exec: lazy initialization + scratch-slot seeding *)
-        assert_equal ~printer:bool_printer (Ok false) (is_match re subject);
+        check_eq bool_printer "" (Ok false) (is_match re subject);
         (* The loop body stays allocation-lean (no assert_equal: its
            allocations trigger minor GCs that promote live harness state
            into the major heap, polluting the measurement); correctness
@@ -374,9 +379,8 @@ end = struct
           | Ok true | Error _ -> incr wrong
         done;
         let delta = (Gc.quick_stat ()).Gc.major_words -. before in
-        assert_equal ~printer:string_of_int ~msg:"unexpected is_match results" 0
-          !wrong;
-        assert_bool
+        check_eq string_of_int "unexpected is_match results" 0 !wrong;
+        check_true
           (Printf.sprintf
              "expected O(1) major allocation for 1,000 execs (frames arena \
               reused across execs), measured %.0f major words"
@@ -385,35 +389,36 @@ end = struct
 
   let tests =
     [
-      "simple_test" >:: simple_test;
-      "simple_captures" >:: simple_captures;
-      "split_comma" >:: split_comma;
-      "non_contiguous_capture" >:: non_contiguous_capture;
-      "non_contiguous_named_capture" >:: non_contiguous_named_capture;
-      "bad_pattern" >:: bad_pattern;
-      "bad_offset" >:: bad_offset;
-      "capture_group_names" >:: capture_group_names;
-      "find_iter" >:: find_iter_test;
-      "find_iter_empty" >:: find_iter_empty;
-      "find_iter_with_offset" >:: find_iter_with_offset;
-      "captures_iter" >:: captures_iter_test;
-      "is_match" >:: is_match_test;
-      "substring_of_match" >:: substring_of_match_test;
-      "captures_length" >:: captures_length_test;
-      "split_advanced" >:: split_advanced_test;
-      "split_with_offset" >:: split_with_offset_test;
-      "empty_pattern" >:: empty_pattern_test;
-      "unicode" >:: unicode_test;
-      "overlapping_matches" >:: overlapping_matches_test;
-      "alloc_per_attempt" >:: alloc_per_attempt_test;
-      "alloc_per_exec_major" >:: alloc_per_exec_major_test;
+      Alcotest.test_case "simple_test" `Quick simple_test;
+      Alcotest.test_case "simple_captures" `Quick simple_captures;
+      Alcotest.test_case "split_comma" `Quick split_comma;
+      Alcotest.test_case "non_contiguous_capture" `Quick non_contiguous_capture;
+      Alcotest.test_case "non_contiguous_named_capture" `Quick
+        non_contiguous_named_capture;
+      Alcotest.test_case "bad_pattern" `Quick bad_pattern;
+      Alcotest.test_case "bad_offset" `Quick bad_offset;
+      Alcotest.test_case "capture_group_names" `Quick capture_group_names;
+      Alcotest.test_case "find_iter" `Quick find_iter_test;
+      Alcotest.test_case "find_iter_empty" `Quick find_iter_empty;
+      Alcotest.test_case "find_iter_with_offset" `Quick find_iter_with_offset;
+      Alcotest.test_case "captures_iter" `Quick captures_iter_test;
+      Alcotest.test_case "is_match" `Quick is_match_test;
+      Alcotest.test_case "substring_of_match" `Quick substring_of_match_test;
+      Alcotest.test_case "captures_length" `Quick captures_length_test;
+      Alcotest.test_case "split_advanced" `Quick split_advanced_test;
+      Alcotest.test_case "split_with_offset" `Quick split_with_offset_test;
+      Alcotest.test_case "empty_pattern" `Quick empty_pattern_test;
+      Alcotest.test_case "unicode" `Quick unicode_test;
+      Alcotest.test_case "overlapping_matches" `Quick overlapping_matches_test;
+      Alcotest.test_case "alloc_per_attempt" `Quick alloc_per_attempt_test;
+      Alcotest.test_case "alloc_per_exec_major" `Quick alloc_per_exec_major_test;
     ]
 end
 
-let check_version ctxt =
-  assert_bool "Version is older than newest tested" (Pcre2.version >= (10, 43))
+let check_version () =
+  check_true "Version is older than newest tested" (Pcre2.version >= (10, 43))
 
-let alloc_per_exec_minor ctxt =
+let alloc_per_exec_minor () =
   (* Perf chunk 2 P4b pin at the ENGINE seam (plan target < ~40 minor
      words/exec): the per-exec mb/match_state/driver_state records are
      cached and re-filled (interpreter.ml fresh_trio, one scratch bundle
@@ -432,13 +437,13 @@ let alloc_per_exec_minor ctxt =
     match Pcre2_engine.Engine.compile "(q)z" 0l with
     | Ok r -> r
     | Error code ->
-        assert_failure ("failed to compile: error " ^ string_of_int code)
+        Alcotest.fail ("failed to compile: error " ^ string_of_int code)
   in
   let subject = "qqqq" in
   (* warm-up exec: lazy initialization + scratch seeding *)
   (match Pcre2_engine.Engine.exec re subject 0 0l with
   | Ok None -> ()
-  | _ -> assert_failure "expected no match");
+  | _ -> Alcotest.fail "expected no match");
   let wrong = ref 0 in
   let before = Gc.minor_words () in
   for _ = 1 to 1_000 do
@@ -447,8 +452,8 @@ let alloc_per_exec_minor ctxt =
     | Ok (Some _) | Error _ -> incr wrong
   done;
   let delta = (Gc.minor_words () -. before) /. 1000. in
-  assert_equal ~printer:string_of_int ~msg:"unexpected exec results" 0 !wrong;
-  assert_bool
+  check_eq string_of_int "unexpected exec results" 0 !wrong;
+  check_true
     (Printf.sprintf
        "expected < 40 minor words per exec at the engine seam (scratch-trio \
         reuse + exec fast path), measured %.1f words/exec"
@@ -458,12 +463,14 @@ let alloc_per_exec_minor ctxt =
 let suite =
   let module Interp_Tests = MakeTests (Interp) in
   let module Jit_Tests = MakeTests (Jit) in
-  "Test pcre"
-  >::: [
-         "version" >:: check_version;
-         "alloc_per_exec_minor" >:: alloc_per_exec_minor;
-         "Interp" >::: Interp_Tests.tests;
-         "JIT" >::: Jit_Tests.tests;
-       ]
+  [
+    ( "misc",
+      [
+        Alcotest.test_case "version" `Quick check_version;
+        Alcotest.test_case "alloc_per_exec_minor" `Quick alloc_per_exec_minor;
+      ] );
+    ("Interp", Interp_Tests.tests);
+    ("JIT", Jit_Tests.tests);
+  ]
 
-let _ = if not !Sys.interactive then run_test_tt_main suite else ()
+let () = if not !Sys.interactive then Alcotest.run "pcre2" suite

@@ -497,12 +497,6 @@ let match_error_texts =
     "INTERNAL ERROR: invalid substring offset";
   |]
 
-(* Table-length checks: compile texts cover codes 100..201 (ERR0..ERR101),
-   match texts cover codes 0..-67 (through PCRE2_ERROR_INVALIDOFFSET,
-   pcre2.h.generic:409). *)
-let () = assert (Int.equal (Array.length compile_error_texts) 102)
-let () = assert (Int.equal (Array.length match_error_texts) 68)
-
 (* pcre2_error.c:300-343 — pcre2_get_error_message. Error numbers are
    positive for compile-time errors (>= compile_error_base) and negative for
    match-time/UTF errors; the numbers are all distinct. The C function walks
