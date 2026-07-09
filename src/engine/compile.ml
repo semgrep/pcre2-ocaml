@@ -8,8 +8,9 @@
    compile_block records with their pcre2_compile() defaults, and the
    small helpers compile_branch and its callers need early
    (check_workspace_overflow, first_significant_code,
-   find_dupname_details). compile_branch, compile_regex, and the
-   pcre2_compile() driver are later M1 chunks
+   find_dupname_details), plus compile_branch (chars/escapes, classes, and
+   repeats live; bracket/group arms next). compile_regex and the
+   pcre2_compile() driver are the remaining M1 compile chunks
    (docs/ocaml-engine/02-core-compile-match.md).
 
    The compiled pattern is a Bytes.t of 8-bit code units (this port is the
@@ -696,6 +697,150 @@ let add_not_list_to_class (classbits : Bytes.t) (uchardptr : int ref)
   done;
   !n8
 
+(* ---------- Repeat-compilation tables ---------- *)
+
+(* pcre2_compile.c:687-691 — offsets from OP_STAR for case-independent and
+   negative repeat opcodes. Indexed by op_previous - OP_CHAR for previous
+   items OP_CHAR/OP_CHARI/OP_NOT/OP_NOTI. *)
+let chartypeoffset =
+  [|
+    Opcodes.op_star - Opcodes.op_star;
+    Opcodes.op_stari - Opcodes.op_star;
+    Opcodes.op_notstar - Opcodes.op_star;
+    Opcodes.op_notstari - Opcodes.op_star;
+  |]
+
+(* pcre2_compile.c:861-917 — this table is used when converting repeating
+   opcodes into possessified versions as a result of an explicit possessive
+   quantifier such as ++. A zero value means there is no possessified
+   version - in those cases the item in question must be wrapped in ONCE
+   brackets. The table is truncated at OP_CALLOUT because all relevant
+   opcodes are less than that. *)
+let opcode_possessify =
+  [|
+    (* 0 - 15 *)
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    (* 16 - 31 *)
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0;
+    0 (* NOTI *);
+    Opcodes.op_posstar;
+    0 (* STAR, MINSTAR *);
+    Opcodes.op_posplus;
+    0 (* PLUS, MINPLUS *);
+    Opcodes.op_posquery;
+    0 (* QUERY, MINQUERY *);
+    Opcodes.op_posupto;
+    0 (* UPTO, MINUPTO *);
+    0 (* EXACT *);
+    0;
+    0;
+    0;
+    0 (* POS{STAR,PLUS,QUERY,UPTO} *);
+    Opcodes.op_posstari;
+    0 (* STARI, MINSTARI *);
+    Opcodes.op_posplusi;
+    0 (* PLUSI, MINPLUSI *);
+    Opcodes.op_posqueryi;
+    0 (* QUERYI, MINQUERYI *);
+    Opcodes.op_posuptoi;
+    0 (* UPTOI, MINUPTOI *);
+    0 (* EXACTI *);
+    0;
+    0;
+    0;
+    0 (* POS{STARI,PLUSI,QUERYI,UPTOI} *);
+    Opcodes.op_notposstar;
+    0 (* NOTSTAR, NOTMINSTAR *);
+    Opcodes.op_notposplus;
+    0 (* NOTPLUS, NOTMINPLUS *);
+    Opcodes.op_notposquery;
+    0 (* NOTQUERY, NOTMINQUERY *);
+    Opcodes.op_notposupto;
+    0 (* NOTUPTO, NOTMINUPTO *);
+    0 (* NOTEXACT *);
+    0;
+    0;
+    0;
+    0 (* NOTPOS{STAR,PLUS,QUERY,UPTO} *);
+    Opcodes.op_notposstari;
+    0 (* NOTSTARI, NOTMINSTARI *);
+    Opcodes.op_notposplusi;
+    0 (* NOTPLUSI, NOTMINPLUSI *);
+    Opcodes.op_notposqueryi;
+    0 (* NOTQUERYI, NOTMINQUERYI *);
+    Opcodes.op_notposuptoi;
+    0 (* NOTUPTOI, NOTMINUPTOI *);
+    0 (* NOTEXACTI *);
+    0;
+    0;
+    0;
+    0 (* NOTPOS{STARI,PLUSI,QUERYI,UPTOI} *);
+    Opcodes.op_typeposstar;
+    0 (* TYPESTAR, TYPEMINSTAR *);
+    Opcodes.op_typeposplus;
+    0 (* TYPEPLUS, TYPEMINPLUS *);
+    Opcodes.op_typeposquery;
+    0 (* TYPEQUERY, TYPEMINQUERY *);
+    Opcodes.op_typeposupto;
+    0 (* TYPEUPTO, TYPEMINUPTO *);
+    0 (* TYPEEXACT *);
+    0;
+    0;
+    0;
+    0 (* TYPEPOS{STAR,PLUS,QUERY,UPTO} *);
+    Opcodes.op_crposstar;
+    0 (* CRSTAR, CRMINSTAR *);
+    Opcodes.op_crposplus;
+    0 (* CRPLUS, CRMINPLUS *);
+    Opcodes.op_crposquery;
+    0 (* CRQUERY, CRMINQUERY *);
+    Opcodes.op_crposrange;
+    0 (* CRRANGE, CRMINRANGE *);
+    0;
+    0;
+    0;
+    0 (* CRPOS{STAR,PLUS,QUERY,RANGE} *);
+    0;
+    0;
+    0 (* CLASS, NCLASS, XCLASS *);
+    0;
+    0 (* REF, REFI *);
+    0;
+    0 (* DNREF, DNREFI *);
+    0;
+    0 (* RECURSE, CALLOUT *);
+  |]
+
 (* ---------- Compile one branch ---------- *)
 
 (* pcre2_compile.c:5604-5640 — compile_branch. Scan the parsed pattern,
@@ -728,13 +873,14 @@ let add_not_list_to_class (classbits : Bytes.t) (uchardptr : int ref)
                       +1 Success, this branch must match at least one char
                       -1 Success, this branch may match an empty string
 
-   Chunk boundary (M1 chunks "compile_branch A" + "compile_branch B"): the
-   arms for quantifiers (chunk C), groups/conditionals/lookarounds (chunk D
-   and later milestones), verbs, backrefs, recursion and string callouts
-   are deferred — they fail loudly with Parse.err_deferred (identically in
-   both phases, before any phase-dependent work). The C locals owned by
-   those arms (bravalue, group_return, repeat_min/max, repeat_type,
-   op_type, offset, length_prevgroup, tempcode, op_previous,
+   Chunk boundary (M1 chunks "compile_branch A" + "compile_branch B" +
+   "compile_branch C — repeats"): the arms for
+   groups/conditionals/lookarounds (chunk D and later milestones), verbs,
+   backrefs, recursion and string callouts are deferred — they fail loudly
+   with Parse.err_deferred (identically in both phases, before any
+   phase-dependent work); within the repeat arm, a bracket or OP_RECURSE
+   previous item likewise defers (chunk D / M5). The C locals owned by the
+   still-deferred arms (bravalue, group_return, offset, length_prevgroup,
    groupsetfirstcu, pcre2_compile.c:5642-5694) arrive with their arms. The
    class locals (negate_class, should_flip_negation,
    match_all_or_no_wide_chars, class_has_8bitchar, xclass, xclass_has_prop,
@@ -828,6 +974,11 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
   let exception Return of int in
   let return_from_branch (rc : int) : 'a = raise_notrace (Return rc) in
 
+  (* The repetition arm's forward `goto END_REPEAT`
+     (pcre2_compile.c:7277,7327,7329,7352,7771,7800,7832): jumps to the
+     arm's epilogue, skipping the possessive-quantifier post-pass. Local
+     exception caught at the end of that arm only (port-conventions §2). *)
+  let exception End_repeat in
   (* pcre2_compile.c:8259-8336 — the CLASS_CASELESS_CHAR label: caseful
      matches, or caseless and not one of the multicase characters. Entered
      by fallthrough from NORMAL_CHAR_SET below, and by goto from a positive
@@ -1704,11 +1855,472 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
         meta >= Parse.meta_first_quantifier
         && meta <= Parse.meta_last_quantifier
       then (
-        (* pcre2_compile.c:7178-8011 — repetition (META_ASTERISK ..
-           META_MINMAX_QUERY): M1 chunk compile_branch C. Deferred
-           loudly. *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+        (* pcre2_compile.c:7178-8011 — handle repetition. The different
+           types are all sorted out in the parsing pass. The C locals this
+           arm owns (repeat_min/repeat_max, repeat_type, op_type, reqvary:
+           pcre2_compile.c:5645,5647,5657; tempcode, op_previous:
+           5663,5665; possessive_quantifier, mclength, mcbuffer:
+           5731,5734,5741) are declared here — this arm is their only
+           reader. The locals of the bracket-repeat region (group_return,
+           length_prevgroup, groupsetfirstcu, bralink, brazeroptr) arrive
+           with chunk D. *)
+        let repeat_min = ref 0
+        and repeat_max = ref 0 in
+        if
+          Int.equal meta Parse.meta_minmax_plus
+          || Int.equal meta Parse.meta_minmax_query
+          || Int.equal meta Parse.meta_minmax
+        then (
+          (* pcre2_compile.c:7182-7187 — repeat_min = *(++pptr);
+             repeat_max = *(++pptr); *)
+          pptr := !pptr + 1;
+          repeat_min := cb.parsed_pattern.(!pptr);
+          pptr := !pptr + 1;
+          repeat_max := cb.parsed_pattern.(!pptr))
+        else if
+          Int.equal meta Parse.meta_asterisk
+          || Int.equal meta Parse.meta_asterisk_plus
+          || Int.equal meta Parse.meta_asterisk_query
+        then (
+          (* pcre2_compile.c:7189-7194 *)
+          repeat_min := 0;
+          repeat_max := Limits.repeat_unlimited)
+        else if
+          Int.equal meta Parse.meta_plus
+          || Int.equal meta Parse.meta_plus_plus
+          || Int.equal meta Parse.meta_plus_query
+        then (
+          (* pcre2_compile.c:7196-7201 *)
+          repeat_min := 1;
+          repeat_max := Limits.repeat_unlimited)
+        else (
+          (* pcre2_compile.c:7203-7207 — the META_QUERY family falls
+             through to REPEAT *)
+          repeat_min := 0;
+          repeat_max := 1);
+
+        (* pcre2_compile.c:7209-7210 — the REPEAT label. *)
+        if !previous_matched_char && !repeat_min > 0 then matched_char := true;
+
+        (* pcre2_compile.c:7212-7216 — remember whether this is a variable
+           length repeat, and default to single-char opcodes. *)
+        let reqvary =
+          if Int.equal !repeat_min !repeat_max then 0 else req_vary
+        in
+        let op_type = ref 0 in
+
+        (* pcre2_compile.c:7218-7226 — adjust first and required code
+           units for a zero repeat. *)
+        if Int.equal !repeat_min 0 then (
+          firstcu := !zerofirstcu;
+          firstcuflags := !zerofirstcuflags;
+          reqcu := !zeroreqcu;
+          reqcuflags := !zeroreqcuflags);
+
+        (* pcre2_compile.c:7228-7252 — note the greediness and
+           possessiveness. *)
+        let repeat_type = ref 0 in
+        let possessive_quantifier = ref false in
+        if
+          Int.equal meta Parse.meta_minmax_plus
+          || Int.equal meta Parse.meta_asterisk_plus
+          || Int.equal meta Parse.meta_plus_plus
+          || Int.equal meta Parse.meta_query_plus
+        then (
+          repeat_type := 0 (* Force greedy *);
+          possessive_quantifier := true)
+        else if
+          Int.equal meta Parse.meta_minmax_query
+          || Int.equal meta Parse.meta_asterisk_query
+          || Int.equal meta Parse.meta_plus_query
+          || Int.equal meta Parse.meta_query_query
+        then (
+          repeat_type := !greedy_non_default;
+          possessive_quantifier := false)
+        else (
+          repeat_type := !greedy_default;
+          possessive_quantifier := false);
+
+        (* pcre2_compile.c:7254-7258 — save start of previous item, in
+           case we have to move it up in order to insert something before
+           it, and remember what it was. *)
+        let tempcode = ref !previous in
+        let op_previous = Char.code (Bytes.get cb.start_code !previous) in
+
+        (* pcre2_compile.c:7784-7904 — the OUTPUT_SINGLE_REPEAT label and
+           the shared single-item repeat emission that follows it, factored
+           as a function because both the single-character cases (goto at
+           7309) and the character-type default case reach it. On entry:
+           mclength = 1 with the character in mcbuffer0 (single code unit),
+           or mclength = 0 for a non-property character type in
+           op_previous; prop_type/prop_value >= 0 carry a property
+           character type (OP_PROP/OP_NOTPROP, M7). op_type has been set by
+           the caller; repeat_type does not yet include it. *)
+        let output_single_repeat ~(mclength : int) ~(mcbuffer0 : int)
+            ~(prop_type : int) ~(prop_value : int) : unit =
+          (* pcre2_compile.c:7853-7866 and 7890-7903 — the C duplicates
+             this fill; factored (port-conventions §2). mclength is 1 or 0
+             in M1: multi-code-unit UTF characters were deferred by the
+             caller (see the M6 DEVIATION in the OP_CHAR case). *)
+          let emit_char_or_type () =
+            if mclength > 0 then emit_cu mcbuffer0
+            else (
+              emit_cu op_previous;
+              if prop_type >= 0 then (
+                emit_cu prop_type;
+                emit_cu prop_value))
+          in
+          (* pcre2_compile.c:7794-7795 *)
+          let oldcode = !code (* Save where we were *) in
+          code := !previous (* Usually overwrite previous item *);
+
+          (* pcre2_compile.c:7797-7800 — if the maximum is zero then the
+             minimum must also be zero; Perl allows this case, so we do
+             too - by simply omitting the item altogether. *)
+          if Int.equal !repeat_max 0 then raise_notrace End_repeat;
+
+          (* pcre2_compile.c:7802-7804 — combine the op_type with the
+             repeat_type. *)
+          repeat_type := !repeat_type + !op_type;
+
+          if Int.equal !repeat_min 0 then
+            if
+              (* pcre2_compile.c:7806-7818 — a minimum of zero is handled
+                 either as the special case * or ?, or as an UPTO, with the
+                 maximum given. *)
+              Int.equal !repeat_max Limits.repeat_unlimited
+            then emit_cu (Opcodes.op_star + !repeat_type)
+            else if Int.equal !repeat_max 1 then
+              emit_cu (Opcodes.op_query + !repeat_type)
+            else (
+              emit_cu (Opcodes.op_upto + !repeat_type);
+              put2inc cb.start_code code !repeat_max)
+          else if Int.equal !repeat_min 1 then
+            if
+              (* pcre2_compile.c:7820-7836 — a repeat minimum of 1 is
+                 optimized into some special cases. If the maximum is
+                 unlimited, we use OP_PLUS. Otherwise, the original item is
+                 left in place and, if the maximum is greater than 1, we use
+                 OP_UPTO with one less than the maximum. *)
+              Int.equal !repeat_max Limits.repeat_unlimited
+            then emit_cu (Opcodes.op_plus + !repeat_type)
+            else (
+              code := oldcode (* Leave previous item in place *);
+              if Int.equal !repeat_max 1 then raise_notrace End_repeat;
+              emit_cu (Opcodes.op_upto + !repeat_type);
+              put2inc cb.start_code code (!repeat_max - 1))
+          else (
+            (* pcre2_compile.c:7838-7844 — the case {n,n} is just an
+               EXACT, while the general case {n,m} is handled as an EXACT
+               followed by an UPTO or STAR or QUERY. *)
+            emit_cu (Opcodes.op_exact + !op_type)
+            (* NB EXACT doesn't have repeat_type *);
+            put2inc cb.start_code code !repeat_min;
+
+            (* pcre2_compile.c:7846-7885 — unless repeat_max equals
+               repeat_min, fill in the data for EXACT, and then generate
+               the second opcode. For a repeated Unicode property match,
+               there are two extra values that define the required
+               property, and mclength is set zero to indicate this. *)
+            if not (Int.equal !repeat_max !repeat_min) then (
+              emit_char_or_type ();
+              (* pcre2_compile.c:7868-7884 — now set up the following
+                 opcode. *)
+              if Int.equal !repeat_max Limits.repeat_unlimited then
+                emit_cu (Opcodes.op_star + !repeat_type)
+              else (
+                repeat_max := !repeat_max - !repeat_min;
+                if Int.equal !repeat_max 1 then
+                  emit_cu (Opcodes.op_query + !repeat_type)
+                else (
+                  emit_cu (Opcodes.op_upto + !repeat_type);
+                  put2inc cb.start_code code !repeat_max))));
+
+          (* pcre2_compile.c:7888-7903 — fill in the character or
+             character type for the final opcode. *)
+          emit_char_or_type ()
+        in
+
+        (* pcre2_compile.c:7260-7906 — now handle repetition for the
+           different types of item: switch (op_previous). If the repeat
+           minimum and the repeat maximum are both 1, we can ignore the
+           quantifier for non-parenthesized items, as they have only one
+           alternative. For anything in parentheses, we must not ignore if
+           {1} is possessive. *)
+        (try
+           if
+             Int.equal op_previous Opcodes.op_char
+             || Int.equal op_previous Opcodes.op_chari
+             || Int.equal op_previous Opcodes.op_not
+             || Int.equal op_previous Opcodes.op_noti
+           then (
+             (* pcre2_compile.c:7267-7278 — if previous was a character or
+                negated character match, abolish the item and generate a
+                repeat item instead. If a char item has a minimum of more
+                than one, ensure that it is set in reqcu - it might not be
+                if a sequence such as x{3} is the first thing in a branch
+                because the x will have gone into firstcu instead. *)
+             if Int.equal !repeat_max 1 && Int.equal !repeat_min 1 then
+               raise_notrace End_repeat;
+             op_type := chartypeoffset.(op_previous - Opcodes.op_char);
+
+             (* pcre2_compile.c:7280-7289 — deal with UTF characters that
+                take up more than one code unit (MAYBE_UTF_MULTI;
+                NOT_FIRSTCU(c) = (c & 0xc0) == 0x80,
+                pcre2_intmodedep.h:296). DEVIATION: multi-code-unit
+                literal emission is M6 (docs/ocaml-engine/07-utf.md); no
+                M1 arm can emit one, so this defers loudly instead of
+                saving the character into mcbuffer. *)
+             if
+               utf
+               && Int.equal
+                    (Char.code (Bytes.get cb.start_code (!code - 1)) land 0xc0)
+                    0x80
+             then (
+               errorcodeptr := Parse.err_deferred;
+               return_from_branch 0);
+
+             (* pcre2_compile.c:7293-7308 — handle the case of a single
+                code unit - either with no UTF support, or with UTF
+                disabled, or for a single-code-unit UTF character. In the
+                latter case, for a repeated positive match, get the
+                caseless flag for the required code unit from the previous
+                character, because a class like [Aa] sets a caseless A but
+                by now the req_caseopt flag has been reset. *)
+             let mcbuffer0 = Char.code (Bytes.get cb.start_code (!code - 1)) in
+             if op_previous <= Opcodes.op_chari && !repeat_min > 1 then (
+               reqcu := mcbuffer0;
+               reqcuflags := cb.req_varyopt;
+               if Int.equal op_previous Opcodes.op_chari then
+                 reqcuflags := !reqcuflags lor req_caseless);
+
+             (* goto OUTPUT_SINGLE_REPEAT — code shared with single
+                character types (pcre2_compile.c:7309) *)
+             output_single_repeat ~mclength:1 ~mcbuffer0 ~prop_type:(-1)
+               ~prop_value:(-1))
+           else if
+             Int.equal op_previous Opcodes.op_xclass
+             || Int.equal op_previous Opcodes.op_class
+             || Int.equal op_previous Opcodes.op_nclass
+             || Int.equal op_previous Opcodes.op_ref
+             || Int.equal op_previous Opcodes.op_refi
+             || Int.equal op_previous Opcodes.op_dnref
+             || Int.equal op_previous Opcodes.op_dnrefi
+           then (
+             (* pcre2_compile.c:7311-7344 — if previous was a character
+                class or a back reference, we put the repeat stuff after
+                it, but just skip the item if the repeat was {0,0}.
+                (OP_REF/OP_REFI/OP_DNREF/OP_DNREFI previous items arrive
+                with M2, OP_XCLASS with M6; only the class opcodes can be
+                previous in M1.) *)
+             if Int.equal !repeat_max 0 then (
+               code := !previous;
+               raise_notrace End_repeat);
+             if Int.equal !repeat_max 1 && Int.equal !repeat_min 1 then
+               raise_notrace End_repeat;
+
+             (* pcre2_compile.c:7331-7343 *)
+             if
+               Int.equal !repeat_min 0
+               && Int.equal !repeat_max Limits.repeat_unlimited
+             then emit_cu (Opcodes.op_crstar + !repeat_type)
+             else if
+               Int.equal !repeat_min 1
+               && Int.equal !repeat_max Limits.repeat_unlimited
+             then emit_cu (Opcodes.op_crplus + !repeat_type)
+             else if Int.equal !repeat_min 0 && Int.equal !repeat_max 1 then
+               emit_cu (Opcodes.op_crquery + !repeat_type)
+             else (
+               emit_cu (Opcodes.op_crrange + !repeat_type);
+               put2inc cb.start_code code !repeat_min;
+               if Int.equal !repeat_max Limits.repeat_unlimited then
+                 repeat_max := 0 (* 2-byte encoding for max *);
+               put2inc cb.start_code code !repeat_max))
+           else if Int.equal op_previous Opcodes.op_fail then
+             (* pcre2_compile.c:7346-7352 — if previous is OP_FAIL, it was
+                generated by an empty class [] (PCRE2_ALLOW_EMPTY_CLASS is
+                set). The other ways in which OP_FAIL can be generated,
+                that is by ( *FAIL) or (?!), disallow a quantifier at parse
+                time. We can just ignore this repeat. *)
+             raise_notrace End_repeat
+           else if Int.equal op_previous Opcodes.op_recurse then (
+             (* pcre2_compile.c:7354-7422 — repeated recursion:
+                replication for a non-zero minimum, then wrapping in
+                OP_BRA brackets and falling through to the repeated-
+                bracket case. M5 (docs/ocaml-engine/
+                05-conditionals-recursion.md); unreachable in M1 because
+                META_RECURSE itself defers above. Deferred loudly. *)
+             errorcodeptr := Parse.err_deferred;
+             return_from_branch 0)
+           else if
+             Int.equal op_previous Opcodes.op_assert
+             || Int.equal op_previous Opcodes.op_assert_not
+             || Int.equal op_previous Opcodes.op_assert_na
+             || Int.equal op_previous Opcodes.op_assertback
+             || Int.equal op_previous Opcodes.op_assertback_not
+             || Int.equal op_previous Opcodes.op_assertback_na
+             || Int.equal op_previous Opcodes.op_once
+             || Int.equal op_previous Opcodes.op_script_run
+             || Int.equal op_previous Opcodes.op_bra
+             || Int.equal op_previous Opcodes.op_cbra
+             || Int.equal op_previous Opcodes.op_cond
+           then (
+             (* pcre2_compile.c:7424-7751 — if previous was a bracket
+                group, we may have to replicate it in certain cases:
+                OP_BRAZERO/OP_SKIPZERO insertion for a zero minimum,
+                nested replication for a limited maximum,
+                OP_KETRMAX/OP_KETRMIN/OP_KETRPOS conversion and the
+                possessive BRAPOS transform for an unlimited one. M1 chunk
+                compile_branch D owns this region together with bracket
+                emission itself (no bracket opcode can be a previous item
+                until that chunk lands). Deferred loudly. *)
+             errorcodeptr := Parse.err_deferred;
+             return_from_branch 0)
+           else if op_previous >= Opcodes.op_eodn then (
+             (* pcre2_compile.c:7760-7765 — default case: not a character
+                type - internal error. *)
+             errorcodeptr := Errors.err10;
+             return_from_branch 0)
+           else (
+             (* pcre2_compile.c:7753-7786 — if previous was a character
+                type match (\d or similar), abolish it and create a
+                suitable repeat item. The code is shared with
+                single-character repeats by setting op_type to add a
+                suitable offset into repeat_type. Note the the Unicode
+                property types will be present only when SUPPORT_UNICODE
+                is defined, but we don't wrap the little bits of code here
+                because it just makes it horribly messy. *)
+             if Int.equal !repeat_max 1 && Int.equal !repeat_min 1 then
+               raise_notrace End_repeat;
+             op_type := Opcodes.op_typestar - Opcodes.op_star
+             (* Use type opcodes *);
+             (* mclength = 0 — not a character *)
+             let prop_type, prop_value =
+               if
+                 Int.equal op_previous Opcodes.op_prop
+                 || Int.equal op_previous Opcodes.op_notprop
+               then
+                 (* pcre2_compile.c:7776-7780 — a repeated Unicode
+                    property match carries its two property data units.
+                    OP_PROP/OP_NOTPROP previous items arrive with M7
+                    (docs/ocaml-engine/08-ucp.md); the plumbing is kept in
+                    the C's shape. *)
+                 ( Char.code (Bytes.get cb.start_code (!previous + 1)),
+                   Char.code (Bytes.get cb.start_code (!previous + 2)) )
+               else (-1, -1)
+             in
+             output_single_repeat ~mclength:0 ~mcbuffer0:0 ~prop_type
+               ~prop_value);
+
+           (* pcre2_compile.c:7909-7929 — if the character following a
+              repeat is '+', possessive_quantifier is TRUE. For some
+              opcodes, there are special alternative opcodes for this
+              case. For anything else, we wrap the entire repeated item
+              inside OP_ONCE brackets. Note that the repeated item starts
+              at tempcode, not at previous, which might be the first part
+              of a string whose (former) last char we repeated.
+
+              Possessifying an EXACT quantifier has no effect, so we can
+              ignore it. However, QUERY, STAR, or UPTO may follow (for
+              quantifiers such as {5,6}, {5,}, or {5,10}). We skip over an
+              EXACT item; if the length of what remains is greater than
+              zero, there's a further opcode that can be handled. If not,
+              do nothing, leaving the EXACT alone. *)
+           if !possessive_quantifier then (
+             let t = Char.code (Bytes.get cb.start_code !tempcode) in
+             if Int.equal t Opcodes.op_typeexact then
+               (* pcre2_compile.c:7933-7937 *)
+               tempcode :=
+                 !tempcode + Opcodes.op_lengths.(t)
+                 +
+                 let following =
+                   Char.code
+                     (Bytes.get cb.start_code
+                        (!tempcode + 1 + Limits.imm2_size))
+                 in
+                 if
+                   Int.equal following Opcodes.op_prop
+                   || Int.equal following Opcodes.op_notprop
+                 then 2
+                 else 0
+             else if
+               (* pcre2_compile.c:7939-7949 — CHAR opcodes are used for
+                  exacts whose count is 1. *)
+               Int.equal t Opcodes.op_char
+               || Int.equal t Opcodes.op_chari
+               || Int.equal t Opcodes.op_not
+               || Int.equal t Opcodes.op_noti
+               || Int.equal t Opcodes.op_exact
+               || Int.equal t Opcodes.op_exacti
+               || Int.equal t Opcodes.op_notexact
+               || Int.equal t Opcodes.op_notexacti
+             then (
+               tempcode := !tempcode + Opcodes.op_lengths.(t);
+               (* pcre2_compile.c:7950-7953 — SUPPORT_UNICODE:
+                  HAS_EXTRALEN(c) = c >= 0xc0 (pcre2_internal.h:272,
+                  pcre2_intmodedep.h:286). DEVIATION: the GET_EXTRALEN
+                  skip is M6 (docs/ocaml-engine/07-utf.md); unreachable in
+                  M1 (no multi-code-unit literal is ever emitted), so this
+                  defers loudly rather than mis-skipping. *)
+               if
+                 utf
+                 && Char.code (Bytes.get cb.start_code (!tempcode - 1)) >= 0xc0
+               then (
+                 errorcodeptr := Parse.err_deferred;
+                 return_from_branch 0))
+             else if
+               Int.equal t Opcodes.op_class || Int.equal t Opcodes.op_nclass
+             then
+               (* pcre2_compile.c:7956-7962 — for the class opcodes, the
+                  repeat operator appears at the end; adjust tempcode to
+                  point to it. 32/sizeof(PCRE2_UCHAR) = 32. *)
+               tempcode := !tempcode + 1 + 32
+             else if Int.equal t Opcodes.op_xclass then
+               (* pcre2_compile.c:7964-7968 — unreachable in M1 (OP_XCLASS
+                  emission is M6), kept in the C's shape. *)
+               tempcode := !tempcode + get cb.start_code (!tempcode + 1);
+
+             (* pcre2_compile.c:7971-7977 — if tempcode is equal to code
+                (which points to the end of the repeated item), it means
+                we have skipped an EXACT item but there is no following
+                QUERY, STAR, or UPTO; the value of len will be 0, and we
+                do nothing. In all other cases, tempcode will be pointing
+                to the repeat opcode, and will be less than code, so the
+                value of len will be greater than 0. *)
+             let len = !code - !tempcode in
+             if len > 0 then
+               let repcode = Char.code (Bytes.get cb.start_code !tempcode) in
+
+               (* pcre2_compile.c:7982-7987 — there is a table for
+                  possessifying opcodes, all of which are less than
+                  OP_CALLOUT. A zero entry means there is no possessified
+                  version. *)
+               if
+                 repcode < Opcodes.op_callout && opcode_possessify.(repcode) > 0
+               then
+                 Bytes.set cb.start_code !tempcode
+                   (Char.chr opcode_possessify.(repcode))
+               else (
+                 (* pcre2_compile.c:7989-8001 — for opcodes without a
+                    special possessified version, wrap the item in ONCE
+                    brackets. Bytes.blit = the C's memmove
+                    (overlap-safe). *)
+                 Bytes.blit cb.start_code !tempcode cb.start_code
+                   (!tempcode + 1 + Limits.link_size)
+                   len;
+                 code := !code + 1 + Limits.link_size;
+                 let len = len + 1 + Limits.link_size in
+                 Bytes.set cb.start_code !tempcode (Char.chr Opcodes.op_once);
+                 emit_cu Opcodes.op_ket;
+                 putinc cb.start_code code len;
+                 put cb.start_code (!tempcode + 1) len))
+         with End_repeat -> ());
+
+        (* pcre2_compile.c:8005-8010 — END_REPEAT: we set the "follows
+           varying string" flag for subsequently encountered reqcus if it
+           isn't already set and we have just passed a varying length
+           item. *)
+        cb.req_varyopt <- cb.req_varyopt lor reqvary)
       else if Int.equal meta Parse.meta_bigvalue then (
         (* pcre2_compile.c:8014-8019 — handle a 32-bit data character with
            a value greater than META_END. *)
@@ -2008,6 +2620,32 @@ let () =
   assert (Int.equal Parse.esc_big_z Opcodes.op_eodn);
   assert (Int.equal Parse.esc_z Opcodes.op_eod)
 
+(* Repeat tables: chartypeoffset (pcre2_compile.c:687-691) and
+   opcode_possessify (pcre2_compile.c:861-917) — length (OP_END..OP_CALLOUT
+   inclusive) and the entries the repeat arm relies on. *)
+let () =
+  assert (Int.equal (Array.length chartypeoffset) 4);
+  assert (Int.equal chartypeoffset.(0) 0);
+  assert (Int.equal chartypeoffset.(1) 13);
+  assert (Int.equal chartypeoffset.(2) 26);
+  assert (Int.equal chartypeoffset.(3) 39);
+  assert (Int.equal (Array.length opcode_possessify) (Opcodes.op_callout + 1));
+  assert (Int.equal opcode_possessify.(Opcodes.op_star) Opcodes.op_posstar);
+  assert (Int.equal opcode_possessify.(Opcodes.op_minstar) 0);
+  assert (Int.equal opcode_possessify.(Opcodes.op_upto) Opcodes.op_posupto);
+  assert (Int.equal opcode_possessify.(Opcodes.op_exact) 0);
+  assert (Int.equal opcode_possessify.(Opcodes.op_stari) Opcodes.op_posstari);
+  assert (Int.equal opcode_possessify.(Opcodes.op_notstar) Opcodes.op_notposstar);
+  assert (
+    Int.equal opcode_possessify.(Opcodes.op_notuptoi) Opcodes.op_notposuptoi);
+  assert (
+    Int.equal opcode_possessify.(Opcodes.op_typestar) Opcodes.op_typeposstar);
+  assert (Int.equal opcode_possessify.(Opcodes.op_crrange) Opcodes.op_crposrange);
+  assert (Int.equal opcode_possessify.(Opcodes.op_crposstar) 0);
+  assert (Int.equal opcode_possessify.(Opcodes.op_class) 0);
+  assert (Int.equal opcode_possessify.(Opcodes.op_ref) 0);
+  assert (Int.equal opcode_possessify.(Opcodes.op_recurse) 0)
+
 (* compile_branch on parsed streams produced by Parse.parse_regex, driven
    with pcre2_compile()'s two-phase protocol (pre-compile pass accumulating
    the length into the workspace, then the real pass into a buffer of
@@ -2065,6 +2703,7 @@ let () =
     in
     assert (Int.equal err1 0);
     cb.start_code <- Bytes.make !length '\000' (* real-phase buffer *);
+    cb.req_varyopt <- 0 (* pcre2_compile.c:10676, between the phases *);
     let rc2, err2, endcode, endpptr, opts_out, fcu, fcuf, rcu, rcuf =
       run_branch ~options ~extra cb None
     in
@@ -2473,11 +3112,295 @@ let () =
   assert_class cb Opcodes.op_class (fun c ->
       is_digit c || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66));
 
-  (* Deferred arms fail loudly in both phases: quantifiers (chunk C),
-     groups (chunk D), backrefs (M2), Unicode property classes (M7), and
-     the Unicode caseless-literal path (M6/M7 DEVIATION in
-     compile_branch). *)
-  expect_deferred "a*";
+  (* --- Repeats (compile_branch C, pcre2_compile.c:7178-8011). The
+     quantifier arm abolishes and rewrites a previous single-char or
+     character-type item (OUTPUT_SINGLE_REPEAT, 7784-7904), appends a CR
+     opcode after a class (7311-7344), and the possessive pass (7909-8003)
+     then switches the repeat opcode to its POS variant via
+     opcode_possessify. compile2 also checks the two-pass protocol: the
+     pre-compile length must equal the real phase's emitted length. *)
+
+  (* Hand-verified trace 1 — "a*" (pcre2_compile.c:7189-7194, 7215,
+     7220-7226, 7794-7795, 7809-7811, 7888-7894): OP_CHAR 0x61 at offset 0
+     is abolished (code = previous, 7795); min=0/max=unlimited emits
+     OP_STAR + repeat_type(greedy_default=0) + op_type(0) = 33 at offset 0
+     (7811 after 7804); the final fill re-emits 0x61 at offset 1
+     (7890-7894). The zero-minimum repeat backs off to the zero* values
+     (7220-7226): firstcuflags = zerofirstcuflags = REQ_NONE (set when 'a'
+     was first, 8285), so the branch may match empty (rc -1); END_REPEAT
+     ORs REQ_VARY into req_varyopt (8010). *)
+  let cb, rc, _, _, _, fcuf, _, rcuf = compile2 "a*" in
+  assert (Int.equal rc (-1));
+  assert_code cb [ Opcodes.op_star; 0x61 ];
+  assert (Int.equal fcuf req_none);
+  assert (Int.equal rcuf req_unset);
+  assert (Int.equal cb.req_varyopt req_vary);
+
+  (* Lazy quantifiers take repeat_type = greedy_non_default = 1
+     (pcre2_compile.c:7240-7246): a+? = OP_MINPLUS, a?? = OP_MINQUERY.
+     a+? must match at least one char (7210). *)
+  let cb, rc, _, _, fcu, fcuf, _, rcuf = compile2 "a+?" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_minplus; 0x61 ];
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal fcuf 0);
+  assert (Int.equal rcuf req_unset);
+  let cb, rc, _, _, _, _, _, _ = compile2 "a??" in
+  assert (Int.equal rc (-1));
+  assert_code cb [ Opcodes.op_minquery; 0x61 ];
+
+  (* Hand-verified trace 2 — "a{2,5}" (pcre2_compile.c:7182-7187,
+     7293-7308, 7838-7884, 7888-7894): min=2/max=5 from the two words
+     after META_MINMAX. repeat_min > 1 sets reqcu = 0x61 with reqcuflags =
+     cb->req_varyopt = 0 (7302-7305). {n,m} = EXACT then UPTO: OP_EXACT +
+     op_type(0) = 41, PUT2(2) (7843-7844); fill 0x61 (7853-7857);
+     repeat_max = 5-2 = 3 != 1, so OP_UPTO + repeat_type(0) = 39, PUT2(3)
+     (7874-7883); final fill 0x61 (7890-7894). *)
+  let cb, rc, _, _, fcu, fcuf, rcu, rcuf = compile2 "a{2,5}" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_exact; 0; 2; 0x61; Opcodes.op_upto; 0; 3; 0x61 ];
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal fcuf 0);
+  assert (Int.equal rcu 0x61);
+  assert (Int.equal rcuf 0);
+  assert (Int.equal cb.req_varyopt req_vary);
+
+  (* "a{3,}": EXACT 3 then STAR (pcre2_compile.c:7843-7844, 7851-7857,
+     7870-7871, 7890-7894). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "a{3,}" in
+  assert_code cb [ Opcodes.op_exact; 0; 3; 0x61; Opcodes.op_star; 0x61 ];
+
+  (* "a{4}" = {n,n}: just an EXACT (pcre2_compile.c:7838-7844 with the
+     7851 middle skipped); reqvary = 0 (7215) leaves req_varyopt alone. *)
+  let cb, rc, _, _, fcu, _, rcu, rcuf = compile2 "a{4}" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_exact; 0; 4; 0x61 ];
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal rcu 0x61);
+  assert (Int.equal rcuf 0);
+  assert (Int.equal cb.req_varyopt 0);
+
+  (* "a{1,3}": min=1/max limited leaves the char item in place and appends
+     OP_UPTO with max-1 (pcre2_compile.c:7825-7835), then the final fill
+     (7890-7894). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "a{1,3}" in
+  assert_code cb [ Opcodes.op_char; 0x61; Opcodes.op_upto; 0; 2; 0x61 ];
+
+  (* "a{0,3}": zero minimum with a limited maximum is an UPTO
+     (pcre2_compile.c:7813-7817). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "a{0,3}" in
+  assert_code cb [ Opcodes.op_upto; 0; 3; 0x61 ];
+
+  (* "a{1}" = {1,1}: the quantifier is ignored for non-parenthesized items
+     (pcre2_compile.c:7277). *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "a{1}" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_char; 0x61 ];
+  assert (Int.equal cb.req_varyopt 0);
+
+  (* Hand-verified trace 3 — "(?i)a*" (pcre2_compile.c:7278, 689-691):
+     previous is OP_CHARI, so op_type = chartypeoffset[OP_CHARI - OP_CHAR]
+     = OP_STARI - OP_STAR = 13, and 7811 emits OP_STAR + 0 + 13 = 46 =
+     OP_STARI, then the fill 0x61. *)
+  let cb, _, _, _, _, fcuf, _, _ = compile2 "(?i)a*" in
+  assert_code cb [ Opcodes.op_stari; 0x61 ];
+  assert (Int.equal fcuf req_none);
+
+  (* (?i)x{3}: OP_EXACT + op_type(13) = OP_EXACTI (7843, "NB EXACT doesn't
+     have repeat_type"); OP_CHARI previous adds REQ_CASELESS to the reqcu
+     flags (7306). *)
+  let cb, _, _, _, fcu, fcuf, rcu, rcuf = compile2 "(?i)x{3}" in
+  assert_code cb [ Opcodes.op_exacti; 0; 3; 0x78 ];
+  assert (Int.equal fcu 0x78);
+  assert (Int.equal fcuf req_caseless);
+  assert (Int.equal rcu 0x78);
+  assert (Int.equal rcuf req_caseless);
+
+  (* PCRE2_UNGREEDY flips the greedy default (pcre2_compile.c:5698-5699,
+     7244,7249): (?U)a* = OP_MINSTAR, (?U)a*? = OP_STAR. *)
+  let cb, _, _, _, _, _, _, _ = compile2 "(?U)a*" in
+  assert_code cb [ Opcodes.op_minstar; 0x61 ];
+  let cb, _, _, _, _, _, _, _ = compile2 "(?U)a*?" in
+  assert_code cb [ Opcodes.op_star; 0x61 ];
+
+  (* Character-type repeats use the TYPE opcodes: op_type = OP_TYPESTAR -
+     OP_STAR = 52 (pcre2_compile.c:7773), and the type opcode itself is
+     the final fill (7895-7897). *)
+  let cb, rc, _, _, _, fcuf, _, _ = compile2 ".*" in
+  assert (Int.equal rc (-1));
+  assert_code cb [ Opcodes.op_typestar; Opcodes.op_any ];
+  assert (Int.equal fcuf req_none);
+  let cb, rc, _, _, _, _, _, _ = compile2 ".+?" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_typeminplus; Opcodes.op_any ];
+  let cb, _, _, _, _, _, _, _ = compile2 "(?s).*" in
+  assert_code cb [ Opcodes.op_typestar; Opcodes.op_allany ];
+  let cb, rc, _, _, _, _, _, _ = compile2 "\\d+" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_typeplus; Opcodes.op_digit ];
+  let cb, _, _, _, _, _, _, _ = compile2 "\\W*?" in
+  assert_code cb [ Opcodes.op_typeminstar; Opcodes.op_not_wordchar ];
+  let cb, _, _, _, _, _, _, _ = compile2 "\\d{2,4}" in
+  assert_code cb
+    [
+      Opcodes.op_typeexact;
+      0;
+      2;
+      Opcodes.op_digit;
+      Opcodes.op_typeupto;
+      0;
+      2;
+      Opcodes.op_digit;
+    ];
+
+  (* Negated one-char classes repeat through the NOT opcodes: op_type =
+     chartypeoffset[OP_NOT - OP_CHAR] = 26, chartypeoffset[OP_NOTI -
+     OP_CHAR] = 39 (pcre2_compile.c:689-691, 7278). *)
+  let cb, rc, _, _, _, fcuf, _, _ = compile2 "[^x]*" in
+  assert (Int.equal rc (-1));
+  assert_code cb [ Opcodes.op_notstar; 0x78 ];
+  assert (Int.equal fcuf req_none);
+  let cb, rc, _, _, _, _, _, _ = compile2 "(?i)[^x]+?" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_notminplusi; 0x78 ];
+
+  (* Class repeats: the CR opcode goes after the 33-unit bitmap item
+     (pcre2_compile.c:7311-7344). Check the opcode + full bitmap + repeat
+     tail. *)
+  let assert_class_with_tail (cb : compile_block) (expected_op : int)
+      (member : int -> bool) (tail : int list) =
+    assert (Int.equal (Bytes.length cb.start_code) (33 + List.length tail));
+    assert (Int.equal (Char.code (Bytes.get cb.start_code 0)) expected_op);
+    for c = 0 to 255 do
+      let bit =
+        Char.code (Bytes.get cb.start_code (1 + (c lsr 3)))
+        land (1 lsl (c land 7))
+      in
+      assert (Bool.equal (not (Int.equal bit 0)) (member c))
+    done;
+    List.iteri
+      (fun i v ->
+        assert (Int.equal (Char.code (Bytes.get cb.start_code (33 + i))) v))
+      tail
+  in
+  let is_lower c = c >= 0x61 && c <= 0x7a in
+
+  (* Hand-verified trace 4 — "[a-z]{2,4}" (pcre2_compile.c:7337-7343):
+     previous is OP_CLASS (110) + the 32-byte bitmap for a-z; {2,4} is
+     neither *, + nor ?, so OP_CRRANGE + repeat_type(0) = 104 is appended,
+     then PUT2INC(repeat_min=2) and PUT2INC(repeat_max=4), each big-endian
+     over two code units: tail = 104,0,2,0,4 at offsets 33..37. *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "[a-z]{2,4}" in
+  assert (Int.equal rc 1);
+  assert_class_with_tail cb Opcodes.op_class is_lower
+    [ Opcodes.op_crrange; 0; 2; 0; 4 ];
+  let cb, _, _, _, _, _, _, _ = compile2 "[a-z]*" in
+  assert_class_with_tail cb Opcodes.op_class is_lower [ Opcodes.op_crstar ];
+  let cb, _, _, _, _, _, _, _ = compile2 "[a-z]+?" in
+  assert_class_with_tail cb Opcodes.op_class is_lower [ Opcodes.op_crminplus ];
+  (* Unlimited max in a CRRANGE uses the 2-byte encoding 0
+     (pcre2_compile.c:7341). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[a-z]{2,}" in
+  assert_class_with_tail cb Opcodes.op_class is_lower
+    [ Opcodes.op_crrange; 0; 2; 0; 0 ];
+  let cb, _, _, _, _, _, _, _ = compile2 "[^ab]??" in
+  assert_class_with_tail cb Opcodes.op_nclass
+    (fun c -> not (Int.equal c 0x61 || Int.equal c 0x62))
+    [ Opcodes.op_crminquery ];
+
+  (* Possessive quantifiers (pcre2_compile.c:7232-7238, 7909-8003):
+     repeat_type is forced greedy and the emitted repeat opcode is
+     switched to its POS variant via opcode_possessify (7986-7987). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "a*+" in
+  assert_code cb [ Opcodes.op_posstar; 0x61 ];
+  let cb, _, _, _, _, _, _, _ = compile2 "a++" in
+  assert_code cb [ Opcodes.op_posplus; 0x61 ];
+  let cb, _, _, _, _, _, _, _ = compile2 "a?+" in
+  assert_code cb [ Opcodes.op_posquery; 0x61 ];
+  let cb, _, _, _, _, _, _, _ = compile2 "[a-z]*+" in
+  assert_class_with_tail cb Opcodes.op_class is_lower [ Opcodes.op_crposstar ];
+  let cb, _, _, _, _, _, _, _ = compile2 "\\d++" in
+  assert_code cb [ Opcodes.op_typeposplus; Opcodes.op_digit ];
+
+  (* Hand-verified trace 5 — "a{2,3}+" (pcre2_compile.c:7838-7878,
+     7931-7954, 7971-7987): the repeat compiles as EXACT 2 'a' then, since
+     repeat_max - repeat_min = 1, OP_QUERY + repeat_type(0) 'a'
+     (7875-7878). The possessive pass starts at tempcode = previous, skips
+     the EXACT item (op_lengths[OP_EXACT] = 4, 7945-7949) to the OP_QUERY;
+     len = 2 > 0, and opcode_possessify[OP_QUERY] = OP_POSQUERY replaces
+     it in place (7986-7987). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "a{2,3}+" in
+  assert_code cb [ Opcodes.op_exact; 0; 2; 0x61; Opcodes.op_posquery; 0x61 ];
+
+  (* "a{3}+": possessifying an EXACT has no effect — after skipping the
+     EXACT item, tempcode == code, len = 0, nothing is done
+     (pcre2_compile.c:7925-7929, 7971-7978). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "a{3}+" in
+  assert_code cb [ Opcodes.op_exact; 0; 3; 0x61 ];
+
+  (* "a{1,2}+": the char item stays (7831), OP_UPTO 1 follows; the skip
+     over OP_CHAR (op_lengths = 2) lands on the UPTO, which possessifies
+     to OP_POSUPTO (7941-7949, 7986-7987). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "a{1,2}+" in
+  assert_code cb [ Opcodes.op_char; 0x61; Opcodes.op_posupto; 0; 1; 0x61 ];
+
+  (* A quantified empty-class OP_FAIL is ignored (pcre2_compile.c:
+     7346-7352), but END_REPEAT still ORs the REQ_VARY in (8010). *)
+  let cb, rc, _, _, _, _, _, _ =
+    compile2 ~options:Options.allow_empty_class "[]*"
+  in
+  assert (Int.equal rc (-1));
+  assert_code cb [ Opcodes.op_fail ];
+  assert (Int.equal cb.req_varyopt req_vary);
+
+  (* The zerofirstcu/zeroreqcu interplay across a zero-min repeat
+     (pcre2_compile.c:7220-7226): in "a?b" the backoff resets firstcu to
+     "none" and reqcu to unset, then 'b' becomes the required unit with
+     the REQ_VARY flag from req_varyopt (8323). In "ab*c" the backoff
+     restores firstcu = 'a' (zerofirstcu was saved at 8316-8317). *)
+  let cb, rc, _, _, _, fcuf, rcu, rcuf = compile2 "a?b" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_query; 0x61; Opcodes.op_char; 0x62 ];
+  assert (Int.equal fcuf req_none);
+  assert (Int.equal rcu 0x62);
+  assert (Int.equal rcuf req_vary);
+  let cb, _, _, _, fcu, fcuf, rcu, rcuf = compile2 "ab*c" in
+  assert_code cb
+    [ Opcodes.op_char; 0x61; Opcodes.op_star; 0x62; Opcodes.op_char; 0x63 ];
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal fcuf 0);
+  assert (Int.equal rcu 0x63);
+  assert (Int.equal rcuf req_vary);
+
+  (* {0} repeats make code go backwards (the item is emitted, then
+     dropped): the pre-compile length keeps the dropped item
+     (pcre2_compile.c:5761-5767 "don't ever reduce the length"), so the
+     real phase emits no more than the estimate rather than exactly it.
+     Char items pass through OUTPUT_SINGLE_REPEAT's max == 0 exit (7800);
+     classes through the class arm's (7324-7328). *)
+  let compile2_shrink ?(options = 0) pat expected =
+    let cx = parse ~options pat in
+    let cb = make_cb ~options pat cx in
+    let length = ref 0 in
+    let rc1, err1, _, _, _, _, _, _, _ = run_branch ~options cb (Some length) in
+    assert (Int.equal err1 0);
+    cb.start_code <- Bytes.make !length '\000';
+    cb.req_varyopt <- 0 (* pcre2_compile.c:10676, between the phases *);
+    let rc2, err2, endcode, _, _, _, _, _, _ = run_branch ~options cb None in
+    assert (Int.equal err2 0);
+    assert (Int.equal rc1 rc2);
+    assert (endcode <= !length);
+    assert (Int.equal endcode (List.length expected));
+    List.iteri
+      (fun i v -> assert (Int.equal (Char.code (Bytes.get cb.start_code i)) v))
+      expected
+  in
+  compile2_shrink "a{0}b" [ Opcodes.op_char; 0x62 ];
+  compile2_shrink "[ab]{0}c" [ Opcodes.op_char; 0x63 ];
+
+  (* Deferred arms fail loudly in both phases: groups (chunk D), backrefs
+     (M2), Unicode property classes (M7), and the Unicode caseless-literal
+     path (M6/M7 DEVIATION in compile_branch). *)
   expect_deferred "(a)";
   expect_deferred "(?:a)";
   expect_deferred "\\1()" (* META_BACKREF comes first in this stream *);

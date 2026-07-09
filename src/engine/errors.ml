@@ -36,6 +36,7 @@ let err7 =
 
 let err8 = compile_error_base + 8 (* range out of order in character class *)
 let err9 = compile_error_base + 9 (* quantifier does not follow repeatable *)
+let err10 = compile_error_base + 10 (* internal error: unexpected repeat *)
 let err11 = compile_error_base + 11 (* unrecognized character after (? or (?- *)
 
 let err12 =

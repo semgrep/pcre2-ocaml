@@ -46,8 +46,13 @@ Compile phase (`compile.ml` ← pcre2_compile.c back half):
   new ucd.ml for GET_UCD/UCD_CASESET/UCD_OTHERCASE, pcre2_internal.h:1864-1889.
   OP_XCLASS extra data, \p/\P in classes, and the UTF/UCP caseless closure
   defer loudly with err 299 to M6/M7, identically in both passes)
-- [ ] compile_branch C — repeats: OP_STAR..OP_MINUPTO families, EXACT, repeated
-  groups/classes (pcre2_compile.c:6812-8050)
+- [x] compile_branch C — (this commit) repeats: OP_STAR..OP_MINUPTO families, EXACT,
+  repeated classes CRSTAR..CRMINRANGE, type repeats TYPESTAR..TYPEEXACT, the
+  possessive pass (opcode_possessify / ONCE wrap)
+  (pcre2_compile.c:7178-8011 — the 6812-8050 estimate was wrong, now pinned;
+  + chartypeoffset 687-691, opcode_possessify 861-917. The repeated-bracket
+  region 7424-7751 and repeated-recursion 7354-7422 defer loudly with err 299:
+  no bracket/OP_RECURSE previous item exists until chunk D / M5)
 - [ ] compile_branch D — group emission OP_BRA/OP_CBRA, name table entries
   (pcre2_compile.c:8050-8370, minus backref/recursion arms → M2/M4)
 - [ ] compile_regex + branch linking, OP_ALT/OP_KET chains, first/req cu seed
