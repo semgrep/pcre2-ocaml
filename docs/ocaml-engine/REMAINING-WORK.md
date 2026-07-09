@@ -81,57 +81,57 @@ See §0. G8's fuzz half: 200k×{42,101,20260708} + 1M seed-42 all clean at
 
 ### 2.2 THE PERF GAP (M10 — the main remaining engineering)
 **Gate: engine/oracle ≤ 2.0x, geomean AND per-benchmark** (user's hard
-requirement). First honest numbers (commit `35c6fb6`,
-`bench/results.json`, clean machine, median-of-5, oracle ≈ raw-C so the
-denominator is fair): **geomean 46.9x FAIL**, range 7.6x–95.4x.
+requirement).
 
-Diagnosis (measured, in the log row for `35c6fb6`):
-- The interpreter frame loop itself is zero-alloc as designed
-  (244 minor words per 10M backtrack ticks) and its floor is **7.6x**
-  (`pathological` benchmark: one attempt, 10M ticks, both engines hit the
-  same `-47 MATCHLIMIT`).
-- The dominant cost is **~66 minor words allocated per match ATTEMPT**
-  (per start position): the interpreter's giant mutually-recursive
-  function nest lives INSIDE `match_` (`interpreter.ml:604-7460`) and the
-  closure graph is rebuilt at every attempt via `attempt`
-  (`interpreter.ml:8269-8291`). Email benchmark: 2.6 GB minor heap/rep →
-  93.6x. First-char-selective patterns (ipv4) drop to 18x.
+**Chunk 1 (closure-nest hoist) — DONE** (commits `6d2be8e`→`e233089`,
+P0–P6 per the plan at
+`/home/ubuntu/.claude/plans/pcre2-perf-chunk1-hoist-plan.md`; every step
+battery-gated + fidelity-reviewed, P2/P3-P5/P6 by whole-file
+token-equality proofs). The 131-function nest is module-level over the
+per-exec `match_state`; `match_` is a 12-line per-attempt entry; the new
+`alloc_per_attempt` OUnit test (both Interp and Jit) pins ONE exec
+spanning ~100k attempts at < 1000 minor words (measures 205; pre-hoist
+≈ 6.3M).
 
-A detailed, code-verified implementation plan for chunk 1 (capture
-inventory, target `match_state` record shape, P0–P6 mechanical steps,
-risk register, alloc-gate) is at
-`/home/ubuntu/.claude/plans/pcre2-perf-chunk1-hoist-plan.md` (line numbers
-valid at `e8eeaa8`; re-anchor by function name).
+**Bench denominator fix** (`9aba2e1`): 13454e2's stub slack padding
+(kept, correct for fuzz/conformance) had turned the oracle bench column
+into per-call subject memcpy; bench now uses `oracle_test_exec_nopad`
+(timing-only, containment documented) so oracle ≈ raw-C again.
 
-Plan, two sequential chunks (both touch `interpreter.ml` — do NOT
-parallelize with the crash fix):
-1. **Hoist the closure nest**: move the `let rec … and …` graph to module
-   level over an explicit state record (mirror the C's shape: `mb` +
-   frame arena + the F-slot locals as one mutable state value, allocated
-   once per `exec` — or fully static). Expected effect: collapse the
-   per-attempt overhead; geomean should fall toward the ~7.6x floor.
-   Gate for the chunk: zero conformance delta (per-unit set diff), fuzz
-   smoke clean, bench re-run showing the attempt-scaling benchmarks
-   (email/uri/findall/repeat_*) collapsing toward pathological's ratio.
-   §6/§8 still binding ([@tailcall], no exceptions across the loop).
-2. **Grind the dispatch floor 7.6x → ≤2.0x**: profile-guided (perf is
-   unavailable on this box — `perf_event_paranoid=4`, lowering denied;
-   use OCaml Gc counters + manual instrumentation or `ltrace`-style
-   sampling via repeated bench `--only` runs). Candidate levers, in
-   likely-impact order: upgrade hot-path `Bytes.get`/`Array.get` to
-   `unsafe_*` under proven bounds (§8 requires a proof comment per site —
-   many sites still use safe variants); frame-slot access patterns (cache
-   `fr` array + base offset in locals per dispatch iteration); opcode
-   dispatch shape (the big `match` on int should compile to a jump table —
-   verify with `-dlambda`/`-dcmm` that it does and that arms aren't
-   boxing); `land 0xff`/`Char.code` chains in char arms; the
-   ovector-write paths in CBRA/KET; possibly flambda (`-O3` exists in the
-   release profile — the dev shell compiler is NON-flambda; test whether
-   an flambda switch changes the floor materially and document, but the
-   gate should hold on the standard compiler if possible).
-3. **Re-gate**: `dune exec bench/bench.exe` (full, uncontended) +
-   `compare.exe` exit 0. Then mark **G9/G10** in `10-performance.md`.
-   Per-benchmark >2.0x requires explicit user sign-off if any residual.
+**Honest baseline after chunk 1** (full bench, reps=5, uncontended,
+2026-07-09): **geomean 10.30x** (was 46.9x). Per-benchmark
+engine/oracle: repeat_negclass 5.45, uri 5.96, findall_email 6.08,
+email 6.13, pathological 6.85 (the floor; was 7.6), ipv4 7.57, backref
+7.80, keywords 10.56, repeat_bounded 14.94, findall_utf 23.92,
+utf_letters 25.23, http_lines 30.44. `bench/results.json` (gitignored)
+holds the full run. Note: on high-call-count benchmarks the oracle
+column includes per-call FFI overhead (match-data create/free,
+copy-out) by design — documented in bench.ml.
+
+**Chunk 2 — grind 10.3x → ≤2.0x, profile-guided** (perf(1) unavailable:
+`perf_event_paranoid=4`; use Gc counters, bench `--only` sampling,
+`-dlambda`/`-dcmm` inspection). Fresh target order from the new numbers:
+1. **http_lines 30.4x** — line-anchored scan shape; suspect the
+   bump-along/startline path (C uses a fast newline scan; check the
+   engine's per-position work vs C's memchr-like advance).
+2. **utf_letters 25.2x / findall_utf 23.9x** — the UTF decode path
+   (GETCHARINC chains, Utf.getchar call overhead, per-char prop lookups).
+3. **repeat_bounded 14.9x, keywords 10.6x** — repeat machinery + multi-
+   keyword scan.
+4. **The ~6x floor** (pathological 6.85, negclass 5.45): candidate
+   levers in likely-impact order: hot-path `Bytes.get`/`Array.get` →
+   `unsafe_*` under §8 proof comments (many sites still safe variants);
+   frame-slot access caching (fr array + base offset in locals per
+   dispatch iteration); opcode dispatch shape (verify the big int
+   `match` compiles to a jump table and arms don't box); `land
+   0xff`/`Char.code` chains in char arms; ovector-write paths in
+   CBRA/KET; possibly flambda (dev shell is NON-flambda; test whether it
+   moves the floor materially and document — but the gate should hold on
+   the standard compiler if possible).
+
+Then **re-gate**: `dune exec bench/bench.exe` (full, uncontended) +
+`compare.exe` exit 0 → mark **G9/G10** in `10-performance.md`.
+Per-benchmark >2.0x requires explicit user sign-off if any residual.
 
 ### 2.3 Housekeeping (small, after or interleaved)
 - **Skip-list freeze** (09-long-tail.md item): final review of
