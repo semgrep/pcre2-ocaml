@@ -41,7 +41,7 @@ byte-identically outside the skip-list; oracle OUnit green.
   + deferred expiry; replays `fuzz/corpus/regressions/`. (~800 LOC)
 - [x] **oracle suite**: (done in 4f8f03f) `test/oracle/` (pcre2-dev) instantiates the existing OUnit functor
   over `Pcre2_c`; guards against suite drift. Existing pure suite unchanged. (~100 LOC)
-- [ ] **engine skeleton + swap**: `src/engine/engine.ml/.mli` per the signature in
+- [x] **engine skeleton + swap**: (this commit) `src/engine/engine.ml/.mli` per the signature in
   `00-architecture.md`, all paths returning not-implemented errors; `frames.ml`,
   `parse.ml`, `compile.ml`, `interpreter.ml` stubs; rewrite `src/bindings.ml` as the pure
   shim (same names/types, BADOFFSET checks, NOMATCH/PARTIAL folding, jit aliases,

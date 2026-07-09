@@ -1,0 +1,6 @@
+; The pure-OCaml PCRE2 engine. Public only so the dev-only harness/fuzzer/
+; bench (package pcre2-dev) can drive it directly; consumers should use the
+; Pcre2 module. Stdlib only — no ppx, no external dependencies.
+(library
+ (name pcre2_engine)
+ (public_name pcre2.engine))

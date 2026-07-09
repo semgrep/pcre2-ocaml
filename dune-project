@@ -20,15 +20,10 @@ pcre2-ocaml offers library functions for string pattern matching and
 substitution, similar to the functionality offered by the Perl language.")
   (depends
     (ocaml (>= 4.14))
-    ; NOTE: dune-configurator and conf-libpcre2-8 remain only until the pure
-    ; OCaml engine replaces the C stubs (M0 swap); they then move entirely to
-    ; pcre2-dev.
-    dune-configurator
     ; NOTE: cannot be a test only dep since the ppx must be used to remove the
     ; test code when _not_ in a test conf.
     ppx_inline_test
     ppx_deriving
-    (conf-libpcre2-8 :build)
     (ounit2 :with-test)
   )
 )

@@ -16,10 +16,8 @@ bug-reports: "https://github.com/semgrep/pcre2-ocaml/issues"
 depends: [
   "dune" {>= "3.12"}
   "ocaml" {>= "4.14"}
-  "dune-configurator"
   "ppx_inline_test"
   "ppx_deriving"
-  "conf-libpcre2-8" {build}
   "ounit2" {with-test}
   "odoc" {with-doc}
 ]
