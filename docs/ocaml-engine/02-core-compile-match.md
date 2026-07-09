@@ -34,8 +34,12 @@ Parse phase (`parse.ml` ← pcre2_compile.c front half):
 Compile phase (`compile.ml` ← pcre2_compile.c back half):
 - [x] compile utilities: (this commit) PUT/GET/PUT2/GET2, code-size first pass plumbing, find_dupname
   scaffold (pcre2_compile.c:5538-5630 + macros pcre2_internal.h)
-- [ ] compile_branch A — single chars, escapes, OP_CHAR/CHARI/NOT/NOTI emission
-  (pcre2_compile.c:5636-6500)
+- [x] compile_branch A — (this commit) function head + two-pass lengthptr protocol,
+  branch terminators, ^ $ ., META_OPTIONS, numerical callouts, simple escapes,
+  literal chars OP_CHAR/CHARI (pcre2_compile.c:5604-5857, 6576-6587, 7101-7111,
+  8014-8019, 8101-8206, 8209-8341; OP_NOT/NOTI come from the negated one-char
+  class optimization at 5917-5947, i.e. chunk B, not this chunk; \P\p and the
+  Unicode caseless-literal/ord2utf paths defer loudly to M6/M7)
 - [ ] compile_branch B — class compilation → OP_CLASS/OP_NCLASS bitmaps
   (pcre2_compile.c:6500-6810)
 - [ ] compile_branch C — repeats: OP_STAR..OP_MINUPTO families, EXACT, repeated

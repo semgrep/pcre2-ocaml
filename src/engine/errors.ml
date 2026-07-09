@@ -48,6 +48,7 @@ let err14 = compile_error_base + 14 (* missing closing parenthesis *)
 let err15 = compile_error_base + 15 (* reference to non-existent subpattern *)
 let err18 = compile_error_base + 18 (* missing ) after (?# comment *)
 let err19 = compile_error_base + 19 (* parentheses are too deeply nested *)
+let err20 = compile_error_base + 20 (* regular expression is too large *)
 let err22 = compile_error_base + 22 (* unmatched closing parenthesis *)
 let err26 = compile_error_base + 26 (* a relative value of zero not allowed *)
 let err28 = compile_error_base + 28 (* assertion expected after (?( or (?(?C) *)
@@ -91,6 +92,7 @@ let err64 = compile_error_base + 64 (* non-octal character in \o{} *)
 
 let err65 =
   compile_error_base + 65 (* different names for subpatterns of same number *)
+
 let err67 = compile_error_base + 67 (* non-hex character in \x{} *)
 let err68 = compile_error_base + 68 (* \c must be followed by printable ASCII *)
 
@@ -115,9 +117,14 @@ let err84 =
   compile_error_base + 84 (* (?| / (?J: / (?x: parens too deeply nested *)
 
 let err86 = compile_error_base + 86 (* regular expression is too complicated *)
+
+let err89 =
+  compile_error_base + 89 (* internal error: unknown code in parsed pattern *)
+
 let err93 = compile_error_base + 93 (* \N{U+dddd} only in Unicode (UTF) mode *)
 let err94 = compile_error_base + 94 (* invalid hyphen in option setting *)
 let err97 = compile_error_base + 97 (* too many capturing groups (max 65535) *)
+let err99 = compile_error_base + 99 (* \K is not allowed in lookarounds *)
 
 (* "Expected" matching error codes: pcre2.h.generic:327-328. *)
 let error_nomatch = -1
