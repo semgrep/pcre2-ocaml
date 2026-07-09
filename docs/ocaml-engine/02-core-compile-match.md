@@ -17,7 +17,7 @@ Line ranges are 10.44 vendor estimates; pin exact boundaries when dispatching (�
 Parse phase (`parse.ml` ← pcre2_compile.c front half):
 - [ ] parse helpers: read_number/read_repeat_counts (pcre2_compile.c:1325-1520), read_name
   (2464-2560), check_posix_syntax/name (2377-2435), manage_callouts no-op shim (2595-2625)
-- [ ] check_escape (pcre2_compile.c:1551-2160) — ASCII escapes, \x/\o/\c, backslash-digit
+- [x] check_escape (pcre2_compile.c:1551-2160) — ASCII escapes, \x/\o/\c, backslash-digit
   disambiguation (backref emission itself is M2)
 - [ ] parse_regex A — main loop skeleton, literals, \Q..\E, comments, inline option
   settings (?i)(?-i)(?^), newline conventions (*CR) etc. (pcre2_compile.c:2773-3800)

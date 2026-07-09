@@ -22,15 +22,44 @@ let error_backslash_k_in_lookaround = 199 (* pcre2.h.generic:322 *)
    greater than the enum offsets, i.e. errn = 100 + n). Constants are added
    here as ported code needs them; the message texts are in
    compile_error_texts below. *)
+let err1 = compile_error_base + 1 (* \ at end of pattern *)
+let err2 = compile_error_base + 2 (* \c at end of pattern *)
+let err3 = compile_error_base + 3 (* unrecognized character follows \ *)
 let err4 = compile_error_base + 4 (* numbers out of order in {} quantifier *)
 let err5 = compile_error_base + 5 (* number too big in {} quantifier *)
 let err15 = compile_error_base + 15 (* reference to non-existent subpattern *)
 let err26 = compile_error_base + 26 (* a relative value of zero not allowed *)
+let err34 = compile_error_base + 34 (* code point in \x{} or \o{} too large *)
+
+let err37 =
+  compile_error_base + 37 (* \F, \L, \l, \N{name}, \U, \u unsupported *)
+
 let err42 = compile_error_base + 42 (* syntax error in subpattern name *)
 let err44 = compile_error_base + 44 (* name must start with a non-digit *)
 let err48 = compile_error_base + 48 (* subpattern name is too long *)
+
+let err51 =
+  compile_error_base + 51 (* octal value > \377 in 8-bit non-UTF mode *)
+
+let err55 = compile_error_base + 55 (* missing opening brace after \o *)
+let err57 = compile_error_base + 57 (* \g not followed by name/number *)
 let err60 = compile_error_base + 60 (* ( *VERB) not recognized or malformed *)
+let err61 = compile_error_base + 61 (* subpattern number is too big *)
 let err62 = compile_error_base + 62 (* subpattern name expected *)
+let err64 = compile_error_base + 64 (* non-octal character in \o{} *)
+let err67 = compile_error_base + 67 (* non-hex character in \x{} *)
+let err68 = compile_error_base + 68 (* \c must be followed by printable ASCII *)
+
+let err73 =
+  compile_error_base + 73 (* disallowed Unicode code point (surrogate) *)
+
+let err77 =
+  compile_error_base + 77 (* code point in \u.... sequence too large *)
+
+let err78 =
+  compile_error_base + 78 (* digits missing in \x{} or \o{} or \N{U+} *)
+
+let err93 = compile_error_base + 93 (* \N{U+dddd} only in Unicode (UTF) mode *)
 
 (* "Expected" matching error codes: pcre2.h.generic:327-328. *)
 let error_nomatch = -1
@@ -131,8 +160,8 @@ let compile_error_texts =
     (* 55 *)
     "missing opening brace after \\o";
     "internal error: unknown newline setting";
-    "\\g is not followed by a braced, angle-bracketed, or quoted \
-     name/number or by a plain number";
+    "\\g is not followed by a braced, angle-bracketed, or quoted name/number \
+     or by a plain number";
     "(?R (recursive pattern call) must be followed by a closing parenthesis";
     "obsolete error (should not occur)";
     (* ^ was: "an argument is not allowed for (*ACCEPT), (*FAIL), or
@@ -181,8 +210,8 @@ let compile_error_texts =
     "invalid hyphen in option setting";
     (* 95 *)
     "(*alpha_assertion) not recognized";
-    "script runs require Unicode support, which this version of PCRE2 does \
-     not have";
+    "script runs require Unicode support, which this version of PCRE2 does not \
+     have";
     "too many capturing groups (maximum 65535)";
     "atomic assertion expected after (?( or (?(?C)";
     "\\K is not allowed in lookarounds (but see \
@@ -240,7 +269,8 @@ let match_error_texts =
     (* 35 *)
     "invalid replacement string";
     "bad offset into UTF string";
-    "callout error code"; (* Never returned by PCRE2 itself *)
+    "callout error code";
+    (* Never returned by PCRE2 itself *)
     "invalid data in workspace for DFA restart";
     "too much recursion for DFA matching";
     (* 40 *)
@@ -294,18 +324,16 @@ let () = assert (Int.equal (Array.length match_error_texts) 68)
    invalid range 0..99; we mirror those BADDATA cases by raising
    Invalid_argument (error paths only — never crosses the match loop). *)
 let message (enumber : int) : string =
-  if enumber >= compile_error_base then begin
+  if enumber >= compile_error_base then
     (* Compile error: n = enumber - COMPILE_ERROR_BASE. *)
     let n = enumber - compile_error_base in
     if n < Array.length compile_error_texts then compile_error_texts.(n)
     else invalid_arg "Errors.message: bad error code" (* C: BADDATA *)
-  end
-  else if enumber < 0 then begin
+  else if enumber < 0 then
     (* Match or UTF error: n = -enumber. *)
     let n = -enumber in
     if n < Array.length match_error_texts then match_error_texts.(n)
     else invalid_arg "Errors.message: bad error code" (* C: BADDATA *)
-  end
   else
     (* Invalid error number (0..99): C uses an empty message list and
        returns BADDATA. *)

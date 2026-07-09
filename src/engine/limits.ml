@@ -53,6 +53,11 @@ let notachar = 0xffffffff
 (* pcre2_internal.h:227 — the largest valid UTF/Unicode code point. *)
 let max_utf_code_point = 0x10ffff
 
+(* pcre2_internal.h:1927 — the largest code point value in non-UTF mode:
+   0xffffffffU >> (32 - PCRE2_CODE_UNIT_WIDTH), i.e. 0xff for the 8-bit
+   library. *)
+let max_non_utf_char = 0xff
+
 (* pcre2_intmodedep.h:213 — maximum length of a "(*MARK)" name, 8-bit mode:
    (1 << 8) - 1. *)
 let max_mark = 255
