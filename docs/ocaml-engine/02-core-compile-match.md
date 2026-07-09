@@ -40,8 +40,12 @@ Compile phase (`compile.ml` ← pcre2_compile.c back half):
   8014-8019, 8101-8206, 8209-8341; OP_NOT/NOTI come from the negated one-char
   class optimization at 5917-5947, i.e. chunk B, not this chunk; \P\p and the
   Unicode caseless-literal/ord2utf paths defer loudly to M6/M7)
-- [ ] compile_branch B — class compilation → OP_CLASS/OP_NCLASS bitmaps
-  (pcre2_compile.c:6500-6810)
+- [x] compile_branch B — (this commit) class compilation → OP_CLASS/OP_NCLASS bitmaps
+  (pcre2_compile.c:5860-6484 per A's corrected layout, NOT the 6500-6810 estimate;
+  + add_to_class family 5206-5530, posix_class_maps 709-740, SETBIT 377-386;
+  new ucd.ml for GET_UCD/UCD_CASESET/UCD_OTHERCASE, pcre2_internal.h:1864-1889.
+  OP_XCLASS extra data, \p/\P in classes, and the UTF/UCP caseless closure
+  defer loudly with err 299 to M6/M7, identically in both passes)
 - [ ] compile_branch C — repeats: OP_STAR..OP_MINUPTO families, EXACT, repeated
   groups/classes (pcre2_compile.c:6812-8050)
 - [ ] compile_branch D — group emission OP_BRA/OP_CBRA, name table entries

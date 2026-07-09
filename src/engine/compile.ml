@@ -478,6 +478,224 @@ let find_dupname_details ~(name : int) ~(length : int) (indexptr : int ref)
     countptr := !count;
     true)
 
+(* ---------- Class-compilation helpers ---------- *)
+
+(* pcre2_internal.h:1927 — MAX_NON_UTF_CHAR: the largest character value
+   that can be handled when not in UTF mode; 0xff in the 8-bit library. *)
+let max_non_utf_char = 0xff
+
+(* pcre2_compile.c:377-386 — SETBIT: set an individual bit in a class
+   bitmap (bits run from the least significant end of each byte). *)
+let setbit (map : Bytes.t) (b : int) : unit =
+  let i = b lsr 3 in
+  Bytes.set map i
+    (Char.chr (Char.code (Bytes.get map i) lor (1 lsl (b land 7))))
+
+(* pcre2_compile.c:709-713 — indices into posix_class_maps triples for the
+   classes compile_branch treats specially (PC_DIGIT/PC_XDIGIT live in
+   Parse, which owns their parse-phase use). *)
+let pc_graph = 8
+let pc_print = 9
+let pc_punct = 10
+
+(* pcre2_compile.c:715-740 — table of class bit maps for each POSIX class.
+   Each class is formed from a base map, with an optional addition or
+   removal of another map. Then, for some classes, there is some additional
+   tweaking: for [:blank:] the vertical space characters are removed, and
+   for [:alpha:] and [:alnum:] the underscore character is removed. The
+   triples in the table consist of the base map offset, second map offset
+   or -1 if no second map, and a non-negative value for map addition or a
+   negative value for map subtraction (if there are two maps). The absolute
+   value of the third field has these meanings: 0 => no tweaking, 1 =>
+   remove vertical space characters, 2 => remove underscore. *)
+let posix_class_maps =
+  [|
+    Chartables.cbit_word;
+    Chartables.cbit_digit;
+    -2 (* alpha *);
+    Chartables.cbit_lower;
+    -1;
+    0 (* lower *);
+    Chartables.cbit_upper;
+    -1;
+    0 (* upper *);
+    Chartables.cbit_word;
+    -1;
+    2 (* alnum - word without underscore *);
+    Chartables.cbit_print;
+    Chartables.cbit_cntrl;
+    0 (* ascii *);
+    Chartables.cbit_space;
+    -1;
+    1 (* blank - a GNU extension *);
+    Chartables.cbit_cntrl;
+    -1;
+    0 (* cntrl *);
+    Chartables.cbit_digit;
+    -1;
+    0 (* digit *);
+    Chartables.cbit_graph;
+    -1;
+    0 (* graph *);
+    Chartables.cbit_print;
+    -1;
+    0 (* print *);
+    Chartables.cbit_punct;
+    -1;
+    0 (* punct *);
+    Chartables.cbit_space;
+    -1;
+    0 (* space *);
+    Chartables.cbit_word;
+    -1;
+    0 (* word - a Perl extension *);
+    Chartables.cbit_xdigit;
+    -1;
+    0 (* xdigit *);
+  |]
+
+(* pcre2_compile.c:5206-5365 — add_to_class_internal. This function
+   packages up the logic of adding a character or range of characters to a
+   class. The character values in the arguments will be within the valid
+   values for the current mode. This function is called only from within
+   the "add to class" group of functions; the external entry point is
+   add_to_class(). Returns the number of < 256 characters added.
+
+   uchardptr (the XCLASS extra-data write cursor, an offset into
+   cb.start_code) is threaded through unused until M6: in the 8-bit library
+   only the UTF arm writes through it (pcre2_compile.c:5322-5336).
+
+   DEVIATION: an errorcodeptr argument is appended (the C signature has
+   none). Two Unicode paths are later-milestone chunks and defer loudly,
+   identically in both compile phases, instead of emitting:
+   - the caseless UTF/UCP closure (pcre2_compile.c:5246-5282,
+     get_othercase_range / add_list_to_class_internal / ucd_caseless_sets)
+     is M7 (docs/ocaml-engine/08-ucp.md) with M6 for the UTF side;
+   - the extra-data emission for wide characters under UTF
+     (pcre2_compile.c:5322-5336, XCL_SINGLE/XCL_RANGE + ord2utf) is M6
+     XCLASS work (docs/ocaml-engine/07-utf.md).
+   Callers propagate the deferral from compile_branch's CONTINUE_CLASS
+   point. The n8 value returned after a deferral is meaningless: the
+   compile is abandoned with the error. *)
+let add_to_class_internal (classbits : Bytes.t) (_uchardptr : int ref)
+    (options : int) (_xoptions : int) (cb : compile_block)
+    (errorcodeptr : int ref) (start : int) (end_ : int) : int =
+  (* pcre2_compile.c:5235-5237 *)
+  let classbits_end = if end_ <= 0xff then end_ else 0xff in
+  let n8 = ref 0 in
+  (* pcre2_compile.c:5239-5295 — if caseless matching is required, scan the
+     range and process alternate cases. *)
+  if not (Int.equal (options land Options.caseless) 0) then
+    if not (Int.equal (options land (Options.utf lor Options.ucp)) 0) then
+      (* pcre2_compile.c:5247-5282 — Unicode caseless closure: deferred
+         (see the DEVIATION note above). *)
+      errorcodeptr := Parse.err_deferred
+    else
+      (* pcre2_compile.c:5288-5294 — not UTF mode. Loop bound: c <= 0xff,
+         so Chartables.fcc's 0..255 precondition holds. *)
+      for c = start to classbits_end do
+        setbit classbits (Chartables.fcc c);
+        incr n8
+      done;
+  if not (Int.equal !errorcodeptr 0) then !n8
+  else
+    (* pcre2_compile.c:5297-5302 — now handle the originally supplied
+       range. Adjust the final value according to the bit length. *)
+    let end_ =
+      if Int.equal (options land Options.utf) 0 && end_ > max_non_utf_char then
+        max_non_utf_char
+      else end_
+    in
+    (* pcre2_compile.c:5304 *)
+    if start > cb.class_range_start && end_ < cb.class_range_end then !n8
+    else (
+      (* pcre2_compile.c:5306-5313 — use the bitmap for characters < 256.
+         Regardless of start, c will always be <= 255. *)
+      for c = start to classbits_end do
+        setbit classbits c;
+        incr n8
+      done;
+      (* pcre2_compile.c:5315-5318 — otherwise use extra data. *)
+      let start = if start <= 0xff then 0xff + 1 else start in
+      if end_ >= start then
+        if not (Int.equal (options land Options.utf) 0) then
+          (* pcre2_compile.c:5322-5336 — XCL_SINGLE/XCL_RANGE via ord2utf:
+             deferred (see the DEVIATION note above). *)
+          errorcodeptr := Parse.err_deferred
+          (* pcre2_compile.c:5340-5344 — without UTF support, character
+             values are constrained by the bit length: in the 8-bit library
+             there is nothing to do (end_ was clamped to 0xff above). *);
+      !n8)
+
+(* pcre2_compile.c:5416-5444 — add_to_class: external entry point for
+   adding a range to a class. Sets the overall range so that the internal
+   functions can try to avoid duplication when handling case-independence.
+   Returns the number of < 256 characters added. *)
+let add_to_class (classbits : Bytes.t) (uchardptr : int ref) (options : int)
+    (xoptions : int) (cb : compile_block) (errorcodeptr : int ref) (start : int)
+    (end_ : int) : int =
+  cb.class_range_start <- start;
+  cb.class_range_end <- end_;
+  add_to_class_internal classbits uchardptr options xoptions cb errorcodeptr
+    start end_
+
+(* pcre2_compile.c:5447-5491 — add_list_to_class: add a list of horizontal
+   or vertical whitespace characters to a class. The list (p, an ascending
+   NOTACHAR-terminated int array) must be in order so that ranges of
+   characters can be detected and handled appropriately. except is a
+   character to omit (NOTACHAR to omit none). The C walks the pointer p;
+   here pi is the index into p. *)
+let add_list_to_class (classbits : Bytes.t) (uchardptr : int ref)
+    (options : int) (xoptions : int) (cb : compile_block)
+    (errorcodeptr : int ref) (p : int array) (except : int) : int =
+  let n8 = ref 0 in
+  let pi = ref 0 in
+  while p.(!pi) < Tables.notachar do
+    let n = ref 0 in
+    if not (Int.equal p.(!pi) except) then (
+      while Int.equal p.(!pi + !n + 1) (p.(!pi) + !n + 1) do
+        incr n
+      done;
+      cb.class_range_start <- p.(!pi);
+      cb.class_range_end <- p.(!pi + !n);
+      n8 :=
+        !n8
+        + add_to_class_internal classbits uchardptr options xoptions cb
+            errorcodeptr p.(!pi)
+            p.(!pi + !n));
+    pi := !pi + !n + 1
+  done;
+  !n8
+
+(* pcre2_compile.c:5495-5530 — add_not_list_to_class: add the complement of
+   a list of horizontal or vertical whitespace to a class. The list must be
+   in order. *)
+let add_not_list_to_class (classbits : Bytes.t) (uchardptr : int ref)
+    (options : int) (xoptions : int) (cb : compile_block)
+    (errorcodeptr : int ref) (p : int array) : int =
+  let utf = not (Int.equal (options land Options.utf) 0) in
+  let n8 = ref 0 in
+  let pi = ref 0 in
+  if p.(0) > 0 then
+    n8 :=
+      !n8
+      + add_to_class classbits uchardptr options xoptions cb errorcodeptr 0
+          (p.(0) - 1);
+  while p.(!pi) < Tables.notachar do
+    while Int.equal p.(!pi + 1) (p.(!pi) + 1) do
+      incr pi
+    done;
+    n8 :=
+      !n8
+      + add_to_class classbits uchardptr options xoptions cb errorcodeptr
+          (p.(!pi) + 1)
+          (if Int.equal p.(!pi + 1) Tables.notachar then
+             if utf then 0x10ffff else 0xffffffff
+           else p.(!pi + 1) - 1);
+    incr pi
+  done;
+  !n8
+
 (* ---------- Compile one branch ---------- *)
 
 (* pcre2_compile.c:5604-5640 — compile_branch. Scan the parsed pattern,
@@ -510,16 +728,20 @@ let find_dupname_details ~(name : int) ~(length : int) (indexptr : int ref)
                       +1 Success, this branch must match at least one char
                       -1 Success, this branch may match an empty string
 
-   Chunk boundary (this is M1 chunk "compile_branch A"): the arms for
-   character classes (chunk B), quantifiers (chunk C), groups/conditionals/
-   lookarounds (chunk D and later milestones), verbs, backrefs, recursion
-   and string callouts are deferred — they fail loudly with
-   Parse.err_deferred (identically in both phases, before any
-   phase-dependent work). The C locals owned by those arms (bravalue,
-   group_return, repeat_min/max, repeat_type, op_type, offset,
-   length_prevgroup, tempcode, op_previous, groupsetfirstcu, classbits,
-   class_uchardata and friends, pcre2_compile.c:5642-5694) arrive with
-   their arms. *)
+   Chunk boundary (M1 chunks "compile_branch A" + "compile_branch B"): the
+   arms for quantifiers (chunk C), groups/conditionals/lookarounds (chunk D
+   and later milestones), verbs, backrefs, recursion and string callouts
+   are deferred — they fail loudly with Parse.err_deferred (identically in
+   both phases, before any phase-dependent work). The C locals owned by
+   those arms (bravalue, group_return, repeat_min/max, repeat_type,
+   op_type, offset, length_prevgroup, tempcode, op_previous,
+   groupsetfirstcu, pcre2_compile.c:5642-5694) arrive with their arms. The
+   class locals (negate_class, should_flip_negation,
+   match_all_or_no_wide_chars, class_has_8bitchar, xclass, xclass_has_prop,
+   class_uchardata, classbits; pcre2_compile.c:5672,5690-5693,5725-5733)
+   live in the class arm, which is where the C first assigns them each
+   iteration; the per-branch classbits[32] buffer (5672) becomes a fresh
+   32-byte Bytes per class, standing in for the C's memset (6026). *)
 let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
     (codeptr : int ref) (pptrptr : int ref) (errorcodeptr : int ref)
     (firstcuptr : int ref) (firstcuflagsptr : int ref) (reqcuptr : int ref)
@@ -814,13 +1036,567 @@ let compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
       else if
         Int.equal meta Parse.meta_class_empty
         || Int.equal meta Parse.meta_class_empty_not
-        || Int.equal meta Parse.meta_class_not
-        || Int.equal meta Parse.meta_class
       then (
-        (* pcre2_compile.c:5860-6484 — character classes: M1 chunk
-           compile_branch B. Deferred loudly, identically in both phases. *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+        (* pcre2_compile.c:5860-5873 — empty character classes are allowed
+           if PCRE2_ALLOW_EMPTY_CLASS is set. Otherwise, an initial ']' is
+           taken as a data character. When empty classes are allowed, []
+           must always fail, so generate OP_FAIL, whereas [^] must match
+           any character, so generate OP_ALLANY. *)
+        matched_char := true;
+        emit_cu
+          (if Int.equal meta Parse.meta_class_empty_not then Opcodes.op_allany
+           else Opcodes.op_fail);
+        if Int.equal !firstcuflags req_unset then firstcuflags := req_none;
+        zerofirstcu := !firstcu;
+        zerofirstcuflags := !firstcuflags)
+      else if
+        Int.equal meta Parse.meta_class_not || Int.equal meta Parse.meta_class
+      then (
+        (* pcre2_compile.c:5876-6484 — non-empty character class. If the
+           included characters are all < 256, we build a 32-byte bitmap of
+           the permitted characters, except in the special case where there
+           is only one such character. For negated classes, we build the
+           map as usual, then invert it at the end. However, we use a
+           different opcode so that data characters > 255 can be handled
+           correctly.
+
+           If the class contains characters outside the 0-255 range, a
+           different opcode is compiled (OP_XCLASS — M6, deferred; see the
+           deferral notes below). *)
+        matched_char := true;
+        let negate_class = Int.equal meta Parse.meta_class_not in
+
+        (* pcre2_compile.c:5894-5947 — we can optimize the case of a single
+           character in a class by generating OP_CHAR or OP_CHARI if it's
+           positive, or OP_NOT or OP_NOTI if it's negative. In the negative
+           case there can be no first char if this item is first, whatever
+           repeat count may follow. In the case of reqcu, save the previous
+           value for reinstating. *)
+        if
+          cb.parsed_pattern.(!pptr + 1) < Parse.meta_end
+          && Int.equal cb.parsed_pattern.(!pptr + 2) Parse.meta_class_end
+        then (
+          let c = cb.parsed_pattern.(!pptr + 1) in
+          pptr := !pptr + 2 (* Move on to class end *);
+          if Int.equal meta Parse.meta_class then
+            (* pcre2_compile.c:5911-5915 — a positive one-char class can be
+               handled as a normal literal character: meta = c;
+               goto NORMAL_CHAR_SET. *)
+            normal_char_set c
+          else (
+            (* pcre2_compile.c:5917-5923 — handle a negative one-character
+               class. *)
+            zeroreqcu := !reqcu;
+            zeroreqcuflags := !reqcuflags;
+            if Int.equal !firstcuflags req_unset then firstcuflags := req_none;
+            zerofirstcu := !firstcu;
+            zerofirstcuflags := !firstcuflags;
+
+            (* pcre2_compile.c:5925-5941 — for caseless UTF or UCP mode,
+               check whether this character has more than one other case.
+               If so, generate a special OP_NOTPROP item instead of
+               OP_NOTI. When restricted by PCRE2_EXTRA_CASELESS_RESTRICT,
+               ignore any caseless set that starts with an ASCII character.
+               DEVIATION: the OP_NOTPROP PT_CLIST emission is Unicode
+               property machinery (M7, docs/ocaml-engine/08-ucp.md); until
+               it lands this case fails loudly instead. *)
+            (if
+               (utf || ucp)
+               && not (Int.equal (!options land Options.caseless) 0)
+             then
+               let d = Ucd.caseset c in
+               if
+                 (not (Int.equal d 0))
+                 && (Int.equal
+                       (!xoptions land Options.extra_caseless_restrict)
+                       0
+                    || Ucd_tables.ucd_caseless_sets.(d) > 127)
+               then (
+                 errorcodeptr := Parse.err_deferred;
+                 return_from_branch 0));
+
+            (* pcre2_compile.c:5942-5946 — char has only one other (usable)
+               case, or UCP not available. *)
+            emit_cu
+              (if not (Int.equal (!options land Options.caseless) 0) then
+                 Opcodes.op_noti
+               else Opcodes.op_not);
+            (* code += PUTCHAR(c, code) — pcre2_intmodedep.h:357-358: with
+               utf and c > 127 this is a multi-code-unit ord2utf store.
+               DEVIATION: ord2utf emission is M6 (docs/ocaml-engine/
+               07-utf.md); defer loudly rather than truncate. *)
+            if utf && c > 127 then (
+              errorcodeptr := Parse.err_deferred;
+              return_from_branch 0);
+            emit_cu c (* We are finished with this class *)))
+        else
+          (* pcre2_compile.c:5949-5992 — handle character classes that
+             contain more than just one literal character. If there are
+             exactly two characters in a positive class, see if they are
+             case partners. This can be optimized to generate a caseless
+             single character match (which also sets first/required code
+             units if relevant). When casing restrictions apply, ignore a
+             caseless set if both characters are ASCII. *)
+          let caseless_pair =
+            if
+              Int.equal meta Parse.meta_class
+              && cb.parsed_pattern.(!pptr + 1) < Parse.meta_end
+              && cb.parsed_pattern.(!pptr + 2) < Parse.meta_end
+              && Int.equal cb.parsed_pattern.(!pptr + 3) Parse.meta_class_end
+            then
+              let c = cb.parsed_pattern.(!pptr + 1) in
+              if
+                Int.equal (Ucd.caseset c) 0
+                || (not
+                      (Int.equal
+                         (!xoptions land Options.extra_caseless_restrict)
+                         0))
+                   && c < 128
+                   && cb.parsed_pattern.(!pptr + 2) < 128
+              then
+                (* pcre2_compile.c:5969-5977 — find the other case: the UCD
+                   for high code points under UTF/UCP, otherwise the fcc
+                   table (TABLE_GET(c, cb->fcc, c); c <= 255 whenever this
+                   arm is reached in the 8-bit library). *)
+                let d =
+                  if (utf || ucp) && c > 127 then Ucd.othercase c
+                  else Chartables.fcc c
+                in
+                if
+                  (not (Int.equal c d))
+                  && Int.equal cb.parsed_pattern.(!pptr + 2) d
+                then (
+                  (* pcre2_compile.c:5979-5990 *)
+                  pptr := !pptr + 3 (* Move on to class end *);
+                  if Int.equal (!options land Options.caseless) 0 then (
+                    reset_caseful := true;
+                    options := !options lor Options.caseless;
+                    req_caseopt := req_caseless);
+                  (* goto CLASS_CASELESS_CHAR *)
+                  class_caseless_char c;
+                  true)
+                else false
+              else false
+            else false
+          in
+          if not caseless_pair then (
+            (* pcre2_compile.c:5994-6000 — if a non-extended class contains
+               a negative special such as \S, we need to flip the negation
+               flag at the end, so that support for characters > 255 works
+               correctly (they are all included in the class). An extended
+               class may need to insert specific matching or non-matching
+               code for wide characters. *)
+            let should_flip_negation = ref false in
+            let match_all_or_no_wide_chars = ref false in
+
+            (* pcre2_compile.c:6002-6009 — extended class (xclass) will be
+               used when characters > 255 might match. class_uchardata is
+               the XCLASS extra-data write cursor (offset into
+               cb.start_code); in M1 nothing ever writes through it — every
+               producer defers loudly first — but the plumbing is kept so
+               M6 lands in the C's shape. *)
+            let xclass = ref false in
+            let class_uchardata =
+              ref (!code + Limits.link_size + 2)
+              (* For XCLASS items *)
+            in
+            let class_uchardata_base = !class_uchardata (* Save the start *) in
+
+            (* pcre2_compile.c:6011-6019 — for optimization purposes, we
+               track some properties of the class: class_has_8bitchar will
+               be non-zero if the class contains at least one character
+               with a code point less than 256; xclass_has_prop will be
+               TRUE if Unicode property checks are present in the class.
+               Both are only consumed by the OP_XCLASS emission (M6);
+               tracked here so the class loop matches the C. *)
+            let class_has_8bitchar = ref 0 in
+            let xclass_has_prop = ref false in
+
+            (* pcre2_compile.c:6021-6026 — initialize the 256-bit (32-byte)
+               bit map to all zeros (fresh buffer = the C's memset of the
+               function-scope classbits). *)
+            let classbits = Bytes.make 32 '\000' in
+
+            (* pcre2_compile.c:6262-6346 — the CLASS_LITERAL label: a
+               literal character, possibly the start of a range. At parse
+               time there are checks for out-of-order characters, for
+               ranges where the two characters are equal, and for hyphens
+               that cannot indicate a range, so no checking is needed
+               here. Factored as a function because both the META_BIGVALUE
+               arm and the plain-literal default reach it (goto
+               CLASS_LITERAL). *)
+            let class_literal (c : int) : unit =
+              (* pcre2_compile.c:6274-6276 — remember if \r or \n were
+                 explicitly used. *)
+              if Int.equal c 0x0d || Int.equal c 0x0a then
+                cb.external_flags <- cb.external_flags lor hascrorlf;
+
+              (* pcre2_compile.c:6278-6338 — process a character range. *)
+              if
+                Int.equal cb.parsed_pattern.(!pptr + 1) Parse.meta_range_literal
+                || Int.equal
+                     cb.parsed_pattern.(!pptr + 1)
+                     Parse.meta_range_escaped
+              then (
+                pptr := !pptr + 2;
+                let d = ref cb.parsed_pattern.(!pptr) in
+                if Int.equal !d Parse.meta_bigvalue then (
+                  pptr := !pptr + 1;
+                  d := cb.parsed_pattern.(!pptr));
+
+                (* pcre2_compile.c:6289-6291 — remember an explicit \r or
+                   \n, and add the range to the class. *)
+                if Int.equal !d 0x0d || Int.equal !d 0x0a then
+                  cb.external_flags <- cb.external_flags lor hascrorlf;
+
+                (* pcre2_compile.c:6293-6336 — the EBCDIC special-range
+                   block (6298-6331) does not apply: not an EBCDIC
+                   environment. *)
+                class_has_8bitchar :=
+                  !class_has_8bitchar
+                  + add_to_class classbits class_uchardata !options !xoptions cb
+                      errorcodeptr c !d
+                (* goto CONTINUE_CLASS *))
+              else
+                (* pcre2_compile.c:6341-6345 — handle a single character. *)
+                class_has_8bitchar :=
+                  !class_has_8bitchar
+                  + add_to_class classbits class_uchardata !options !xoptions cb
+                      errorcodeptr c c
+            in
+
+            (* pcre2_compile.c:6028-6371 — process items until
+               META_CLASS_END is reached:
+               while ((meta = *(++pptr)) != META_CLASS_END). *)
+            let done_ = ref false in
+            while not !done_ do
+              pptr := !pptr + 1;
+              let item = cb.parsed_pattern.(!pptr) in
+              if Int.equal item Parse.meta_class_end then done_ := true
+              else (
+                if
+                  (* pcre2_compile.c:6032-6143 — handle POSIX classes such
+                     as [:alpha:] etc. *)
+                  Int.equal item Parse.meta_posix
+                  || Int.equal item Parse.meta_posix_neg
+                then (
+                  let local_negate = Int.equal item Parse.meta_posix_neg in
+                  pptr := !pptr + 1;
+                  let posix_class = ref cb.parsed_pattern.(!pptr) in
+                  should_flip_negation := local_negate
+                  (* Note negative special *);
+
+                  (* pcre2_compile.c:6043-6048 — if matching is caseless,
+                     upper and lower are converted to alpha. This relies
+                     on the fact that the class table starts with alpha,
+                     lower, upper as the first 3 entries. *)
+                  if
+                    (not (Int.equal (!options land Options.caseless) 0))
+                    && !posix_class <= 2
+                  then posix_class := 0;
+
+                  (* pcre2_compile.c:6050-6096 — when PCRE2_UCP is set,
+                     some of the POSIX classes are converted to different
+                     escape sequences that use Unicode properties \p or \P
+                     (done at parse time, Parse.posix_substitutes). Others
+                     that are not available via \p or \P have to generate
+                     XCL_PROP/XCL_NOTPROP directly, which is done here. *)
+                  if
+                    (not (Int.equal (!options land Options.ucp) 0))
+                    && Int.equal (!xoptions land Options.extra_ascii_posix) 0
+                  then
+                    if
+                      Int.equal !posix_class pc_graph
+                      || Int.equal !posix_class pc_print
+                      || Int.equal !posix_class pc_punct
+                    then (
+                      (* pcre2_compile.c:6061-6070 — XCL_PROP/XCL_NOTPROP
+                         PT_PXGRAPH/PT_PXPRINT/PT_PXPUNCT emission.
+                         DEVIATION: Unicode property classes are M7
+                         (docs/ocaml-engine/08-ucp.md); fails loudly, both
+                         phases. *)
+                      errorcodeptr := Parse.err_deferred;
+                      return_from_branch 0)
+                    else if utf then
+                      (* pcre2_compile.c:6072-6093 — for the other POSIX
+                         classes (ex: ascii) we fall through to the
+                         non-UCP case and build a bit map for characters
+                         with code points less than 256. In a negated
+                         POSIX class, characters with code points greater
+                         than 255 must either all match or all not match;
+                         setting this flag causes an explicit range to be
+                         generated later when it is known that OP_XCLASS
+                         is required. In the 8-bit library this is
+                         relevant only in utf mode. *)
+                      match_all_or_no_wide_chars :=
+                        !match_all_or_no_wide_chars || local_negate;
+
+                  (* pcre2_compile.c:6098-6109 — in the non-UCP case, or
+                     when UCP makes no difference, we build the bit map
+                     for the POSIX class in a chunk of local store because
+                     we may be adding and subtracting from it, and we
+                     don't want to subtract bits that may be in the main
+                     map already. At the end we or the result into the bit
+                     map that is being built. Copy in the first table
+                     (always present). *)
+                  let posix_class = !posix_class * 3 in
+                  let pbits = Bytes.make 32 '\000' in
+                  for i = 0 to 31 do
+                    Bytes.set pbits i
+                      (Char.chr
+                         (Chartables.cbits (i + posix_class_maps.(posix_class))))
+                  done;
+
+                  (* pcre2_compile.c:6111-6122 — if there is a second
+                     table, add or remove it as required. *)
+                  let taboffset = posix_class_maps.(posix_class + 1) in
+                  let tabopt = posix_class_maps.(posix_class + 2) in
+                  if taboffset >= 0 then
+                    if tabopt >= 0 then
+                      for i = 0 to 31 do
+                        Bytes.set pbits i
+                          (Char.chr
+                             (Char.code (Bytes.get pbits i)
+                             lor Chartables.cbits (i + taboffset)))
+                      done
+                    else
+                      for i = 0 to 31 do
+                        Bytes.set pbits i
+                          (Char.chr
+                             (Char.code (Bytes.get pbits i)
+                             land (lnot (Chartables.cbits (i + taboffset))
+                                  land 0xff)))
+                      done;
+
+                  (* pcre2_compile.c:6124-6129 — now see if we need to
+                     remove any special characters. An option value of 1
+                     removes vertical space and 2 removes underscore. *)
+                  let tabopt = if tabopt < 0 then -tabopt else tabopt in
+                  if Int.equal tabopt 1 then
+                    Bytes.set pbits 1
+                      (Char.chr (Char.code (Bytes.get pbits 1) land lnot 0x3c))
+                  else if Int.equal tabopt 2 then
+                    Bytes.set pbits 11
+                      (Char.chr (Char.code (Bytes.get pbits 11) land 0x7f));
+
+                  (* pcre2_compile.c:6131-6141 — add the POSIX table or
+                     its complement into the main table that is being
+                     built and we are done. Every class contains at least
+                     one < 256 character. *)
+                  if local_negate then
+                    for i = 0 to 31 do
+                      Bytes.set classbits i
+                        (Char.chr
+                           (Char.code (Bytes.get classbits i)
+                           lor (lnot (Char.code (Bytes.get pbits i)) land 0xff)
+                           ))
+                    done
+                  else
+                    for i = 0 to 31 do
+                      Bytes.set classbits i
+                        (Char.chr
+                           (Char.code (Bytes.get classbits i)
+                           lor Char.code (Bytes.get pbits i)))
+                    done;
+                  class_has_8bitchar := 1
+                  (* goto CONTINUE_CLASS — end of POSIX handling *))
+                else if Int.equal item Parse.meta_bigvalue then (
+                  (* pcre2_compile.c:6148-6152 — other than POSIX classes,
+                     the only items we should encounter are \d-type
+                     escapes and literal characters (possibly as
+                     ranges). *)
+                  pptr := !pptr + 1;
+                  (* goto CLASS_LITERAL *)
+                  class_literal cb.parsed_pattern.(!pptr))
+                else if item >= Parse.meta_end then (
+                  (* pcre2_compile.c:6154-6166 — any other non-literal
+                     must be an escape. *)
+                  if not (Int.equal (Parse.meta_code item) Parse.meta_escape)
+                  then (
+                    errorcodeptr := Errors.err89
+                    (* Internal error - unrecognized *);
+                    return_from_branch 0);
+                  let escape = Parse.meta_data item in
+
+                  (* pcre2_compile.c:6169-6171 — every class contains at
+                     least one < 256 character. *)
+                  class_has_8bitchar := !class_has_8bitchar + 1;
+
+                  (* switch(escape), pcre2_compile.c:6173-6257 *)
+                  if Int.equal escape Parse.esc_d then
+                    for i = 0 to 31 do
+                      Bytes.set classbits i
+                        (Char.chr
+                           (Char.code (Bytes.get classbits i)
+                           lor Chartables.cbits (i + Chartables.cbit_digit)))
+                    done
+                  else if Int.equal escape Parse.esc_big_d then (
+                    should_flip_negation := true;
+                    for i = 0 to 31 do
+                      Bytes.set classbits i
+                        (Char.chr
+                           (Char.code (Bytes.get classbits i)
+                           lor (lnot
+                                  (Chartables.cbits (i + Chartables.cbit_digit))
+                               land 0xff)))
+                    done)
+                  else if Int.equal escape Parse.esc_w then
+                    for i = 0 to 31 do
+                      Bytes.set classbits i
+                        (Char.chr
+                           (Char.code (Bytes.get classbits i)
+                           lor Chartables.cbits (i + Chartables.cbit_word)))
+                    done
+                  else if Int.equal escape Parse.esc_big_w then (
+                    should_flip_negation := true;
+                    for i = 0 to 31 do
+                      Bytes.set classbits i
+                        (Char.chr
+                           (Char.code (Bytes.get classbits i)
+                           lor (lnot
+                                  (Chartables.cbits (i + Chartables.cbit_word))
+                               land 0xff)))
+                    done)
+                  else if Int.equal escape Parse.esc_s then
+                    (* pcre2_compile.c:6195-6204 — from PCRE 8.34 we no
+                       longer treat \s and \S specially (VT). *)
+                    for i = 0 to 31 do
+                      Bytes.set classbits i
+                        (Char.chr
+                           (Char.code (Bytes.get classbits i)
+                           lor Chartables.cbits (i + Chartables.cbit_space)))
+                    done
+                  else if Int.equal escape Parse.esc_big_s then (
+                    should_flip_negation := true;
+                    for i = 0 to 31 do
+                      Bytes.set classbits i
+                        (Char.chr
+                           (Char.code (Bytes.get classbits i)
+                           lor (lnot
+                                  (Chartables.cbits (i + Chartables.cbit_space))
+                               land 0xff)))
+                    done)
+                  else if Int.equal escape Parse.esc_h then
+                    (* pcre2_compile.c:6212-6222 — when adding the
+                       horizontal or vertical space lists to a class, or
+                       their complements, disable PCRE2_CASELESS, because
+                       it just wastes time, and in the "not-x" UTF cases
+                       can create unwanted duplicates in the XCLASS
+                       list. *)
+                    ignore
+                      (add_list_to_class classbits class_uchardata
+                         (!options land lnot Options.caseless)
+                         !xoptions cb errorcodeptr Tables.hspace_list
+                         Tables.notachar)
+                  else if Int.equal escape Parse.esc_big_h then
+                    ignore
+                      (add_not_list_to_class classbits class_uchardata
+                         (!options land lnot Options.caseless)
+                         !xoptions cb errorcodeptr Tables.hspace_list)
+                  else if Int.equal escape Parse.esc_v then
+                    ignore
+                      (add_list_to_class classbits class_uchardata
+                         (!options land lnot Options.caseless)
+                         !xoptions cb errorcodeptr Tables.vspace_list
+                         Tables.notachar)
+                  else if Int.equal escape Parse.esc_big_v then
+                    ignore
+                      (add_not_list_to_class classbits class_uchardata
+                         (!options land lnot Options.caseless)
+                         !xoptions cb errorcodeptr Tables.vspace_list)
+                  else if
+                    Int.equal escape Parse.esc_p
+                    || Int.equal escape Parse.esc_big_p
+                  then (
+                    (* pcre2_compile.c:6243-6256 — \p and \P in a class:
+                       XCL_PROP/XCL_NOTPROP extra data, xclass_has_prop,
+                       and the class_has_8bitchar-- undo. DEVIATION:
+                       Unicode property classes are M7
+                       (docs/ocaml-engine/08-ucp.md); fails loudly, both
+                       phases. *)
+                    errorcodeptr := Parse.err_deferred;
+                    return_from_branch 0)
+                  (* no other escape reaches a class item: the C switch
+                     has no default and falls through to CONTINUE_CLASS
+                     with only the class_has_8bitchar increment above *))
+                else
+                  (* pcre2_compile.c:6267-6272 — a literal character,
+                     CLASS_LITERAL. *)
+                  class_literal item;
+
+                (* pcre2_compile.c:6348-6370 — CONTINUE_CLASS. DEVIATION:
+                   first propagate a deferral recorded by the add_to_class
+                   family (see its DEVIATION note); the C helpers have no
+                   error path. *)
+                if not (Int.equal !errorcodeptr 0) then return_from_branch 0;
+                (* If any wide characters or Unicode properties have been
+                   encountered, set xclass = TRUE. Then, in the pre-compile
+                   phase, accumulate the length of the extra data and reset
+                   the pointer. Dead in M1 (nothing writes extra data), kept
+                   for M6. *)
+                if !class_uchardata > class_uchardata_base then (
+                  xclass := true;
+                  match lengthptr with
+                  | Some length ->
+                      length :=
+                        !length + (!class_uchardata - class_uchardata_base);
+                      class_uchardata := class_uchardata_base
+                  | None -> ()))
+            done
+            (* End of main class-processing loop *);
+
+            (* pcre2_compile.c:6373-6381 — if this class is the first thing
+               in the branch, there can be no first char setting, whatever
+               the repeat count. Any reqcu setting must remain unchanged
+               after any kind of repeat. *)
+            if Int.equal !firstcuflags req_unset then firstcuflags := req_none;
+            zerofirstcu := !firstcu;
+            zerofirstcuflags := !firstcuflags;
+            zeroreqcu := !reqcu;
+            zeroreqcuflags := !reqcuflags;
+
+            (* pcre2_compile.c:6383-6465 — if there are characters with
+               values > 255, or Unicode property settings (\p or \P), we
+               have to compile an extended class (OP_XCLASS), unless there
+               were no property settings and there was a negated special
+               such as \S in the class, and PCRE2_UCP is not set.
+               DEVIATION: OP_XCLASS emission is M6
+               (docs/ocaml-engine/07-utf.md). xclass can never be true in
+               M1 — every extra-data producer defers loudly above — but the
+               C's entry condition is kept so both phases stay in step when
+               M6 lands. *)
+            if
+              !xclass
+              && ((not (Int.equal (!options land Options.ucp) 0))
+                 || !xclass_has_prop || not !should_flip_negation)
+            then (
+              errorcodeptr := Parse.err_deferred;
+              return_from_branch 0);
+
+            (* pcre2_compile.c:6467-6484 — if there are no characters
+               > 255, or they are all to be included or excluded, set the
+               opcode to OP_CLASS or OP_NCLASS, depending on whether the
+               whole class was negated and whether there were negative
+               specials such as \S (non-UCP) in the class. Then copy the
+               32-byte map into the code vector, negating it if
+               necessary. *)
+            emit_cu
+              (if Bool.equal negate_class !should_flip_negation then
+                 Opcodes.op_class
+               else Opcodes.op_nclass);
+            (match lengthptr with
+            | None ->
+                (* Save time in the pre-compile phase *)
+                if negate_class then
+                  (* Using 255 ^ instead of ~ (a note for the C, exact here
+                     anyway). *)
+                  for i = 0 to 31 do
+                    Bytes.set classbits i
+                      (Char.chr (255 lxor Char.code (Bytes.get classbits i)))
+                  done;
+                Bytes.blit classbits 0 cb.start_code !code 32
+            | Some _ -> ());
+            code := !code + 32 (* End of class processing *)))
       else if
         Int.equal meta Parse.meta_accept
         || Int.equal meta Parse.meta_prune
@@ -1509,12 +2285,204 @@ let () =
   assert (Int.equal rc (-1));
   assert (Int.equal err 0);
 
-  (* Deferred arms fail loudly in both phases: classes (chunk B),
-     quantifiers (chunk C), groups (chunk D), backrefs (M2), and the
-     Unicode caseless-literal path (M6/M7 DEVIATION in compile_branch). *)
-  expect_deferred "[ab]";
+  (* --- Character classes (compile_branch B, pcre2_compile.c:5860-6484,
+     helpers 5206-5530). assert_class checks the opcode and all 256 bitmap
+     bits of an emitted 33-unit bitmap class against a membership
+     predicate. *)
+  let assert_class (cb : compile_block) (expected_op : int)
+      (member : int -> bool) =
+    assert (Int.equal (Bytes.length cb.start_code) 33);
+    assert (Int.equal (Char.code (Bytes.get cb.start_code 0)) expected_op);
+    for c = 0 to 255 do
+      let bit =
+        Char.code (Bytes.get cb.start_code (1 + (c lsr 3)))
+        land (1 lsl (c land 7))
+      in
+      assert (Bool.equal (not (Int.equal bit 0)) (member c))
+    done
+  in
+  let is_digit c = c >= 0x30 && c <= 0x39 in
+  let is_letter c = (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) in
+
+  (* Empty classes under PCRE2_ALLOW_EMPTY_CLASS: [] always fails (OP_FAIL),
+     [^] matches anything (OP_ALLANY) (pcre2_compile.c:5860-5873). *)
+  let cb, rc, _, _, _, fcuf, _, rcuf =
+    compile2 ~options:Options.allow_empty_class "[]"
+  in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_fail ];
+  assert (Int.equal fcuf req_none);
+  assert (Int.equal rcuf req_unset);
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~options:Options.allow_empty_class "[^]"
+  in
+  assert_code cb [ Opcodes.op_allany ];
+
+  (* One-char classes: positive is a normal literal via NORMAL_CHAR_SET
+     (pcre2_compile.c:5911-5915); negative is OP_NOT/OP_NOTI with no first
+     code unit (5917-5946). *)
+  let cb, rc, _, _, fcu, fcuf, _, _ = compile2 "[x]" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_char; 0x78 ];
+  assert (Int.equal fcu 0x78);
+  assert (Int.equal fcuf 0);
+  let cb, _, _, _, fcu, fcuf, _, _ = compile2 "(?i)[x]" in
+  assert_code cb [ Opcodes.op_chari; 0x78 ];
+  assert (Int.equal fcu 0x78);
+  assert (Int.equal fcuf req_caseless);
+  let cb, rc, _, _, _, fcuf, _, rcuf = compile2 "[^x]" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_not; 0x78 ];
+  assert (Int.equal fcuf req_none);
+  assert (Int.equal rcuf req_unset);
+  let cb, _, _, _, _, _, _, _ = compile2 "(?i)[^x]" in
+  assert_code cb [ Opcodes.op_noti; 0x78 ];
+  (* No UCD caseset check for OP_NOTI without UTF/UCP: (?i)[^k] stays a
+     plain OP_NOTI (pcre2_compile.c:5930-5931 requires utf||ucp). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "(?i)[^k]" in
+  assert_code cb [ Opcodes.op_noti; 0x6b ];
+  (* One-char class + \r/\n flag via the literal path. *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\r]" in
+  assert_code cb [ Opcodes.op_char; 0x0d ];
+  assert (Int.equal (cb.external_flags land hascrorlf) hascrorlf);
+
+  (* Two-char case-partner classes become caseless single characters via
+     CLASS_CASELESS_CHAR, with the temporary caseless setting reset
+     afterwards (pcre2_compile.c:5949-5992, 8327-8334). *)
+  let cb, rc, _, opts_out, fcu, fcuf, rcu, rcuf = compile2 "[aA]b" in
+  assert (Int.equal rc 1);
+  assert_code cb [ Opcodes.op_chari; 0x61; Opcodes.op_char; 0x62 ];
+  assert (Int.equal opts_out 0) (* caseless was only instated temporarily *);
+  assert (Int.equal fcu 0x61);
+  assert (Int.equal fcuf req_caseless);
+  assert (Int.equal rcu 0x62);
+  assert (Int.equal rcuf 0);
+  let cb, _, _, _, _, _, _, _ = compile2 "[Aa]" in
+  assert_code cb [ Opcodes.op_chari; 0x41 ];
+  (* k/K (and s/S) have multi-character caseless sets (0x212a / 0x17f), so
+     UCD_CASESET(c) != 0 blocks the optimization and a bitmap class is
+     compiled (pcre2_compile.c:5962) — unless PCRE2_EXTRA_CASELESS_RESTRICT
+     applies with both chars ASCII (5963-5964). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[kK]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      Int.equal c 0x6b || Int.equal c 0x4b);
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~extra:Options.extra_caseless_restrict "[kK]"
+  in
+  assert_code cb [ Opcodes.op_chari; 0x6b ];
+  let cb, _, _, _, _, _, _, _ = compile2 "[sS]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      Int.equal c 0x73 || Int.equal c 0x53);
+
+  (* General bitmap classes (pcre2_compile.c:6021-6371, 6467-6484):
+     literals, ranges, negation (OP_NCLASS + inverted map), the caseless
+     fcc closure, class escapes, and POSIX tables. *)
+  let cb, rc, _, _, _, fcuf, _, rcuf = compile2 "[abc]" in
+  assert (Int.equal rc 1);
+  assert_class cb Opcodes.op_class (fun c -> c >= 0x61 && c <= 0x63);
+  assert (Int.equal fcuf req_none);
+  assert (Int.equal rcuf req_unset);
+  let cb, _, _, _, _, _, _, _ = compile2 "[^abc]" in
+  assert_class cb Opcodes.op_nclass (fun c -> not (c >= 0x61 && c <= 0x63));
+  let cb, _, _, _, _, _, _, _ = compile2 "[a-z]" in
+  assert_class cb Opcodes.op_class (fun c -> c >= 0x61 && c <= 0x7a);
+  (* Caseless closure of a range via the fcc table
+     (pcre2_compile.c:5288-5294). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "(?i)[a-z]" in
+  assert_class cb Opcodes.op_class is_letter;
+  let cb, _, _, _, _, _, _, _ = compile2 "(?i)[^a-k]" in
+  assert_class cb Opcodes.op_nclass (fun c ->
+      not ((c >= 0x61 && c <= 0x6b) || (c >= 0x41 && c <= 0x4b)));
+  (* An escaped range endpoint (META_RANGE_ESCAPED) fills the same bits. *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\x41-\\x5a]" in
+  assert_class cb Opcodes.op_class (fun c -> c >= 0x41 && c <= 0x5a);
+  (* Explicit \n inside a range sets PCRE2_HASCRORLF
+     (pcre2_compile.c:6274-6291). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\n-\\r]" in
+  assert_class cb Opcodes.op_class (fun c -> c >= 0x0a && c <= 0x0d);
+  assert (Int.equal (cb.external_flags land hascrorlf) hascrorlf);
+
+  (* Class escapes: \d ORs the digit map in; \D ORs its complement and
+     flips the negation logic, so [\D] and [^\d] are both OP_NCLASS while
+     [^\D] collapses back to OP_CLASS of the digits
+     (pcre2_compile.c:6175-6183, 6473-6482). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\d]" in
+  assert_class cb Opcodes.op_class is_digit;
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\D]" in
+  assert_class cb Opcodes.op_nclass (fun c -> not (is_digit c));
+  let cb, _, _, _, _, _, _, _ = compile2 "[^\\d]" in
+  assert_class cb Opcodes.op_nclass (fun c -> not (is_digit c));
+  let cb, _, _, _, _, _, _, _ = compile2 "[^\\D]" in
+  assert_class cb Opcodes.op_class is_digit;
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\w]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      is_letter c || is_digit c || Int.equal c 0x5f);
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\s]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      (c >= 0x09 && c <= 0x0d) || Int.equal c 0x20);
+  let cb, _, _, _, _, _, _, _ = compile2 "[^\\S]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      (c >= 0x09 && c <= 0x0d) || Int.equal c 0x20);
+  (* \h/\H use the [hv]space lists; wide list entries are clamped away in
+     non-UTF 8-bit mode (pcre2_compile.c:6218-6238, 5297-5302). \H does NOT
+     set should_flip_negation — its complement is added explicitly. *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\h]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      Int.equal c 0x09 || Int.equal c 0x20 || Int.equal c 0xa0);
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\H]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      not (Int.equal c 0x09 || Int.equal c 0x20 || Int.equal c 0xa0));
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\v]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      (c >= 0x0a && c <= 0x0d) || Int.equal c 0x85);
+  let cb, _, _, _, _, _, _, _ = compile2 "[^\\v]" in
+  assert_class cb Opcodes.op_nclass (fun c ->
+      not ((c >= 0x0a && c <= 0x0d) || Int.equal c 0x85));
+
+  (* POSIX classes: base map +/- second map + tweaks
+     (pcre2_compile.c:6098-6142, posix_class_maps 715-740). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[[:alpha:]]" in
+  assert_class cb Opcodes.op_class is_letter;
+  let cb, _, _, _, _, _, _, _ = compile2 "[[:^alpha:]]" in
+  assert_class cb Opcodes.op_nclass (fun c -> not (is_letter c));
+  let cb, _, _, _, _, _, _, _ = compile2 "[^[:^alpha:]]" in
+  assert_class cb Opcodes.op_class is_letter;
+  let cb, _, _, _, _, _, _, _ = compile2 "[[:alnum:]]" in
+  assert_class cb Opcodes.op_class (fun c -> is_letter c || is_digit c);
+  let cb, _, _, _, _, _, _, _ = compile2 "[[:word:]]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      is_letter c || is_digit c || Int.equal c 0x5f);
+  (* [:blank:] = space map minus vertical space (tweak 1). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[[:blank:]]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      Int.equal c 0x09 || Int.equal c 0x20);
+  (* Caseless [:upper:]/[:lower:] convert to alpha
+     (pcre2_compile.c:6043-6048). *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[[:upper:]]" in
+  assert_class cb Opcodes.op_class (fun c -> c >= 0x41 && c <= 0x5a);
+  let cb, _, _, _, _, _, _, _ = compile2 "(?i)[[:upper:]]" in
+  assert_class cb Opcodes.op_class is_letter;
+  (* [:ascii:] = print + cntrl maps. *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[[:ascii:]]" in
+  assert_class cb Opcodes.op_class (fun c -> c <= 0x7f);
+  let cb, _, _, _, _, _, _, _ = compile2 "[^[:ascii:]]" in
+  assert_class cb Opcodes.op_nclass (fun c -> c > 0x7f);
+
+  (* Mixed class content ORs together. *)
+  let cb, _, _, _, _, _, _, _ = compile2 "[\\dA-Fa-f]" in
+  assert_class cb Opcodes.op_class (fun c ->
+      is_digit c || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66));
+
+  (* Deferred arms fail loudly in both phases: quantifiers (chunk C),
+     groups (chunk D), backrefs (M2), Unicode property classes (M7), and
+     the Unicode caseless-literal path (M6/M7 DEVIATION in
+     compile_branch). *)
   expect_deferred "a*";
   expect_deferred "(a)";
   expect_deferred "(?:a)";
   expect_deferred "\\1()" (* META_BACKREF comes first in this stream *);
-  expect_deferred ~options:(Options.ucp lor Options.caseless) "k"
+  expect_deferred ~options:(Options.ucp lor Options.caseless) "k";
+  expect_deferred ~options:Options.ucp "[\\d]"
+  (* parse substitutes \p{Nd} under UCP: ESC_p in a class = XCL_PROP (M7) *);
+  expect_deferred ~options:(Options.ucp lor Options.caseless) "[^k]"
+(* OP_NOTPROP PT_CLIST (M7) *)
