@@ -634,6 +634,334 @@ let scheck_partial (mb : match_block) (feptr : int) : int =
     if mb.partial > 1 then Errors.error_partial else 0)
   else 0
 
+(* ---------- match() helpers ---------- *)
+
+(* The functions below are match()-locals/macros in the C; they are
+   module-level here (DEVIATION (perf) — see [match_state]) so [match_]'s
+   dispatch loop builds no closures per attempt. Per-exec state reaches
+   them through an explicit [match_state] or [match_block] first
+   parameter; they are always fully applied. *)
+
+(* pcre2_internal.h:496-507 — IS_NEWLINE(p): NLBLOCK is mb, PSEND is
+   end_subject (pcre2_match.c:60-66). For the non-fixed conventions
+   PRIV(is_newline) writes the length of the newline it found through
+   &mb->nllen; [st.nl_scratch] is that out-parameter, preallocated once
+   per exec in [match_state] so the dispatch loop stays allocation-free,
+   and copied to mb.nllen exactly when the C writes it (TRUE returns only
+   — Newline.is_newline leaves the ref untouched on FALSE). *)
+let is_newline_at (st : match_state) (p : int) : bool =
+  let mb = st.mb in
+  let nl_scratch = st.nl_scratch in
+  let utf = st.utf in
+  if not (Int.equal mb.nltype Newline.nltype_fixed) then (
+    p < mb.end_subject
+    &&
+    let hit =
+      Newline.is_newline mb.subject mb.nltype p mb.end_subject nl_scratch utf
+    in
+    if hit then mb.nllen <- !nl_scratch;
+    hit)
+  else
+    p <= mb.end_subject - mb.nllen
+    && Int.equal
+         (* safe: 0 <= start_subject <= p (callers pass eptr values; mb
+            invariant) and p <= end_subject - nllen < end_subject <=
+            String.length mb.subject (nllen is 1 or 2, mb invariant) *)
+         (Char.code (String.unsafe_get mb.subject p))
+         mb.nl0
+    && (Int.equal mb.nllen 1
+       || Int.equal (Char.code (String.unsafe_get mb.subject (p + 1))) mb.nl1)
+
+(* pcre2_internal.h:510-521 — WAS_NEWLINE(p): PSSTART is start_subject
+   (pcre2_match.c:60-66). *)
+let was_newline_at (st : match_state) (p : int) : bool =
+  let mb = st.mb in
+  let nl_scratch = st.nl_scratch in
+  let utf = st.utf in
+  if not (Int.equal mb.nltype Newline.nltype_fixed) then (
+    p > mb.start_subject
+    &&
+    let hit =
+      Newline.was_newline mb.subject mb.nltype p mb.start_subject nl_scratch utf
+    in
+    if hit then mb.nllen <- !nl_scratch;
+    hit)
+  else
+    p >= mb.start_subject + mb.nllen
+    && Int.equal
+         (* safe: p - nllen >= start_subject >= 0 (checked above) and
+            p - nllen < p <= end_subject <= String.length mb.subject
+            (callers pass eptr values; mb invariant) *)
+         (Char.code (String.unsafe_get mb.subject (p - mb.nllen)))
+         mb.nl0
+    && (Int.equal mb.nllen 1
+       || Int.equal
+            (Char.code (String.unsafe_get mb.subject (p - mb.nllen + 1)))
+            mb.nl1)
+
+(* pcre2_match.c:1930 + 2014 — Lbyte_map[fc/8] & (1u << (fc&7)): probe
+   the 32-byte class bitmap saved at Lbyte_map_address (temp_sptr[1]).
+   In bounds: the map is part of the OP_CLASS/OP_NCLASS item in the
+   compiled program (mb invariant) and fc lsr 3 <= 31. *)
+let class_bit (st : match_state) (f : int) (fc : int) : int =
+  let mb = st.mb in
+  let a = st.arena in
+  let fr = a.Frames.frames in
+  let fb = Frames.base a f in
+  Char.code
+    (Bytes.get mb.start_code (fr.(fb + Frames.slot_temp_sptr_1) + (fc lsr 3)))
+  land (1 lsl (fc land 7))
+
+(* GETCHARINCTEST(fc, Feptr); Feptr = PRIV(extuni)(fc, Feptr,
+   mb->start_subject, mb->end_subject, utf, NULL) — the shared body of
+   the four OP_EXTUNI stepping sites (pcre2_match.c:2629-2631 =
+   2990-2992 = 3821-3823 = 4415-4417): one grapheme cluster from [eptr],
+   returning the position after it. Module-level (the [is_newline_at]
+   precedent), so the dispatch loop stays allocation-free. Caller
+   contract: eptr < mb.end_subject. *)
+let extuni_step (st : match_state) (eptr : int) : int =
+  let mb = st.mb in
+  let utf = st.utf in
+  (* safe: eptr < mb.end_subject <= String.length mb.subject (caller
+     contract); 0 <= start_eptr <= eptr (mb invariant) *)
+  let c0 = Char.code (String.unsafe_get mb.subject eptr) in
+  let fc = if utf && c0 >= 0xc0 then Utf.getutf8 c0 mb.subject eptr else c0 in
+  let eptr' =
+    if utf && c0 >= 0xc0 then eptr + 1 + Utf.get_extralen c0 else eptr + 1
+  in
+  Extuni.extuni fc mb.subject eptr' mb.start_subject mb.end_subject utf
+
+(* pcre2_string_utils.c:101-112 — PRIV(strcmp) over two zero-terminated
+   verb names stored in the compiled code, consulted only for equality
+   (the `== 0` test at the OP_MARK resume, pcre2_match.c:6351-6352).
+   Terminates: verb names are emitted with a terminating zero
+   (pcre2_compile.c:6571-6572; mb complete-program invariant). *)
+let rec strcmp_code_eq (mb : match_block) (p1 : int) (p2 : int) : bool =
+  let c1 = Char.code (Bytes.get mb.start_code p1) in
+  let c2 = Char.code (Bytes.get mb.start_code p2) in
+  if Int.equal c1 0 && Int.equal c2 0 then true
+  else if not (Int.equal c1 c2) then false
+  else (strcmp_code_eq [@tailcall]) mb (p1 + 1) (p2 + 1)
+
+(* Bounds contract shared by the three match_ref compare loops below
+   ([match_ref] establishes it): [p] ranges over the captured substring
+   — p0 = start_subject + Fovector[Loffset] up to (exclusive)
+   start_subject + Fovector[Loffset+1] — whose bounds are former eptr
+   values recorded as eptr - start_subject by the capturing-ket writes
+   (pcre2_match.c:6077-6084), so 0 <= start_subject <= p and, while
+   length > 0, p < start_subject + Fovector[Loffset+1] <= end_subject
+   <= String.length mb.subject. [eptr] starts at Feptr >= 0 (mb
+   invariant). *)
+(* pcre2_match.c:424-429 — match_ref()'s caseless-set probe: walk the
+   NOTACHAR-terminated ascending list at [pp] in
+   Ucd_tables.ucd_caseless_sets; `if (c < *pp) return -1` is the
+   no-match exit (entries ascend and end with NOTACHAR = 0xffffffff,
+   larger than any code point). *)
+let rec caseless_set_member (c : int) (pp : int) : bool =
+  let v = Ucd_tables.ucd_caseless_sets.(pp) in
+  if c < v then false
+  else if Int.equal c v then true
+  else (caseless_set_member [@tailcall]) c (pp + 1)
+
+(* pcre2_match.c:390-434 — match_ref()'s caseless compare loop in UTF
+   and/or UCP mode: match characters up to the end of the REFERENCE
+   (p < endptr — the number of subject code units matched may differ,
+   e.g. U+023A/U+2C65 have different UTF-8 lengths, so the length is
+   checked along the reference, not the subject). On success the number
+   of subject code units consumed (eptr - eptr_start) goes through
+   [lengthptr] (the C's shared exit at 479). Returns 0 matched / -1 no
+   match / 1 partial. *)
+let rec match_ref_ci_uni (mb : match_block) ~(utf : bool) (p : int)
+    (endptr : int) (eptr : int) (eptr_start : int) (lengthptr : int ref) : int =
+  if p >= endptr then (
+    lengthptr := eptr - eptr_start (* 479 *);
+    0)
+  else if eptr >= mb.end_subject then 1 (* partial match, 408 *)
+  else
+    (* pcre2_match.c:410-419 — if (utf) GETCHARINC(c, eptr);
+       GETCHARINC(d, p); else one code unit each. Lead bytes in bounds:
+       eptr < end_subject (checked above) and p < endptr <=
+       end_subject (the reference bounds contract above). *)
+    let ce = Char.code (String.unsafe_get mb.subject eptr) in
+    let c = if utf && ce >= 0xc0 then Utf.getutf8 ce mb.subject eptr else ce in
+    let eptr' =
+      if utf && ce >= 0xc0 then eptr + 1 + Utf.get_extralen ce else eptr + 1
+    in
+    let cp = Char.code (String.unsafe_get mb.subject p) in
+    let d = if utf && cp >= 0xc0 then Utf.getutf8 cp mb.subject p else cp in
+    let p' = if utf && cp >= 0xc0 then p + 1 + Utf.get_extralen cp else p + 1 in
+    (* pcre2_match.c:421-431 — ur = GET_UCD(d); other case, then the
+       caseless set. *)
+    if
+      Int.equal c d
+      || Int.equal c (Ucd.othercase d)
+      || caseless_set_member c (Ucd.caseset d)
+    then
+      (match_ref_ci_uni [@tailcall]) mb ~utf p' endptr eptr' eptr_start
+        lengthptr
+    else -1 (* no match, 427 *)
+
+(* pcre2_match.c:438-451 — match_ref()'s caseless compare loop, not in
+   UTF or UCP mode: fold both code units through the lcc table.
+   Returns 0 all matched / -1 no match / 1 partial. *)
+let rec match_ref_ci (mb : match_block) (p : int) (eptr : int) (length : int) :
+    int =
+  if length <= 0 then 0
+  else if eptr >= mb.end_subject then 1 (* partial match, 443 *)
+  else
+    (* safe: eptr < mb.end_subject <= String.length mb.subject (checked
+       above), eptr >= 0; p in the captured substring (contract above) *)
+    let cc = Char.code (String.unsafe_get mb.subject eptr) in
+    let cp = Char.code (String.unsafe_get mb.subject p) in
+    if not (Int.equal (Chartables.lcc cp) (Chartables.lcc cc)) then -1
+      (* no match, 446-447 *)
+    else (match_ref_ci [@tailcall]) mb (p + 1) (eptr + 1) (length - 1)
+
+(* pcre2_match.c:460-467 — match_ref()'s caseful compare loop for
+   partial matching: unit by unit, checking the subject end before each
+   unit. *)
+let rec match_ref_cs_partial (mb : match_block) (p : int) (eptr : int)
+    (length : int) : int =
+  if length <= 0 then 0
+  else if eptr >= mb.end_subject then 1 (* partial match, 464 *)
+  else if
+    not
+      (Int.equal
+         (* safe: eptr < mb.end_subject <= String.length mb.subject
+            (checked above), eptr >= 0; p in the captured substring
+            (contract above) *)
+         (Char.code (String.unsafe_get mb.subject p))
+         (Char.code (String.unsafe_get mb.subject eptr)))
+  then -1 (* no match, 465 *)
+  else (match_ref_cs_partial [@tailcall]) mb (p + 1) (eptr + 1) (length - 1)
+
+(* pcre2_match.c:474 — memcmp(p, eptr, CU2BYTES(length)) != 0 as an
+   equality scan (only equality is consulted). Caller checked
+   end_subject - eptr >= length. *)
+let rec match_ref_memcmp (mb : match_block) (p : int) (eptr : int)
+    (length : int) : bool =
+  length <= 0
+  || Int.equal
+       (* safe: eptr + length <= mb.end_subject <= String.length
+          mb.subject (caller's 473 check), eptr >= 0; p in the captured
+          substring (contract above) *)
+       (Char.code (String.unsafe_get mb.subject p))
+       (Char.code (String.unsafe_get mb.subject eptr))
+     && (match_ref_memcmp [@tailcall]) mb (p + 1) (eptr + 1) (length - 1)
+
+(* pcre2_match.c:1299 (and 1321, 1341) — memcmp(Feptr, Lcharptr,
+   CU2BYTES(Flength)) == 0: compare [n] code units of the compiled
+   pattern at [cpos] with the subject at [spos]. Caller checked
+   spos + n <= end_subject; cpos + n is inside the pattern literal
+   (complete-program invariant). *)
+let rec code_eq_subject (mb : match_block) (cpos : int) (spos : int) (n : int) :
+    bool =
+  n <= 0
+  || Int.equal
+       (Char.code (Bytes.get mb.start_code cpos))
+       (* safe: spos + n <= mb.end_subject <= String.length mb.subject
+          (caller's bound) and spos >= 0 (an eptr; mb invariant) *)
+       (Char.code (String.unsafe_get mb.subject spos))
+     && (code_eq_subject [@tailcall]) mb (cpos + 1) (spos + 1) (n - 1)
+
+(* pcre2_match.c:1301-1302 (and 1323-1324, 1343-1345) — memcmp(Feptr,
+   Foccu, CU2BYTES(Loclength)) == 0: as [code_eq_subject] but against
+   the frame's occu slots (one code unit per slot). *)
+let rec occu_eq_subject (mb : match_block) (fr : int array) (opos : int)
+    (spos : int) (n : int) : bool =
+  n <= 0
+  || Int.equal fr.(opos)
+       (* safe: spos + n <= mb.end_subject <= String.length mb.subject
+          (caller's bound) and spos >= 0 (an eptr; mb invariant) *)
+       (Char.code (String.unsafe_get mb.subject spos))
+     && (occu_eq_subject [@tailcall]) mb fr (opos + 1) (spos + 1) (n - 1)
+
+(* pcre2_match.c:338-481 — match_ref(): match a back-reference at frame
+   [f]'s Feptr. Called only when it is known that the offset lies
+   within the offsets that have so far been used in the match (or for
+   the unset-group entry check).
+
+   Arguments (360-362): offset = Loffset, the index into the frame
+   ovector; caseless = Lcaseless; f = the frame (the C's F); lengthptr
+   = the out-parameter for the length matched (the per-exec
+   [st.ref_length] cell).
+
+   Returns (355-357): = 0 successful match, number of code units
+   matched written to [lengthptr]; < 0 no match; > 0 partial match. *)
+let match_ref (st : match_state) (f : int) (offset : int) (caseless : bool)
+    (lengthptr : int ref) : int =
+  let mb = st.mb in
+  let a = st.arena in
+  let utf = st.utf in
+  let ucp = st.ucp in
+  let fr = a.Frames.frames in
+  let fb = Frames.base a f in
+  (* pcre2_match.c:369-380 — deal with an unset group: the default is
+     no match, but there is an option to match an empty string. *)
+  if
+    offset >= fr.(fb + Frames.slot_offset_top)
+    || Int.equal fr.(fb + Frames.slot_ovector + offset) Frames.unset
+  then
+    if not (Int.equal (mb.poptions land Options.match_unset_backref) 0) then (
+      lengthptr := 0;
+      0 (* match *))
+    else -1 (* no match *)
+  else
+    (* pcre2_match.c:382-386 — separate the caseless and UTF cases for
+       speed. *)
+    let eptr = fr.(fb + Frames.slot_eptr) in
+    let p = mb.start_subject + fr.(fb + Frames.slot_ovector + offset) in
+    let length =
+      fr.(fb + Frames.slot_ovector + offset + 1)
+      - fr.(fb + Frames.slot_ovector + offset)
+    in
+    if caseless then (
+      if utf || ucp then
+        (* pcre2_match.c:388-434 — the SUPPORT_UNICODE utf/ucp fold:
+           character-wise compare with UCD other-case and caseless-set
+           fallback; [match_ref_ci_uni] writes lengthptr itself on
+           success (the consumed subject length can differ from the
+           reference length in UTF mode). *)
+        match_ref_ci_uni mb ~utf p (p + length) eptr eptr lengthptr
+      else
+        (* pcre2_match.c:438-451 — not in UTF or UCP mode. *)
+        let rc = match_ref_ci mb p eptr length in
+        (* pcre2_match.c:479 — *lengthptr = eptr - eptr_start: the loop
+           advanced eptr one unit per reference unit, so this is exactly
+           [length] in the non-UTF arm. *)
+        if Int.equal rc 0 then lengthptr := length;
+        rc)
+    else if not (Int.equal mb.partial 0) then (
+      (* pcre2_match.c:454-467 — in the caseful case, just compare the
+         code units; when partial matching, do it unit by unit. *)
+      let rc = match_ref_cs_partial mb p eptr length in
+      if Int.equal rc 0 then lengthptr := length (* 479, as above *);
+      rc)
+    else if
+      (* pcre2_match.c:469-476 — not partial matching. *)
+      mb.end_subject - eptr < length
+    then 1 (* partial, 473 *)
+    else if not (match_ref_memcmp mb p eptr length) then -1 (* no match, 474 *)
+    else (
+      (* pcre2_match.c:475-480 — eptr += length;
+         *lengthptr = eptr - eptr_start. *)
+      lengthptr := length;
+      0)
+
+(* pcre2_match.c:254-334 — do_callout: process a callout, whether
+   "standalone" or at the start of a conditional group. [ecode] (Fecode)
+   points to either OP_CALLOUT or OP_CALLOUT_STR. Returns the length of
+   the callout item (the C's *lengthptr, pcre2_match.c:280-281). The C
+   then returns the return from the callout function, or 0 if no callout
+   function exists (pcre2_match.c:283); this library's API has no callout
+   surface, so mb->callout is always NULL and the callout return is
+   always 0 — the rest of the C body (callout block setup and invocation,
+   pcre2_match.c:285-333) is unreachable and not ported. *)
+let do_callout_length (mb : match_block) (ecode : int) : int =
+  if Int.equal (Char.code (Bytes.get mb.start_code ecode)) Opcodes.op_callout
+  then Opcodes.op_lengths.(Opcodes.op_callout)
+  else Compile.get mb.start_code (ecode + 1 + (2 * Limits.link_size))
+
 (* ---------- Match from current position ---------- *)
 
 (* pcre2_match.c:566-6502 — match(): run one match attempt at a single
@@ -656,17 +984,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
   (* pcre2_match.c:630-637 — UTF and UCP flags (computed per exec into
      [st] from mb.poptions). Field punning keeps every downstream name
      unchanged; the arena field reintroduces its local name [a]. *)
-  let {
-    mb;
-    arena = a;
-    match_data;
-    top_bracket;
-    utf;
-    ucp;
-    nl_scratch;
-    ref_length;
-    _;
-  } =
+  let { mb; arena = a; match_data; top_bracket; utf; ucp; ref_length; _ } =
     st
   in
   (* pcre2_match.c:609 — PCRE2_SPTR branch_end = NULL: a match()-local;
@@ -685,314 +1003,6 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
      [branch_end], a match()-local that persists across RMATCH, living in
      [st] and reset at every match() entry. *)
   st.assert_accept_frame <- -1;
-
-  (* pcre2_internal.h:496-507 — IS_NEWLINE(p): NLBLOCK is mb, PSEND is
-     end_subject (pcre2_match.c:60-66). For the non-fixed conventions
-     PRIV(is_newline) writes the length of the newline it found through
-     &mb->nllen; [nl_scratch] is that out-parameter, preallocated once per
-     exec in [match_state] so the dispatch loop stays allocation-free, and
-     copied to mb.nllen exactly when the C writes it (TRUE returns only —
-     Newline.is_newline leaves the ref untouched on FALSE). *)
-  let is_newline_at (p : int) : bool =
-    if not (Int.equal mb.nltype Newline.nltype_fixed) then (
-      p < mb.end_subject
-      &&
-      let hit =
-        Newline.is_newline mb.subject mb.nltype p mb.end_subject nl_scratch utf
-      in
-      if hit then mb.nllen <- !nl_scratch;
-      hit)
-    else
-      p <= mb.end_subject - mb.nllen
-      && Int.equal
-           (* safe: 0 <= start_subject <= p (callers pass eptr values; mb
-              invariant) and p <= end_subject - nllen < end_subject <=
-              String.length mb.subject (nllen is 1 or 2, mb invariant) *)
-           (Char.code (String.unsafe_get mb.subject p))
-           mb.nl0
-      && (Int.equal mb.nllen 1
-         || Int.equal (Char.code (String.unsafe_get mb.subject (p + 1))) mb.nl1
-         )
-  in
-  (* pcre2_internal.h:510-521 — WAS_NEWLINE(p): PSSTART is start_subject
-     (pcre2_match.c:60-66). *)
-  let was_newline_at (p : int) : bool =
-    if not (Int.equal mb.nltype Newline.nltype_fixed) then (
-      p > mb.start_subject
-      &&
-      let hit =
-        Newline.was_newline mb.subject mb.nltype p mb.start_subject nl_scratch
-          utf
-      in
-      if hit then mb.nllen <- !nl_scratch;
-      hit)
-    else
-      p >= mb.start_subject + mb.nllen
-      && Int.equal
-           (* safe: p - nllen >= start_subject >= 0 (checked above) and
-              p - nllen < p <= end_subject <= String.length mb.subject
-              (callers pass eptr values; mb invariant) *)
-           (Char.code (String.unsafe_get mb.subject (p - mb.nllen)))
-           mb.nl0
-      && (Int.equal mb.nllen 1
-         || Int.equal
-              (Char.code (String.unsafe_get mb.subject (p - mb.nllen + 1)))
-              mb.nl1)
-  in
-  (* pcre2_match.c:1930 + 2014 — Lbyte_map[fc/8] & (1u << (fc&7)): probe
-     the 32-byte class bitmap saved at Lbyte_map_address (temp_sptr[1]).
-     In bounds: the map is part of the OP_CLASS/OP_NCLASS item in the
-     compiled program (mb invariant) and fc lsr 3 <= 31. *)
-  let class_bit (f : int) (fc : int) : int =
-    let fr = a.Frames.frames in
-    let fb = Frames.base a f in
-    Char.code
-      (Bytes.get mb.start_code (fr.(fb + Frames.slot_temp_sptr_1) + (fc lsr 3)))
-    land (1 lsl (fc land 7))
-  in
-  (* GETCHARINCTEST(fc, Feptr); Feptr = PRIV(extuni)(fc, Feptr,
-     mb->start_subject, mb->end_subject, utf, NULL) — the shared body of
-     the four OP_EXTUNI stepping sites (pcre2_match.c:2629-2631 =
-     2990-2992 = 3821-3823 = 4415-4417): one grapheme cluster from [eptr],
-     returning the position after it. Defined once per match (the
-     [is_newline_at] precedent), so the dispatch loop stays
-     allocation-free. Caller contract: eptr < mb.end_subject. *)
-  let extuni_step (eptr : int) : int =
-    (* safe: eptr < mb.end_subject <= String.length mb.subject (caller
-       contract); 0 <= start_eptr <= eptr (mb invariant) *)
-    let c0 = Char.code (String.unsafe_get mb.subject eptr) in
-    let fc = if utf && c0 >= 0xc0 then Utf.getutf8 c0 mb.subject eptr else c0 in
-    let eptr' =
-      if utf && c0 >= 0xc0 then eptr + 1 + Utf.get_extralen c0 else eptr + 1
-    in
-    Extuni.extuni fc mb.subject eptr' mb.start_subject mb.end_subject utf
-  in
-  (* pcre2_string_utils.c:101-112 — PRIV(strcmp) over two zero-terminated
-     verb names stored in the compiled code, consulted only for equality
-     (the `== 0` test at the OP_MARK resume, pcre2_match.c:6351-6352).
-     Terminates: verb names are emitted with a terminating zero
-     (pcre2_compile.c:6571-6572; mb complete-program invariant). *)
-  let rec strcmp_code_eq (p1 : int) (p2 : int) : bool =
-    let c1 = Char.code (Bytes.get mb.start_code p1) in
-    let c2 = Char.code (Bytes.get mb.start_code p2) in
-    if Int.equal c1 0 && Int.equal c2 0 then true
-    else if not (Int.equal c1 c2) then false
-    else (strcmp_code_eq [@tailcall]) (p1 + 1) (p2 + 1)
-  in
-  (* Bounds contract shared by the three match_ref compare loops below
-     ([match_ref] establishes it): [p] ranges over the captured substring
-     — p0 = start_subject + Fovector[Loffset] up to (exclusive)
-     start_subject + Fovector[Loffset+1] — whose bounds are former eptr
-     values recorded as eptr - start_subject by the capturing-ket writes
-     (pcre2_match.c:6077-6084), so 0 <= start_subject <= p and, while
-     length > 0, p < start_subject + Fovector[Loffset+1] <= end_subject
-     <= String.length mb.subject. [eptr] starts at Feptr >= 0 (mb
-     invariant). *)
-  (* pcre2_match.c:424-429 — match_ref()'s caseless-set probe: walk the
-     NOTACHAR-terminated ascending list at [pp] in
-     Ucd_tables.ucd_caseless_sets; `if (c < *pp) return -1` is the
-     no-match exit (entries ascend and end with NOTACHAR = 0xffffffff,
-     larger than any code point). *)
-  let rec caseless_set_member (c : int) (pp : int) : bool =
-    let v = Ucd_tables.ucd_caseless_sets.(pp) in
-    if c < v then false
-    else if Int.equal c v then true
-    else (caseless_set_member [@tailcall]) c (pp + 1)
-  in
-  (* pcre2_match.c:390-434 — match_ref()'s caseless compare loop in UTF
-     and/or UCP mode: match characters up to the end of the REFERENCE
-     (p < endptr — the number of subject code units matched may differ,
-     e.g. U+023A/U+2C65 have different UTF-8 lengths, so the length is
-     checked along the reference, not the subject). On success the number
-     of subject code units consumed (eptr - eptr_start) goes through
-     [lengthptr] (the C's shared exit at 479). Returns 0 matched / -1 no
-     match / 1 partial. *)
-  let rec match_ref_ci_uni (p : int) (endptr : int) (eptr : int)
-      (eptr_start : int) (lengthptr : int ref) : int =
-    if p >= endptr then (
-      lengthptr := eptr - eptr_start (* 479 *);
-      0)
-    else if eptr >= mb.end_subject then 1 (* partial match, 408 *)
-    else
-      (* pcre2_match.c:410-419 — if (utf) GETCHARINC(c, eptr);
-         GETCHARINC(d, p); else one code unit each. Lead bytes in bounds:
-         eptr < end_subject (checked above) and p < endptr <=
-         end_subject (the reference bounds contract above). *)
-      let ce = Char.code (String.unsafe_get mb.subject eptr) in
-      let c =
-        if utf && ce >= 0xc0 then Utf.getutf8 ce mb.subject eptr else ce
-      in
-      let eptr' =
-        if utf && ce >= 0xc0 then eptr + 1 + Utf.get_extralen ce else eptr + 1
-      in
-      let cp = Char.code (String.unsafe_get mb.subject p) in
-      let d = if utf && cp >= 0xc0 then Utf.getutf8 cp mb.subject p else cp in
-      let p' =
-        if utf && cp >= 0xc0 then p + 1 + Utf.get_extralen cp else p + 1
-      in
-      (* pcre2_match.c:421-431 — ur = GET_UCD(d); other case, then the
-         caseless set. *)
-      if
-        Int.equal c d
-        || Int.equal c (Ucd.othercase d)
-        || caseless_set_member c (Ucd.caseset d)
-      then (match_ref_ci_uni [@tailcall]) p' endptr eptr' eptr_start lengthptr
-      else -1 (* no match, 427 *)
-  in
-  (* pcre2_match.c:438-451 — match_ref()'s caseless compare loop, not in
-     UTF or UCP mode: fold both code units through the lcc table.
-     Returns 0 all matched / -1 no match / 1 partial. *)
-  let rec match_ref_ci (p : int) (eptr : int) (length : int) : int =
-    if length <= 0 then 0
-    else if eptr >= mb.end_subject then 1 (* partial match, 443 *)
-    else
-      (* safe: eptr < mb.end_subject <= String.length mb.subject (checked
-         above), eptr >= 0; p in the captured substring (contract above) *)
-      let cc = Char.code (String.unsafe_get mb.subject eptr) in
-      let cp = Char.code (String.unsafe_get mb.subject p) in
-      if not (Int.equal (Chartables.lcc cp) (Chartables.lcc cc)) then -1
-        (* no match, 446-447 *)
-      else (match_ref_ci [@tailcall]) (p + 1) (eptr + 1) (length - 1)
-  in
-  (* pcre2_match.c:460-467 — match_ref()'s caseful compare loop for
-     partial matching: unit by unit, checking the subject end before each
-     unit. *)
-  let rec match_ref_cs_partial (p : int) (eptr : int) (length : int) : int =
-    if length <= 0 then 0
-    else if eptr >= mb.end_subject then 1 (* partial match, 464 *)
-    else if
-      not
-        (Int.equal
-           (* safe: eptr < mb.end_subject <= String.length mb.subject
-              (checked above), eptr >= 0; p in the captured substring
-              (contract above) *)
-           (Char.code (String.unsafe_get mb.subject p))
-           (Char.code (String.unsafe_get mb.subject eptr)))
-    then -1 (* no match, 465 *)
-    else (match_ref_cs_partial [@tailcall]) (p + 1) (eptr + 1) (length - 1)
-  in
-  (* pcre2_match.c:474 — memcmp(p, eptr, CU2BYTES(length)) != 0 as an
-     equality scan (only equality is consulted). Caller checked
-     end_subject - eptr >= length. *)
-  let rec match_ref_memcmp (p : int) (eptr : int) (length : int) : bool =
-    length <= 0
-    || Int.equal
-         (* safe: eptr + length <= mb.end_subject <= String.length
-            mb.subject (caller's 473 check), eptr >= 0; p in the captured
-            substring (contract above) *)
-         (Char.code (String.unsafe_get mb.subject p))
-         (Char.code (String.unsafe_get mb.subject eptr))
-       && (match_ref_memcmp [@tailcall]) (p + 1) (eptr + 1) (length - 1)
-  in
-  (* pcre2_match.c:1299 (and 1321, 1341) — memcmp(Feptr, Lcharptr,
-     CU2BYTES(Flength)) == 0: compare [n] code units of the compiled
-     pattern at [cpos] with the subject at [spos]. Caller checked
-     spos + n <= end_subject; cpos + n is inside the pattern literal
-     (complete-program invariant). *)
-  let rec code_eq_subject (cpos : int) (spos : int) (n : int) : bool =
-    n <= 0
-    || Int.equal
-         (Char.code (Bytes.get mb.start_code cpos))
-         (* safe: spos + n <= mb.end_subject <= String.length mb.subject
-            (caller's bound) and spos >= 0 (an eptr; mb invariant) *)
-         (Char.code (String.unsafe_get mb.subject spos))
-       && (code_eq_subject [@tailcall]) (cpos + 1) (spos + 1) (n - 1)
-  in
-  (* pcre2_match.c:1301-1302 (and 1323-1324, 1343-1345) — memcmp(Feptr,
-     Foccu, CU2BYTES(Loclength)) == 0: as [code_eq_subject] but against
-     the frame's occu slots (one code unit per slot). *)
-  let rec occu_eq_subject (fr : int array) (opos : int) (spos : int) (n : int) :
-      bool =
-    n <= 0
-    || Int.equal fr.(opos)
-         (* safe: spos + n <= mb.end_subject <= String.length mb.subject
-            (caller's bound) and spos >= 0 (an eptr; mb invariant) *)
-         (Char.code (String.unsafe_get mb.subject spos))
-       && (occu_eq_subject [@tailcall]) fr (opos + 1) (spos + 1) (n - 1)
-  in
-  (* pcre2_match.c:338-481 — match_ref(): match a back-reference at frame
-     [f]'s Feptr. Called only when it is known that the offset lies
-     within the offsets that have so far been used in the match (or for
-     the unset-group entry check).
-
-     Arguments (360-362): offset = Loffset, the index into the frame
-     ovector; caseless = Lcaseless; f = the frame (the C's F); lengthptr
-     = the out-parameter for the length matched (the per-match
-     [ref_length] cell).
-
-     Returns (355-357): = 0 successful match, number of code units
-     matched written to [lengthptr]; < 0 no match; > 0 partial match. *)
-  let match_ref (f : int) (offset : int) (caseless : bool) (lengthptr : int ref)
-      : int =
-    let fr = a.Frames.frames in
-    let fb = Frames.base a f in
-    (* pcre2_match.c:369-380 — deal with an unset group: the default is
-       no match, but there is an option to match an empty string. *)
-    if
-      offset >= fr.(fb + Frames.slot_offset_top)
-      || Int.equal fr.(fb + Frames.slot_ovector + offset) Frames.unset
-    then
-      if not (Int.equal (mb.poptions land Options.match_unset_backref) 0) then (
-        lengthptr := 0;
-        0 (* match *))
-      else -1 (* no match *)
-    else
-      (* pcre2_match.c:382-386 — separate the caseless and UTF cases for
-         speed. *)
-      let eptr = fr.(fb + Frames.slot_eptr) in
-      let p = mb.start_subject + fr.(fb + Frames.slot_ovector + offset) in
-      let length =
-        fr.(fb + Frames.slot_ovector + offset + 1)
-        - fr.(fb + Frames.slot_ovector + offset)
-      in
-      if caseless then (
-        if utf || ucp then
-          (* pcre2_match.c:388-434 — the SUPPORT_UNICODE utf/ucp fold:
-             character-wise compare with UCD other-case and caseless-set
-             fallback; [match_ref_ci_uni] writes lengthptr itself on
-             success (the consumed subject length can differ from the
-             reference length in UTF mode). *)
-          match_ref_ci_uni p (p + length) eptr eptr lengthptr
-        else
-          (* pcre2_match.c:438-451 — not in UTF or UCP mode. *)
-          let rc = match_ref_ci p eptr length in
-          (* pcre2_match.c:479 — *lengthptr = eptr - eptr_start: the loop
-             advanced eptr one unit per reference unit, so this is exactly
-             [length] in the non-UTF arm. *)
-          if Int.equal rc 0 then lengthptr := length;
-          rc)
-      else if not (Int.equal mb.partial 0) then (
-        (* pcre2_match.c:454-467 — in the caseful case, just compare the
-           code units; when partial matching, do it unit by unit. *)
-        let rc = match_ref_cs_partial p eptr length in
-        if Int.equal rc 0 then lengthptr := length (* 479, as above *);
-        rc)
-      else if
-        (* pcre2_match.c:469-476 — not partial matching. *)
-        mb.end_subject - eptr < length
-      then 1 (* partial, 473 *)
-      else if not (match_ref_memcmp p eptr length) then -1 (* no match, 474 *)
-      else (
-        (* pcre2_match.c:475-480 — eptr += length;
-           *lengthptr = eptr - eptr_start. *)
-        lengthptr := length;
-        0)
-  in
-
-  (* pcre2_match.c:254-334 — do_callout: process a callout, whether
-     "standalone" or at the start of a conditional group. [ecode] (Fecode)
-     points to either OP_CALLOUT or OP_CALLOUT_STR. Returns the length of
-     the callout item (the C's *lengthptr, pcre2_match.c:280-281). The C
-     then returns the return from the callout function, or 0 if no callout
-     function exists (pcre2_match.c:283); this library's API has no callout
-     surface, so mb->callout is always NULL and the callout return is
-     always 0 — the rest of the C body (callout block setup and invocation,
-     pcre2_match.c:285-333) is unreachable and not ported. *)
-  let do_callout_length (ecode : int) : int =
-    if Int.equal (Char.code (Bytes.get mb.start_code ecode)) Opcodes.op_callout
-    then Opcodes.op_lengths.(Opcodes.op_callout)
-    else Compile.get mb.start_code (ecode + 1 + (2 * Limits.link_size))
-  in
 
   (* pcre2_match.c:550-556 + 662-773 + 790-798 + 6462-6501 — the goto
      graph as four mutually tail-recursive functions over the frame index
@@ -1147,7 +1157,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
            partial matching. Falls through to OP_ALLANY (whose shared
            tail carries the UTF ACROSSCHAR advance). *)
         let eptr = fr.(fb + Frames.slot_eptr) in
-        if is_newline_at eptr then (backtrack [@tailcall]) f match_nomatch
+        if is_newline_at st eptr then (backtrack [@tailcall]) f match_nomatch
         else if
           (* pcre2_match.c:949-957 — a CRLF pattern newline with only
              its CR present at the end of the subject could be
@@ -1968,7 +1978,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
         else
           (* pcre2_match.c:2627-2632 — GETCHARINCTEST(fc, Feptr); Feptr =
              PRIV(extuni)(...). *)
-          let eptr' = extuni_step eptr in
+          let eptr' = extuni_step st eptr in
           fr.(fb + Frames.slot_eptr) <- eptr';
           (* CHECK_PARTIAL() (2633). *)
           let rc =
@@ -2212,7 +2222,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
            do_callout(F, mb, &length) is always 0 (pcre2_match.c:283): the
            rrc > 0 RRETURN(MATCH_NOMATCH) and rrc < 0 RRETURN(rrc) exits
            (5597-5598) are unreachable. *)
-        fr.(fb + Frames.slot_ecode) <- ecode + do_callout_length ecode
+        fr.(fb + Frames.slot_ecode) <- ecode + do_callout_length mb ecode
         (* Fecode += length (5599) *);
         (dispatch [@tailcall]) f
     | 139 | 144 ->
@@ -2257,7 +2267,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
             Int.equal op0 Opcodes.op_callout
             || Int.equal op0 Opcodes.op_callout_str
           then (
-            let length = do_callout_length ecode in
+            let length = do_callout_length mb ecode in
             fr.(fb + Frames.slot_ecode) <- ecode + length (* Fecode (5636) *);
             fr.(fb + Frames.slot_length) <-
               fr.(fb + Frames.slot_length) - length
@@ -2721,7 +2731,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
           (not (Int.equal eptr mb.start_subject))
           && (Int.equal eptr mb.end_subject
               && Int.equal (mb.poptions land Options.alt_circumflex) 0
-             || not (was_newline_at eptr))
+             || not (was_newline_at st eptr))
         then (backtrack [@tailcall]) f match_nomatch
         else (
           fr.(fb + Frames.slot_ecode) <- ecode + 1;
@@ -2732,7 +2742,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
            mode. *)
         let eptr = fr.(fb + Frames.slot_eptr) in
         if eptr < mb.end_subject then
-          if not (is_newline_at eptr) then
+          if not (is_newline_at st eptr) then
             if
               (* pcre2_match.c:6220-6228 — a CRLF pattern newline with
                  only its CR present at the end of the subject could be
@@ -3188,7 +3198,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
     let flength = fr.(fb + Frames.slot_length) in
     if
       eptr <= mb.end_subject - flength
-      && code_eq_subject fr.(fb + Frames.slot_temp_sptr_1) eptr flength
+      && code_eq_subject mb fr.(fb + Frames.slot_temp_sptr_1) eptr flength
     then (
       fr.(fb + Frames.slot_eptr) <- eptr + flength;
       true)
@@ -3197,7 +3207,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
       if
         loclength > 0
         && eptr <= mb.end_subject - loclength
-        && occu_eq_subject fr (fb + Frames.slot_occu) eptr loclength
+        && occu_eq_subject mb fr (fb + Frames.slot_occu) eptr loclength
       then (
         fr.(fb + Frames.slot_eptr) <- eptr + loclength;
         true)
@@ -3821,7 +3831,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
            (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
         let fc = Char.code (String.unsafe_get mb.subject eptr) in
         fr.(fb + Frames.slot_eptr) <- eptr + 1;
-        if Int.equal (class_bit f fc) 0 then
+        if Int.equal (class_bit st f fc) 0 then
           (backtrack [@tailcall]) f match_nomatch
         else (class_min [@tailcall]) f (i + 1) reptype)
     else if
@@ -3853,7 +3863,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
         (* safe: eptr < mb.end_subject <= String.length mb.subject
            (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
         let fc = Char.code (String.unsafe_get mb.subject eptr) in
-        if Int.equal (class_bit f fc) 0 then
+        if Int.equal (class_bit st f fc) 0 then
           (class_maxend [@tailcall]) f reptype (* break, 2134 *)
         else (
           fr.(fb + Frames.slot_eptr) <- eptr + 1;
@@ -3898,7 +3908,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
           if Int.equal fr.(fb + Frames.slot_op) Opcodes.op_class then
             (backtrack [@tailcall]) f match_nomatch
           else (class_utf_min [@tailcall]) f (i + 1) reptype
-        else if Int.equal (class_bit f fc) 0 then
+        else if Int.equal (class_bit st f fc) 0 then
           (backtrack [@tailcall]) f match_nomatch
         else (class_utf_min [@tailcall]) f (i + 1) reptype)
     else if
@@ -3934,7 +3944,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
         let len = if c0 >= 0xc0 then 1 + Utf.get_extralen c0 else 1 in
         if
           if fc > 255 then Int.equal fr.(fb + Frames.slot_op) Opcodes.op_class
-          else Int.equal (class_bit f fc) 0
+          else Int.equal (class_bit st f fc) 0
         then (class_utf_maxend [@tailcall]) f reptype (* break *)
         else (
           fr.(fb + Frames.slot_eptr) <- eptr + len;
@@ -4182,7 +4192,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
       if eptr >= mb.end_subject then
         let rc = scheck_partial mb eptr in
         if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch
-      else if is_newline_at eptr then (backtrack [@tailcall]) f match_nomatch
+      else if is_newline_at st eptr then (backtrack [@tailcall]) f match_nomatch
       else if
         (* pcre2_match.c:3267-3275 *)
         (not (Int.equal mb.partial 0))
@@ -4506,7 +4516,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
       else
         (* pcre2_match.c:2988-2993 — GETCHARINCTEST(fc, Feptr); Feptr =
            PRIV(extuni)(...). *)
-        let eptr' = extuni_step eptr in
+        let eptr' = extuni_step st eptr in
         fr.(fb + Frames.slot_eptr) <- eptr';
         (* CHECK_PARTIAL() (2994). *)
         let rc =
@@ -4544,7 +4554,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
       else
         (* pcre2_match.c:4413-4418 — GETCHARINCTEST(fc, Feptr); Feptr =
            PRIV(extuni)(...). *)
-        let eptr' = extuni_step eptr in
+        let eptr' = extuni_step st eptr in
         fr.(fb + Frames.slot_eptr) <- eptr';
         (* CHECK_PARTIAL() (4419). *)
         let rc =
@@ -4706,7 +4716,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
         (* 4728-4732 — SCHECK_PARTIAL(); break. *)
         let rc = scheck_partial mb eptr in
         if rc < 0 then rc else (typemax_tail [@tailcall]) f reptype
-      else if is_newline_at eptr then
+      else if is_newline_at st eptr then
         (typemax_tail [@tailcall]) f reptype (* break, 4734 *)
       else if
         (* 4735-4743 — take care with CRLF partial. *)
@@ -4865,7 +4875,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
       if eptr >= mb.end_subject then
         let rc = scheck_partial mb eptr in
         if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch
-      else if is_newline_at eptr then (backtrack [@tailcall]) f match_nomatch
+      else if is_newline_at st eptr then (backtrack [@tailcall]) f match_nomatch
       else if
         (* pcre2_match.c:3014-3022 *)
         (not (Int.equal mb.partial 0))
@@ -5159,7 +5169,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
       if eptr >= mb.end_subject then
         let rc = scheck_partial mb eptr in
         if rc < 0 then rc else (typemax_utf_tail [@tailcall]) f reptype
-      else if is_newline_at eptr then
+      else if is_newline_at st eptr then
         (typemax_utf_tail [@tailcall]) f reptype (* break, 4484 *)
       else if
         (* pcre2_match.c:4485-4493 — take care with CRLF partial. *)
@@ -5390,7 +5400,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
          reference once and continue with the main loop. *)
       fr.(fb + Frames.slot_ecode) <- ecode;
       let rrc =
-        match_ref f
+        match_ref st f
           fr.(fb + Frames.slot_temp_size)
           (not (Int.equal fr.(fb + Frames.slot_temp_32_2) 0))
           ref_length
@@ -5442,7 +5452,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
     let fb = Frames.base a f in
     if i <= fr.(fb + Frames.slot_temp_32_0) then
       let rrc =
-        match_ref f
+        match_ref st f
           fr.(fb + Frames.slot_temp_size)
           (not (Int.equal fr.(fb + Frames.slot_temp_32_2) 0))
           ref_length
@@ -5495,7 +5505,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
     let fb = Frames.base a f in
     if i < fr.(fb + Frames.slot_temp_32_1) then (
       let rrc =
-        match_ref f
+        match_ref st f
           fr.(fb + Frames.slot_temp_size)
           (not (Int.equal fr.(fb + Frames.slot_temp_32_2) 0))
           ref_length
@@ -5558,7 +5568,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
     let fb = Frames.base a f in
     if i < fr.(fb + Frames.slot_temp_32_1) then (
       let (_ : int) =
-        match_ref f
+        match_ref st f
           fr.(fb + Frames.slot_temp_size)
           (not (Int.equal fr.(fb + Frames.slot_temp_32_2) 0))
           ref_length
@@ -5613,7 +5623,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
     let eptr = fr.(fb + Frames.slot_eptr) in
     if
       eptr < mb.end_subject
-      && ((not (is_newline_at eptr))
+      && ((not (is_newline_at st eptr))
          || not (Int.equal eptr (mb.end_subject - mb.nllen)))
     then
       if
@@ -6434,7 +6444,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
                    invariant) *)
                 let fc = Char.code (String.unsafe_get mb.subject eptr) in
                 fr.(fb + Frames.slot_eptr) <- eptr + 1;
-                if Int.equal (class_bit f fc) 0 then
+                if Int.equal (class_bit st f fc) 0 then
                   (backtrack [@tailcall]) f match_nomatch
                 else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm23 0
       | 24 ->
@@ -6465,7 +6475,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
               else
                 let lctype = fr.(fb + Frames.slot_temp_32_2) in
                 (* pcre2_match.c:3973-3974 *)
-                if Int.equal lctype Opcodes.op_any && is_newline_at eptr then
+                if Int.equal lctype Opcodes.op_any && is_newline_at st eptr then
                   (backtrack [@tailcall]) f match_nomatch
                 else
                   (* pcre2_match.c:3975 — fc = *Feptr++. *)
@@ -6643,7 +6653,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
               (backtrack [@tailcall]) f match_nomatch
             else
               let rrc2 =
-                match_ref f
+                match_ref st f
                   fr.(fb + Frames.slot_temp_size)
                   (not (Int.equal fr.(fb + Frames.slot_temp_32_2) 0))
                   ref_length
@@ -6976,7 +6986,9 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
              code unaltered. *)
           if
             Int.equal rrc match_skip_arg
-            && strcmp_code_eq (fr.(fb + Frames.slot_ecode) + 2) mb.verb_skip_ptr
+            && strcmp_code_eq mb
+                 (fr.(fb + Frames.slot_ecode) + 2)
+                 mb.verb_skip_ptr
           then (
             mb.verb_skip_ptr <- fr.(fb + Frames.slot_eptr)
             (* pass back current position *);
@@ -7122,7 +7134,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
                     (backtrack [@tailcall]) f match_nomatch
                   else
                     (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm200 0
-                else if Int.equal (class_bit f fc) 0 then
+                else if Int.equal (class_bit st f fc) 0 then
                   (backtrack [@tailcall]) f match_nomatch
                 else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm200 0
       | 201 ->
@@ -7281,7 +7293,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
               else
                 let lctype = fr.(fb + Frames.slot_temp_32_2) in
                 (* pcre2_match.c:3846 *)
-                if Int.equal lctype Opcodes.op_any && is_newline_at eptr then
+                if Int.equal lctype Opcodes.op_any && is_newline_at st eptr then
                   (backtrack [@tailcall]) f match_nomatch
                 else
                   (* pcre2_match.c:3847 — GETCHARINC(fc, Feptr). *)
@@ -7538,7 +7550,7 @@ let match_ (st : match_state) ~(start_eptr : int) ~(start_ecode : int) : int =
               else
                 (* pcre2_match.c:3819-3824 — GETCHARINCTEST(fc, Feptr);
                    Feptr = PRIV(extuni)(...). *)
-                let eptr' = extuni_step eptr in
+                let eptr' = extuni_step st eptr in
                 fr.(fb + Frames.slot_eptr) <- eptr';
                 (* CHECK_PARTIAL() (3825). *)
                 let rc =
