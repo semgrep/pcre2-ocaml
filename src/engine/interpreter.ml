@@ -965,6 +965,183 @@ let do_callout_length (mb : match_block) (ecode : int) : int =
   then Opcodes.op_lengths.(Opcodes.op_callout)
   else Compile.get mb.start_code (ecode + 1 + (2 * Limits.link_size))
 
+(* ---------- Localized hot scan loops ---------- *)
+
+(* DEVIATION (perf): compiled C runs the hottest per-character repeat
+   loops (ranges cited per helper below) with Feptr/end_subject/map in
+   registers; the frame-slot transcription paid 3-4 checked array
+   operations plus a cross-function bitmap call per character. These
+   module-level tail-recursive helpers carry ONLY immediates and strings;
+   the wrapper at each original seam reads the loop-invariant slots once,
+   runs the scan, writes slot_eptr back once, and re-enters the original
+   control flow. Per-iteration read order, test polarity and the
+   advance-on-fail placement transcribe each family's C loop EXACTLY —
+   the char/notchar/class min loops advance Feptr past the failing
+   character (post-increment reads), the ctype min loop does not
+   (Feptr++ after the test) — and SCHECK_PARTIAL runs in the wrapper on
+   the hit-end exit, the only iteration on which the C can reach it.
+
+   Encodings (subject offsets are far below 2^60, so the shifted eptr
+   fits an OCaml int): max loops return (eptr lsl 1) lor hit_end;
+   min loops return (eptr lsl 2) lor tag with tag 0 = count exhausted
+   (minimum satisfied), 1 = hit end-of-subject, 2 = char test failed.
+
+   Shared bound proofs for the String.unsafe_get in every helper:
+   eptr < end_subject is checked on the same iteration, and end_subject
+   <= String.length subject (mb invariant: the driver sets end_subject
+   from the subject length, possibly shortened per fragment); eptr >= 0
+   because scans start at slot_eptr >= 0 and only increment. *)
+
+(* pcre2_match.c:2119-2139 — OP_CLASS/OP_NCLASS greedy scan, not UTF:
+   for (i = Lmin; i < Lmax; i++) { end check (SCHECK_PARTIAL; break);
+   fc = *Feptr; bitmap miss -> break; Feptr++ (2138) }. [n] = Lmax - i
+   iterations remain. Bytes.unsafe_get bound: fc <= 255 so fc lsr 3 <=
+   31, and map_base + 31 < Bytes.length code — the 32-byte bitmap is
+   part of the OP_CLASS/OP_NCLASS item at map_base = ecode + 1 inside
+   the compiled block, and the dispatch arm already read the code unit
+   AFTER the map (the repeat-info byte at ecode + 33). *)
+let rec scan_class_max (subject : string) (code : Bytes.t) (end_subject : int)
+    (map_base : int) (n : int) (eptr : int) : int =
+  if n <= 0 then eptr lsl 1
+  else if eptr >= end_subject then (eptr lsl 1) lor 1
+  else
+    (* safe: shared bound proof at the section head — eptr < end_subject
+       checked this iteration *)
+    let fc = Char.code (String.unsafe_get subject eptr) in
+    if
+      Int.equal
+        (Char.code (Bytes.unsafe_get code (map_base + (fc lsr 3)))
+        land (1 lsl (fc land 7)))
+        0
+    then eptr lsl 1
+    else
+      (scan_class_max [@tailcall]) subject code end_subject map_base (n - 1)
+        (eptr + 1)
+
+(* pcre2_match.c:1996-2017 — OP_CLASS/OP_NCLASS minimum consumption, not
+   UTF: for (i = 1; i <= Lmin; i++) { end check (SCHECK_PARTIAL;
+   RRETURN(MATCH_NOMATCH)); fc = *Feptr++; bitmap miss ->
+   RRETURN(MATCH_NOMATCH) } — the post-increment advances Feptr even
+   when the bitmap test fails (tag-2 exits carry eptr + 1). [n] =
+   Lmin - i + 1 iterations remain. Bounds as at [scan_class_max]. *)
+let rec scan_class_min (subject : string) (code : Bytes.t) (end_subject : int)
+    (map_base : int) (n : int) (eptr : int) : int =
+  if n <= 0 then eptr lsl 2
+  else if eptr >= end_subject then (eptr lsl 2) lor 1
+  else
+    (* safe: shared bound proof at the section head — eptr < end_subject
+       checked this iteration *)
+    let fc = Char.code (String.unsafe_get subject eptr) in
+    if
+      Int.equal
+        (Char.code (Bytes.unsafe_get code (map_base + (fc lsr 3)))
+        land (1 lsl (fc land 7)))
+        0
+    then ((eptr + 1) lsl 2) lor 2
+    else
+      (scan_class_min [@tailcall]) subject code end_subject map_base (n - 1)
+        (eptr + 1)
+
+(* pcre2_match.c:1493-1506 — REPEATCHAR caseful greedy scan:
+   for (i = Lmin; i < Lmax; i++) { end check (SCHECK_PARTIAL; break);
+   Lc != UCHAR21TEST(Feptr) -> break; Feptr++ }. *)
+let rec scan_chareq_max (subject : string) (end_subject : int) (lc : int)
+    (n : int) (eptr : int) : int =
+  if n <= 0 then eptr lsl 1
+  else if eptr >= end_subject then (eptr lsl 1) lor 1
+  else if
+    (* safe: shared bound proof at the section head — eptr < end_subject
+       checked this iteration *)
+    not (Int.equal (Char.code (String.unsafe_get subject eptr)) lc)
+  then eptr lsl 1
+  else (scan_chareq_max [@tailcall]) subject end_subject lc (n - 1) (eptr + 1)
+
+(* pcre2_match.c:1461-1473 — REPEATCHAR caseful minimum consumption:
+   for (i = 1; i <= Lmin; i++) { end check (SCHECK_PARTIAL;
+   RRETURN(MATCH_NOMATCH)); Lc != UCHAR21INCTEST(Feptr) ->
+   RRETURN(MATCH_NOMATCH) } — the INCTEST post-increment advances Feptr
+   even when the test fails (tag-2 exits carry eptr + 1). *)
+let rec scan_chareq_min (subject : string) (end_subject : int) (lc : int)
+    (n : int) (eptr : int) : int =
+  if n <= 0 then eptr lsl 2
+  else if eptr >= end_subject then (eptr lsl 2) lor 1
+  else if
+    (* safe: shared bound proof at the section head — eptr < end_subject
+       checked this iteration *)
+    not (Int.equal (Char.code (String.unsafe_get subject eptr)) lc)
+  then ((eptr + 1) lsl 2) lor 2
+  else (scan_chareq_min [@tailcall]) subject end_subject lc (n - 1) (eptr + 1)
+
+(* pcre2_match.c:1887-1899 — REPEATNOTCHAR caseful greedy scan, not UTF:
+   for (i = Lmin; i < Lmax; i++) { end check (SCHECK_PARTIAL; break);
+   Lc == *Feptr -> break; Feptr++ }. *)
+let rec scan_charne_max (subject : string) (end_subject : int) (lc : int)
+    (n : int) (eptr : int) : int =
+  if n <= 0 then eptr lsl 1
+  else if eptr >= end_subject then (eptr lsl 1) lor 1
+  else if
+    (* safe: shared bound proof at the section head — eptr < end_subject
+       checked this iteration *)
+    Int.equal (Char.code (String.unsafe_get subject eptr)) lc
+  then eptr lsl 1
+  else (scan_charne_max [@tailcall]) subject end_subject lc (n - 1) (eptr + 1)
+
+(* pcre2_match.c:1795-1806 — REPEATNOTCHAR caseful minimum consumption,
+   not UTF: for (i = 1; i <= Lmin; i++) { end check (SCHECK_PARTIAL;
+   RRETURN(MATCH_NOMATCH)); Lc == *Feptr++ -> RRETURN(MATCH_NOMATCH) } —
+   the post-increment advances Feptr even when the test fails (tag-2
+   exits carry eptr + 1). *)
+let rec scan_charne_min (subject : string) (end_subject : int) (lc : int)
+    (n : int) (eptr : int) : int =
+  if n <= 0 then eptr lsl 2
+  else if eptr >= end_subject then (eptr lsl 2) lor 1
+  else if
+    (* safe: shared bound proof at the section head — eptr < end_subject
+       checked this iteration *)
+    Int.equal (Char.code (String.unsafe_get subject eptr)) lc
+  then ((eptr + 1) lsl 2) lor 2
+  else (scan_charne_min [@tailcall]) subject end_subject lc (n - 1) (eptr + 1)
+
+(* pcre2_match.c:4870-4953 — the six OP_NOT_DIGIT..OP_WORDCHAR maximize
+   scans, not UTF, merged on [mask]/[negated] exactly like
+   [typemax_ctype] (its DEVIATION(structure) note): for (i = Lmin;
+   i < Lmax; i++) { end check (SCHECK_PARTIAL; break); ctype test ->
+   break; Feptr++ }; MAX_255() is TRUE in the 8-bit library. *)
+let rec scan_ctype_max (subject : string) (end_subject : int) (mask : int)
+    (negated : bool) (n : int) (eptr : int) : int =
+  if n <= 0 then eptr lsl 1
+  else if eptr >= end_subject then (eptr lsl 1) lor 1
+  else
+    (* safe: shared bound proof at the section head — eptr < end_subject
+       checked this iteration *)
+    let fc = Char.code (String.unsafe_get subject eptr) in
+    if Bool.equal (not (Int.equal (Chartables.ctypes fc land mask) 0)) negated
+    then eptr lsl 1
+    else
+      (scan_ctype_max [@tailcall]) subject end_subject mask negated (n - 1)
+        (eptr + 1)
+
+(* pcre2_match.c:3414-3496 — the six OP_NOT_DIGIT..OP_WORDCHAR minimum
+   loops, not UTF, merged on [mask]/[negated] exactly like
+   [typemin_ctype] (its DEVIATION(structure) note): for (i = 1;
+   i <= Lmin; i++) { end check (SCHECK_PARTIAL; RRETURN(MATCH_NOMATCH));
+   ctype test -> RRETURN(MATCH_NOMATCH); Feptr++ }. UNLIKE the
+   char/notchar/class families, Feptr++ comes AFTER the test: tag-2
+   exits carry the UNADVANCED eptr. *)
+let rec scan_ctype_min (subject : string) (end_subject : int) (mask : int)
+    (negated : bool) (n : int) (eptr : int) : int =
+  if n <= 0 then eptr lsl 2
+  else if eptr >= end_subject then (eptr lsl 2) lor 1
+  else
+    (* safe: shared bound proof at the section head — eptr < end_subject
+       checked this iteration *)
+    let fc = Char.code (String.unsafe_get subject eptr) in
+    if Bool.equal (not (Int.equal (Chartables.ctypes fc land mask) 0)) negated
+    then (eptr lsl 2) lor 2
+    else
+      (scan_ctype_min [@tailcall]) subject end_subject mask negated (n - 1)
+        (eptr + 1)
+
 (* ---------- Match from current position ---------- *)
 
 (* pcre2_match.c:550-556 + 662-773 + 790-798 + 6462-6501 — the goto
@@ -3415,25 +3592,38 @@ and repeatchar_cs_min (st : match_state) (f : int) (i : int) (reptype : int) :
   let mb = st.mb in
   let a = st.arena in
   (* pcre2_match.c:1461-1473 — caseful comparisons (includes all
-     multi-byte characters): for (i = 1; i <= Lmin; i++). *)
+     multi-byte characters): for (i = 1; i <= Lmin; i++), via
+     [scan_chareq_min]. Loop invariants read once (Lc = temp_32[2],
+     Lmin = temp_32[0], Feptr); Feptr written back once. *)
   let fr = a.Frames.frames in
   let fb = Frames.base a f in
-  if i <= fr.(fb + Frames.slot_temp_32_0) then (
-    let eptr = fr.(fb + Frames.slot_eptr) in
-    if eptr >= mb.end_subject then
-      let rc = scheck_partial mb eptr in
+  (* safe (the unsafe frame ops): f is a valid frame index — a
+     dispatch-arm continuation on the same f (the arena-capacity bound
+     proven at Frames.push's copy loop). *)
+  let lmin = Array.unsafe_get fr (fb + Frames.slot_temp_32_0) in
+  if i <= lmin then (
+    let r =
+      scan_chareq_min mb.subject mb.end_subject
+        (Array.unsafe_get fr (fb + Frames.slot_temp_32_2))
+        (lmin - i + 1)
+        (Array.unsafe_get fr (fb + Frames.slot_eptr))
+    in
+    let eptr' = r lsr 2 in
+    Array.unsafe_set fr (fb + Frames.slot_eptr) eptr';
+    let tag = r land 3 in
+    if Int.equal tag 0 then
+      (* minimum satisfied — re-enter at i = lmin + 1: the post-min
+         branch below. *)
+      (repeatchar_cs_min [@tailcall]) st f (lmin + 1) reptype
+    else if Int.equal tag 1 then
+      (* pcre2_match.c:1467-1471 — SCHECK_PARTIAL();
+         RRETURN(MATCH_NOMATCH). *)
+      let rc = scheck_partial mb eptr' in
       if rc < 0 then rc else (backtrack [@tailcall]) st f match_nomatch
     else
-      (* pcre2_match.c:1472 — if (Lc != UCHAR21INCTEST(Feptr))
-         RRETURN(MATCH_NOMATCH): the post-increment advances Feptr even
-         when the test fails. *)
-      (* safe: eptr < mb.end_subject <= String.length mb.subject
-         (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
-      let cc = Char.code (String.unsafe_get mb.subject eptr) in
-      fr.(fb + Frames.slot_eptr) <- eptr + 1;
-      if not (Int.equal fr.(fb + Frames.slot_temp_32_2) cc) then
-        (backtrack [@tailcall]) st f match_nomatch
-      else (repeatchar_cs_min [@tailcall]) st f (i + 1) reptype)
+      (* pcre2_match.c:1472 — Lc != UCHAR21INCTEST(Feptr); Feptr already
+         advanced past the failing character: RRETURN(MATCH_NOMATCH). *)
+      (backtrack [@tailcall]) st f match_nomatch)
   else if
     (* pcre2_match.c:1475 — if (Lmin == Lmax) continue. *)
     Int.equal fr.(fb + Frames.slot_temp_32_0) fr.(fb + Frames.slot_temp_32_1)
@@ -3454,24 +3644,27 @@ and repeatchar_cs_maxscan (st : match_state) (f : int) (i : int) (reptype : int)
   let mb = st.mb in
   let a = st.arena in
   (* pcre2_match.c:1496-1506 — caseful greedy scan:
-     for (i = Lmin; i < Lmax; i++). *)
+     for (i = Lmin; i < Lmax; i++), via [scan_chareq_max]. Loop
+     invariants read once (Lc = temp_32[2], Lmax = temp_32[1], Feptr);
+     Feptr written back once; every exit continues at
+     [repeatchar_cs_maxend] (the C's break target). *)
   let fr = a.Frames.frames in
   let fb = Frames.base a f in
-  if i < fr.(fb + Frames.slot_temp_32_1) then
-    let eptr = fr.(fb + Frames.slot_eptr) in
-    if eptr >= mb.end_subject then
-      (* pcre2_match.c:1498-1502 — SCHECK_PARTIAL(); break. *)
-      let rc = scheck_partial mb eptr in
-      if rc < 0 then rc else (repeatchar_cs_maxend [@tailcall]) st f reptype
-    else
-      (* safe: eptr < mb.end_subject <= String.length mb.subject
-         (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
-      let cc = Char.code (String.unsafe_get mb.subject eptr) in
-      if not (Int.equal fr.(fb + Frames.slot_temp_32_2) cc) then
-        (repeatchar_cs_maxend [@tailcall]) st f reptype (* break, 1504 *)
-      else (
-        fr.(fb + Frames.slot_eptr) <- eptr + 1;
-        (repeatchar_cs_maxscan [@tailcall]) st f (i + 1) reptype)
+  (* safe (the unsafe frame ops): f is a valid frame index — a
+     dispatch-arm continuation on the same f (the arena-capacity bound
+     proven at Frames.push's copy loop). *)
+  let r =
+    scan_chareq_max mb.subject mb.end_subject
+      (Array.unsafe_get fr (fb + Frames.slot_temp_32_2))
+      (Array.unsafe_get fr (fb + Frames.slot_temp_32_1) - i)
+      (Array.unsafe_get fr (fb + Frames.slot_eptr))
+  in
+  let eptr' = r lsr 1 in
+  Array.unsafe_set fr (fb + Frames.slot_eptr) eptr';
+  if Int.equal (r land 1) 1 then
+    (* pcre2_match.c:1498-1502 — SCHECK_PARTIAL(); break. *)
+    let rc = scheck_partial mb eptr' in
+    if rc < 0 then rc else (repeatchar_cs_maxend [@tailcall]) st f reptype
   else (repeatchar_cs_maxend [@tailcall]) st f reptype
 
 and repeatchar_cs_maxend (st : match_state) (f : int) (reptype : int) : int =
@@ -3617,25 +3810,37 @@ and repeatnotchar_cs_min (st : match_state) (f : int) (i : int) (reptype : int)
   let mb = st.mb in
   let a = st.arena in
   (* pcre2_match.c:1795-1806 — caseful, not UTF: for (i = 1; i <= Lmin;
-     i++). *)
+     i++), via [scan_charne_min]. Loop invariants read once (Lc =
+     temp_32[2], Lmin = temp_32[0], Feptr); Feptr written back once. *)
   let fr = a.Frames.frames in
   let fb = Frames.base a f in
-  if i <= fr.(fb + Frames.slot_temp_32_0) then (
-    let eptr = fr.(fb + Frames.slot_eptr) in
-    if eptr >= mb.end_subject then
-      let rc = scheck_partial mb eptr in
+  (* safe (the unsafe frame ops): f is a valid frame index — a
+     dispatch-arm continuation on the same f (the arena-capacity bound
+     proven at Frames.push's copy loop). *)
+  let lmin = Array.unsafe_get fr (fb + Frames.slot_temp_32_0) in
+  if i <= lmin then (
+    let r =
+      scan_charne_min mb.subject mb.end_subject
+        (Array.unsafe_get fr (fb + Frames.slot_temp_32_2))
+        (lmin - i + 1)
+        (Array.unsafe_get fr (fb + Frames.slot_eptr))
+    in
+    let eptr' = r lsr 2 in
+    Array.unsafe_set fr (fb + Frames.slot_eptr) eptr';
+    let tag = r land 3 in
+    if Int.equal tag 0 then
+      (* minimum satisfied — re-enter at i = lmin + 1: the post-min
+         branch below. *)
+      (repeatnotchar_cs_min [@tailcall]) st f (lmin + 1) reptype
+    else if Int.equal tag 1 then
+      (* pcre2_match.c:1799-1803 — SCHECK_PARTIAL();
+         RRETURN(MATCH_NOMATCH). *)
+      let rc = scheck_partial mb eptr' in
       if rc < 0 then rc else (backtrack [@tailcall]) st f match_nomatch
     else
-      (* pcre2_match.c:1804 — if (Lc == *Feptr++)
-         RRETURN(MATCH_NOMATCH): the post-increment advances Feptr even
-         when the test fails. *)
-      (* safe: eptr < mb.end_subject <= String.length mb.subject
-         (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
-      let cc = Char.code (String.unsafe_get mb.subject eptr) in
-      fr.(fb + Frames.slot_eptr) <- eptr + 1;
-      if Int.equal fr.(fb + Frames.slot_temp_32_2) cc then
-        (backtrack [@tailcall]) st f match_nomatch
-      else (repeatnotchar_cs_min [@tailcall]) st f (i + 1) reptype)
+      (* pcre2_match.c:1804 — Lc == *Feptr++; Feptr already advanced
+         past the failing character: RRETURN(MATCH_NOMATCH). *)
+      (backtrack [@tailcall]) st f match_nomatch)
   else if
     (* pcre2_match.c:1808 — if (Lmin == Lmax) continue. *)
     Int.equal fr.(fb + Frames.slot_temp_32_0) fr.(fb + Frames.slot_temp_32_1)
@@ -3656,24 +3861,27 @@ and repeatnotchar_cs_maxscan (st : match_state) (f : int) (i : int)
   let mb = st.mb in
   let a = st.arena in
   (* pcre2_match.c:1887-1899 — caseful greedy scan, not UTF:
-     for (i = Lmin; i < Lmax; i++). *)
+     for (i = Lmin; i < Lmax; i++), via [scan_charne_max]. Loop
+     invariants read once (Lc = temp_32[2], Lmax = temp_32[1], Feptr);
+     Feptr written back once; every exit continues at
+     [repeatnotchar_cs_maxend] (the C's break target). *)
   let fr = a.Frames.frames in
   let fb = Frames.base a f in
-  if i < fr.(fb + Frames.slot_temp_32_1) then
-    let eptr = fr.(fb + Frames.slot_eptr) in
-    if eptr >= mb.end_subject then
-      (* pcre2_match.c:1892-1896 — SCHECK_PARTIAL(); break. *)
-      let rc = scheck_partial mb eptr in
-      if rc < 0 then rc else (repeatnotchar_cs_maxend [@tailcall]) st f reptype
-    else
-      (* safe: eptr < mb.end_subject <= String.length mb.subject
-         (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
-      let cc = Char.code (String.unsafe_get mb.subject eptr) in
-      if Int.equal fr.(fb + Frames.slot_temp_32_2) cc then
-        (repeatnotchar_cs_maxend [@tailcall]) st f reptype (* break, 1897 *)
-      else (
-        fr.(fb + Frames.slot_eptr) <- eptr + 1;
-        (repeatnotchar_cs_maxscan [@tailcall]) st f (i + 1) reptype)
+  (* safe (the unsafe frame ops): f is a valid frame index — a
+     dispatch-arm continuation on the same f (the arena-capacity bound
+     proven at Frames.push's copy loop). *)
+  let r =
+    scan_charne_max mb.subject mb.end_subject
+      (Array.unsafe_get fr (fb + Frames.slot_temp_32_2))
+      (Array.unsafe_get fr (fb + Frames.slot_temp_32_1) - i)
+      (Array.unsafe_get fr (fb + Frames.slot_eptr))
+  in
+  let eptr' = r lsr 1 in
+  Array.unsafe_set fr (fb + Frames.slot_eptr) eptr';
+  if Int.equal (r land 1) 1 then
+    (* pcre2_match.c:1892-1896 — SCHECK_PARTIAL(); break. *)
+    let rc = scheck_partial mb eptr' in
+    if rc < 0 then rc else (repeatnotchar_cs_maxend [@tailcall]) st f reptype
   else (repeatnotchar_cs_maxend [@tailcall]) st f reptype
 
 and repeatnotchar_cs_maxend (st : match_state) (f : int) (reptype : int) : int =
@@ -3924,21 +4132,38 @@ and class_min (st : match_state) (f : int) (i : int) (reptype : int) : int =
   let a = st.arena in
   let fr = a.Frames.frames in
   let fb = Frames.base a f in
-  if i <= fr.(fb + Frames.slot_temp_32_0) then (
-    let eptr = fr.(fb + Frames.slot_eptr) in
-    if eptr >= mb.end_subject then
-      let rc = scheck_partial mb eptr in
+  (* safe (the unsafe frame ops in this wrapper): f is a valid frame
+     index — a dispatch-arm continuation on the same f (the
+     arena-capacity bound proven at Frames.push's copy loop). *)
+  let lmin = Array.unsafe_get fr (fb + Frames.slot_temp_32_0) in
+  if i <= lmin then (
+    (* The whole remaining min loop runs in [scan_class_min]
+       (pcre2_match.c:1996-2017); loop invariants read once:
+       Lbyte_map_address = temp_sptr[1] (the OP_CLASS arm stored
+       ecode + 1), Feptr; Feptr written back once. *)
+    let r =
+      scan_class_min mb.subject mb.start_code mb.end_subject
+        (Array.unsafe_get fr (fb + Frames.slot_temp_sptr_1))
+        (lmin - i + 1)
+        (Array.unsafe_get fr (fb + Frames.slot_eptr))
+    in
+    let eptr' = r lsr 2 in
+    Array.unsafe_set fr (fb + Frames.slot_eptr) eptr';
+    let tag = r land 3 in
+    if Int.equal tag 0 then
+      (* minimum satisfied — re-enter at i = lmin + 1: the post-min
+         branch below. *)
+      (class_min [@tailcall]) st f (lmin + 1) reptype
+    else if Int.equal tag 1 then
+      (* pcre2_match.c:2001-2005 — SCHECK_PARTIAL();
+         RRETURN(MATCH_NOMATCH). *)
+      let rc = scheck_partial mb eptr' in
       if rc < 0 then rc else (backtrack [@tailcall]) st f match_nomatch
     else
-      (* pcre2_match.c:2009 — fc = *Feptr++: the post-increment advances
-         Feptr even when the bitmap test fails. *)
-      (* safe: eptr < mb.end_subject <= String.length mb.subject
-         (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
-      let fc = Char.code (String.unsafe_get mb.subject eptr) in
-      fr.(fb + Frames.slot_eptr) <- eptr + 1;
-      if Int.equal (class_bit st f fc) 0 then
-        (backtrack [@tailcall]) st f match_nomatch
-      else (class_min [@tailcall]) st f (i + 1) reptype)
+      (* pcre2_match.c:2009-2014 — bitmap miss; Feptr already advanced
+         past the failing character (fc = *Feptr++):
+         RRETURN(MATCH_NOMATCH). *)
+      (backtrack [@tailcall]) st f match_nomatch)
   else if
     (* pcre2_match.c:2019-2021 — if (Lmin == Lmax) continue. *)
     Int.equal fr.(fb + Frames.slot_temp_32_0) fr.(fb + Frames.slot_temp_32_1)
@@ -3956,26 +4181,29 @@ and class_min (st : match_state) (f : int) (i : int) (reptype : int) : int =
 and class_maxscan (st : match_state) (f : int) (i : int) (reptype : int) : int =
   let mb = st.mb in
   let a = st.arena in
-  (* pcre2_match.c:2119-2137 — class greedy scan, not UTF:
-     for (i = Lmin; i < Lmax; i++); fc = *Feptr with no increment until
-     the bitmap test passes. *)
+  (* pcre2_match.c:2119-2139 — class greedy scan, not UTF, via
+     [scan_class_max]: for (i = Lmin; i < Lmax; i++); fc = *Feptr with no
+     increment until the bitmap test passes. Loop invariants read once
+     (Lbyte_map_address = temp_sptr[1], Lmax = temp_32[1], Feptr); Feptr
+     written back once; every exit continues at [class_maxend] (the C's
+     break target). *)
   let fr = a.Frames.frames in
   let fb = Frames.base a f in
-  if i < fr.(fb + Frames.slot_temp_32_1) then
-    let eptr = fr.(fb + Frames.slot_eptr) in
-    if eptr >= mb.end_subject then
-      (* pcre2_match.c:2121-2125 — SCHECK_PARTIAL(); break. *)
-      let rc = scheck_partial mb eptr in
-      if rc < 0 then rc else (class_maxend [@tailcall]) st f reptype
-    else
-      (* safe: eptr < mb.end_subject <= String.length mb.subject
-         (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
-      let fc = Char.code (String.unsafe_get mb.subject eptr) in
-      if Int.equal (class_bit st f fc) 0 then
-        (class_maxend [@tailcall]) st f reptype (* break, 2134 *)
-      else (
-        fr.(fb + Frames.slot_eptr) <- eptr + 1;
-        (class_maxscan [@tailcall]) st f (i + 1) reptype)
+  (* safe (the unsafe frame ops): f is a valid frame index — a
+     dispatch-arm continuation on the same f (the arena-capacity bound
+     proven at Frames.push's copy loop). *)
+  let r =
+    scan_class_max mb.subject mb.start_code mb.end_subject
+      (Array.unsafe_get fr (fb + Frames.slot_temp_sptr_1))
+      (Array.unsafe_get fr (fb + Frames.slot_temp_32_1) - i)
+      (Array.unsafe_get fr (fb + Frames.slot_eptr))
+  in
+  let eptr' = r lsr 1 in
+  Array.unsafe_set fr (fb + Frames.slot_eptr) eptr';
+  if Int.equal (r land 1) 1 then
+    (* pcre2_match.c:2124-2128 — SCHECK_PARTIAL(); break. *)
+    let rc = scheck_partial mb eptr' in
+    if rc < 0 then rc else (class_maxend [@tailcall]) st f reptype
   else (class_maxend [@tailcall]) st f reptype
 
 and class_maxend (st : match_state) (f : int) (reptype : int) : int =
@@ -4447,29 +4675,43 @@ and typemin_ctype (st : match_state) (f : int) (i : int) (mask : int)
   let mb = st.mb in
   let a = st.arena in
   (* pcre2_match.c:3414-3496 — min loops for OP_NOT_DIGIT..OP_WORDCHAR,
-     not UTF: if (MAX_255( *Feptr ) && (mb->ctypes[*Feptr] & ctype_x) !=
-     0) RRETURN(MATCH_NOMATCH) for the negated forms, the complement for
-     the positive forms; MAX_255() is TRUE in the 8-bit library
-     (pcre2_intmodedep.h:212). Feptr++ happens AFTER the test — no
-     advance on failure, unlike the single-match arms.
-     DEVIATION(structure): the C writes six separate loops; merged here
-     on [mask]/[negated], per-iteration reads and order identical. *)
+     not UTF, via [scan_ctype_min]: if (MAX_255( *Feptr ) &&
+     (mb->ctypes[*Feptr] & ctype_x) != 0) RRETURN(MATCH_NOMATCH) for the
+     negated forms, the complement for the positive forms; MAX_255() is
+     TRUE in the 8-bit library (pcre2_intmodedep.h:212). Feptr++ happens
+     AFTER the test — no advance on failure, unlike the
+     char/notchar/class min loops (the scan's tag-2 exit carries the
+     unadvanced eptr). DEVIATION(structure): the C writes six separate
+     loops; merged on [mask]/[negated], per-iteration reads and order
+     identical. Loop invariants read once (Lmin = temp_32[0], Feptr);
+     Feptr written back once. *)
   let fr = a.Frames.frames in
   let fb = Frames.base a f in
-  if i <= fr.(fb + Frames.slot_temp_32_0) then
-    let eptr = fr.(fb + Frames.slot_eptr) in
-    if eptr >= mb.end_subject then
-      let rc = scheck_partial mb eptr in
+  (* safe (the unsafe frame ops): f is a valid frame index — a
+     dispatch-arm continuation on the same f (the arena-capacity bound
+     proven at Frames.push's copy loop). *)
+  let lmin = Array.unsafe_get fr (fb + Frames.slot_temp_32_0) in
+  if i <= lmin then (
+    let r =
+      scan_ctype_min mb.subject mb.end_subject mask negated
+        (lmin - i + 1)
+        (Array.unsafe_get fr (fb + Frames.slot_eptr))
+    in
+    let eptr' = r lsr 2 in
+    Array.unsafe_set fr (fb + Frames.slot_eptr) eptr';
+    let tag = r land 3 in
+    if Int.equal tag 0 then
+      (* minimum satisfied — the loop-exhausted continuation below. *)
+      (repeattype_post_min [@tailcall]) st f reptype
+    else if Int.equal tag 1 then
+      (* e.g. pcre2_match.c:3417-3421 — SCHECK_PARTIAL();
+         RRETURN(MATCH_NOMATCH). *)
+      let rc = scheck_partial mb eptr' in
       if rc < 0 then rc else (backtrack [@tailcall]) st f match_nomatch
     else
-      (* safe: eptr < mb.end_subject <= String.length mb.subject
-         (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
-      let fc = Char.code (String.unsafe_get mb.subject eptr) in
-      if Bool.equal (not (Int.equal (Chartables.ctypes fc land mask) 0)) negated
-      then (backtrack [@tailcall]) st f match_nomatch
-      else (
-        fr.(fb + Frames.slot_eptr) <- eptr + 1;
-        (typemin_ctype [@tailcall]) st f (i + 1) mask negated reptype)
+      (* e.g. pcre2_match.c:3422-3423 — ctype test failed; Feptr NOT
+         advanced: RRETURN(MATCH_NOMATCH). *)
+      (backtrack [@tailcall]) st f match_nomatch)
   else (repeattype_post_min [@tailcall]) st f reptype
 
 and propmin (st : match_state) (f : int) (i : int) (ptype : int) (reptype : int)
@@ -5019,25 +5261,28 @@ and typemax_ctype (st : match_state) (f : int) (i : int) (mask : int)
   let mb = st.mb in
   let a = st.arena in
   (* pcre2_match.c:4870-4953 — maximize scans for OP_NOT_DIGIT..
-     OP_WORDCHAR, not UTF; MAX_255() is TRUE in the 8-bit library.
-     DEVIATION(structure): the C writes six separate loops; merged here
-     on [mask]/[negated], per-iteration reads and order identical. *)
+     OP_WORDCHAR, not UTF, via [scan_ctype_max]; MAX_255() is TRUE in
+     the 8-bit library. DEVIATION(structure): the C writes six separate
+     loops; merged on [mask]/[negated], per-iteration reads and order
+     identical. Loop invariants read once (Lmax = temp_32[1], Feptr);
+     Feptr written back once; every exit continues at [typemax_tail]
+     (the C's break target). *)
   let fr = a.Frames.frames in
   let fb = Frames.base a f in
-  if i < fr.(fb + Frames.slot_temp_32_1) then
-    let eptr = fr.(fb + Frames.slot_eptr) in
-    if eptr >= mb.end_subject then
-      let rc = scheck_partial mb eptr in
-      if rc < 0 then rc else (typemax_tail [@tailcall]) st f reptype
-    else
-      (* safe: eptr < mb.end_subject <= String.length mb.subject
-         (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
-      let fc = Char.code (String.unsafe_get mb.subject eptr) in
-      if Bool.equal (not (Int.equal (Chartables.ctypes fc land mask) 0)) negated
-      then (typemax_tail [@tailcall]) st f reptype
-      else (
-        fr.(fb + Frames.slot_eptr) <- eptr + 1;
-        (typemax_ctype [@tailcall]) st f (i + 1) mask negated reptype)
+  (* safe (the unsafe frame ops): f is a valid frame index — a
+     dispatch-arm continuation on the same f (the arena-capacity bound
+     proven at Frames.push's copy loop). *)
+  let r =
+    scan_ctype_max mb.subject mb.end_subject mask negated
+      (Array.unsafe_get fr (fb + Frames.slot_temp_32_1) - i)
+      (Array.unsafe_get fr (fb + Frames.slot_eptr))
+  in
+  let eptr' = r lsr 1 in
+  Array.unsafe_set fr (fb + Frames.slot_eptr) eptr';
+  if Int.equal (r land 1) 1 then
+    (* e.g. pcre2_match.c:4873-4877 — SCHECK_PARTIAL(); break. *)
+    let rc = scheck_partial mb eptr' in
+    if rc < 0 then rc else (typemax_tail [@tailcall]) st f reptype
   else (typemax_tail [@tailcall]) st f reptype
 
 and typemax_tail (st : match_state) (f : int) (reptype : int) : int =
