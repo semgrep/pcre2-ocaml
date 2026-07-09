@@ -343,6 +343,46 @@ end = struct
              delta)
           (delta < 1000.)
 
+  let alloc_per_exec_major_test ctxt =
+    (* Perf chunk 2 P1 (frames.ml scratch arena — the C's keep-if-big-
+       enough frames-vector reuse, pcre2_match.c:7062-7077): the
+       backtracking-frame arena is retained across execs in a module
+       scratch slot, so N execs allocate O(1) MAJOR words instead of one
+       fresh ~4,000-word zeroed int array each (> Max_young_wosize, so it
+       was a major-heap allocation becoming major garbage per call).
+       Pattern "(q)z" (one capture group) against a small subject: 1,000
+       execs must stay under 2,000 major words TOTAL. Before the reuse
+       each exec allocated ~4,200 major words (~4.2M for this loop); the
+       2,000-word slack covers minor-to-major promotions of live per-exec
+       setup data at minor-GC boundaries. *)
+    match compile "(q)z" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let subject = "qqqq" in
+        let bool_printer = [%show: (bool, match_error) result] in
+        (* warm-up exec: lazy initialization + scratch-slot seeding *)
+        assert_equal ~printer:bool_printer (Ok false) (is_match re subject);
+        (* The loop body stays allocation-lean (no assert_equal: its
+           allocations trigger minor GCs that promote live harness state
+           into the major heap, polluting the measurement); correctness
+           is checked once, after. *)
+        let wrong = ref 0 in
+        let before = (Gc.quick_stat ()).Gc.major_words in
+        for _ = 1 to 1_000 do
+          match is_match re subject with
+          | Ok false -> ()
+          | Ok true | Error _ -> incr wrong
+        done;
+        let delta = (Gc.quick_stat ()).Gc.major_words -. before in
+        assert_equal ~printer:string_of_int ~msg:"unexpected is_match results" 0
+          !wrong;
+        assert_bool
+          (Printf.sprintf
+             "expected O(1) major allocation for 1,000 execs (frames arena \
+              reused across execs), measured %.0f major words"
+             delta)
+          (delta < 2000.)
+
   let tests =
     [
       "simple_test" >:: simple_test;
@@ -366,6 +406,7 @@ end = struct
       "unicode" >:: unicode_test;
       "overlapping_matches" >:: overlapping_matches_test;
       "alloc_per_attempt" >:: alloc_per_attempt_test;
+      "alloc_per_exec_major" >:: alloc_per_exec_major_test;
     ]
 end
 

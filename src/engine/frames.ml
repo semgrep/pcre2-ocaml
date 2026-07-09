@@ -235,11 +235,15 @@ let frame_size_bytes_for ~(top_bracket : int) : int =
 (* The frames vector state the C splits between pcre2_match_data
    (heapframes / heapframes_size, pcre2_intmodedep.h:661-662) and
    pcre2_match() locals (frame_size, mb->heap_limit).
-   DEVIATION: there is no match_data object at the OCaml seam, so no
-   cached vector is reused across matches (pcre2_match.c:7062-7077's
-   keep-if-big-enough path) — every match starts from the freshly computed
-   initial size. Heap-limit trip points are unaffected: they compare
-   absolute simulated sizes. *)
+   DEVIATION: there is no match_data object at the OCaml seam, so the C's
+   caller-owned vector cache (match_data->heapframes, kept across
+   pcre2_match calls and reused when big enough, pcre2_match.c:7062-7077)
+   becomes the single module-level scratch slot below ([scratch_arena] /
+   [scratch_busy]): [create ~use_scratch:true] acquires it, [release]
+   hands the (possibly grown) arena back. [heapframes_size] is
+   nevertheless ALWAYS the freshly computed initial size — the C keeps
+   the retained vector's larger heapframes_size (see the DEVIATION note
+   in [create]) — so heap-limit trip points are history-independent. *)
 type t = {
   mutable frames : int array;
       (* match_data->heapframes — the flat arena; frame f occupies slots
@@ -252,10 +256,38 @@ type t = {
   heap_limit : int;
       (* mb->heap_limit, in KiB — already resolved by the caller as
          min(mcontext->heap_limit, re->limit_heap), pcre2_match.c:7039 *)
+  holds_scratch : bool;
+      (* this arena holds the module scratch slot: [release] must write
+         [frames] back and clear [scratch_busy] when the match returns *)
 }
 
 (* Base slot index of frame [f]. *)
 let base (a : t) (f : int) : int = f * a.frame_size_ints
+
+(* pcre2_match.c:7062-7077 — "If an existing frame vector in the
+   match_data block is large enough, we can use it. Otherwise, free any
+   pre-existing vector and get a new one." The C's cache is the
+   caller-owned match_data, reused across pcre2_match calls; this port
+   has no match_data object at the seam, so the cache is one module-level
+   scratch slot: the arena of the previous match, written back by
+   [release]. [scratch_busy] keeps the slot single-owner under
+   reentrancy/systhreads: [create ~use_scratch:true] takes it only via an
+   atomic test-and-set, and a busy slot (a match already running) falls
+   back to a fresh allocation that is NOT written back. Reused memory is
+   NOT re-zeroed — exactly the C, which reuses the malloc'd vector as is:
+   the only initialization a match relies on is frame 0's ovector unset
+   fill (pcre2_match.c:7079-7083, in [create]) plus the frame-0 field
+   setup at match() entry (pcre2_match.c:649-656, in the interpreter);
+   every other slot is write-before-read under the frame protocol. *)
+let scratch_arena : int array ref = ref [||]
+let scratch_busy : bool Atomic.t = Atomic.make false
+
+(* DEVIATION: the C never caps the cached vector — its lifetime is
+   caller-controlled (it lives until pcre2_match_data_free). Ours is a
+   process-global scratch, so an arena grown by one pathological match
+   must not stay pinned forever: [release] drops arenas larger than
+   ~1 MiB (131072 8-byte words). *)
+let scratch_max_retained_ints = 131072
 
 (* pcre2_match.c:7048-7060 + 7079-7083 — set the initial frame vector size
    to ensure that there are at least 10 available frames, but enforce a
@@ -264,9 +296,14 @@ let base (a : t) (f : int) : int = f * a.frame_size_ints
    PCRE2_ERROR_HEAPLIMIT (as a value). The first frame's ovector region is
    marked all-unset (the C memsets it to 0xff bytes = PCRE2_UNSET; here
    each slot becomes -1) so that copying it to new frames never reads
-   uninitialized captures. All other slots start 0; the interpreter
-   initializes frame 0's live fields exactly as pcre2_match.c:649-656. *)
-let create ~(top_bracket : int) ~(heap_limit : int) : (t, int) result =
+   uninitialized captures. On the fresh path all other slots start 0; the
+   interpreter initializes frame 0's live fields exactly as
+   pcre2_match.c:649-656. [use_scratch] selects the scratch-slot reuse
+   path (pcre2_match.c:7062-7077) — only the real match driver passes
+   true; the module-initialization asserts here and the test-only
+   entries stay on the fresh (zeroed) path. *)
+let create ~(use_scratch : bool) ~(top_bracket : int) ~(heap_limit : int) :
+    (t, int) result =
   let frame_size_bytes = frame_size_bytes_for ~top_bracket in
   let frame_size_ints = frame_header_ints + (2 * top_bracket) in
   (* pcre2_match.c:7053-7054 *)
@@ -288,13 +325,74 @@ let create ~(top_bracket : int) ~(heap_limit : int) : (t, int) result =
        lies strictly below frames_top (see [push]'s >= test), so
        floor(heapframes_size / frame_size_bytes) frames always suffice. *)
     let capacity_frames = heapframes_size / frame_size_bytes in
-    let frames = Array.make (capacity_frames * frame_size_ints) 0 in
+    let needed = capacity_frames * frame_size_ints in
+    (* pcre2_match.c:7062-7077 — reuse the scratch arena when it is large
+       enough, without re-zeroing (see the scratch-slot comment above);
+       otherwise get a new one ([release]'s write-back then replaces the
+       slot's old, too-small contents — the C's free + malloc at
+       7067-7070). The compare_and_set is the entire acquire: no separate
+       test/set to interleave, so two concurrent matches can never both
+       hold the slot; the loser allocates fresh. DEVIATION: on reuse the
+       C keeps the retained vector's heapframes_size — the `<` test at
+       7065 leaves the larger cached value in match_data, giving later
+       matches extra pre-grow headroom that depends on call history. Here
+       [heapframes_size] stays the freshly computed value, so grow points
+       and heap-limit errors are identical to a first match on a fresh
+       match_data (the behavior the conformance baselines record).
+       DEVIATION (OOM while holding the flag): the undersized-replacement
+       Array.make below — and any [grow] during the match — allocates
+       while this match holds the flag; if the runtime raises
+       Out_of_memory there, no [release] runs and the flag sticks true,
+       permanently degrading every later create to the fresh-alloc path.
+       Accepted: the degraded mode is behavior-neutral (identical to
+       per-exec allocation before this cache existed, i.e. to a
+       permanently busy slot), and OOM is already effectively fatal to
+       the differential harness (the C oracle stubs abort on OOM). *)
+    let holds_scratch =
+      use_scratch && Atomic.compare_and_set scratch_busy false true
+    in
+    let frames =
+      if holds_scratch && Array.length !scratch_arena >= needed then
+        !scratch_arena
+      else Array.make needed 0
+    in
     (* pcre2_match.c:7079-7083 — mark every capture in frame 0 unset. *)
     for i = slot_ovector to frame_size_ints - 1 do
       frames.(i) <- unset
     done;
     Ok
-      { frames; heapframes_size; frame_size_ints; frame_size_bytes; heap_limit }
+      {
+        frames;
+        heapframes_size;
+        frame_size_ints;
+        frame_size_bytes;
+        heap_limit;
+        holds_scratch;
+      }
+
+(* Hand the arena back to the scratch slot at match exit — the C's
+   counterpart is doing nothing: the vector simply stays in match_data
+   for pcre2_match.c:7062-7077 to reuse on the next call. [a.frames] is
+   written back rather than the array [create] handed out: [grow]
+   re-points it, so growth is retained for the next match exactly like
+   the C's grown vector staying in match_data->heapframes
+   (pcre2_match.c:701-711). No-op for arenas that never held the slot
+   (fresh-path creates and the busy fallback). This site is reached only
+   on normal (value-encoded) match returns: an Out_of_memory raised while
+   the flag is held — e.g. from [grow]'s Array.make mid-match — skips it
+   and permanently degrades the process to fresh-alloc mode, which is
+   accepted as behavior-neutral (see the DEVIATION note at the acquire in
+   [create]). *)
+let release (a : t) : unit =
+  if a.holds_scratch then (
+    if Array.length a.frames <= scratch_max_retained_ints then
+      scratch_arena := a.frames
+    else
+      (* DEVIATION (retention cap): see [scratch_max_retained_ints]. *)
+      scratch_arena := [||];
+    (* The plain write above is published by this release store: the next
+       acquire's compare_and_set synchronizes with it. *)
+    Atomic.set scratch_busy false)
 
 (* pcre2_match.c:668-712 — the frames vector is full: get a new one,
    doubling the size, but constrained by the heap limit (which is in KiB).
@@ -430,7 +528,9 @@ let () =
 (* create: default-limit sizing (pcre2_match.c:7053-7054), frame-0 ovector
    all-unset (7079-7083), header zeros. *)
 let () =
-  (match create ~top_bracket:2 ~heap_limit:Limits.heap_limit with
+  (match
+     create ~use_scratch:false ~top_bracket:2 ~heap_limit:Limits.heap_limit
+   with
   | Ok a ->
       assert (Int.equal a.frame_size_bytes 168);
       assert (Int.equal a.frame_size_ints 32);
@@ -448,7 +548,9 @@ let () =
   | Error _ -> assert false);
   (* At least 10 frames when the frame is huge: top_bracket = 200 gives
      frame_size 3336, initial size 33360 > START_FRAMES_SIZE. *)
-  (match create ~top_bracket:200 ~heap_limit:Limits.heap_limit with
+  (match
+     create ~use_scratch:false ~top_bracket:200 ~heap_limit:Limits.heap_limit
+   with
   | Ok a ->
       assert (Int.equal a.frame_size_bytes 3336);
       assert (Int.equal a.heapframes_size 33360);
@@ -456,19 +558,21 @@ let () =
   | Error _ -> assert false);
   (* create-time clamp (pcre2_match.c:7055-7060): 1 KiB limit clamps
      20480 -> 1024; a 0 KiB limit cannot hold one frame -> HEAPLIMIT. *)
-  (match create ~top_bracket:0 ~heap_limit:1 with
+  (match create ~use_scratch:false ~top_bracket:0 ~heap_limit:1 with
   | Ok a ->
       assert (Int.equal a.heapframes_size 1024);
       assert (Int.equal (Array.length a.frames) (7 * 28))
   | Error _ -> assert false);
-  match create ~top_bracket:0 ~heap_limit:0 with
+  match create ~use_scratch:false ~top_bracket:0 ~heap_limit:0 with
   | Error e -> assert (Int.equal e Errors.error_heaplimit)
   | Ok _ -> assert false
 
 (* push: copy boundary and rdepth (pcre2_match.c:745-754), frame
    isolation, and the RMATCH copy carrying frame-0 captures upward. *)
 let () =
-  match create ~top_bracket:2 ~heap_limit:Limits.heap_limit with
+  match
+    create ~use_scratch:false ~top_bracket:2 ~heap_limit:Limits.heap_limit
+  with
   | Error _ -> assert false
   | Ok a ->
       (* Populate frame 0: header scratch + copied fields + captures. *)
@@ -528,7 +632,7 @@ let () =
      (frame 158 would end at 21624 >= 21504 -> grow; 21504/1024 = 21 and
      heap_limit <= 21 -> HEAPLIMIT). *)
 let () =
-  (match create ~top_bracket:0 ~heap_limit:20 with
+  (match create ~use_scratch:false ~top_bracket:0 ~heap_limit:20 with
   | Error _ -> assert false
   | Ok a ->
       let f = ref 0 in
@@ -540,7 +644,7 @@ let () =
       assert (Int.equal !f 149);
       assert (Int.equal !rc Errors.error_heaplimit);
       assert (Int.equal a.heapframes_size 20480));
-  (match create ~top_bracket:0 ~heap_limit:21 with
+  (match create ~use_scratch:false ~top_bracket:0 ~heap_limit:21 with
   | Error _ -> assert false
   | Ok a ->
       a.frames.(slot_eptr) <- 77 (* survives growth + copies to every N *);
@@ -563,7 +667,7 @@ let () =
      (top_bracket 200, frame 3336 bytes) is not a whole KiB (over 592);
      with heap_limit 40, growth at frame 9 clamps 66720 down to
      33360 + 1024*(40-32) - (1024-592) = 41120. *)
-  match create ~top_bracket:200 ~heap_limit:40 with
+  match create ~use_scratch:false ~top_bracket:200 ~heap_limit:40 with
   | Error _ -> assert false
   | Ok a ->
       a.frames.(slot_ovector) <- 12345;
@@ -578,3 +682,81 @@ let () =
       (* Used prefix (including frame 0's captures) copied by grow. *)
       assert (Int.equal a.frames.(slot_ovector) 12345);
       assert (Int.equal a.frames.(base a 9 + slot_ovector) 12345)
+
+(* Scratch-slot protocol (pcre2_match.c:7062-7077 reuse + the busy flag
+   and retention-cap DEVIATIONs): acquire, busy fallback, write-back,
+   dirty reuse with the frame-0 ovector re-fill, undersized replacement,
+   cap drop. Runs last and leaves the slot exactly as module init found
+   it (empty, not busy) — the fresh-path creates above never touch it. *)
+let () =
+  assert (Int.equal (Array.length !scratch_arena) 0);
+  assert (not (Atomic.get scratch_busy));
+  (match
+     create ~use_scratch:true ~top_bracket:2 ~heap_limit:Limits.heap_limit
+   with
+  | Error _ -> assert false
+  | Ok a ->
+      (* Empty slot: fresh (zeroed) arena, but the slot is now held. *)
+      assert a.holds_scratch;
+      assert (Atomic.get scratch_busy);
+      for i = 0 to slot_ovector - 1 do
+        assert (Int.equal a.frames.(i) 0)
+      done;
+      (* Busy slot: a nested/concurrent match falls back to a fresh
+         arena and its release is a no-op. *)
+      (match
+         create ~use_scratch:true ~top_bracket:2 ~heap_limit:Limits.heap_limit
+       with
+      | Error _ -> assert false
+      | Ok b ->
+          assert (not b.holds_scratch);
+          assert (not (b.frames == a.frames));
+          release b;
+          assert (Atomic.get scratch_busy);
+          assert (Int.equal (Array.length !scratch_arena) 0));
+      a.frames.(slot_ecode) <- 424242 (* dirt: must survive reuse *);
+      release a;
+      assert (not (Atomic.get scratch_busy));
+      assert (!scratch_arena == a.frames));
+  (* Reuse: the same array comes back, NOT re-zeroed; only frame 0's
+     ovector region is re-marked unset (pcre2_match.c:7079-7083). *)
+  (match
+     create ~use_scratch:true ~top_bracket:2 ~heap_limit:Limits.heap_limit
+   with
+  | Error _ -> assert false
+  | Ok a ->
+      assert a.holds_scratch;
+      assert (a.frames == !scratch_arena);
+      assert (Int.equal a.frames.(slot_ecode) 424242);
+      for i = slot_ovector to a.frame_size_ints - 1 do
+        assert (Int.equal a.frames.(i) unset)
+      done;
+      release a);
+  (* Undersized slot: a bigger pattern gets a fresh arena, and the
+     write-back replaces the slot's old contents (the C's free + malloc,
+     pcre2_match.c:7064-7076). *)
+  (match
+     create ~use_scratch:true ~top_bracket:200 ~heap_limit:Limits.heap_limit
+   with
+  | Error _ -> assert false
+  | Ok a ->
+      assert a.holds_scratch;
+      assert (not (a.frames == !scratch_arena));
+      release a;
+      assert (!scratch_arena == a.frames));
+  (* Retention cap: an arena grown past [scratch_max_retained_ints]
+     (simulated here by re-pointing [frames] like [grow] does) is dropped
+     at release instead of staying pinned in the slot. *)
+  (match
+     create ~use_scratch:true ~top_bracket:2 ~heap_limit:Limits.heap_limit
+   with
+  | Error _ -> assert false
+  | Ok a ->
+      assert a.holds_scratch;
+      a.frames <- Array.make (scratch_max_retained_ints + 1) 0;
+      release a;
+      assert (not (Atomic.get scratch_busy));
+      assert (Int.equal (Array.length !scratch_arena) 0));
+  (* The slot is back to its pristine state. *)
+  assert (Int.equal (Array.length !scratch_arena) 0);
+  assert (not (Atomic.get scratch_busy))
