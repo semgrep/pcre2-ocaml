@@ -2343,9 +2343,11 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            and makes for Perl compatibility. *)
         if utf then
           (* pcre2_match.c:5843-5857 — UTF: step back by characters with
-             BACKCHAR, stopping at the subject start; NOMATCH when even
-             the minimum cannot be reached, and Lmax is clamped to the
-             characters actually available. *)
+             BACKCHAR, stopping at the subject start (the BACKCHAR walk
+             itself is bounded there — see the DEVIATION note on
+             [op_vreverse_utf_loop]); NOMATCH when even the minimum
+             cannot be reached, and Lmax is clamped to the characters
+             actually available. *)
           (op_vreverse_utf_loop [@tailcall]) f 0
             (ecode + 1 + (2 * Limits.imm2_size))
         else
@@ -2763,10 +2765,20 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
           if Int.equal eptr mb.check_subject then false
           else if utf then (
             (* pcre2_match.c:6271-6277 — lastptr = Feptr - 1;
-               BACKCHAR(lastptr); GETCHAR(fc, lastptr). eptr - 1 >=
-               check_subject >= 0 (eptr <> check_subject above and
-               lookbehinds stop at check_subject); backchar_subject and
-               getchar_subject clamp their reads. *)
+               BACKCHAR(lastptr); GETCHAR(fc, lastptr). Invariant: eptr >=
+               start_subject = 0 (all reverse ops floor there), but eptr
+               CAN sit below check_subject — 10.44's max_lookbehind does
+               not count nested lookbehinds (pcre2_compile.c:9604-9612),
+               so OP_VREVERSE legitimately walks below it on valid UTF —
+               and eptr <> check_subject above therefore does NOT give
+               eptr - 1 >= check_subject. When eptr = 0 < check_subject
+               the C probes subject[-1] here (BACKCHAR-before-subject UB
+               family; the oracle reads its zero slack) — on that path
+               lastptr is -1 and getchar_subject reads 0 on this LE host
+               (see the out-of-scope note in the orchestrator log; a
+               dedicated defined pin for this probe is still owed). For
+               eptr > 0 the reads are in-string; backchar_subject bounds
+               its walk at 0. *)
             let lastptr = backchar_subject mb.subject (eptr - 1) in
             let fc = getchar_subject mb.subject lastptr in
             if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
@@ -5599,8 +5611,47 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
   and op_vreverse_utf_loop (f : int) (i : int) (branch_ecode : int) : int =
     (* pcre2_match.c:5845-5856 — OP_VREVERSE, UTF: for (i = 0; i < Lmax;
        i++) stop at the subject start (NOMATCH below the minimum,
-       otherwise Lmax = i), stepping back with BACKCHAR; then fall into
-       the shared RM37 loop (5871-5876). *)
+       otherwise Lmax = i, 5848-5853), stepping back with `Feptr--;
+       BACKCHAR(Feptr)` (5854-5855); then fall into the shared RM37 loop
+       (5871-5876).
+       DEVIATION (defined behavior where the C is undefined; third member
+       of the BACKCHAR-before-subject family — Newline.was_newline and
+       the oracle's zero slack padding): C's BACKCHAR at 5855 is the
+       unbounded continuation-byte walk (pcre2_intmodedep.h:345). When
+       the code units from start_subject up to the walk position are ALL
+       continuation bytes — an invalid-UTF prefix, which no option
+       excludes: (a) PCRE2_MATCH_INVALID_UTF starts matching after such
+       a prefix (bad-start skip, 6829-6836); (b) plain PCRE2_UTF with a
+       nonzero start offset validates only from check_subject
+       (pcre2_match.c:6891), so an all-continuation prefix BELOW
+       check_subject goes unchecked and a nested VREVERSE (the
+       max_lookbehind undercount below) walks into it, e.g.
+       /(?<=(?<=(a{3,5}))a)/utf on "\x80\x80aaaaaa" at offset 7,
+       check_subject = 2; (c) NO_UTF_CHECK garbage. Only a subject
+       actually validated from position 0 cannot trigger it — the walk
+       crosses below the subject start and C reads out of bounds, then
+       matches the branch from subject-1 (ovector entries at -1 ==
+       PCRE2_UNSET; fuzz seed 20260708 case 125828, minimized:
+       /(?<=(.)?)/match_invalid_utf on "\x80"). Pin: option-INDEPENDENT
+       — it keys on the bytes alone, exactly like the C walk it bounds,
+       and must never move behind an option gate (that would reintroduce
+       the UB divergence on the routes above). The walk is bounded at
+       start_subject, and if the
+       bounded walk still lands on a continuation byte (exactly the
+       crossing condition) this back-step cannot be completed — same
+       effect as reaching start_subject in the 5848-5853 too-few/cap
+       logic, with eptr left at its pre-step value. The stop test itself
+       stays C-literal (start_subject, NOT check_subject): a
+       check_subject floor was REJECTED because it changes DEFINED
+       behavior — 10.44's max_lookbehind does not count nested
+       lookbehinds ("A nested lookbehind does not contribute any length",
+       pcre2_compile.c:9604-9612), so on valid UTF with a large start
+       offset an inner lookbehind legitimately walks below check_subject
+       (e.g. /(?<=(?<=(a{3,4}))a)/ on "aaaaaa" at offset 5: real C gives
+       group 1 = (0,4), a check_subject floor would give (1,4)) and the
+       engine must too. The dev-only oracle carries the matching pin
+       (oracle/patches/pcre2-10.44-oracle-vreverse-backchar-bound
+       .patch). *)
     let fr = a.Frames.frames in
     let fb = Frames.base a f in
     if i < fr.(fb + Frames.slot_temp_32_1) then
@@ -5611,12 +5662,30 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         else (
           fr.(fb + Frames.slot_temp_32_1) <- i (* Lmax = i *);
           (rmatch [@tailcall]) f branch_ecode rm37 0)
-      else (
+      else
         (* eptr - 1 >= start_subject = 0 (eptr <> start_subject above and
            eptr >= start_subject by the mb invariant); backchar_subject
-           clamps its reads. *)
-        fr.(fb + Frames.slot_eptr) <- backchar_subject mb.subject (eptr - 1);
-        (op_vreverse_utf_loop [@tailcall]) f (i + 1) branch_ecode)
+           bounds the walk at 0. *)
+        let p = backchar_subject mb.subject (eptr - 1) in
+        if
+          (* safe: 0 <= p <= eptr - 1 < eptr <= mb.end_subject <=
+             String.length mb.subject *)
+          Int.equal
+            (Char.code (String.unsafe_get mb.subject p) land 0xc0)
+            0x80
+        then
+          (* pin: the bounded walk landed on a continuation byte, so C's
+             unbounded BACKCHAR would cross below the subject — the step
+             cannot be completed; same cap logic as the start_subject arm
+             above (5848-5853), eptr unchanged. *)
+          if i < fr.(fb + Frames.slot_temp_32_0) then
+            (backtrack [@tailcall]) f match_nomatch
+          else (
+            fr.(fb + Frames.slot_temp_32_1) <- i (* Lmax = i *);
+            (rmatch [@tailcall]) f branch_ecode rm37 0)
+        else (
+          fr.(fb + Frames.slot_eptr) <- p;
+          (op_vreverse_utf_loop [@tailcall]) f (i + 1) branch_ecode)
     else
       (* pcre2_match.c:5871-5876 — now try matching (RM37). *)
       (rmatch [@tailcall]) f branch_ecode rm37 0

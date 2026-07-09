@@ -50,7 +50,28 @@
           # affects ONLY the dev oracle library; vendor/pcre2 stays pristine
           # and the published `pcre2` OCaml package is unaffected. Upstream-
           # reportable C bug; see oracle/patches/*.patch header for full detail.
-          patches = [ ./oracle/patches/pcre2-10.44-oracle-ucd-clamp.patch ];
+          #
+          # The vreverse patch pins a second UB in the same spirit:
+          # OP_VREVERSE's per-character back-step `Feptr--; BACKCHAR(Feptr)`
+          # (pcre2_match.c:5854-5855) uses the UNBOUNDED continuation-byte
+          # walk, so under MATCH_INVALID_UTF a subject whose first code units
+          # are all UTF-8 continuation bytes lets it walk below the subject
+          # start (OOB read; the lookbehind then matches slack bytes and
+          # records ovector entries at -1 == PCRE2_UNSET; fuzz seed 20260708
+          # case 125828, minimized to /(?<=(.)?)/match_invalid_utf on
+          # "\x80"). The patch bounds ONLY the walk at start_subject and caps
+          # the step when it would cross (the 5848-5853 too-few/cap logic),
+          # firing exactly where unpatched C reads out of bounds; all defined
+          # behavior is untouched. Deliberately NOT a check_subject floor:
+          # max_lookbehind under-counts nested lookbehinds
+          # (pcre2_compile.c:9604-9612), so defined valid-UTF matching walks
+          # below check_subject and must keep doing so. Matches
+          # src/engine/interpreter.ml op_vreverse_utf_loop's DEVIATION pin.
+          # See the patch header.
+          patches = [
+            ./oracle/patches/pcre2-10.44-oracle-ucd-clamp.patch
+            ./oracle/patches/pcre2-10.44-oracle-vreverse-backchar-bound.patch
+          ];
           postPatch = "";
         });
       in let

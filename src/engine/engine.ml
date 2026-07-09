@@ -410,3 +410,98 @@ let () =
       match exec_full re "\xb9t" 0 0l with
       | No_match { mark = None } -> ()
       | _ -> assert false)
+
+(* The fuzz repro pinned by fuzz/corpus/regressions/125828-1cfb496a.txt:
+   OP_VREVERSE's per-character back-step `Feptr--; BACKCHAR(Feptr)`
+   (pcre2_match.c:5854-5855) walks below the subject under
+   PCRE2_MATCH_INVALID_UTF when the subject starts with UTF-8
+   continuation bytes; the engine bounds the walk at the subject start
+   and caps the step when it would cross (see the DEVIATION note on
+   Interpreter.op_vreverse_utf_loop; the dev oracle carries the matching
+   patch). Hand-minimized form: the lookbehind at the fragment start
+   (offset 1, after the bad-start skip) must NOT step back into the
+   invalid prefix, so (.)? matches empty and group 1 stays unset: rc = 1,
+   group 0 = (1,1). Expected values are the patched 10.44 oracle's
+   recorded result. *)
+let () =
+  let copts = Int32.of_int Options.match_invalid_utf in
+  (match compile "(?<=(.)?)" copts with
+  | Result.Error _ -> assert false
+  | Ok re -> (
+      match exec_full re "\x80" 0 0l with
+      | Match { ovector = [| 1; 1 |]; mark = None; start_char = 1 } -> ()
+      | _ -> assert false));
+  (* The full discovery-time shape (fuzz seed 20260708 case 125828): the
+     BRAZERO'd capture group inside the lookbehind — with its nested
+     group and ( *ACCEPT)-terminated lookahead — is skipped, not matched
+     against the invalid 0x80 byte, so groups 1-2 stay unset while the
+     zero-width groups 6-9 record (1,1). Expected ovector is the 10.44
+     oracle's recorded result (rc = 10 pairs). *)
+  match
+    compile
+      "(*LIMIT_MATCH=80000)(?<=(((?:[\\PL[:lower:]]{1}))(*positive_lookahead:(*ACCEPT)()))?(?!()H())(?!Z)()((?=()())))"
+      copts
+  with
+  | Result.Error _ -> assert false
+  | Ok re -> (
+      match exec_full re "\x80" 0 0l with
+      | Match
+          {
+            ovector =
+              [|
+                1; 1; -1; -1; -1; -1; -1; -1; -1; -1; -1; -1; 1; 1; 1; 1; 1; 1;
+                1; 1;
+              |];
+            mark = None;
+            start_char = 1;
+          } ->
+          ()
+      | _ -> assert false)
+
+(* The defined-behavior corner that forbids a check_subject floor on the
+   OP_VREVERSE walk (found in fidelity review of the 125828 fix): 10.44's
+   max_lookbehind does not count nested lookbehinds ("A nested lookbehind
+   does not contribute any length", pcre2_compile.c:9604-9612), so with a
+   start offset beyond max_lookbehind (check_subject = start_match -
+   max_lookbehind, pcre2_match.c:6851-6872) an inner lookbehind
+   legitimately walks below check_subject on fully valid UTF — every read
+   in bounds, no UB. Real C matches the inner a{3,4} max-first from
+   offset 0: group 1 = (0,4), the empty overall match at 5. Verified
+   against the patched oracle (whose pin never fires on valid data) AND
+   an unpatched real pcre2test (10.46 prints "1: aaaa", four chars =
+   start 0; on the UB repro above it prints group 1 offsets 0x1
+   0xffffffffffffffff, confirming the family). *)
+let () =
+  match compile "(?<=(?<=(a{3,4}))a)" (Int32.of_int Options.utf) with
+  | Result.Error _ -> assert false
+  | Ok re -> (
+      match exec_full re "aaaaaa" 5 0l with
+      | Match
+          { ovector = [| 5; 5; 0; 4 |]; mark = None; start_char = 5 } ->
+          ()
+      | _ -> assert false)
+
+(* The option-independent (plain-UTF) route through the same OP_VREVERSE
+   pin: with only PCRE2_UTF and a nonzero start offset, valid_utf checks
+   the subject only from check_subject (pcre2_match.c:6891) — here
+   start_match(7) - max_lookbehind(5) = 2 — so the all-continuation
+   prefix "\x80\x80" below it goes unchecked, and the inner lookbehind's
+   OP_VREVERSE (below check_subject via the max_lookbehind undercount,
+   pcre2_compile.c:9604-9612) walks into it: at the fifth back-step from
+   offset 2 the bounded BACKCHAR lands on the continuation byte at 0
+   (unpatched C reads subject[-1]) and the pin caps Lmax at 4, so the
+   branch is tried from offset 2: a{3,5} takes the four a's (2,6), the
+   inner assertion ends at 6, the outer matches "a" to 7. Expected
+   values are the patched 10.44 oracle's recorded result, and the
+   final result also agrees with unpatched real pcre2test (10.46: "1:
+   aaaa" — its doomed subject-1 candidate fails and it converges on the
+   same answer; only the OOB read differs). *)
+let () =
+  match compile "(?<=(?<=(a{3,5}))a)" (Int32.of_int Options.utf) with
+  | Result.Error _ -> assert false
+  | Ok re -> (
+      match exec_full re "\x80\x80aaaaaa" 7 0l with
+      | Match
+          { ovector = [| 7; 7; 2; 6 |]; mark = None; start_char = 7 } ->
+          ()
+      | _ -> assert false)

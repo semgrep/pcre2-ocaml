@@ -1,0 +1,99 @@
+Dev-only oracle hardening — NOT an upstream/vendor change.
+
+This patch is applied ONLY to the nix `pcre2c1044` derivation that backs the
+differential-testing C oracle (oracle/, fuzz/, test/conformance/). It is never
+applied to vendor/ (which stays a pristine copy of the 10.44 release) and never
+ships in the published `pcre2` OCaml package.
+
+Root cause it pins
+------------------
+OP_VREVERSE (the variable-length-lookbehind back-step, pcre2_match.c:5834-5883)
+steps back one character per iteration with `Feptr--; BACKCHAR(Feptr);`
+(5854-5855), where 8-bit BACKCHAR is the UNBOUNDED continuation-byte walk
+`while((*eptr & 0xc0u) == 0x80u) eptr--` (pcre2_intmodedep.h:345). When the
+code units from mb->start_subject up to the walk position are ALL UTF-8
+continuation bytes — an invalid-UTF prefix, which no option excludes:
+(a) PCRE2_MATCH_INVALID_UTF starts matching after such a prefix (bad-start
+skip, 6829-6836); (b) plain PCRE2_UTF with a nonzero start offset validates
+only from check_subject (pcre2_match.c:6891), so an all-continuation prefix
+BELOW check_subject goes unchecked and a nested OP_VREVERSE (the
+max_lookbehind undercount described below) walks into it, e.g.
+/(?<=(?<=(a{3,5}))a)/utf on "\x80\x80aaaaaa" at offset 7 (check_subject = 2);
+(c) PCRE2_NO_UTF_CHECK garbage. Only a subject actually validated from
+position 0 cannot trigger it — the walk crosses below the subject start: an
+out-of-bounds read. Because the trigger is option-independent, the pin below
+keys on the bytes alone, exactly like the walk it bounds — it must never be
+moved behind an option gate. The lookbehind branch is then matched from
+subject-1: it reads unowned memory as subject content, and a capturing group
+opened there records `P->eptr - mb->start_subject` = (PCRE2_SIZE)(-1) ==
+PCRE2_UNSET into the ovector (pcre2_match.c:6081), so callers receive an
+"unset" start with a set end, and pcre2test's substring printing indexes the
+subject at -1. This is the third member of the BACKCHAR-before-subject UB
+family (was_newline / the stubs' zero slack padding).
+
+Discovered by the differential fuzzer (seed 20260708, case 125828):
+  pattern (*LIMIT_MATCH=80000)(?<=(((?:[\PL[:lower:]]{1}))(*positive_lookahead:
+  (*ACCEPT)()))?(?!()H())(?!Z)()((?=()())))
+  compiled match_invalid_utf, subject 0x80 -> groups 1-2 diverge.
+Hand-minimized: /(?<=(.)?)/match_invalid_utf on subject 0x80 — the unpatched
+oracle returns group 1 = (-1, 1) and prints the slack byte it read at
+subject[-1]. Upstream-reportable C UB; documented here rather than "fixed" in
+vendor/.
+
+What the patch does, and why NOT a check_subject floor
+------------------------------------------------------
+The pin bounds ONLY the BACKCHAR walk, at mb->start_subject. If the bounded
+walk still lands on a continuation byte, the unbounded walk would have crossed
+below the subject (that landing is possible only when every unit from
+start_subject to the landing position is a continuation byte — the invalid
+prefix above), so the back-step cannot be completed: the pin applies the same
+too-few/cap logic as reaching start_subject in the loop's own stop test
+(5848-5853), leaving Feptr at its pre-step value. The pin therefore fires
+EXACTLY where unpatched C reads before the subject, and nowhere else: all
+defined behavior is byte-identical to the real 10.44 library. The stop test at
+5848 (`Feptr == mb->start_subject`) is deliberately left untouched.
+
+An earlier draft floored the walk at mb->check_subject (mirroring OP_REVERSE,
+5800). That was REJECTED because it changes DEFINED behavior: check_subject >
+start_subject also arises in fully valid-UTF matching when the start offset
+exceeds re->max_lookbehind (check_subject = start_match - max_lookbehind,
+pcre2_match.c:6851-6872), and 10.44's max_lookbehind does NOT count nested
+lookbehinds ("A nested lookbehind does not contribute any length",
+pcre2_compile.c:9604-9612), so an inner OP_VREVERSE legitimately — with every
+read in bounds — walks below check_subject on valid data. Example:
+/(?<=(?<=(a{3,4}))a)/ in UTF mode on "aaaaaa" at offset 5 has check_subject =
+1; real C walks the inner lookbehind back to offset 0 and yields group 1 =
+(0,4); a check_subject floor would yield (1,4).
+
+The pure-OCaml engine implements the identical pin (see the DEVIATION note on
+op_vreverse_utf_loop in src/engine/interpreter.ml); the equivalent bounded
+walk there is 8-bit by construction. Here only the 8-bit compilation of
+pcre2_match.c is pinned (the oracle links libpcre2-8 exclusively); the 16- and
+32-bit builds keep the upstream code path via the #else branch.
+
+--- a/src/pcre2_match.c
++++ b/src/pcre2_match.c
+@@ -5851,8 +5851,21 @@
+           Lmax = i;
+           break;
+           }
+-        Feptr--;
+-        BACKCHAR(Feptr);
++        {
++        PCRE2_SPTR fq = Feptr - 1;
++#if PCRE2_CODE_UNIT_WIDTH == 8
++        while (fq > mb->start_subject && (*fq & 0xc0u) == 0x80u) fq--;
++        if ((*fq & 0xc0u) == 0x80u)
++          {
++          if (i < Lmin) RRETURN(MATCH_NOMATCH);
++          Lmax = i;
++          break;
++          }
++#else
++        BACKCHAR(fq);
++#endif
++        Feptr = fq;
++        }
+         }
+       }
+     else

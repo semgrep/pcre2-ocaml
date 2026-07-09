@@ -1,0 +1,11 @@
+# fuzz-diff repro (differential: pure engine vs C oracle)
+# seed=20260708 case=125828 kind=exec
+# reason: ovector [1;1;0;1;0;1;-1;-1;-1;-1;-1;-1;1;1;1;1;1;1;1;1] vs [1;1;-1;-1;-1;-1;-1;-1;-1;-1;-1;-1;1;1;1;1;1;1;1;1]
+# pattern (ascii): (*LIMIT_MATCH=80000)(?<=(((?:[\\PL[:lower:]]{1}))(*positive_lookahead:(*ACCEPT)()))?(?!()H())(?!Z)()((?=()())))
+# compile: options=0x04000000 extra=0x00000000 newline=0 bsr=0
+# exec: subject="\128" offset=0 mopts=0x00000000
+# engine: rc=10 ov=[1;1;0;1;0;1;-1;-1;-1;-1;-1;-1;1;1;1;1;1;1;1;1] mark=<none> sc=1
+# oracle: rc=10 ov=[1;1;-1;-1;-1;-1;-1;-1;-1;-1;-1;-1;1;1;1;1;1;1;1;1] mark=<none> sc=1
+/28 2a 4c 49 4d 49 54 5f 4d 41 54 43 48 3d 38 30 30 30 30 29 28 3f 3c 3d 28 28 28 3f 3a 5b 5c 50 4c 5b 3a 6c 6f 77 65 72 3a 5d 5d 7b 31 7d 29 29 28 2a 70 6f 73 69 74 69 76 65 5f 6c 6f 6f 6b 61 68 65 61 64 3a 28 2a 41 43 43 45 50 54 29 28 29 29 29 3f 28 3f 21 28 29 48 28 29 29 28 3f 21 5a 29 28 29 28 28 3f 3d 28 29 28 29 29 29 29/hex,match_invalid_utf
+    \x80\=offset=0,mark,startchar
+
