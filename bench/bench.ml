@@ -268,6 +268,9 @@ module Oracle_driver : DRIVER = struct
   let last_end = ref 0
 
   let compile pattern options =
+    (* Compile stays on the default PADDED oracle path (oracle_test_compile):
+       it runs once per benchmark, outside the timed region, so the slack
+       copy costs nothing measurable and keeps the UB guard. *)
     match T.compile ~options pattern with
     | Ok c -> Ok c
     | Error { T.errcode; erroroffset } ->
@@ -275,14 +278,38 @@ module Oracle_driver : DRIVER = struct
           (Printf.sprintf "compile error %d at offset %d (%s)" errcode
              erroroffset (T.error_message errcode))
 
+  (* UNPADDED oracle exec — TIMING ONLY. This is the one deliberate hole in
+     13454e2's zero-slack padding: that commit copies every subject into a
+     padded buffer per pcre2_match call to pin PCRE2 10.44's bounded UB
+     overruns to deterministic 0x00 (required for fuzz/conformance), but at
+     bench call counts (~100k-200k execs over MB-scale corpora) the
+     O(calls x subject_len) memcpy IS the measurement: at e233089,
+     repeat_bounded read oracle=105,349ms vs raw-C=96ms (~1000x) and email
+     2481ms vs 137ms, while single-call pathological was unaffected
+     (156ms ~= 157ms). The M10 gate ratio engine/oracle <= 2.0 is only
+     meaningful under its fairness premise oracle ~= raw-C (35c6fb6 log
+     row), so the bench opts out of padding here: pcre2 reads the OCaml
+     string in place, exactly as the stub did before 13454e2. This inherits
+     the C's UB on crafted inputs (invalid trailing UTF-8 etc.) — acceptable
+     ONLY because the bench corpora are fixed, benign, and valid UTF-8 where
+     UTF is enabled. The `external` below is the sole OCaml declaration of
+     this symbol; fuzz/conformance go through Test_driver.exec and stay
+     padded. Mark-read guard (5c790c2) applies on this path too — the C side
+     shares one body (test_exec_common in oracle/pcre2test_stubs.c). *)
+  external exec_nopad_raw :
+    T.code -> string -> int -> int -> int * int array * string option * int
+    = "oracle_test_exec_nopad"
+
   let exec code subject offset options =
-    let r = T.exec ~options ~subject ~offset code in
-    if r.T.rc > 0 then (
-      last_start := r.T.ovector.(0);
-      last_end := r.T.ovector.(1);
+    let rc, ovector, _mark, _startchar =
+      exec_nopad_raw code subject offset options
+    in
+    if rc > 0 then (
+      last_start := ovector.(0);
+      last_end := ovector.(1);
       1)
-    else if r.T.rc = -1 || r.T.rc = -2 then 0 (* NOMATCH / PARTIAL *)
-    else r.T.rc
+    else if rc = -1 || rc = -2 then 0 (* NOMATCH / PARTIAL *)
+    else rc
 end
 
 module Raw_c = struct

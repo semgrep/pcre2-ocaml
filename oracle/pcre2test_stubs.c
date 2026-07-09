@@ -139,10 +139,16 @@ CAMLprim value oracle_test_compile(value pattern, value voptions, value vnewline
         CAMLreturn(result);
 }
 
-/* exec : code -> string -> int (offset) -> int (options)
- *      -> int (rc) * int array (ovector, unset = -1) * string option (mark)
- *      * int (startchar) */
-CAMLprim value oracle_test_exec(value vcode, value subject, value voffset, value voptions) {
+/* Shared body of [oracle_test_exec] (padded, the default) and
+ * [oracle_test_exec_nopad] (bench-only). One body so the mark-read guard
+ * below (commit 5c790c2 -- about UNINITIALIZED match_data->mark on
+ * early-return rcs, orthogonal to subject padding) provably applies on both
+ * paths and cannot drift. [use_slack] selects the subject buffer:
+ *   1 -> slack-padded copy (see ORACLE_OVERRUN_SLACK above; commit 13454e2);
+ *   0 -> String_val(subject) handed to pcre2 directly, as the stub did
+ *        before 13454e2. TIMING-ONLY -- see oracle_test_exec_nopad. */
+static value test_exec_common(value vcode, value subject, value voffset, value voptions,
+                              int use_slack) {
         CAMLparam4(vcode, subject, voffset, voptions);
         CAMLlocal4(res, ovec_arr, mark_opt, mark_str);
 
@@ -154,13 +160,18 @@ CAMLprim value oracle_test_exec(value vcode, value subject, value voffset, value
         /* Match pcre2test: make unset groups deterministic. */
         for (uint32_t i = 0; i < 2 * oveccount; i++) ovector[i] = PCRE2_UNSET;
 
-        /* Slack-padded copy so any bounded subject overrun reads 0x00. */
+        /* Padded: slack copy so any bounded subject overrun reads 0x00.
+         * Unpadded: SAFETY: passing String_val(subject) directly is fine --
+         * nothing between the read and pcre2_match returning allocates on the
+         * OCaml heap (match_data / slack buffers use C malloc), so no GC can
+         * move the string while pcre2 holds the pointer. */
         size_t subject_len = caml_string_length(subject);
         unsigned char *subj_buf =
-            oracle_slack_dup((const unsigned char *)String_val(subject), subject_len);
+            use_slack ? oracle_slack_dup((const unsigned char *)String_val(subject), subject_len)
+                      : (unsigned char *)String_val(subject);
         int rc = pcre2_match(regex, (PCRE2_SPTR)subj_buf, subject_len,
                              (PCRE2_SIZE)Long_val(voffset), (uint32_t)Long_val(voptions), md, NULL);
-        oracle_slack_free(subj_buf);
+        if (use_slack) oracle_slack_free(subj_buf);
 
         ovec_arr = caml_alloc(2 * oveccount, 0);
         for (uint32_t i = 0; i < 2 * oveccount; i++) {
@@ -228,6 +239,40 @@ CAMLprim value oracle_test_exec(value vcode, value subject, value voffset, value
         Field(res, 2) = mark_opt;
         Field(res, 3) = Val_long(startchar);
         CAMLreturn(res);
+}
+
+/* exec : code -> string -> int (offset) -> int (options)
+ *      -> int (rc) * int array (ovector, unset = -1) * string option (mark)
+ *      * int (startchar)
+ * DEFAULT entry point (oracle/test_driver.ml): subject slack-padded, so the
+ * fuzzer and the conformance runner always get the pinned reads-as-zero
+ * overrun model. */
+CAMLprim value oracle_test_exec(value vcode, value subject, value voffset, value voptions) {
+        return test_exec_common(vcode, subject, voffset, voptions, /*use_slack=*/1);
+}
+
+/* exec, UNPADDED subject -- TIMING ONLY. Same signature as oracle_test_exec.
+ *
+ * Exists solely so the M10 perf bench (bench/bench.ml Oracle_driver) can
+ * measure the C matcher instead of memcpy: the gate metric engine/oracle
+ * <= 2.0x assumes oracle ~= raw-C (35c6fb6 log row), but the per-call
+ * oracle_slack_dup added by 13454e2 costs O(calls x subject_len) -- measured
+ * at e233089 it inflated repeat_bounded to oracle=105,349ms vs raw-C=96ms
+ * (~1000x) and email to 2481ms vs 137ms, while single-call pathological
+ * stayed 156ms ~= 157ms (padding-copy cost, not matcher cost). 13454e2's
+ * padding itself is correct and REQUIRED for fuzz/conformance, which pin
+ * PCRE2 10.44's bounded UB overruns to deterministic 0x00; this variant
+ * reintroduces that UB by design, so it must only ever see the bench's
+ * fixed, benign corpora (valid UTF-8 where UTF is on; no crafted invalid
+ * trailing sequences).
+ *
+ * Containment: this symbol is deliberately NOT declared in
+ * oracle/test_driver.ml -- the ONLY OCaml `external` for it lives in
+ * bench/bench.ml, so the fuzzer / conformance runner cannot reach it without
+ * writing a new external declaration. The mark-read guard (5c790c2) is in
+ * test_exec_common and therefore applies here too. */
+CAMLprim value oracle_test_exec_nopad(value vcode, value subject, value voffset, value voptions) {
+        return test_exec_common(vcode, subject, voffset, voptions, /*use_slack=*/0);
 }
 
 /* info : code -> int (argoptions) * int (alloptions) * int (newline)
