@@ -1202,16 +1202,69 @@ let rec rmatch (st : match_state) (f : int) (ra : int) (rb : int)
     let fr = a.Frames.frames in
     let fsz = a.Frames.frame_size_ints in
     let src = (f * fsz) + Frames.slot_eptr in
-    let dst = (n * fsz) + Frames.slot_eptr in
+    let fb = n * fsz in
+    let dst = fb + Frames.slot_eptr in
     let len = fsz - Frames.slot_eptr in
-    for i = 0 to len - 1 do
-      Array.unsafe_set fr (dst + i) (Array.unsafe_get fr (src + i))
-    done;
+    (* The first 8 slots exist in every frame: len = (slot_ovector -
+       slot_eptr) + 2 * top_bracket = 8 + 2 * top_bracket >= 8 (the
+       copied header fields eptr..offset_top, frames.ml layout), so the
+       straight-line copy below is the whole memcpy for top_bracket = 0
+       patterns and the loop covers only the ovector tail. Same
+       elements, same order as the loop it replaces. *)
+    Array.unsafe_set fr dst (Array.unsafe_get fr src);
+    Array.unsafe_set fr (dst + 1) (Array.unsafe_get fr (src + 1));
+    Array.unsafe_set fr (dst + 2) (Array.unsafe_get fr (src + 2));
+    Array.unsafe_set fr (dst + 3) (Array.unsafe_get fr (src + 3));
+    Array.unsafe_set fr (dst + 4) (Array.unsafe_get fr (src + 4));
+    Array.unsafe_set fr (dst + 5) (Array.unsafe_get fr (src + 5));
+    Array.unsafe_set fr (dst + 6) (Array.unsafe_get fr (src + 6));
+    Array.unsafe_set fr (dst + 7) (Array.unsafe_get fr (src + 7));
+    (* len > 8 implies top_bracket >= 1, i.e. len >= 10: slots 8 and 9
+       (the group-1 ovector pair) exist in both frames. *)
+    if len > 8 then (
+      Array.unsafe_set fr (dst + 8) (Array.unsafe_get fr (src + 8));
+      Array.unsafe_set fr (dst + 9) (Array.unsafe_get fr (src + 9));
+      for i = 10 to len - 1 do
+        Array.unsafe_set fr (dst + i) (Array.unsafe_get fr (src + i))
+      done);
     (* pcre2_match.c:753 — N->rdepth = Frdepth + 1 (same bound). *)
-    Array.unsafe_set fr
-      ((n * fsz) + Frames.slot_rdepth)
+    Array.unsafe_set fr (fb + Frames.slot_rdepth)
       (Array.unsafe_get fr ((f * fsz) + Frames.slot_rdepth) + 1);
-    (new_frame [@tailcall]) st n ra group_frame_type
+    (* [new_frame]'s body inlined on the hot path (DEVIATION (perf):
+       the C's RMATCH goto chain falls through MATCH_RECURSE into
+       NEW_FRAME inside ONE function with F in a register; the separate
+       [new_frame] entry re-derives mb/a/fr/fb per call. Same statements
+       in the same order as [new_frame], which stays the canonical copy
+       for the cold-grow path and the match_ entry). All unsafe fr
+       accesses below are on header slots of frame n: fb + slot <
+       (n + 1) * frame_size_ints <= Array.length fr (the fast-path bound
+       proven above). *)
+    (* pcre2_match.c:758-761 — NEW_FRAME: type, starting code pointer,
+       and the default backtrack of one frame (Fback_frame = frame_size
+       in C bytes; frame units here, frames.ml DEVIATION). *)
+    Array.unsafe_set fr (fb + Frames.slot_group_frame_type) group_frame_type;
+    Array.unsafe_set fr (fb + Frames.slot_ecode) ra;
+    Array.unsafe_set fr (fb + Frames.slot_back_frame) 1;
+    (* pcre2_match.c:763-773 — if this is a special type of group frame,
+       remember its offset (frame index here, frames.ml DEVIATION); if a
+       recursion, set a new current recursion value. *)
+    if not (Int.equal group_frame_type 0) then (
+      Array.unsafe_set fr (fb + Frames.slot_last_group_offset) n;
+      if Int.equal (Frames.gf_idmask group_frame_type) Frames.gf_recurse then
+        Array.unsafe_set fr
+          (fb + Frames.slot_current_recurse)
+          (Frames.gf_datamask group_frame_type));
+    (* pcre2_match.c:776-783 — first check that we haven't recorded too
+       many backtracks, or exceeded the recursive depth limit. The C's
+       post-increment compares the OLD count and bumps it regardless. *)
+    let mb = st.mb in
+    let count = mb.match_call_count in
+    mb.match_call_count <- count + 1;
+    if count >= mb.match_limit then Errors.error_matchlimit
+    else if
+      Array.unsafe_get fr (fb + Frames.slot_rdepth) >= mb.match_limit_depth
+    then Errors.error_depthlimit
+    else (dispatch [@tailcall]) st n
 
 and new_frame (st : match_state) (f : int) (ecode : int)
     (group_frame_type : int) : int =
@@ -2805,11 +2858,25 @@ and dispatch (st : match_state) (f : int) : int =
                   (Array.unsafe_get fr (pb + Frames.slot_last_group_offset));
                 (* pcre2_match.c:5975-5984 — reinstate the previous set
                    of captures and then carry on after the recursion
-                   call. In bounds: offset_top <= 2 * top_bracket in
-                   every frame. *)
-                Array.blit fr (pb + Frames.slot_ovector) fr
-                  (fb + Frames.slot_ovector)
-                  fr.(fb + Frames.slot_offset_top);
+                   call: memcpy of Foffset_top PCRE2_SIZEs from
+                   P->ovector to Fovector (the C casts F to a char
+                   pointer and offsets to its ovector). Manual
+                   int loop, NOT Array.blit: blit into the major-heap
+                   arena runs the caml_modify write barrier per element
+                   even for immediates (§8). safe: len = Foffset_top <=
+                   2 * top_bracket (every frame's offset_top invariant:
+                   OP_CLOSE/CBRA set it to offset + 2 with number <=
+                   top_bracket, frame 0 starts at 0, pushes copy it), so
+                   both spans end at or before slot_ovector + 2 *
+                   top_bracket = frame_size_ints inside frames p and f —
+                   valid indices per this arm's head proof and the
+                   unchain proof above. *)
+                let len = Array.unsafe_get fr (fb + Frames.slot_offset_top) in
+                for i = 0 to len - 1 do
+                  Array.unsafe_set fr
+                    (fb + Frames.slot_ovector + i)
+                    (Array.unsafe_get fr (pb + Frames.slot_ovector + i))
+                done;
                 Array.unsafe_set fr
                   (fb + Frames.slot_offset_top)
                   (Array.unsafe_get fr (pb + Frames.slot_offset_top));
@@ -2944,12 +3011,22 @@ and dispatch (st : match_state) (f : int) : int =
                  P = N - frame_size (6067); the generic unchain above
                  already established that as [p] (>= 0: the recursed
                  group's frame is the GF_RECURSE frame recorded by
-                 OP_RECURSE's RM11 RMATCH). In bounds: offset_top <=
-                 2 * top_bracket in every frame. *)
+                 OP_RECURSE's RM11 RMATCH). Manual int loop, NOT
+                 Array.blit: blit into the major-heap arena runs the
+                 caml_modify write barrier per element even for
+                 immediates (§8). safe: len = Foffset_top <= 2 *
+                 top_bracket (every frame's offset_top invariant), so
+                 both spans end at or before slot_ovector + 2 *
+                 top_bracket = frame_size_ints inside frames p and f —
+                 valid indices per this arm's head proof and the unchain
+                 proof above. *)
               let pb = Frames.base a p in
-              Array.blit fr (pb + Frames.slot_ovector) fr
-                (fb + Frames.slot_ovector)
-                fr.(fb + Frames.slot_offset_top);
+              let len = Array.unsafe_get fr (fb + Frames.slot_offset_top) in
+              for i = 0 to len - 1 do
+                Array.unsafe_set fr
+                  (fb + Frames.slot_ovector + i)
+                  (Array.unsafe_get fr (pb + Frames.slot_ovector + i))
+              done;
               Array.unsafe_set fr
                 (fb + Frames.slot_offset_top)
                 (Array.unsafe_get fr (pb + Frames.slot_offset_top));
@@ -3392,7 +3469,20 @@ and op_end_tail (st : match_state) (f : int) : int =
       if top_bracket + 1 > match_data.oveccount then match_data.oveccount
       else top_bracket + 1
     in
-    Array.blit fr (fb + Frames.slot_ovector) match_data.ovector 2 (i - 2);
+    (* memcpy(match_data->ovector + 2, Fovector, (i - 2) *
+       sizeof(PCRE2_SIZE)) (pcre2_match.c:938). Manual int loop, NOT
+       Array.blit: blit runs the caml_modify write barrier per element
+       even for immediates (§8), and this copy runs once per successful
+       match. safe: i <= 2 * oveccount = Array.length
+       match_data.ovector (every match_data construction site sizes it
+       so), so destination indices 2 .. i - 1 are in bounds; i - 2 <=
+       2 * top_bracket, so source indices end at or before slot_ovector
+       + 2 * top_bracket = frame_size_ints inside frame f (valid per
+       this function's fb, [dispatch]'s head proof). *)
+    for k = 0 to i - 3 do
+      Array.unsafe_set match_data.ovector (2 + k)
+        (Array.unsafe_get fr (fb + Frames.slot_ovector + k))
+    done;
     let i = ref i in
     decr i;
     while !i >= fr.(fb + Frames.slot_offset_top) + 2 do
@@ -6848,10 +6938,18 @@ and op_ket_tail (st : match_state) (f : int) (p : int) (bracode : int) : int =
        in this case that test is done at the outer level. [p] >= 0:
        OP_KETRPOS is only compiled as the ket of the BRAPOS bracket
        family, never OP_BRA/OP_COND (mb invariant), so the P computation
-       above took the non-NULL branch. *)
-    Array.blit fr (fb + Frames.slot_eptr) fr
-      (Frames.base a p + Frames.slot_eptr)
-      (a.Frames.frame_size_ints - Frames.slot_eptr);
+       above took the non-NULL branch. Manual int loop, NOT Array.blit:
+       blit into the major-heap arena runs the caml_modify write barrier
+       per element even for immediates (§8). safe: the copy spans slots
+       slot_eptr .. frame_size_ints - 1 of frames f and p, both valid
+       frame indices (this function's head proof: (f + 1) *
+       frame_size_ints <= Array.length fr and 0 <= p < f). *)
+    let pd = Frames.base a p + Frames.slot_eptr in
+    let sc = fb + Frames.slot_eptr in
+    let len = a.Frames.frame_size_ints - Frames.slot_eptr in
+    for i = 0 to len - 1 do
+      Array.unsafe_set fr (pd + i) (Array.unsafe_get fr (sc + i))
+    done;
     (backtrack [@tailcall]) st f match_ketrpos)
   else if
     (* pcre2_match.c:6100-6121 — a non-repeating ket needs no special
@@ -7572,13 +7670,23 @@ and backtrack (st : match_state) (f : int) (rrc : int) : int =
         if Int.equal rrc match_accept then (
           (* pcre2_match.c:5522-5527 — memcpy(Fovector,
              assert_accept_frame->ovector, assert_accept_frame->
-             offset_top * sizeof(PCRE2_SIZE)). In bounds:
-             [assert_accept_frame] is a valid frame index (MATCH_ACCEPT
-             is only produced by the OP_ASSERT_ACCEPT arm, which sets
-             it) and offset_top <= 2 * top_bracket in both frames. *)
+             offset_top * sizeof(PCRE2_SIZE)). Manual int loop, NOT
+             Array.blit: blit into the major-heap arena runs the
+             caml_modify write barrier per element even for immediates
+             (§8). safe: [assert_accept_frame] is a valid frame index
+             (MATCH_ACCEPT is only produced by the OP_ASSERT_ACCEPT arm,
+             which sets it) and len = its offset_top <= 2 * top_bracket
+             (every frame's offset_top invariant), so both spans end at
+             or before slot_ovector + 2 * top_bracket = frame_size_ints
+             inside their frames (f valid per this function's head
+             proof). *)
           let ab = Frames.base a st.assert_accept_frame in
-          Array.blit fr (ab + Frames.slot_ovector) fr (fb + Frames.slot_ovector)
-            fr.(ab + Frames.slot_offset_top);
+          let len = Array.unsafe_get fr (ab + Frames.slot_offset_top) in
+          for i = 0 to len - 1 do
+            Array.unsafe_set fr
+              (fb + Frames.slot_ovector + i)
+              (Array.unsafe_get fr (ab + Frames.slot_ovector + i))
+          done;
           fr.(fb + Frames.slot_offset_top) <- fr.(ab + Frames.slot_offset_top);
           fr.(fb + Frames.slot_mark) <- fr.(ab + Frames.slot_mark);
           (* pcre2_match.c:5534-5535 — break out of the branch loop:
@@ -7714,12 +7822,22 @@ and backtrack (st : match_state) (f : int) (rrc : int) : int =
            branch came back: switch (rrc). *)
         if Int.equal rrc match_accept then (
           (* pcre2_match.c:5712-5717 — MATCH_ACCEPT: save captures from
-             the frame remembered by OP_ASSERT_ACCEPT. In bounds: as at
-             the RM3 resume ([assert_accept_frame] is a valid frame
-             index and offset_top <= 2 * top_bracket in both frames). *)
+             the frame remembered by OP_ASSERT_ACCEPT. Manual int loop,
+             NOT Array.blit: blit into the major-heap arena runs the
+             caml_modify write barrier per element even for immediates
+             (§8). safe: as at the RM3 resume — [assert_accept_frame]
+             is a valid frame index and len = its offset_top <= 2 *
+             top_bracket (every frame's offset_top invariant), so both
+             spans end at or before slot_ovector + 2 * top_bracket =
+             frame_size_ints inside their frames (f valid per this
+             function's head proof). *)
           let ab = Frames.base a st.assert_accept_frame in
-          Array.blit fr (ab + Frames.slot_ovector) fr (fb + Frames.slot_ovector)
-            fr.(ab + Frames.slot_offset_top);
+          let len = Array.unsafe_get fr (ab + Frames.slot_offset_top) in
+          for i = 0 to len - 1 do
+            Array.unsafe_set fr
+              (fb + Frames.slot_ovector + i)
+              (Array.unsafe_get fr (ab + Frames.slot_ovector + i))
+          done;
           fr.(fb + Frames.slot_offset_top) <- fr.(ab + Frames.slot_offset_top);
           (* fallthrough from MATCH_ACCEPT in C (5719-5724): in the
              case of a match, the captures have already been put into
