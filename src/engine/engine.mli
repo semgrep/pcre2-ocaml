@@ -19,6 +19,28 @@ type exec_result =
 
 val compile : string -> int32 -> (t, int) result
 
+val compile_ctx :
+  ?newline:int -> ?bsr:int -> ?extra:int -> string -> int32 -> (t, int * int) result
+(** [compile] plus the pcre2_compile_context knobs the pcre2test harness
+    drives: [newline]/[bsr] take PCRE2_NEWLINE_* / PCRE2_BSR_* numeric
+    values, [extra] the extra-options word; 0 = build default. On failure
+    returns [(errcode, erroroffset)] — the harness prints both. *)
+
+type info = {
+  argoptions : int;  (** options as passed to compile (PCRE2_INFO_ARGOPTIONS) *)
+  alloptions : int;  (** options after (?...) etc. (PCRE2_INFO_ALLOPTIONS) *)
+  newline : int;  (** PCRE2_NEWLINE_* (PCRE2_INFO_NEWLINE) *)
+  bsr : int;  (** PCRE2_BSR_* (PCRE2_INFO_BSR) *)
+  capture_count : int;  (** highest capture number (PCRE2_INFO_CAPTURECOUNT) *)
+}
+
+val info : t -> info
+(** The pcre2_pattern_info() subset the pcre2test harness reads. *)
+
+val error_message : int -> string
+(** Total variant of [Errors.message] (pcre2_get_error_message): returns
+    [""] for codes where the C returns PCRE2_ERROR_BADDATA. *)
+
 val exec_full : t -> string -> int -> int32 -> exec_result
 
 val exec : t -> string -> int -> int32 -> ((int * int) option, int) result

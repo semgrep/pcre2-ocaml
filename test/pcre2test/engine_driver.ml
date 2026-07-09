@@ -1,0 +1,85 @@
+(* Pure-engine driver for the pcre2test-compatible harness: adapts
+   Pcre2_engine.Engine (src/engine/) to the DRIVER seam (driver.ml).
+
+   From M1 on the conformance frontier tracks THIS driver; the C oracle
+   (oracle/test_driver.ml) remains the fixed reference implementation. *)
+
+module E = Pcre2_engine.Engine
+
+type code = E.t
+
+type compile_error = { errcode : int; erroroffset : int }
+
+let compile ?(options = 0) ?(newline = 0) ?(bsr = 0) ?(extra = 0) pattern :
+    (code, compile_error) Result.t =
+  (* Option bits cross to the engine boundary as int32 exactly once, per
+     port-conventions.md §3 (Int32.of_int keeps the low 32 bits). *)
+  match E.compile_ctx ~newline ~bsr ~extra pattern (Int32.of_int options) with
+  | Ok c -> Ok c
+  | Error (errcode, erroroffset) -> Error { errcode; erroroffset }
+
+type exec_result = {
+  rc : int;  (** pcre2_match return: >0 pairs, 0 ovector too small, <0 error *)
+  ovector : int array;  (** 2 * ovector-count entries; unset = -1 *)
+  mark : string option;
+  startchar : int;
+}
+
+(* rc mirrors pcre2_match return conventions: >0 = (index of highest set
+   pair) + 1, 0 = ovector too small — never produced here because the engine
+   returns a full-size ovector (like the oracle stub; the harness emulates
+   pcre2test's finite match-data ovector on top).
+
+   TODO(M1 wiring): once exec_full returns real matches, rc must come from
+   the engine's end_offset_top (rc = offset_top/2 + 1, as pcre2_match sets
+   match_data->rc): unset middle groups BELOW offset_top still count in C,
+   so scanning for the highest set pair is only a shape-correct placeholder
+   for the skeleton (exec_full never returns Match yet). *)
+let rc_of_ovector (ovector : int array) : int =
+  let rec highest i =
+    if i < 0 then 0
+    else if ovector.(2 * i) <> -1 || ovector.((2 * i) + 1) <> -1 then i + 1
+    else highest (i - 1)
+  in
+  highest ((Array.length ovector / 2) - 1)
+
+let exec ?(options = 0) ~subject ~offset code : exec_result =
+  match E.exec_full code subject offset (Int32.of_int options) with
+  | E.Match { ovector; mark; start_char } ->
+      { rc = rc_of_ovector ovector; ovector; mark; startchar = start_char }
+  | E.No_match ->
+      { rc = Flags.error_nomatch; ovector = [||]; mark = None; startchar = 0 }
+  | E.Partial { start; mark } ->
+      (* pcre2_match PARTIAL: ovector[0] = start of the partial match,
+         ovector[1] = end of the inspected subject (its length: a partial
+         match always runs off the end). *)
+      {
+        rc = Flags.error_partial;
+        ovector = [| start; String.length subject |];
+        mark;
+        startchar = start;
+      }
+  | E.Error e -> { rc = e; ovector = [||]; mark = None; startchar = 0 }
+
+type info = {
+  argoptions : int;
+  alloptions : int;
+  newline : int;
+  bsr : int;
+  capture_count : int;
+}
+
+let info code : info =
+  let i = E.info code in
+  {
+    argoptions = i.E.argoptions;
+    alloptions = i.E.alloptions;
+    newline = i.E.newline;
+    bsr = i.E.bsr;
+    capture_count = i.E.capture_count;
+  }
+
+let name_table code = E.capture_groups code
+
+(** Exactly pcre2_get_error_message; empty string for unknown codes. *)
+let error_message = E.error_message

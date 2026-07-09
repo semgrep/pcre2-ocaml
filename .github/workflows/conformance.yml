@@ -22,6 +22,8 @@ jobs:
         run: nix develop -c dune runtest --force
       - name: Conformance vs baselines (regressions or stale skips fail)
         run: nix develop -c dune exec test/conformance/runner.exe
+      - name: Engine conformance vs engine baseline (the port frontier)
+        run: nix develop -c dune exec test/conformance/runner.exe -- --driver=engine
       # Differential fuzz smoke lands with the fuzzer (per-milestone feature
       # masks; see docs/ocaml-engine plan docs):
       # - run: nix develop -c dune exec fuzz/fuzz_diff.exe -- --cases 10000

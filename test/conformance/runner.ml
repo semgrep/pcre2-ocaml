@@ -1,20 +1,44 @@
 (* Conformance runner: replays vendored pcre2test corpora through the
-   harness (oracle driver, in-process) and byte-compares each unit's output
-   with the vendored testoutput file.
+   harness (in-process) and byte-compares each unit's output with the
+   vendored testoutput file.
 
-   Modes:
+   Drivers (--driver=oracle|engine, default oracle):
+     oracle   the C PCRE2 10.44 library; baseline =
+              test/conformance/baseline_counts.sexp (harness correctness)
+     engine   the pure OCaml engine (src/engine/); baseline =
+              test/conformance/engine_baseline_counts.sexp — THE port
+              frontier lives here from M1 on
+
+   Modes (combine with --driver=...):
      runner                     report per-file counts; if a baseline file
                                 exists, fail (exit 1) on any regression
      runner --frontier          print the first failing in-scope unit, exit 1
      runner --only FILE:ORD     run one unit, print a full expected/actual diff
-     runner --update-baseline   rewrite test/conformance/baseline_counts.sexp
+     runner --update-baseline   rewrite the selected driver's baseline file
 
    Skips: units whose harness run reports an out-of-scope feature
    (reason "modifier:<name>" / "command:<name>") are excluded from pass/fail,
    as are units matching skiplist.sexp. A skiplisted unit that PASSES is
-   reported as STALE-SKIP and makes the run fail. *)
+   reported as STALE-SKIP and makes the run fail — ORACLE MODE ONLY: the
+   skiplist documents harness scope against the oracle, and the engine is
+   expected to fail those units for a long time (they stay excluded from
+   engine counts, just without the staleness error). *)
 
-module H = Pcre2test_harness.Harness.Make (Pcre2_test_driver.Test_driver)
+module type HARNESS = sig
+  type t
+
+  val create : unit -> t
+  val process_line : t -> string -> string list
+  val finish : t -> string list
+  val reset_unit_skips : t -> unit
+  val unit_skips : t -> string list
+end
+
+module Oracle_harness =
+  Pcre2test_harness.Harness.Make (Pcre2_test_driver.Test_driver)
+module Engine_harness =
+  Pcre2test_harness.Harness.Make (Pcre2test_harness.Engine_driver)
+
 module Units = Conformance_lib.Units
 module Sexp_lite = Conformance_lib.Sexp_lite
 
@@ -126,8 +150,8 @@ let load_skiplist () =
         prerr_endline "runner: skiplist.sexp must contain a single list";
         exit 2
 
-let load_baseline () =
-  let file = path "test/conformance/baseline_counts.sexp" in
+let load_baseline baseline_rel =
+  let file = path baseline_rel in
   if not (Sys.file_exists file) then None
   else
     match Sexp_lite.parse_file file with
@@ -141,11 +165,11 @@ let load_baseline () =
                    ] ->
                    (f, int_of_string p, int_of_string tot)
                | _ ->
-                   prerr_endline "runner: malformed baseline_counts.sexp";
+                   prerr_endline ("runner: malformed " ^ baseline_rel);
                    exit 2)
              entries)
     | _ ->
-        prerr_endline "runner: malformed baseline_counts.sexp";
+        prerr_endline ("runner: malformed " ^ baseline_rel);
         exit 2
 
 (* ---------------- running one file ---------------- *)
@@ -156,7 +180,7 @@ let output_name input_name =
   then "testoutput" ^ String.sub input_name 9 (String.length input_name - 9)
   else input_name ^ ".out"
 
-let run_file skiplist file : file_report =
+let run_file (module H : HARNESS) skiplist file : file_report =
   let input_lines = read_raw_lines (path ("vendor/pcre2/testdata/" ^ file)) in
   let expected_file =
     (* some tests have bit-width / link-size specific outputs,
@@ -269,6 +293,25 @@ let print_report r =
 
 let () =
   let args = Array.to_list Sys.argv |> List.tl in
+  let driver = ref `Oracle in
+  let args =
+    List.filter
+      (fun a ->
+        if String.equal a "--driver=oracle" then begin
+          driver := `Oracle;
+          false
+        end
+        else if String.equal a "--driver=engine" then begin
+          driver := `Engine;
+          false
+        end
+        else if String.length a >= 9 && String.sub a 0 9 = "--driver=" then begin
+          prerr_endline ("runner: unknown driver in '" ^ a ^ "'");
+          exit 2
+        end
+        else true)
+      args
+  in
   let mode =
     match args with
     | [] -> `Default
@@ -287,10 +330,25 @@ let () =
             exit 2)
     | _ ->
         prerr_endline
-          "usage: runner [--frontier | --only <file>:<ordinal> | \
-           --update-baseline]";
+          "usage: runner [--driver=oracle|engine] [--frontier | --failures | \
+           --only <file>:<ordinal> | --update-baseline]";
         exit 2
   in
+  (* Everything driver-specific in one place: the harness instantiation, the
+     baseline file it is compared against / updates, and whether STALE-SKIP
+     is enforced (oracle only; see header comment). *)
+  let harness, baseline_rel, enforce_stale_skips =
+    match !driver with
+    | `Oracle ->
+        ( (module Oracle_harness : HARNESS),
+          "test/conformance/baseline_counts.sexp",
+          true )
+    | `Engine ->
+        ( (module Engine_harness : HARNESS),
+          "test/conformance/engine_baseline_counts.sexp",
+          false )
+  in
+  let run_file = run_file harness in
   let skiplist = load_skiplist () in
   let files = load_order () in
   match mode with
@@ -390,14 +448,18 @@ let () =
               | None -> ())
             r.outcomes)
         reports;
-      (* STALE-SKIP detection *)
+      (* STALE-SKIP detection — enforced in oracle mode only (the engine is
+         expected to fail skiplisted units for a long time). *)
       let stale =
-        List.concat_map
-          (fun r ->
-            List.filter_map
-              (fun o -> if o.stale_skip then Some (r.file, o.ordinal) else None)
-              r.outcomes)
-          reports
+        if not enforce_stale_skips then []
+        else
+          List.concat_map
+            (fun r ->
+              List.filter_map
+                (fun o ->
+                  if o.stale_skip then Some (r.file, o.ordinal) else None)
+                r.outcomes)
+            reports
       in
       List.iter
         (fun (f, ord) ->
@@ -405,13 +467,18 @@ let () =
         stale;
       match mode with
       | `Update ->
-          let oc =
-            open_out (path "test/conformance/baseline_counts.sexp")
+          let oc = open_out (path baseline_rel) in
+          let regen_flag =
+            match !driver with
+            | `Oracle -> ""
+            | `Engine -> "--driver=engine "
           in
-          output_string oc
+          Printf.fprintf oc
             "; Conformance baseline: ((<file> <passed> <total-in-scope>) \
-             ...)\n; Regenerate with: dune exec test/conformance/runner.exe \
-             -- --update-baseline\n";
+             ...)\n\
+             ; Regenerate with: dune exec test/conformance/runner.exe -- \
+             %s--update-baseline\n"
+            regen_flag;
           output_string oc "(";
           List.iteri
             (fun i r ->
@@ -421,11 +488,11 @@ let () =
             reports;
           output_string oc ")\n";
           close_out oc;
-          Printf.printf "baseline_counts.sexp updated\n";
+          Printf.printf "%s updated\n" (Filename.basename baseline_rel);
           if stale <> [] then exit 1
       | _ -> (
           if stale <> [] then exit 1;
-          match load_baseline () with
+          match load_baseline baseline_rel with
           | None -> ()
           | Some baseline ->
               let regressed = ref false in

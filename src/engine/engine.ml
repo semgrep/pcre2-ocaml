@@ -21,6 +21,45 @@ type exec_result =
 let compile (_pattern : string) (_options : int32) : (t, int) result =
   Error (Errors.compile_error_base + 23)
 
+(* [compile] plus the pcre2_compile_context knobs (PCRE2_NEWLINE_* /
+   PCRE2_BSR_* / extra-options word, 0 = build default). Skeleton: nothing is
+   stored; same ERR23 placeholder as [compile], erroroffset 0. The context
+   values start mattering when compile.ml lands (M1). *)
+let compile_ctx ?(newline = 0) ?(bsr = 0) ?(extra = 0) (_pattern : string)
+    (_options : int32) : (t, int * int) result =
+  ignore newline;
+  ignore bsr;
+  ignore extra;
+  Error (Errors.compile_error_base + 23, 0)
+
+type info = {
+  argoptions : int;
+  alloptions : int;
+  newline : int;
+  bsr : int;
+  capture_count : int;
+}
+
+(* pcre2_pattern_info() subset for the pcre2test harness. Skeleton values are
+   the 8-bit build defaults (PCRE2_NEWLINE_LF = 2, PCRE2_BSR_UNICODE = 1,
+   options words 0) until compile.ml stores the real compiled values (M1). *)
+let info (re : t) : info =
+  {
+    argoptions = 0;
+    alloptions = 0;
+    newline = 2;
+    bsr = 1;
+    capture_count = re.top_bracket;
+  }
+
+(* Total wrapper over Errors.message: where the C pcre2_get_error_message
+   returns PCRE2_ERROR_BADDATA (unknown / 0..99 codes), the driver seam wants
+   the empty string (mirrors oracle/pcre2test_stubs.c oracle_test_error_message). *)
+let error_message (code : int) : string =
+  match Errors.message code with
+  | s -> s
+  | exception Invalid_argument _ -> ""
+
 let exec_full (_re : t) (_subject : string) (_offset : int) (_options : int32) :
     exec_result =
   Error Errors.error_internal
