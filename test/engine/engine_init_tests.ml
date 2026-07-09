@@ -9,4 +9,5 @@ let () =
   ignore (Sys.opaque_identity Pcre2_engine.Engine.version);
   ignore (Sys.opaque_identity (Pcre2_engine.Chartables.lcc (Char.code 'A')));
   ignore (Sys.opaque_identity Pcre2_engine.Ucd_tables.ucd_block_size);
+  ignore (Sys.opaque_identity Pcre2_engine.Frames.frame_header_ints);
   print_endline "engine module-init asserts: OK"

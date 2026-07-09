@@ -68,7 +68,7 @@ Compile phase (`compile.ml` ← pcre2_compile.c back half):
 
 Match phase (`interpreter.ml`, `frames.ml`, `newline.ml`):
 - [x] newline.ml (this commit) (pcre2_newline.c:1-243)
-- [ ] frames.ml — frame layout/arena alloc/grow/copy + heap accounting
+- [x] frames.ml (this commit) — frame layout/arena alloc/grow/copy + heap accounting
   (pcre2_match.c:100-830)
 - [ ] interpreter dispatch skeleton + OP_END/OP_ACCEPT/match-oveector copy + backtrack
   return dispatch (pcre2_match.c:837-990, 6479-6527)
