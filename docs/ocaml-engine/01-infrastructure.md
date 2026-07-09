@@ -8,6 +8,14 @@ seam, CI. This is the keystone milestone: it forever isolates "harness bug" from
 **Gate G0** (verbatim from plan): harness + C oracle reproduce testoutput1,2,4,5,8,9,10
 byte-identically outside the skip-list; oracle OUnit green.
 
+**GATE MET 2026-07-06** — in-scope units all pass byte-identically vs the C oracle:
+testinput1 1290/1290, testinput2 733/733 (skips: 7 out-of-scope callout units, 1 env
+RunTest artifact, 1102 harness modifier skips — info/debug/jit/dfa/posix/etc.),
+testinput4 617/617, testinput5 418/418 (206 harness skips), testinput8 0 in scope (80
+skips: all debug/bincode), testinput9 10/10 (18 skips), testinput10 44/44 (117 skips).
+Oracle OUnit 41/41. Baselines pinned in test/conformance/baseline_counts.sexp.
+Remaining M0 chunk: CI.
+
 ## Chunks
 
 - [x] **vendor**: pin PCRE2 10.44 sources + testdata under `vendor/pcre2/` with

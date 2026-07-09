@@ -111,8 +111,11 @@ CAMLprim value oracle_test_exec(value vcode, value subject, value voffset, value
         if (mark == NULL) {
                 mark_opt = Val_long(0); /* None */
         } else {
-                /* MARK names are stored zero-terminated in the compiled code. */
-                mark_str = caml_copy_string((const char *)mark);
+                /* MARK names may contain NULs; the length is stored in the
+                 * code unit preceding the name (pcre2test.c:8131 prints via
+                 * PCHARSV(mark, -1, -1, ...) -> pchars8 length = *p++). */
+                size_t mark_len = mark[-1];
+                mark_str = caml_alloc_initialized_string(mark_len, (const char *)mark);
                 mark_opt = caml_alloc_small(1, 0); /* Some */
                 Field(mark_opt, 0) = mark_str;
         }
