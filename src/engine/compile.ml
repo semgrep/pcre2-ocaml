@@ -594,90 +594,229 @@ let posix_class_maps =
     0 (* xdigit *);
   |]
 
+(* pcre2_compile.c:5126-5201 — get_othercase_range. This function is
+   passed the start and end of a class range in UCP mode. For single
+   characters the range may be just one character long. The function
+   searches up the characters, looking for ranges of characters in the
+   "other" case. Each call returns the next one, updating the start
+   address. A character with multiple other cases is returned on its own
+   with a special return value.
+
+   Arguments:
+     cptr        starting character value; updated
+     d           end value
+     ocptr       where to put start of othercase range
+     odptr       where to put end of othercase range
+     restricted  true if caseless restriction applies
+
+   Yield: -1 when no more; 0 when a range is returned; > 0 the CASESET
+   offset for a char with multiple other cases (for this return, *ocptr
+   contains the original). *)
+let get_othercase_range (cptr : int ref) (d : int) (ocptr : int ref)
+    (odptr : int ref) (restricted : bool) : int =
+  (* pcre2_compile.c:5156-5180 — find the first character that has an
+     other case. If it has multiple other cases, return its case offset
+     value. When CASELESS_RESTRICT is set, ignore the multi-case entries
+     that begin with ASCII values. (The `c > MAX_UTF_CODE_POINT ends the
+     range` test at 5163-5165 is 32-bit-mode only.) *)
+  let c = ref !cptr in
+  let othercase = ref 0 in
+  let result = ref None in
+  while Option.is_none !result && !c <= d do
+    let co = Ucd.caseset !c in
+    if
+      (not (Int.equal co 0))
+      && ((not restricted) || Ucd_tables.ucd_caseless_sets.(co) > 127)
+    then (
+      ocptr := !c (* Character that has the set *);
+      incr c;
+      cptr := !c (* Rest of input range *);
+      result := Some co)
+    else (
+      (* pcre2_compile.c:5172-5179 — not a valid multiple-case character.
+         Check that the single other case is different to the original. *)
+      othercase := Ucd.othercase !c;
+      if not (Int.equal !othercase !c) then result := Some 0 (* break *)
+      else incr c)
+  done;
+  match !result with
+  | None -> -1 (* Reached end of range (pcre2_compile.c:5182) *)
+  | Some co when co > 0 -> co
+  | Some _ ->
+      (* pcre2_compile.c:5184-5199 — found a character that has a single
+         other case. Search for the end of the range, which is either the
+         end of the input range, or a character that has zero or more than
+         one other cases. *)
+      ocptr := !othercase;
+      let next = ref (!othercase + 1) in
+      incr c;
+      let brk = ref false in
+      while (not !brk) && !c <= d do
+        if
+          (not (Int.equal (Ucd.caseset !c) 0))
+          || not (Int.equal (Ucd.othercase !c) !next)
+        then brk := true
+        else (
+          incr next;
+          incr c)
+      done;
+      odptr := !next - 1 (* End of othercase range *);
+      cptr := !c (* Rest of input range *);
+      0
+
 (* pcre2_compile.c:5206-5365 — add_to_class_internal. This function
    packages up the logic of adding a character or range of characters to a
    class. The character values in the arguments will be within the valid
    values for the current mode. This function is called only from within
-   the "add to class" group of functions; the external entry point is
-   add_to_class(). Returns the number of < 256 characters added.
-
-   uchardptr (the XCLASS extra-data write cursor, an offset into
-   cb.start_code) is threaded through unused until M6: in the 8-bit library
-   only the UTF arm writes through it (pcre2_compile.c:5322-5336).
-
-   DEVIATION: an errorcodeptr argument is appended (the C signature has
-   none). Two Unicode paths are later-milestone chunks and defer loudly,
-   identically in both compile phases, instead of emitting:
-   - the caseless UTF/UCP closure (pcre2_compile.c:5246-5282,
-     get_othercase_range / add_list_to_class_internal / ucd_caseless_sets)
-     is M7 (docs/ocaml-engine/08-ucp.md) with M6 for the UTF side;
-   - the extra-data emission for wide characters under UTF
-     (pcre2_compile.c:5322-5336, XCL_SINGLE/XCL_RANGE + ord2utf) is M6
-     XCLASS work (docs/ocaml-engine/07-utf.md).
-   Callers propagate the deferral from compile_branch's CONTINUE_CLASS
-   point. The n8 value returned after a deferral is meaningless: the
-   compile is abandoned with the error. *)
-let add_to_class_internal (classbits : Bytes.t) (_uchardptr : int ref)
-    (options : int) (_xoptions : int) (cb : compile_block)
-    (errorcodeptr : int ref) (start : int) (end_ : int) : int =
-  (* pcre2_compile.c:5235-5237 *)
-  let classbits_end = if end_ <= 0xff then end_ else 0xff in
+   the "add to class" group of functions, some of which are recursive and
+   mutually recursive (the caseless closure removes PCRE2_CASELESS before
+   recursing, so the depth is bounded); the external entry point is
+   add_to_class(). Returns the number of < 256 characters added; the extra
+   data cursor [uchardptr] (an offset into cb.start_code, the C's
+   PCRE2_UCHAR **uchardptr) is updated. *)
+let rec add_to_class_internal (classbits : Bytes.t) (uchardptr : int ref)
+    (options : int) (xoptions : int) (cb : compile_block) (start : int)
+    (end_ : int) : int =
+  (* pcre2_compile.c:5234-5237 — start/end/classbits_end are mutated by
+     the caseless closure's range extensions (5273-5278). *)
+  let start = ref start in
+  let end_ = ref end_ in
+  let classbits_end = ref (if !end_ <= 0xff then !end_ else 0xff) in
   let n8 = ref 0 in
   (* pcre2_compile.c:5239-5295 — if caseless matching is required, scan the
-     range and process alternate cases. *)
-  if not (Int.equal (options land Options.caseless) 0) then
-    if not (Int.equal (options land (Options.utf lor Options.ucp)) 0) then
-      (* pcre2_compile.c:5247-5282 — Unicode caseless closure: deferred
-         (see the DEVIATION note above). *)
-      errorcodeptr := Parse.err_deferred
-    else
+     range and process alternate cases. In Unicode, there are 8-bit
+     characters that have alternate cases that are greater than 255 and
+     vice-versa (though these may be ignored if caseless restriction is in
+     force). Sometimes we can just extend the original range. *)
+  let options =
+    if Int.equal (options land Options.caseless) 0 then options
+    else if not (Int.equal (options land (Options.utf lor Options.ucp)) 0) then (
+      (* pcre2_compile.c:5246-5282 — the Unicode caseless closure. *)
+      let options =
+        options land lnot Options.caseless
+        (* Remove for recursive calls *)
+      in
+      let c = ref !start in
+      let oc = ref 0 in
+      let od = ref 0 in
+      let scanning = ref true in
+      while !scanning do
+        let rc =
+          get_othercase_range c !end_ oc od
+            (not (Int.equal (xoptions land Options.extra_caseless_restrict) 0))
+        in
+        if rc < 0 then scanning := false
+        else if rc > 0 then
+          (* pcre2_compile.c:5259-5262 — handle a single character that
+             has more than one other case: PRIV(ucd_caseless_sets) + rc. *)
+          n8 :=
+            !n8
+            + add_list_to_class_internal classbits uchardptr options xoptions cb
+                Ucd_tables.ucd_caseless_sets rc !oc
+        else if !oc >= cb.class_range_start && !od <= cb.class_range_end then
+          (* pcre2_compile.c:5264-5267 — do nothing if the other case
+             range is within the original range. *)
+          ()
+        else if !oc < !start && !od >= !start - 1 then
+          (* pcre2_compile.c:5269-5273 — extend the original range if
+             there is overlap, noting that if oc < c, we can't have
+             od > end because a subrange is always shorter than the basic
+             range. *)
+          start := !oc (* Extend downwards *)
+        else if !od > !end_ && !oc <= !end_ + 1 then (
+          end_ := !od (* Extend upwards *);
+          if !end_ > !classbits_end then
+            classbits_end := if !end_ <= 0xff then !end_ else 0xff)
+        else
+          (* pcre2_compile.c:5279-5280 — otherwise, use a recursive call
+             to add the additional range. *)
+          n8 :=
+            !n8
+            + add_to_class_internal classbits uchardptr options xoptions cb !oc
+                !od
+      done;
+      options)
+    else (
       (* pcre2_compile.c:5288-5294 — not UTF mode. Loop bound: c <= 0xff,
          so Chartables.fcc's 0..255 precondition holds. *)
-      for c = start to classbits_end do
+      for c = !start to !classbits_end do
         setbit classbits (Chartables.fcc c);
         incr n8
       done;
-  if not (Int.equal !errorcodeptr 0) then !n8
-  else
-    (* pcre2_compile.c:5297-5302 — now handle the originally supplied
-       range. Adjust the final value according to the bit length. *)
-    let end_ =
-      if Int.equal (options land Options.utf) 0 && end_ > max_non_utf_char then
-        max_non_utf_char
-      else end_
-    in
-    (* pcre2_compile.c:5304 *)
-    if start > cb.class_range_start && end_ < cb.class_range_end then !n8
-    else (
-      (* pcre2_compile.c:5306-5313 — use the bitmap for characters < 256.
-         Regardless of start, c will always be <= 255. *)
-      for c = start to classbits_end do
-        setbit classbits c;
-        incr n8
+      options)
+  in
+  (* pcre2_compile.c:5297-5302 — now handle the originally supplied range.
+     Adjust the final value according to the bit length. *)
+  if Int.equal (options land Options.utf) 0 && !end_ > max_non_utf_char then
+    end_ := max_non_utf_char;
+  (* pcre2_compile.c:5304 *)
+  if !start > cb.class_range_start && !end_ < cb.class_range_end then !n8
+  else (
+    (* pcre2_compile.c:5306-5313 — use the bitmap for characters < 256.
+       Regardless of start, c will always be <= 255. *)
+    for c = !start to !classbits_end do
+      setbit classbits c;
+      incr n8
+    done;
+    (* pcre2_compile.c:5315-5318 — otherwise use extra data
+       (SUPPORT_WIDE_CHARS). *)
+    if !start <= 0xff then start := 0xff + 1;
+    if !end_ >= !start then (
+      let uchardata = ref !uchardptr in
+      if not (Int.equal (options land Options.utf) 0) then
+        (* pcre2_compile.c:5321-5336 — XCL_RANGE / XCL_SINGLE with the
+           characters as UTF-8 via ord2utf. *)
+        if !start < !end_ then (
+          Bytes.set cb.start_code !uchardata (Char.chr Opcodes.xcl_range);
+          incr uchardata;
+          uchardata := !uchardata + Utf.ord2utf !start cb.start_code !uchardata;
+          uchardata := !uchardata + Utf.ord2utf !end_ cb.start_code !uchardata)
+        else if Int.equal !start !end_ then (
+          Bytes.set cb.start_code !uchardata (Char.chr Opcodes.xcl_single);
+          incr uchardata;
+          uchardata := !uchardata + Utf.ord2utf !start cb.start_code !uchardata
+          (* pcre2_compile.c:5340-5356 — without UTF support, character
+             values are constrained by the bit length: the 8-bit arm
+             (5345-5346) is empty (end_ was clamped to 0xff above). *));
+      uchardptr := !uchardata (* Update extra data pointer *));
+    !n8)
+
+(* pcre2_compile.c:5369-5412 — add_list_to_class_internal: add a list of
+   case-equivalent characters to a class when in UTF mode. Called only
+   from within add_to_class_internal(), with which it is mutually
+   recursive. [p]/[poff] are the C's `const uint32_t *p` pointer into
+   PRIV(ucd_caseless_sets) (an ascending NOTACHAR-terminated row); except
+   is the character to omit — the one we already know about. Returns the
+   number of < 256 characters added. *)
+and add_list_to_class_internal (classbits : Bytes.t) (uchardptr : int ref)
+    (options : int) (xoptions : int) (cb : compile_block) (p : int array)
+    (poff : int) (except : int) : int =
+  let n8 = ref 0 in
+  let poff = ref poff in
+  while p.(!poff) < Tables.notachar do
+    let n = ref 0 in
+    if not (Int.equal p.(!poff) except) then (
+      while Int.equal p.(!poff + !n + 1) (p.(!poff) + !n + 1) do
+        incr n
       done;
-      (* pcre2_compile.c:5315-5318 — otherwise use extra data. *)
-      let start = if start <= 0xff then 0xff + 1 else start in
-      if end_ >= start then
-        if not (Int.equal (options land Options.utf) 0) then
-          (* pcre2_compile.c:5322-5336 — XCL_SINGLE/XCL_RANGE via ord2utf:
-             deferred (see the DEVIATION note above). *)
-          errorcodeptr := Parse.err_deferred
-          (* pcre2_compile.c:5340-5344 — without UTF support, character
-             values are constrained by the bit length: in the 8-bit library
-             there is nothing to do (end_ was clamped to 0xff above). *);
-      !n8)
+      n8 :=
+        !n8
+        + add_to_class_internal classbits uchardptr options xoptions cb
+            p.(!poff)
+            p.(!poff + !n));
+    poff := !poff + !n + 1
+  done;
+  !n8
 
 (* pcre2_compile.c:5416-5444 — add_to_class: external entry point for
    adding a range to a class. Sets the overall range so that the internal
    functions can try to avoid duplication when handling case-independence.
    Returns the number of < 256 characters added. *)
 let add_to_class (classbits : Bytes.t) (uchardptr : int ref) (options : int)
-    (xoptions : int) (cb : compile_block) (errorcodeptr : int ref) (start : int)
-    (end_ : int) : int =
+    (xoptions : int) (cb : compile_block) (start : int) (end_ : int) : int =
   cb.class_range_start <- start;
   cb.class_range_end <- end_;
-  add_to_class_internal classbits uchardptr options xoptions cb errorcodeptr
-    start end_
+  add_to_class_internal classbits uchardptr options xoptions cb start end_
 
 (* pcre2_compile.c:5447-5491 — add_list_to_class: add a list of horizontal
    or vertical whitespace characters to a class. The list (p, an ascending
@@ -686,8 +825,8 @@ let add_to_class (classbits : Bytes.t) (uchardptr : int ref) (options : int)
    character to omit (NOTACHAR to omit none). The C walks the pointer p;
    here pi is the index into p. *)
 let add_list_to_class (classbits : Bytes.t) (uchardptr : int ref)
-    (options : int) (xoptions : int) (cb : compile_block)
-    (errorcodeptr : int ref) (p : int array) (except : int) : int =
+    (options : int) (xoptions : int) (cb : compile_block) (p : int array)
+    (except : int) : int =
   let n8 = ref 0 in
   let pi = ref 0 in
   while p.(!pi) < Tables.notachar do
@@ -700,8 +839,7 @@ let add_list_to_class (classbits : Bytes.t) (uchardptr : int ref)
       cb.class_range_end <- p.(!pi + !n);
       n8 :=
         !n8
-        + add_to_class_internal classbits uchardptr options xoptions cb
-            errorcodeptr p.(!pi)
+        + add_to_class_internal classbits uchardptr options xoptions cb p.(!pi)
             p.(!pi + !n));
     pi := !pi + !n + 1
   done;
@@ -711,23 +849,21 @@ let add_list_to_class (classbits : Bytes.t) (uchardptr : int ref)
    a list of horizontal or vertical whitespace to a class. The list must be
    in order. *)
 let add_not_list_to_class (classbits : Bytes.t) (uchardptr : int ref)
-    (options : int) (xoptions : int) (cb : compile_block)
-    (errorcodeptr : int ref) (p : int array) : int =
+    (options : int) (xoptions : int) (cb : compile_block) (p : int array) : int
+    =
   let utf = not (Int.equal (options land Options.utf) 0) in
   let n8 = ref 0 in
   let pi = ref 0 in
   if p.(0) > 0 then
     n8 :=
-      !n8
-      + add_to_class classbits uchardptr options xoptions cb errorcodeptr 0
-          (p.(0) - 1);
+      !n8 + add_to_class classbits uchardptr options xoptions cb 0 (p.(0) - 1);
   while p.(!pi) < Tables.notachar do
     while Int.equal p.(!pi + 1) (p.(!pi) + 1) do
       incr pi
     done;
     n8 :=
       !n8
-      + add_to_class classbits uchardptr options xoptions cb errorcodeptr
+      + add_to_class classbits uchardptr options xoptions cb
           (p.(!pi) + 1)
           (if Int.equal p.(!pi + 1) Tables.notachar then
              if utf then 0x10ffff else 0xffffffff
@@ -1040,24 +1176,25 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
   let class_caseless_char (meta : int) : unit =
     (* pcre2_compile.c:8261-8270 — get the character's code units into
        mcbuffer, with the length in mclength. When not in UTF mode, the
-       length is always 1.
-       DEVIATION: the utf arm (mclength = PRIV(ord2utf)(meta, mcbuffer)) is
-       the M6 chunk (multi-byte literal emission, byte-read policy); until
-       it lands, UTF compilation fails loudly here rather than emitting a
-       truncated character. mcbuffer[8] reduces to its element 0: with
-       mclength = 1 the C never touches the rest. *)
-    if utf then (
-      errorcodeptr := Parse.err_deferred;
-      return_from_branch 0);
-    let mclength = 1 in
-    let mcbuffer0 = meta land 0xff in
+       length is always 1 (the C's implicit (PCRE2_UCHAR) truncation is
+       the land 0xff). *)
+    let mcbuffer = Bytes.make 8 '\000' in
+    let mclength =
+      if utf then Utf.ord2utf meta mcbuffer 0
+      else (
+        Bytes.set mcbuffer 0 (Char.chr (meta land 0xff));
+        1)
+    in
+    let mcbuffer0 = Char.code (Bytes.get mcbuffer 0) in
 
-    (* pcre2_compile.c:8272-8276 — generate the appropriate code. *)
+    (* pcre2_compile.c:8272-8276 — generate the appropriate code:
+       memcpy(code, mcbuffer, CU2BYTES(mclength)); code += mclength. *)
     emit_cu
       (if not (Int.equal (!options land Options.caseless) 0) then
          Opcodes.op_chari
        else Opcodes.op_char);
-    emit_cu mcbuffer0;
+    Bytes.blit mcbuffer 0 cb.start_code !code mclength;
+    code := !code + mclength;
 
     (* pcre2_compile.c:8278-8281 — remember if \r or \n were seen. *)
     if Int.equal mcbuffer0 0x0d || Int.equal mcbuffer0 0x0a then
@@ -1107,18 +1244,29 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
      already in meta. Falls through into CLASS_CASELESS_CHAR. *)
   let normal_char_set (meta : int) : unit =
     matched_char := true;
-    (* pcre2_compile.c:8231-8252 — for caseless UTF or UCP mode, check
-       whether this character has more than one other case (UCD_CASESET);
-       if so, generate a special OP_PROP PT_CLIST item instead of OP_CHARI.
-       DEVIATION: that block is Unicode machinery (M6 utf / M7 ucp); until
-       those chunks land, caseless literal compilation under PCRE2_UTF or
-       PCRE2_UCP fails loudly here instead of silently skipping the
-       multicase check. Unreachable in M1's ASCII scope. *)
-    if (utf || ucp) && not (Int.equal (!options land Options.caseless) 0) then (
-      errorcodeptr := Parse.err_deferred;
-      return_from_branch 0);
-    (* fallthrough to CLASS_CASELESS_CHAR in C *)
-    class_caseless_char meta
+    (* pcre2_compile.c:8231-8251 — for caseless UTF or UCP mode, check
+       whether this character has more than one other case. If so,
+       generate a special OP_PROP item instead of OP_CHARI. When casing
+       restrictions apply, ignore caseless sets that start with an ASCII
+       character. *)
+    let caseset =
+      if (utf || ucp) && not (Int.equal (!options land Options.caseless) 0) then
+        Ucd.caseset meta
+      else 0
+    in
+    if
+      (not (Int.equal caseset 0))
+      && (Int.equal (!xoptions land Options.extra_caseless_restrict) 0
+         || Ucd_tables.ucd_caseless_sets.(caseset) > 127)
+    then (
+      emit_cu Opcodes.op_prop;
+      emit_cu Opcodes.pt_clist;
+      emit_cu caseset;
+      if Int.equal !firstcuflags req_unset then (
+        firstcuflags := req_none;
+        zerofirstcuflags := req_none (* break: end handling this meta item *)))
+    else (* fallthrough to CLASS_CASELESS_CHAR in C *)
+      class_caseless_char meta
   in
 
   (* pcre2_compile.c:8226-8227 — the NORMAL_CHAR label: get the full 32
@@ -1523,8 +1671,7 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
            correctly.
 
            If the class contains characters outside the 0-255 range, a
-           different opcode is compiled (OP_XCLASS — M6, deferred; see the
-           deferral notes below). *)
+           different opcode is compiled (OP_XCLASS). *)
         matched_char := true;
         let negate_class = Int.equal meta Parse.meta_class_not in
 
@@ -1558,39 +1705,33 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                check whether this character has more than one other case.
                If so, generate a special OP_NOTPROP item instead of
                OP_NOTI. When restricted by PCRE2_EXTRA_CASELESS_RESTRICT,
-               ignore any caseless set that starts with an ASCII character.
-               DEVIATION: the OP_NOTPROP PT_CLIST emission is Unicode
-               property machinery (M7, docs/ocaml-engine/08-ucp.md); until
-               it lands this case fails loudly instead. *)
-            (if
-               (utf || ucp)
-               && not (Int.equal (!options land Options.caseless) 0)
-             then
-               let d = Ucd.caseset c in
-               if
-                 (not (Int.equal d 0))
-                 && (Int.equal
-                       (!xoptions land Options.extra_caseless_restrict)
-                       0
-                    || Ucd_tables.ucd_caseless_sets.(d) > 127)
-               then (
-                 errorcodeptr := Parse.err_deferred;
-                 return_from_branch 0));
-
-            (* pcre2_compile.c:5942-5946 — char has only one other (usable)
-               case, or UCP not available. *)
-            emit_cu
-              (if not (Int.equal (!options land Options.caseless) 0) then
-                 Opcodes.op_noti
-               else Opcodes.op_not);
-            (* code += PUTCHAR(c, code) — pcre2_intmodedep.h:357-358: with
-               utf and c > 127 this is a multi-code-unit ord2utf store.
-               DEVIATION: ord2utf emission is M6 (docs/ocaml-engine/
-               07-utf.md); defer loudly rather than truncate. *)
-            if utf && c > 127 then (
-              errorcodeptr := Parse.err_deferred;
-              return_from_branch 0);
-            emit_cu c (* We are finished with this class *)))
+               ignore any caseless set that starts with an ASCII
+               character. *)
+            let d =
+              if
+                (utf || ucp)
+                && not (Int.equal (!options land Options.caseless) 0)
+              then Ucd.caseset c
+              else 0
+            in
+            if
+              (not (Int.equal d 0))
+              && (Int.equal (!xoptions land Options.extra_caseless_restrict) 0
+                 || Ucd_tables.ucd_caseless_sets.(d) > 127)
+            then (
+              emit_cu Opcodes.op_notprop;
+              emit_cu Opcodes.pt_clist;
+              emit_cu d (* break: we are finished with this class *))
+            else (
+              (* pcre2_compile.c:5942-5946 — char has only one other
+                 (usable) case, or UCP not available. *)
+              emit_cu
+                (if not (Int.equal (!options land Options.caseless) 0) then
+                   Opcodes.op_noti
+                 else Opcodes.op_not);
+              (* code += PUTCHAR(c, code) — pcre2_intmodedep.h:355-358. *)
+              code := !code + Utf.putchar ~utf c cb.start_code !code
+              (* We are finished with this class *))))
         else
           (* pcre2_compile.c:5949-5992 — handle character classes that
              contain more than just one literal character. If there are
@@ -1653,10 +1794,8 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
 
             (* pcre2_compile.c:6002-6009 — extended class (xclass) will be
                used when characters > 255 might match. class_uchardata is
-               the XCLASS extra-data write cursor (offset into
-               cb.start_code); in M1 nothing ever writes through it — every
-               producer defers loudly first — but the plumbing is kept so
-               M6 lands in the C's shape. *)
+               the XCLASS extra-data write cursor (the C's PCRE2_UCHAR
+               pointer becomes an offset into cb.start_code). *)
             let xclass = ref false in
             let class_uchardata =
               ref (!code + Limits.link_size + 2)
@@ -1668,9 +1807,9 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                track some properties of the class: class_has_8bitchar will
                be non-zero if the class contains at least one character
                with a code point less than 256; xclass_has_prop will be
-               TRUE if Unicode property checks are present in the class.
-               Both are only consumed by the OP_XCLASS emission (M6);
-               tracked here so the class loop matches the C. *)
+               TRUE if Unicode property checks are present in the class
+               (the \p/\P producer is M7-deferred, so it stays false until
+               docs/ocaml-engine/08-ucp.md lands). *)
             let class_has_8bitchar = ref 0 in
             let xclass_has_prop = ref false in
 
@@ -1717,14 +1856,14 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                 class_has_8bitchar :=
                   !class_has_8bitchar
                   + add_to_class classbits class_uchardata !options !xoptions cb
-                      errorcodeptr c !d
+                      c !d
                 (* goto CONTINUE_CLASS *))
               else
                 (* pcre2_compile.c:6341-6345 — handle a single character. *)
                 class_has_8bitchar :=
                   !class_has_8bitchar
                   + add_to_class classbits class_uchardata !options !xoptions cb
-                      errorcodeptr c c
+                      c c
             in
 
             (* pcre2_compile.c:6028-6371 — process items until
@@ -1948,24 +2087,22 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                     ignore
                       (add_list_to_class classbits class_uchardata
                          (!options land lnot Options.caseless)
-                         !xoptions cb errorcodeptr Tables.hspace_list
-                         Tables.notachar)
+                         !xoptions cb Tables.hspace_list Tables.notachar)
                   else if Int.equal escape Parse.esc_big_h then
                     ignore
                       (add_not_list_to_class classbits class_uchardata
                          (!options land lnot Options.caseless)
-                         !xoptions cb errorcodeptr Tables.hspace_list)
+                         !xoptions cb Tables.hspace_list)
                   else if Int.equal escape Parse.esc_v then
                     ignore
                       (add_list_to_class classbits class_uchardata
                          (!options land lnot Options.caseless)
-                         !xoptions cb errorcodeptr Tables.vspace_list
-                         Tables.notachar)
+                         !xoptions cb Tables.vspace_list Tables.notachar)
                   else if Int.equal escape Parse.esc_big_v then
                     ignore
                       (add_not_list_to_class classbits class_uchardata
                          (!options land lnot Options.caseless)
-                         !xoptions cb errorcodeptr Tables.vspace_list)
+                         !xoptions cb Tables.vspace_list)
                   else if
                     Int.equal escape Parse.esc_p
                     || Int.equal escape Parse.esc_big_p
@@ -1986,16 +2123,13 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                      CLASS_LITERAL. *)
                   class_literal item;
 
-                (* pcre2_compile.c:6348-6370 — CONTINUE_CLASS. DEVIATION:
-                   first propagate a deferral recorded by the add_to_class
-                   family (see its DEVIATION note); the C helpers have no
-                   error path. *)
-                if not (Int.equal !errorcodeptr 0) then return_from_branch 0;
-                (* If any wide characters or Unicode properties have been
-                   encountered, set xclass = TRUE. Then, in the pre-compile
-                   phase, accumulate the length of the extra data and reset
-                   the pointer. Dead in M1 (nothing writes extra data), kept
-                   for M6. *)
+                (* pcre2_compile.c:6348-6370 — CONTINUE_CLASS. If any wide
+                   characters or Unicode properties have been encountered,
+                   set xclass = TRUE. Then, in the pre-compile phase,
+                   accumulate the length of the extra data and reset the
+                   pointer. This is so that very large classes that contain
+                   a zillion wide characters or Unicode property tests do
+                   not overwrite the workspace. *)
                 if !class_uchardata > class_uchardata_base then (
                   xclass := true;
                   match lengthptr with
@@ -2017,48 +2151,115 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
             zeroreqcu := !reqcu;
             zeroreqcuflags := !reqcuflags;
 
-            (* pcre2_compile.c:6383-6465 — if there are characters with
+            (* pcre2_compile.c:6383-6464 — if there are characters with
                values > 255, or Unicode property settings (\p or \P), we
                have to compile an extended class (OP_XCLASS), unless there
                were no property settings and there was a negated special
-               such as \S in the class, and PCRE2_UCP is not set.
-               DEVIATION: OP_XCLASS emission is M6
-               (docs/ocaml-engine/07-utf.md). xclass can never be true in
-               M1 — every extra-data producer defers loudly above — but the
-               C's entry condition is kept so both phases stay in step when
-               M6 lands. *)
+               such as \S in the class, and PCRE2_UCP is not set, because
+               in that case all characters > 255 are in or not in the
+               class, so any that were explicitly given as well can be
+               ignored. If, when generating an xclass, there are no
+               characters < 256, we can omit the bitmap in the actual
+               compiled code. *)
             if
               !xclass
               && ((not (Int.equal (!options land Options.ucp) 0))
                  || !xclass_has_prop || not !should_flip_negation)
             then (
-              errorcodeptr := Parse.err_deferred;
-              return_from_branch 0);
+              (* pcre2_compile.c:6409-6435 — in a negated UCP POSIX class,
+                 characters > 255 must either all match or all not match
+                 (match_all_or_no_wide_chars, set at 6089-6092): include
+                 an explicit range, which works in both cases. Also force
+                 it when a negated special such as \S is present in a
+                 positive UTF-8 class without PCRE2_UCP. *)
+              if
+                !match_all_or_no_wide_chars
+                || utf (* PCRE2_CODE_UNIT_WIDTH == 8: 6414-6416 *)
+                   && !should_flip_negation && (not negate_class)
+                   && Int.equal (!options land Options.ucp) 0
+              then (
+                Bytes.set cb.start_code !class_uchardata
+                  (Char.chr Opcodes.xcl_range);
+                incr class_uchardata;
+                (* pcre2_compile.c:6421-6424 — "Will always be utf in the
+                   8-bit library"; the 16/32-bit else arm does not
+                   apply. *)
+                class_uchardata :=
+                  !class_uchardata
+                  + Utf.ord2utf 0x100 cb.start_code !class_uchardata;
+                class_uchardata :=
+                  !class_uchardata
+                  + Utf.ord2utf Utf.max_utf_code_point cb.start_code
+                      !class_uchardata);
+              (* pcre2_compile.c:6436-6440 — XCL_END marks the end of the
+                 extra data; then the opcode, the length link, and the
+                 flags code unit. *)
+              Bytes.set cb.start_code !class_uchardata
+                (Char.chr Opcodes.xcl_end);
+              incr class_uchardata;
+              emit_cu Opcodes.op_xclass;
+              code := !code + Limits.link_size;
+              Bytes.set cb.start_code !code
+                (Char.chr (if negate_class then Opcodes.xcl_not else 0));
+              if !xclass_has_prop then
+                Bytes.set cb.start_code !code
+                  (Char.chr
+                     (Char.code (Bytes.get cb.start_code !code)
+                     lor Opcodes.xcl_hasprop));
 
-            (* pcre2_compile.c:6467-6484 — if there are no characters
-               > 255, or they are all to be included or excluded, set the
-               opcode to OP_CLASS or OP_NCLASS, depending on whether the
-               whole class was negated and whether there were negative
-               specials such as \S (non-UCP) in the class. Then copy the
-               32-byte map into the code vector, negating it if
-               necessary. *)
-            emit_cu
-              (if Bool.equal negate_class !should_flip_negation then
-                 Opcodes.op_class
-               else Opcodes.op_nclass);
-            (match lengthptr with
-            | None ->
-                (* Save time in the pre-compile phase *)
-                if negate_class then
-                  (* Using 255 ^ instead of ~ (a note for the C, exact here
-                     anyway). *)
+              (* pcre2_compile.c:6442-6457 — if the map is required, move
+                 up the extra data to make room for it; otherwise just
+                 move the code pointer to the end of the extra data. *)
+              if !class_has_8bitchar > 0 then (
+                Bytes.set cb.start_code !code
+                  (Char.chr
+                     (Char.code (Bytes.get cb.start_code !code)
+                     lor Opcodes.xcl_map));
+                incr code;
+                (* memmove(code + 32, code, CU2BYTES(class_uchardata -
+                   code)): Bytes.blit handles the overlap like memmove. *)
+                Bytes.blit cb.start_code !code cb.start_code (!code + 32)
+                  (!class_uchardata - !code);
+                if negate_class && not !xclass_has_prop then
+                  (* Using 255 ^ instead of ~ (a note for the C, exact
+                     here anyway). *)
                   for i = 0 to 31 do
                     Bytes.set classbits i
                       (Char.chr (255 lxor Char.code (Bytes.get classbits i)))
                   done;
-                Bytes.blit classbits 0 cb.start_code !code 32
-            | Some _ -> ());
-            code := !code + 32 (* End of class processing *)))
+                Bytes.blit classbits 0 cb.start_code !code 32;
+                code := !class_uchardata + 32)
+              else code := !class_uchardata;
+
+              (* pcre2_compile.c:6459-6462 — now fill in the complete
+                 length of the item: PUT(previous, 1, code - previous);
+                 break (end of class handling). *)
+              put cb.start_code (!previous + 1) (!code - !previous))
+            else (
+              (* pcre2_compile.c:6467-6484 — if there are no characters
+                 > 255, or they are all to be included or excluded, set
+                 the opcode to OP_CLASS or OP_NCLASS, depending on whether
+                 the whole class was negated and whether there were
+                 negative specials such as \S (non-UCP) in the class. Then
+                 copy the 32-byte map into the code vector, negating it if
+                 necessary. *)
+              emit_cu
+                (if Bool.equal negate_class !should_flip_negation then
+                   Opcodes.op_class
+                 else Opcodes.op_nclass);
+              (match lengthptr with
+              | None ->
+                  (* Save time in the pre-compile phase *)
+                  if negate_class then
+                    (* Using 255 ^ instead of ~ (a note for the C, exact
+                       here anyway). *)
+                    for i = 0 to 31 do
+                      Bytes.set classbits i
+                        (Char.chr (255 lxor Char.code (Bytes.get classbits i)))
+                    done;
+                  Bytes.blit classbits 0 cb.start_code !code 32
+              | Some _ -> ());
+              code := !code + 32 (* End of class processing *))))
       else if Int.equal meta Parse.meta_accept then (
         (* pcre2_compile.c:6487-6514 — deal with ( *VERB)s. Check for open
            captures before ACCEPT and close those that are within the same
@@ -2141,24 +2342,24 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
         (* tempcode = code++ — reserve the length code unit. *)
         let tempcode = !code in
         incr code;
+        let mcbuffer = Bytes.make 8 '\000' in
         for _i = 0 to verbarglen - 1 do
           pptr := !pptr + 1;
           let vchar = cb.parsed_pattern.(!pptr) in
-          (* pcre2_compile.c:6556-6562 — mclength/mcbuffer: the utf arm
-             (mclength = PRIV(ord2utf)(meta, mcbuffer)) is M6 (utf.ml);
-             UTF compilation is rejected before compile_branch in the
-             current engine, so fail loudly rather than emit a truncated
-             character. *)
-          if utf then (
-            errorcodeptr := Parse.err_deferred;
-            return_from_branch 0);
-          let mclength = 1 in
+          (* pcre2_compile.c:6556-6562 — get the character's code units
+             into mcbuffer, with the length in mclength (meta = *(++pptr)
+             is [vchar] here). *)
+          let mclength =
+            if utf then Utf.ord2utf vchar mcbuffer 0
+            else (
+              Bytes.set mcbuffer 0 (Char.chr (vchar land 0xff));
+              1)
+          in
           match lengthptr with
           | Some length -> length := !length + mclength
           | None ->
-              (* memcpy(code, mcbuffer, CU2BYTES(mclength)); with
-                 mclength = 1 this is one code-unit store. *)
-              Bytes.set cb.start_code !code (Char.chr (vchar land 0xff));
+              (* memcpy(code, mcbuffer, CU2BYTES(mclength)) *)
+              Bytes.blit mcbuffer 0 cb.start_code !code mclength;
               code := !code + mclength;
               verbculen := !verbculen + mclength
         done;
@@ -2673,19 +2874,21 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
            the shared single-item repeat emission that follows it, factored
            as a function because both the single-character cases (goto at
            7309) and the character-type default case reach it. On entry:
-           mclength = 1 with the character in mcbuffer0 (single code unit),
-           or mclength = 0 for a non-property character type in
-           op_previous; prop_type/prop_value >= 0 carry a property
-           character type (OP_PROP/OP_NOTPROP, M7). op_type has been set by
-           the caller; repeat_type does not yet include it. *)
-        let output_single_repeat ~(mclength : int) ~(mcbuffer0 : int)
+           mclength >= 1 with the character's code units in mcbuffer, or
+           mclength = 0 for a non-property character type in op_previous;
+           prop_type/prop_value >= 0 carry a property character type
+           (OP_PROP/OP_NOTPROP, M7). op_type has been set by the caller;
+           repeat_type does not yet include it. *)
+        let output_single_repeat ~(mclength : int) ~(mcbuffer : Bytes.t)
             ~(prop_type : int) ~(prop_value : int) : unit =
           (* pcre2_compile.c:7853-7866 and 7890-7903 — the C duplicates
-             this fill; factored (port-conventions §2). mclength is 1 or 0
-             in M1: multi-code-unit UTF characters were deferred by the
-             caller (see the M6 DEVIATION in the OP_CHAR case). *)
+             this fill; factored (port-conventions §2):
+             memcpy(code, mcbuffer, CU2BYTES(mclength)) when mclength > 0,
+             else the character type plus any property values. *)
           let emit_char_or_type () =
-            if mclength > 0 then emit_cu mcbuffer0
+            if mclength > 0 then (
+              Bytes.blit mcbuffer 0 cb.start_code !code mclength;
+              code := !code + mclength)
             else (
               emit_cu op_previous;
               if prop_type >= 0 then (
@@ -3157,39 +3360,57 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                raise_notrace End_repeat;
              op_type := chartypeoffset.(op_previous - Opcodes.op_char);
 
-             (* pcre2_compile.c:7280-7289 — deal with UTF characters that
-                take up more than one code unit (MAYBE_UTF_MULTI;
-                NOT_FIRSTCU(c) = (c & 0xc0) == 0x80,
-                pcre2_intmodedep.h:296). DEVIATION: multi-code-unit
-                literal emission is M6 (docs/ocaml-engine/07-utf.md); no
-                M1 arm can emit one, so this defers loudly instead of
-                saving the character into mcbuffer. *)
-             if
-               utf
-               && Int.equal
-                    (Char.code (Bytes.get cb.start_code (!code - 1)) land 0xc0)
-                    0x80
-             then (
-               errorcodeptr := Parse.err_deferred;
-               return_from_branch 0);
-
-             (* pcre2_compile.c:7293-7308 — handle the case of a single
-                code unit - either with no UTF support, or with UTF
-                disabled, or for a single-code-unit UTF character. In the
-                latter case, for a repeated positive match, get the
-                caseless flag for the required code unit from the previous
-                character, because a class like [Aa] sets a caseless A but
-                by now the req_caseopt flag has been reset. *)
-             let mcbuffer0 = Char.code (Bytes.get cb.start_code (!code - 1)) in
-             if op_previous <= Opcodes.op_chari && !repeat_min > 1 then (
-               reqcu := mcbuffer0;
-               reqcuflags := cb.req_varyopt;
-               if Int.equal op_previous Opcodes.op_chari then
-                 reqcuflags := !reqcuflags lor req_caseless);
-
+             let mcbuffer = Bytes.make 8 '\000' in
+             let mclength =
+               if
+                 (* pcre2_compile.c:7280-7289 — deal with UTF characters
+                    that take up more than one code unit
+                    (MAYBE_UTF_MULTI): back up over the character's
+                    continuation units (BACKCHAR) and save it into
+                    mcbuffer. *)
+                 utf
+                 && Utf.not_firstcu
+                      (Char.code (Bytes.get cb.start_code (!code - 1)))
+               then (
+                 let lastchar = ref (!code - 1) in
+                 (* BACKCHAR(lastchar) — pcre2_intmodedep.h:345, over the
+                    code buffer. *)
+                 while
+                   Utf.not_firstcu
+                     (Char.code (Bytes.get cb.start_code !lastchar))
+                 do
+                   decr lastchar
+                 done;
+                 let mclength =
+                   !code - !lastchar
+                   (* Length of UTF character *)
+                 in
+                 Bytes.blit cb.start_code !lastchar mcbuffer 0 mclength
+                 (* Save the char *);
+                 mclength)
+               else
+                 (* pcre2_compile.c:7291-7308 — handle the case of a
+                    single code unit - either with no UTF support, or with
+                    UTF disabled, or for a single-code-unit UTF character.
+                    In the latter case, for a repeated positive match, get
+                    the caseless flag for the required code unit from the
+                    previous character, because a class like [Aa] sets a
+                    caseless A but by now the req_caseopt flag has been
+                    reset. *)
+                 let mcbuffer0 =
+                   Char.code (Bytes.get cb.start_code (!code - 1))
+                 in
+                 Bytes.set mcbuffer 0 (Char.chr mcbuffer0);
+                 if op_previous <= Opcodes.op_chari && !repeat_min > 1 then (
+                   reqcu := mcbuffer0;
+                   reqcuflags := cb.req_varyopt;
+                   if Int.equal op_previous Opcodes.op_chari then
+                     reqcuflags := !reqcuflags lor req_caseless);
+                 1
+             in
              (* goto OUTPUT_SINGLE_REPEAT — code shared with single
                 character types (pcre2_compile.c:7309) *)
-             output_single_repeat ~mclength:1 ~mcbuffer0 ~prop_type:(-1)
+             output_single_repeat ~mclength ~mcbuffer ~prop_type:(-1)
                ~prop_value:(-1))
            else if
              Int.equal op_previous Opcodes.op_xclass
@@ -3202,10 +3423,7 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
            then (
              (* pcre2_compile.c:7311-7344 — if previous was a character
                 class or a back reference, we put the repeat stuff after
-                it, but just skip the item if the repeat was {0,0}.
-                (OP_REF/OP_REFI/OP_DNREF/OP_DNREFI previous items arrive
-                with M2, OP_XCLASS with M6; only the class opcodes can be
-                previous in M1.) *)
+                it, but just skip the item if the repeat was {0,0}. *)
              if Int.equal !repeat_max 0 then (
                code := !previous;
                raise_notrace End_repeat);
@@ -3371,15 +3589,15 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                  || Int.equal op_previous Opcodes.op_notprop
                then
                  (* pcre2_compile.c:7776-7780 — a repeated Unicode
-                    property match carries its two property data units.
-                    OP_PROP/OP_NOTPROP previous items arrive with M7
-                    (docs/ocaml-engine/08-ucp.md); the plumbing is kept in
-                    the C's shape. *)
+                    property match carries its two property data units
+                    (reachable via the PT_CLIST caseless-multicase
+                    emission; \p/\P-produced properties arrive with M7,
+                    docs/ocaml-engine/08-ucp.md). *)
                  ( Char.code (Bytes.get cb.start_code (!previous + 1)),
                    Char.code (Bytes.get cb.start_code (!previous + 2)) )
                else (-1, -1)
              in
-             output_single_repeat ~mclength:0 ~mcbuffer0:0 ~prop_type
+             output_single_repeat ~mclength:0 ~mcbuffer:Bytes.empty ~prop_type
                ~prop_value);
 
            (* pcre2_compile.c:7909-7929 — if the character following a
@@ -3426,18 +3644,13 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                || Int.equal t Opcodes.op_notexacti
              then (
                tempcode := !tempcode + Opcodes.op_lengths.(t);
-               (* pcre2_compile.c:7950-7953 — SUPPORT_UNICODE:
-                  HAS_EXTRALEN(c) = c >= 0xc0 (pcre2_internal.h:272,
-                  pcre2_intmodedep.h:286). DEVIATION: the GET_EXTRALEN
-                  skip is M6 (docs/ocaml-engine/07-utf.md); unreachable in
-                  M1 (no multi-code-unit literal is ever emitted), so this
-                  defers loudly rather than mis-skipping. *)
-               if
-                 utf
-                 && Char.code (Bytes.get cb.start_code (!tempcode - 1)) >= 0xc0
-               then (
-                 errorcodeptr := Parse.err_deferred;
-                 return_from_branch 0))
+               (* pcre2_compile.c:7950-7953 — SUPPORT_UNICODE: if
+                  HAS_EXTRALEN(tempcode[-1]), skip the extra code units of
+                  a multi-unit character (the length in the table is a
+                  minimum). *)
+               let last = Char.code (Bytes.get cb.start_code (!tempcode - 1)) in
+               if utf && Utf.has_extralen last then
+                 tempcode := !tempcode + Utf.get_extralen last)
              else if
                Int.equal t Opcodes.op_class || Int.equal t Opcodes.op_nclass
              then
@@ -3446,8 +3659,8 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                   point to it. 32/sizeof(PCRE2_UCHAR) = 32. *)
                tempcode := !tempcode + 1 + 32
              else if Int.equal t Opcodes.op_xclass then
-               (* pcre2_compile.c:7964-7968 — unreachable in M1 (OP_XCLASS
-                  emission is M6), kept in the C's shape. *)
+               (* pcre2_compile.c:7964-7968 — OP_XCLASS carries its length
+                  in the compiled code. *)
                tempcode := !tempcode + get cb.start_code (!tempcode + 1);
 
              (* pcre2_compile.c:7971-7977 — if tempcode is equal to code
@@ -4197,13 +4410,6 @@ let rec is_startline (code : Bytes.t) (pos : int) (bracket_map : int)
    Returns: offset of the opcode for OP_RECURSE, or -1 (the C's NULL) if
    not found. *)
 let find_recurse (code : Bytes.t) (pos : int) ~(utf : bool) : int =
-  (* DEVIATION: the MAYBE_UTF_MULTI switch (pcre2_compile.c:8982-9043),
-     which skips the extra code units of multi-unit UTF characters after
-     the opcodes that are followed by a character, is deferred to M6
-     (docs/ocaml-engine/07-utf8.md) with the rest of UTF compilation —
-     pcre2_compile rejects PCRE2_UTF before any OP_RECURSE can be
-     emitted, so it is unreachable here. *)
-  ignore utf;
   let rec loop pos =
     let c = Char.code (Bytes.get code pos) in
     if Int.equal c Opcodes.op_end then -1
@@ -4269,7 +4475,22 @@ let find_recurse (code : Bytes.t) (pos : int) ~(utf : bool) : int =
       in
       (* Add in the fixed length from the table
          (pcre2_compile.c:8974-8976). *)
-      (loop [@tailcall]) (pos + Opcodes.op_lengths.(c))
+      let pos = pos + Opcodes.op_lengths.(c) in
+      (* pcre2_compile.c:8978-9043 — in UTF-8 mode, opcodes that are
+         followed by a character may be followed by a multi-unit
+         character; the length in the table is a minimum, so we have to
+         arrange to skip the extra units. The MAYBE_UTF_MULTI case list is
+         exactly the contiguous opcode range OP_CHAR..OP_NOTPOSUPTOI
+         (pcre2_internal.h:1433-1512: the four char/not opcodes and every
+         repeat family in caseful/caseless/negated/negated-caseless
+         form). *)
+      let pos =
+        if utf && c >= Opcodes.op_char && c <= Opcodes.op_notposuptoi then
+          let last = Char.code (Bytes.get code (pos - 1)) in
+          if Utf.has_extralen last then pos + Utf.get_extralen last else pos
+        else pos
+      in
+      (loop [@tailcall]) pos
   in
   loop pos
 
@@ -4291,10 +4512,6 @@ let find_recurse (code : Bytes.t) (pos : int) ~(utf : bool) : int =
    not found. *)
 let find_bracket (code : Bytes.t) (pos : int) ~(utf : bool) (number : int) : int
     =
-  (* DEVIATION: as in find_recurse above, the MAYBE_UTF_MULTI switch
-     (pcre2_find_bracket.c:150-211) is deferred to M6; it is unreachable
-     while UTF compilation is rejected. *)
-  ignore utf;
   let rec loop pos =
     let c = Char.code (Bytes.get code pos) in
     if Int.equal c Opcodes.op_end then -1
@@ -4372,7 +4589,20 @@ let find_bracket (code : Bytes.t) (pos : int) ~(utf : bool) (number : int) : int
       in
       (* Add in the fixed length from the table
          (pcre2_find_bracket.c:142-144). *)
-      (loop [@tailcall]) (pos + Opcodes.op_lengths.(c))
+      let pos = pos + Opcodes.op_lengths.(c) in
+      (* pcre2_find_bracket.c:146-211 — in UTF-8 mode, opcodes that are
+         followed by a character may be followed by a multi-byte
+         character; the length in the table is a minimum, so we have to
+         arrange to skip the extra bytes. The MAYBE_UTF_MULTI case list is
+         exactly the contiguous opcode range OP_CHAR..OP_NOTPOSUPTOI
+         (pcre2_internal.h:1433-1512), as in find_recurse above. *)
+      let pos =
+        if utf && c >= Opcodes.op_char && c <= Opcodes.op_notposuptoi then
+          let last = Char.code (Bytes.get code (pos - 1)) in
+          if Utf.has_extralen last then pos + Utf.get_extralen last else pos
+        else pos
+      in
+      (loop [@tailcall]) pos
   in
   loop pos
 
@@ -5824,15 +6054,19 @@ let pcre2_compile ?(ccontext : compile_context = default_compile_context)
     if utf then (
       if not (Int.equal (options land Options.never_utf) 0) then
         raise_notrace (Had_error (Errors.err74, skipatstart));
-      (* pcre2_compile.c:10406-10408 — PRIV(valid_utf) over the pattern
-         unless PCRE2_NO_UTF_CHECK. DEVIATION (M6 deferral,
-         docs/ocaml-engine/07-utf8.md): the whole UTF-8 compile pipeline
-         (valid_utf, GETCHARINC decoding in parse, ord2utf emission) is
-         M6; until it lands, UTF compilation fails loudly here — before
-         parse_regex can misread multi-byte characters bytewise — instead
-         of guessing. The ERR91 surrogate-escapes check (10410-10416) is
-         UTF-16 only, N/A. *)
-      raise_notrace (Had_error (Parse.err_deferred, skipatstart)));
+      (* pcre2_compile.c:10406-10408 — PRIV(valid_utf) over the whole
+         pattern unless PCRE2_NO_UTF_CHECK; the errorcode is valid_utf's
+         negative return and the offset was set by valid_utf() (the C's
+         goto HAD_ERROR, not HAD_EARLY_ERROR). The ERR91 surrogate-escapes
+         check (10410-10416) is UTF-16 only, N/A. *)
+      if Int.equal (options land Options.no_utf_check) 0 then
+        let erroroffset = ref 0 in
+        let errorcode =
+          Valid_utf.valid_utf pattern ~start:0 ~length:(String.length pattern)
+            erroroffset
+        in
+        if not (Int.equal errorcode 0) then
+          raise_notrace (Had_error (errorcode, !erroroffset)));
 
     (* pcre2_compile.c:10419-10426 — check UCP lockout. *)
     let ucp = not (Int.equal (cb.external_options land Options.ucp) 0) in
@@ -7720,14 +7954,125 @@ let () =
   assert (Int.equal rcuf 0);
   assert (Int.equal (Bytes.length cb.start_code) 24);
 
-  (* Deferred arms fail loudly in both phases: Unicode property classes
-     (M7), and the Unicode caseless-literal path (M6/M7 DEVIATION in
-     compile_branch). *)
-  expect_deferred ~options:(Options.ucp lor Options.caseless) "k";
+  (* Deferred arms fail loudly in both phases: \p-produced Unicode
+     property classes (M7). *)
   expect_deferred ~options:Options.ucp "[\\d]"
   (* parse substitutes \p{Nd} under UCP: ESC_p in a class = XCL_PROP (M7) *);
-  expect_deferred ~options:(Options.ucp lor Options.caseless) "[^k]"
-(* OP_NOTPROP PT_CLIST (M7) *)
+
+  (* UTF / Unicode-caseless compile_branch arms, pinned against `pcre2test
+     -q` + fullbincode on the real 10.44 library (testoutput-style dumps
+     probed for each pattern below). *)
+  (* Caseless multicase literal (pcre2_compile.c:8237-8251): /(?i)k/ under
+     UCP (or UTF) = [PROP clist <caseset(k)>]; oracle dump
+     `clist 004b 006b 212a`. *)
+  let kset = Ucd.caseset (Char.code 'k') in
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~options:(Options.ucp lor Options.caseless) "k"
+  in
+  assert_code cb [ Opcodes.op_prop; Opcodes.pt_clist; kset ];
+  (* Negated one-char class of a multicase character
+     (pcre2_compile.c:5930-5940): /(?i)[^k]/ = [NOTPROP clist ...]. *)
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~options:(Options.ucp lor Options.caseless) "[^k]"
+  in
+  assert_code cb [ Opcodes.op_notprop; Opcodes.pt_clist; kset ];
+  (* Multi-byte literal via ord2utf (pcre2_compile.c:8264-8270): /é/utf =
+     [CHAR c3 a9]; caseless single-other-case /(?i)é/utf = [CHARI c3 a9]
+     (caseset(0xe9) = 0 falls through to CLASS_CASELESS_CHAR). *)
+  let cb, _, _, _, fcu, _, rcu, _ = compile2 ~options:Options.utf "\xc3\xa9" in
+  assert_code cb [ Opcodes.op_char; 0xc3; 0xa9 ];
+  (* firstcu = mcbuffer[0], reqcu = code[-1] for a multi-unit char
+     (pcre2_compile.c:8299-8307). *)
+  assert (Int.equal fcu 0xc3);
+  assert (Int.equal rcu 0xa9);
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~options:(Options.utf lor Options.caseless) "\xc3\xa9"
+  in
+  assert_code cb [ Opcodes.op_chari; 0xc3; 0xa9 ];
+  (* Negated one-char class of a wide char (pcre2_compile.c:5942-5945
+     PUTCHAR): /[^\x{100}]/utf = [NOT c4 80] (no OP_XCLASS). *)
+  let cb, _, _, _, _, _, _, _ = compile2 ~options:Options.utf "[^\\x{100}]" in
+  assert_code cb [ Opcodes.op_not; 0xc4; 0x80 ];
+  (* OP_XCLASS without a bitmap (pcre2_compile.c:5321-5336, 6436-6462):
+     /[\x{100}-\x{200}]/utf = [XCLASS len=10 flags=0 XCL_RANGE c4 80 c8 80
+     XCL_END]; oracle shows the item spanning offsets 3-13. *)
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~options:Options.utf "[\\x{100}-\\x{200}]"
+  in
+  assert_code cb
+    [
+      Opcodes.op_xclass;
+      0;
+      10;
+      0;
+      Opcodes.xcl_range;
+      0xc4;
+      0x80;
+      0xc8;
+      0x80;
+      Opcodes.xcl_end;
+    ];
+  (* OP_XCLASS with the XCL_MAP bitmap (pcre2_compile.c:6442-6457):
+     /[\x{ff}-\x{100}]/utf = 40 units, map bit 0xff + XCL_SINGLE 0x100;
+     oracle shows the item spanning offsets 3-43. *)
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~options:Options.utf "[\\x{ff}-\\x{100}]"
+  in
+  let xclass_map_expected map tail =
+    [ Opcodes.op_xclass; 0; 4 + 32 + List.length tail; Opcodes.xcl_map ]
+    @ map @ tail
+  in
+  let map_ff = List.init 32 (fun i -> if Int.equal i 31 then 0x80 else 0) in
+  assert_code cb
+    (xclass_map_expected map_ff
+       [ Opcodes.xcl_single; 0xc4; 0x80; Opcodes.xcl_end ]);
+  (* Caseless closure (pcre2_compile.c:5239-5282 with get_othercase_range
+     and add_list_to_class_internal): /(?i)[à-ÿ]/utf compiles to map bits
+     c0-d6, d8-de, e0-ff plus XCL_SINGLE 0x212b (from å's caseless set,
+     emitted mid-closure) and XCL_SINGLE 0x178 (ÿ's other case) — oracle
+     dump `[\xc0-\xd6\xd8-\xde\xe0-\xff\x{212b}\x{178}]`, 44 units. *)
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~options:(Options.utf lor Options.caseless) "[\xc3\xa0-\xc3\xbf]"
+  in
+  let map_folded =
+    List.init 32 (fun i ->
+        match i with
+        | 24 | 25 -> 0xff (* c0-cf *)
+        | 26 | 27 -> 0x7f (* d0-d6, d8-de *)
+        | 28 | 29 | 30 | 31 -> 0xff (* e0-ff *)
+        | _ -> 0)
+  in
+  assert_code cb
+    (xclass_map_expected map_folded
+       [
+         Opcodes.xcl_single;
+         0xe2;
+         0x84;
+         0xab;
+         Opcodes.xcl_single;
+         0xc5;
+         0xb8;
+         Opcodes.xcl_end;
+       ]);
+  (* Repeated multi-byte character (pcre2_compile.c:7280-7289 BACKCHAR +
+     mcbuffer, OUTPUT_SINGLE_REPEAT): /é{2,4}/utf = [EXACT 2 c3 a9]
+     [UPTO 2 c3 a9] (auto-possessify is M9, so the oracle's {0,2}+ shows
+     here as plain UPTO). *)
+  let cb, _, _, _, _, _, _, _ = compile2 ~options:Options.utf "\xc3\xa9{2,4}" in
+  assert_code cb
+    [ Opcodes.op_exact; 0; 2; 0xc3; 0xa9; Opcodes.op_upto; 0; 2; 0xc3; 0xa9 ];
+  (* Explicitly possessive multi-byte repeat: the possessive post-pass
+     skips the character with GET_EXTRALEN (pcre2_compile.c:7950-7953) and
+     possessifies OP_PLUS: /é++/utf = [POSPLUS c3 a9]. *)
+  let cb, _, _, _, _, _, _, _ = compile2 ~options:Options.utf "\xc3\xa9++" in
+  assert_code cb [ Opcodes.op_posplus; 0xc3; 0xa9 ];
+  (* VERB_ARG with a wide character (pcre2_compile.c:6556-6571): the name
+     is stored as UTF-8 code units with the code-unit length in front:
+     ( *MARK:é) = [MARK 2 c3 a9 0]; oracle dump `*MARK \x{c3}\x{a9}`. *)
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~options:Options.utf "(*MARK:\xc3\xa9)a"
+  in
+  assert_code cb [ Opcodes.op_mark; 2; 0xc3; 0xa9; 0; Opcodes.op_char; 0x61 ]
 
 (* pcre2_compile() end-to-end: two-pass driver, pso settings, error
    propagation, name table, and the anchoring / first-and-required
@@ -7859,8 +8204,55 @@ let () =
   (* ( *UTF) under NEVER_UTF: ERR74 at the post-pso offset. *)
   expect_err "(*UTF)a" Options.never_utf Errors.err74 6;
   expect_err "(*UCP)a" Options.never_ucp Errors.err75 6;
-  (* UTF compile pipeline defers loudly (M6). *)
-  expect_err "a" Options.utf Parse.err_deferred 0;
+  (* UTF pattern validity gate (pcre2_compile.c:10406-10408): the negative
+     valid_utf code, with the offset set by valid_utf itself. Oracle:
+     /\xc3(/utf gives "Failed: error -8 at offset 0"; testoutput10:8-19
+     pins the bracketed and truncated shapes. *)
+  expect_err "\xc3(" Options.utf Errors.error_utf8_err6 0;
+  expect_err "[\xc3(]" Options.utf Errors.error_utf8_err6 1;
+  expect_err "\xc3" Options.utf Errors.error_utf8_err1 0;
+  (* PCRE2_NO_UTF_CHECK skips the gate (10406). *)
+  (match
+     pcre2_compile "\xc3\xa9" ~options:(Options.utf lor Options.no_utf_check)
+   with
+  | Ok _ -> ()
+  | Error _ -> assert false);
+  (* /(?i)é/utf end-to-end; oracle fullbincode:
+       0   6 Bra / 3  /i \x{e9} / 6   6 Ket / 9     End *)
+  (match pcre2_compile "(?i)\xc3\xa9" ~options:Options.utf with
+  | Error _ -> assert false
+  | Ok re ->
+      List.iteri
+        (fun i v -> assert (Int.equal (Char.code (Bytes.get re.code i)) v))
+        [
+          Opcodes.op_bra;
+          0;
+          6;
+          Opcodes.op_chari;
+          0xc3;
+          0xa9;
+          Opcodes.op_ket;
+          0;
+          6;
+          Opcodes.op_end;
+        ]);
+  (* /[\S\x{100}]/utf: the explicitly-given wide char is discarded — the
+     xclass entry condition (pcre2_compile.c:6383-6407) fails for a
+     negated special without UCP or properties, leaving OP_NCLASS (oracle
+     dump: `[\x00-\x08\x0e-\x1f!-\xff] (neg)`); the pre-compile phase
+     over-estimated the length by the discarded extra data, which the
+     driver absorbs (usedlength < length, 10717-10725). *)
+  (match pcre2_compile "[\\S\\x{100}]" ~options:Options.utf with
+  | Error _ -> assert false
+  | Ok re ->
+      assert (Int.equal (Char.code (Bytes.get re.code 3)) Opcodes.op_nclass));
+  (* UTF group names (read_name, pcre2_compile.c:2488-2512): Unicode
+     letters are valid name characters; a leading Nd digit is ERR44 at the
+     name start (oracle: /(?<1é>a)/utf = error 144 at offset 3). *)
+  (match pcre2_compile "(?<\xc3\xa9x>a)\\k<\xc3\xa9x>" ~options:Options.utf with
+  | Ok _ -> ()
+  | Error _ -> assert false);
+  expect_err "(?<1\xc3\xa9>a)" Options.utf Errors.err44 3;
   (* Name table: /(?<xx>a)(?<yy>b)(?<ww>c)/ has 3 entries of size
      2+2+1 = 5, alphabetically ordered by add_name_to_table. *)
   let re = ok "(?<xx>a)(?<yy>b)(?<ww>c)" in

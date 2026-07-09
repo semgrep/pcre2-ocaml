@@ -205,6 +205,31 @@ let err101 =
 let error_nomatch = -1
 let error_partial = -2
 
+(* UTF-8 validity error codes (pcre2.h.generic:330-352): the negative
+   return space of PRIV(valid_utf); the conditions each one reports are
+   listed at pcre2_valid_utf.c:109-131. *)
+let error_utf8_err1 = -3 (* Missing 1 byte at the end of the string *)
+let error_utf8_err2 = -4 (* Missing 2 bytes at the end of the string *)
+let error_utf8_err3 = -5 (* Missing 3 bytes at the end of the string *)
+let error_utf8_err4 = -6 (* Missing 4 bytes at the end of the string *)
+let error_utf8_err5 = -7 (* Missing 5 bytes at the end of the string *)
+let error_utf8_err6 = -8 (* 2nd-byte's two top bits are not 0x80 *)
+let error_utf8_err7 = -9 (* 3rd-byte's two top bits are not 0x80 *)
+let error_utf8_err8 = -10 (* 4th-byte's two top bits are not 0x80 *)
+let error_utf8_err9 = -11 (* 5th-byte's two top bits are not 0x80 *)
+let error_utf8_err10 = -12 (* 6th-byte's two top bits are not 0x80 *)
+let error_utf8_err11 = -13 (* 5-byte character is not permitted by RFC 3629 *)
+let error_utf8_err12 = -14 (* 6-byte character is not permitted by RFC 3629 *)
+let error_utf8_err13 = -15 (* 4-byte character with value > 0x10ffff *)
+let error_utf8_err14 = -16 (* 3-byte character with value 0xd800-0xdfff *)
+let error_utf8_err15 = -17 (* Overlong 2-byte sequence *)
+let error_utf8_err16 = -18 (* Overlong 3-byte sequence *)
+let error_utf8_err17 = -19 (* Overlong 4-byte sequence *)
+let error_utf8_err18 = -20 (* Overlong 5-byte sequence (won't ever occur) *)
+let error_utf8_err19 = -21 (* Overlong 6-byte sequence (won't ever occur) *)
+let error_utf8_err20 = -22 (* Isolated 0x80 byte (not within UTF-8 char) *)
+let error_utf8_err21 = -23 (* Byte with the illegal value 0xfe or 0xff *)
+
 (* Miscellaneous match-time error codes: pcre2.h.generic:370-409. *)
 let error_baddata = -29 (* pcre2.h.generic:370 *)
 let error_badmagic = -31 (* pcre2.h.generic:372 *)

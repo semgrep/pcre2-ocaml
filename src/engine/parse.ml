@@ -887,16 +887,21 @@ let make_context (pattern : string) : parse_context =
    &nllen, utf)`, delegating to Newline.is_newline
    (pcre2_newline.c:78-145); like the C, which passes &(cb->nllen), the
    matched newline's length is written into cx.nllen only on a TRUE return
-   (the caller advances by it). utf is false: parse cannot run in UTF mode
-   until M6 (the pcre2_compile driver defers UTF before parse_regex). The
-   FIXED arm is compared inline by the macro itself — PRIV(is_newline)
-   never sees NLTYPE_FIXED — so it stays here, below. *)
+   (the caller advances by it). The macro's [utf] is parse_regex's local
+   (options & PCRE2_UTF); PCRE2_UTF never changes after the driver folds
+   ( *UTF) into the external options before parsing, so it is recovered
+   here from cx.external_options. The FIXED arm is compared inline by the
+   macro itself — PRIV(is_newline) never sees NLTYPE_FIXED — so it stays
+   here, below. *)
 let is_newline_at (cx : parse_context) (p : int) : bool =
   if not (Int.equal cx.nltype nltype_fixed) then (
     p < cx.ptrend
     &&
     let len = ref 0 in
-    let hit = Newline.is_newline cx.pattern cx.nltype p cx.ptrend len false in
+    let hit =
+      Newline.is_newline cx.pattern cx.nltype p cx.ptrend len
+        (not (Int.equal (cx.external_options land Options.utf) 0))
+    in
     if hit then cx.nllen <- !len;
     hit)
   else
@@ -1267,14 +1272,10 @@ let check_escape (cx : parse_context) (ptrptr : int ref) (chptr : int ref)
     0)
   else
     try
-      (* pcre2_compile.c:1571-1572 — GETCHARINCTEST: get character value,
-         increment pointer. M6: in UTF mode this must decode a UTF-8
-         character (pcre2_intmodedep.h:322-325); until utf.ml lands, the
-         byte read below is the 8-bit non-UTF expansion
-         (pcre2_intmodedep.h:264). UTF compilation is rejected before parse
-         in the current engine, so the utf-true decode is unreachable. *)
-      c := Char.code cx.pattern.[!ptr];
-      incr ptr;
+      (* pcre2_compile.c:1571-1572 — GETCHARINCTEST
+         (pcre2_intmodedep.h:319-324): get character value, increment
+         pointer. *)
+      c := Utf.getcharinctest ~utf cx.pattern ptr;
       cx.errorcode <- 0 (* Be optimistic *);
 
       (* Non-alphanumerics are literals, so we just leave the value in c
@@ -1920,34 +1921,52 @@ let read_name (cx : parse_context) (ptrptr : int ref) ~(utf : bool)
     nameptr := !ptr;
     offsetptr := !ptr;
 
-    (* The SUPPORT_UNICODE group-name scan (pcre2_compile.c:2488-2512) needs
-       GETCHAR/UCD_CHARTYPE from utf.ml, which lands in M6. Until then this
-       function mirrors the !SUPPORT_UNICODE build (pcre2_compile.c:2514-2516),
-       in which utf is ignored ((void)utf) and the byte path below is always
-       taken. UTF compilation is rejected before parse in the current
-       engine, so the arm is unreachable. *)
-    ignore (utf : bool);
-
-    (* pcre2_compile.c:2518-2533 — handle non-group names and group names in
-       non-UTF modes. A group name must not start with a digit. If either of
-       the others start with a digit it just won't be recognized. *)
-    if is_group && is_digit cx.pattern.[!ptr] then (
-      cx.errorcode <- Errors.err44;
-      raise_notrace Goto_exit (* goto FAILED *));
-    (* MAX_255 of *ptr is TRUE in the 8-bit library (pcre2_intmodedep.h:212).
-       cb->ctypes: the engine currently has only the default C-locale
-       tables (Chartables.ctypes); custom-table plumbing arrives with the
-       compile_block. *)
-    while
-      !ptr < cx.ptrend
-      && not
-           (Int.equal
-              (Chartables.ctypes (Char.code cx.pattern.[!ptr])
-              land Chartables.ctype_word)
-              0)
-    do
-      incr ptr
-    done;
+    (* pcre2_compile.c:2485-2512 — in UTF mode, a group name may contain
+       letters and decimal digits as defined by Unicode properties, and
+       underscores, but must not start with a digit. *)
+    if utf && is_group then (
+      let c = ref (Utf.getchar cx.pattern !ptr) in
+      let type_ = ref (Ucd.chartype !c) in
+      if Int.equal !type_ Ucp.ucp_nd then (
+        cx.errorcode <- Errors.err44;
+        raise_notrace Goto_exit (* goto FAILED *));
+      let brk = ref false in
+      while not !brk do
+        if
+          (not (Int.equal !type_ Ucp.ucp_nd))
+          && (not (Int.equal Tables.ucp_gentype.(!type_) Ucp.ucp_l))
+          && not (Int.equal !c (Char.code '_'))
+        then brk := true
+        else (
+          incr ptr;
+          ptr := Utf.forwardchartest cx.pattern !ptr cx.ptrend;
+          if !ptr >= cx.ptrend then brk := true
+          else (
+            c := Utf.getchar cx.pattern !ptr;
+            type_ := Ucd.chartype !c))
+      done)
+    else (
+      (* pcre2_compile.c:2518-2533 — handle non-group names and group
+         names in non-UTF modes. A group name must not start with a
+         digit. If either of the others start with a digit it just won't
+         be recognized. *)
+      if is_group && is_digit cx.pattern.[!ptr] then (
+        cx.errorcode <- Errors.err44;
+        raise_notrace Goto_exit (* goto FAILED *));
+      (* MAX_255 of *ptr is TRUE in the 8-bit library
+         (pcre2_intmodedep.h:212). cb->ctypes: the engine currently has
+         only the default C-locale tables (Chartables.ctypes);
+         custom-table plumbing arrives with the compile_block. *)
+      while
+        !ptr < cx.ptrend
+        && not
+             (Int.equal
+                (Chartables.ctypes (Char.code cx.pattern.[!ptr])
+                land Chartables.ctype_word)
+                0)
+      do
+        incr ptr
+      done);
 
     (* pcre2_compile.c:2535-2542 — check name length. *)
     if !ptr > !nameptr + Limits.max_name_size then (
@@ -2312,16 +2331,9 @@ let parse_regex (cx : parse_context) ~(options : int)
 
   cx.errorcode <- 0;
 
-  (* pcre2_intmodedep.h:322-325 — GETCHARINCTEST(c, ptr). M6: in UTF mode
-     this must decode a UTF-8 character; until utf.ml lands the byte read
-     below is the 8-bit non-UTF expansion (UTF compilation is rejected
-     before parse in the current engine, so the utf-true decode is
-     unreachable). *)
-  let getcharinctest () =
-    let ch = Char.code pat.[!ptr] in
-    incr ptr;
-    ch
-  in
+  (* pcre2_intmodedep.h:319-324 — GETCHARINCTEST(c, ptr), over the
+     function-scope utf and ptr. *)
+  let getcharinctest () = Utf.getcharinctest ~utf pat ptr in
 
   (* pcre2_compile.c:2768 — PARSED_LITERAL(c, p), the 8-bit expansion
      (literal values cannot reach META_END). *)
@@ -2730,8 +2742,7 @@ let parse_regex (cx : parse_context) ~(options : int)
                        land (Options.extended lor Options.alt_verbnames))
                        (Options.extended lor Options.alt_verbnames)))
                 (* OR: character > 255 AND not Unicode Pattern White Space
-                   (pcre2_compile.c:2957-2958); c > 255 is unreachable until
-                   UTF decode lands (M6). *)
+                   (pcre2_compile.c:2957-2958) *)
                 || !c > 255
                    && (not (Int.equal (!c lor 1) 0x200f))
                    && not (Int.equal (!c lor 1) 0x2029)
@@ -2826,9 +2837,7 @@ let parse_regex (cx : parse_context) ~(options : int)
                        (Chartables.ctypes !c land Chartables.ctype_space)
                        0)
              then raise_notrace Loop_continue;
-             (* SUPPORT_UNICODE branch (pcre2_compile.c:3067-3069); the
-                comparisons above 255 are unreachable until UTF decode lands
-                (M6). *)
+             (* SUPPORT_UNICODE branch (pcre2_compile.c:3067-3069). *)
              if
                Int.equal !c 0x85 (* CHAR_NEL *)
                || Int.equal (!c lor 1) 0x200f
@@ -2843,10 +2852,11 @@ let parse_regex (cx : parse_context) ~(options : int)
                       cb->nllen. *)
                    ptr := !ptr + cx.nllen;
                    scanning := false)
-                 else incr ptr
-                   (* M6: if utf then FORWARDCHARTEST(ptr, ptrend)
-                      (pcre2_compile.c:3080-3082) — byte scan until utf.ml
-                      lands. *)
+                 else (
+                   incr ptr;
+                   (* pcre2_compile.c:3080-3082 — if utf,
+                      FORWARDCHARTEST(ptr, ptrend). *)
+                   if utf then ptr := Utf.forwardchartest pat !ptr cx.ptrend)
                done;
                raise_notrace Loop_continue (* Next character in pattern *)));
 
@@ -3005,1539 +3015,1567 @@ let parse_regex (cx : parse_context) ~(options : int)
            (* pcre2_compile.c:3193-3195 — process the next item in the main
               part of a pattern. The C switch's default case (non-special
               character) comes first in the source and is the last arm of
-              this match; c is a byte here (see getcharinctest), so Char.chr
-              is safe. M6: when getcharinctest decodes UTF, c can exceed 255
-              and MUST route to the default parsed_literal arm (C switch
-              default) — replace Char.chr dispatch with an explicit
-              `if !c > 255` guard when utf.ml lands. *)
-           match Char.chr !c with
-           | '\\' ->
-               (* ---- Escape sequence ---- pcre2_compile.c:3202-3404 *)
-               let tempptr = !ptr in
-               let escape =
-                 ref
-                   (check_escape cx ptr c ~options:!options ~xoptions:!xoptions
-                      ~isclass:false (Some cx))
-               in
+              this match. In UTF mode getcharinctest can decode a character
+              above 255: every switch case label is an ASCII code unit, so
+              such a character always takes the default (literal) arm —
+              dispatched here before Char.chr, whose byte precondition
+              holds on the other side of the guard. *)
+           if !c > 255 then
+             (* pcre2_compile.c:3197-3199 — non-special character (the C
+                switch's default case, first in the source). *)
+             parsed_literal !c
+           else
+             match Char.chr !c with
+             | '\\' ->
+                 (* ---- Escape sequence ---- pcre2_compile.c:3202-3404 *)
+                 let tempptr = !ptr in
+                 let escape =
+                   ref
+                     (check_escape cx ptr c ~options:!options
+                        ~xoptions:!xoptions ~isclass:false (Some cx))
+                 in
 
-               (* pcre2_compile.c:3208-3219 — the ESCAPE_FAILED label: a bad
-                  escape is fatal unless PCRE2_EXTRA_BAD_ESCAPE_IS_LITERAL
-                  is set, in which case the escape sequence is re-read as a
-                  literal character. The C's forward gotos to ESCAPE_FAILED
-                  from the arms below are `escape_failed (); process_escape
-                  ()` here: after recovery escape = 0, so the re-entry takes
-                  the literal path. Note that errorcode is NOT reset,
-                  exactly as in the C. *)
-               let escape_failed () =
-                 if
-                   Int.equal
-                     (!xoptions land Options.extra_bad_escape_is_literal)
-                     0
-                 then raise_notrace Goto_failed;
-                 ptr := tempptr;
-                 if !ptr >= cx.ptrend then c := 0x5c (* CHAR_BACKSLASH *)
-                 else (
-                   (* GETCHARINCTEST — byte read; see getcharinctest. *)
-                   c := Char.code pat.[!ptr];
-                   incr ptr);
-                 escape := 0 (* Treat as literal character *)
-               in
-
-               let rec process_escape () =
-                 if Int.equal !escape 0 then
-                   (* pcre2_compile.c:3221-3226 — the escape was a data
-                      escape or literal character. *)
-                   parsed_literal !c
-                 else if !escape < 0 then (
-                   (* pcre2_compile.c:3228-3250 — a back (or forward)
-                      reference. Keep the offset in order to give a more
-                      useful diagnostic for a bad forward reference. For
-                      references to groups numbered less than 10 no more
-                      than two items can be used in parsed_pattern (they may
-                      be just two characters in the input), so for them the
-                      offset of the first occurrence is held in a special
-                      vector. *)
-                   let offset = !ptr - 1 in
-                   (* ptr - cb->start_pattern - 1 *)
-                   let escape = - !escape in
-                   buf.(!pp) <- meta_backref lor escape;
-                   incr pp;
-                   if escape < 10 then (
-                     if Int.equal cx.small_ref_offset.(escape) pcre2_unset then
-                       cx.small_ref_offset.(escape) <- offset)
-                   else putoffset buf pp offset;
-                   okquantifier := true)
-                 else if Int.equal !escape esc_big_c then
-                   (* pcre2_compile.c:3270-3283 — \C. The NEVER_BACKSLASH_C
-                      build-time switch is not defined in the reference
-                      configuration, so only the PCRE2_NEVER_BACKSLASH_C
-                      option check (ERR83) applies. *)
+                 (* pcre2_compile.c:3208-3219 — the ESCAPE_FAILED label: a bad
+                    escape is fatal unless PCRE2_EXTRA_BAD_ESCAPE_IS_LITERAL
+                    is set, in which case the escape sequence is re-read as a
+                    literal character. The C's forward gotos to ESCAPE_FAILED
+                    from the arms below are `escape_failed (); process_escape
+                    ()` here: after recovery escape = 0, so the re-entry takes
+                    the literal path. Note that errorcode is NOT reset,
+                    exactly as in the C. *)
+                 let escape_failed () =
                    if
-                     not (Int.equal (!options land Options.never_backslash_c) 0)
+                     Int.equal
+                       (!xoptions land Options.extra_bad_escape_is_literal)
+                       0
+                   then raise_notrace Goto_failed;
+                   ptr := tempptr;
+                   if !ptr >= cx.ptrend then c := 0x5c (* CHAR_BACKSLASH *)
+                   else
+                     (* GETCHARINCTEST — get character value, increment
+                        pointer (pcre2_compile.c:3216). *)
+                     c := getcharinctest ();
+                   escape := 0 (* Treat as literal character *)
+                 in
+
+                 let rec process_escape () =
+                   if Int.equal !escape 0 then
+                     (* pcre2_compile.c:3221-3226 — the escape was a data
+                        escape or literal character. *)
+                     parsed_literal !c
+                   else if !escape < 0 then (
+                     (* pcre2_compile.c:3228-3250 — a back (or forward)
+                        reference. Keep the offset in order to give a more
+                        useful diagnostic for a bad forward reference. For
+                        references to groups numbered less than 10 no more
+                        than two items can be used in parsed_pattern (they may
+                        be just two characters in the input), so for them the
+                        offset of the first occurrence is held in a special
+                        vector. *)
+                     let offset = !ptr - 1 in
+                     (* ptr - cb->start_pattern - 1 *)
+                     let escape = - !escape in
+                     buf.(!pp) <- meta_backref lor escape;
+                     incr pp;
+                     if escape < 10 then (
+                       if Int.equal cx.small_ref_offset.(escape) pcre2_unset
+                       then cx.small_ref_offset.(escape) <- offset)
+                     else putoffset buf pp offset;
+                     okquantifier := true)
+                   else if Int.equal !escape esc_big_c then
+                     (* pcre2_compile.c:3270-3283 — \C. The NEVER_BACKSLASH_C
+                        build-time switch is not defined in the reference
+                        configuration, so only the PCRE2_NEVER_BACKSLASH_C
+                        option check (ERR83) applies. *)
+                     if
+                       not
+                         (Int.equal (!options land Options.never_backslash_c) 0)
+                     then (
+                       cx.errorcode <- Errors.err83;
+                       escape_failed () (* goto ESCAPE_FAILED *);
+                       process_escape ())
+                     else (
+                       okquantifier := true;
+                       buf.(!pp) <- meta_escape + !escape;
+                       incr pp)
+                   else if Int.equal !escape esc_ub then (
+                     (* pcre2_compile.c:3285-3293 — a special return that
+                        happens only in EXTRA_ALT_BSUX mode, when \u{ is not
+                        followed by hex digits and }. It requests two literal
+                        characters, u and {. *)
+                     buf.(!pp) <- Char.code 'u';
+                     incr pp;
+                     parsed_literal (Char.code '{'))
+                   else if
+                     Int.equal !escape esc_big_x
+                     || Int.equal !escape esc_big_h
+                     || Int.equal !escape esc_h
+                     || Int.equal !escape esc_big_n
+                     || Int.equal !escape esc_big_r
+                     || Int.equal !escape esc_big_v
+                     || Int.equal !escape esc_v
                    then (
-                     cx.errorcode <- Errors.err83;
-                     escape_failed () (* goto ESCAPE_FAILED *);
-                     process_escape ())
-                   else (
+                     (* pcre2_compile.c:3295-3308 — ESC_X (Unicode support is
+                        compiled in, so no ERR45) falls through to
+                        ESC_H/ESC_h/ESC_N/ESC_R/ESC_V/ESC_v in C. *)
                      okquantifier := true;
                      buf.(!pp) <- meta_escape + !escape;
                      incr pp)
-                 else if Int.equal !escape esc_ub then (
-                   (* pcre2_compile.c:3285-3293 — a special return that
-                      happens only in EXTRA_ALT_BSUX mode, when \u{ is not
-                      followed by hex digits and }. It requests two literal
-                      characters, u and {. *)
-                   buf.(!pp) <- Char.code 'u';
-                   incr pp;
-                   parsed_literal (Char.code '{'))
-                 else if
-                   Int.equal !escape esc_big_x
-                   || Int.equal !escape esc_big_h
-                   || Int.equal !escape esc_h
-                   || Int.equal !escape esc_big_n
-                   || Int.equal !escape esc_big_r
-                   || Int.equal !escape esc_big_v
-                   || Int.equal !escape esc_v
-                 then (
-                   (* pcre2_compile.c:3295-3308 — ESC_X (Unicode support is
-                      compiled in, so no ERR45) falls through to
-                      ESC_H/ESC_h/ESC_N/ESC_R/ESC_V/ESC_v in C. *)
-                   okquantifier := true;
-                   buf.(!pp) <- meta_escape + !escape;
-                   incr pp)
-                 else if
-                   Int.equal !escape esc_d
-                   || Int.equal !escape esc_big_d
-                   || Int.equal !escape esc_s
-                   || Int.equal !escape esc_big_s
-                   || Int.equal !escape esc_w
-                   || Int.equal !escape esc_big_w
-                 then (
-                   (* pcre2_compile.c:3314-3325 — escapes that may change in
-                      UCP mode. *)
-                   okquantifier := true;
-                   pp :=
-                     handle_escdsw cx !escape !pp ~options:!options
-                       ~xoptions:!xoptions)
-                 else if Int.equal !escape esc_big_p || Int.equal !escape esc_p
-                 then (
-                   (* pcre2_compile.c:3327-3346 — \P and \p Unicode property
-                      matching needs get_ucp(): deferred to M7. *)
-                   cx.errorcode <- err_deferred;
-                   raise_notrace Goto_failed)
-                 else if Int.equal !escape esc_g || Int.equal !escape esc_k then (
-                   if
-                     (* pcre2_compile.c:3348-3402 — when \g is used with
-                        quotes or angle brackets as delimiters, it is a
-                        numerical or named subroutine call; with brace
-                        delimiters it is a numerical back reference and does
-                        not come here because check_escape() returns it
-                        directly. \k is always a named back reference.
-                        Subroutine calls are deferred (M5). *)
-                     !ptr >= cx.ptrend
-                     || (not (Char.equal pat.[!ptr] '{'))
-                        && (not (Char.equal pat.[!ptr] '<'))
-                        && not (Char.equal pat.[!ptr] '\'')
+                   else if
+                     Int.equal !escape esc_d
+                     || Int.equal !escape esc_big_d
+                     || Int.equal !escape esc_s
+                     || Int.equal !escape esc_big_s
+                     || Int.equal !escape esc_w
+                     || Int.equal !escape esc_big_w
                    then (
-                     cx.errorcode <-
-                       (if Int.equal !escape esc_g then Errors.err57
-                        else Errors.err69);
-                     escape_failed () (* goto ESCAPE_FAILED *);
-                     process_escape ())
-                   else
-                     let terminator =
-                       if Char.equal pat.[!ptr] '<' then Char.code '>'
-                       else if Char.equal pat.[!ptr] '\'' then Char.code '\''
-                       else Char.code '}'
-                     in
-                     (* For a non-braced \g, check for a numerical recursion
-                        (pcre2_compile.c:3366-3384). *)
-                     let recovered = ref false in
-                     (if
-                        Int.equal !escape esc_g
-                        && not (Int.equal terminator (Char.code '}'))
-                      then
-                        let p = ref (!ptr + 1) in
-                        let i = ref 0 in
-                        if
-                          read_number cx p ~allow_sign:cx.bracount
-                            ~max_value:Limits.max_group_number
-                            ~max_error:Errors.err61 i
+                     (* pcre2_compile.c:3314-3325 — escapes that may change in
+                        UCP mode. *)
+                     okquantifier := true;
+                     pp :=
+                       handle_escdsw cx !escape !pp ~options:!options
+                         ~xoptions:!xoptions)
+                   else if
+                     Int.equal !escape esc_big_p || Int.equal !escape esc_p
+                   then (
+                     (* pcre2_compile.c:3327-3346 — \P and \p Unicode property
+                        matching needs get_ucp(): deferred to M7. *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed)
+                   else if Int.equal !escape esc_g || Int.equal !escape esc_k
+                   then (
+                     if
+                       (* pcre2_compile.c:3348-3402 — when \g is used with
+                          quotes or angle brackets as delimiters, it is a
+                          numerical or named subroutine call; with brace
+                          delimiters it is a numerical back reference and does
+                          not come here because check_escape() returns it
+                          directly. \k is always a named back reference.
+                          Subroutine calls are deferred (M5). *)
+                       !ptr >= cx.ptrend
+                       || (not (Char.equal pat.[!ptr] '{'))
+                          && (not (Char.equal pat.[!ptr] '<'))
+                          && not (Char.equal pat.[!ptr] '\'')
+                     then (
+                       cx.errorcode <-
+                         (if Int.equal !escape esc_g then Errors.err57
+                          else Errors.err69);
+                       escape_failed () (* goto ESCAPE_FAILED *);
+                       process_escape ())
+                     else
+                       let terminator =
+                         if Char.equal pat.[!ptr] '<' then Char.code '>'
+                         else if Char.equal pat.[!ptr] '\'' then Char.code '\''
+                         else Char.code '}'
+                       in
+                       (* For a non-braced \g, check for a numerical recursion
+                          (pcre2_compile.c:3366-3384). *)
+                       let recovered = ref false in
+                       (if
+                          Int.equal !escape esc_g
+                          && not (Int.equal terminator (Char.code '}'))
                         then
+                          let p = ref (!ptr + 1) in
+                          let i = ref 0 in
                           if
-                            !p >= cx.ptrend
-                            || not (Int.equal (Char.code pat.[!p]) terminator)
-                          then (
-                            cx.errorcode <- Errors.err57;
+                            read_number cx p ~allow_sign:cx.bracount
+                              ~max_value:Limits.max_group_number
+                              ~max_error:Errors.err61 i
+                          then
+                            if
+                              !p >= cx.ptrend
+                              || not (Int.equal (Char.code pat.[!p]) terminator)
+                            then (
+                              cx.errorcode <- Errors.err57;
+                              escape_failed () (* goto ESCAPE_FAILED *);
+                              process_escape ();
+                              recovered := true)
+                            else (
+                              (* pcre2_compile.c:3380-3381 — ptr = p; goto
+                                 SET_RECURSION. *)
+                              ptr := !p;
+                              set_recursion ~i:!i;
+                              recovered := true)
+                          else if not (Int.equal cx.errorcode 0) then (
                             escape_failed () (* goto ESCAPE_FAILED *);
                             process_escape ();
-                            recovered := true)
-                          else (
-                            (* pcre2_compile.c:3380-3381 — ptr = p; goto
-                               SET_RECURSION. *)
-                            ptr := !p;
-                            set_recursion ~i:!i;
-                            recovered := true)
-                        else if not (Int.equal cx.errorcode 0) then (
-                          escape_failed () (* goto ESCAPE_FAILED *);
-                          process_escape ();
-                          recovered := true));
-                     if not !recovered then
-                       (* Not a numerical recursion. Perl allows spaces and
-                          tabs after { and before } but not for other
-                          delimiters (pcre2_compile.c:3386-3390). *)
-                       let offset = ref 0 in
-                       let name = ref 0 in
-                       let namelen = ref 0 in
-                       if
-                         not
-                           (read_name cx ptr ~utf ~terminator offset name
-                              namelen)
-                       then (
-                         escape_failed () (* goto ESCAPE_FAILED *);
-                         process_escape ())
-                       else if
-                         (* pcre2_compile.c:3392-3402 — \k and \g when used
-                            with braces are back references, whereas \g
-                            used with quotes or angle brackets is a
-                            recursion. *)
-                         Int.equal !escape esc_k
-                         || Int.equal terminator (Char.code '}')
-                       then (
-                         buf.(!pp) <- meta_backref_byname;
-                         incr pp;
-                         buf.(!pp) <- !namelen;
-                         incr pp;
-                         putoffset buf pp !offset;
-                         okquantifier := true)
-                       else (
-                         (* META_RECURSE_BYNAME emission (pcre2_compile.c:
-                            3395-3401 — the \g-with-quotes/angle-brackets
-                            arm of the shared ternary store). *)
-                         buf.(!pp) <- meta_recurse_byname;
-                         incr pp;
-                         buf.(!pp) <- !namelen;
-                         incr pp;
-                         putoffset buf pp !offset;
-                         okquantifier := true))
-                 else (
-                   (* pcre2_compile.c:3310-3312 — the C switch's default
-                      case: \A, \B, \b, \G, \K, \Z, \z cannot be
-                      quantified. *)
-                   buf.(!pp) <- meta_escape + !escape;
-                   incr pp)
-               in
-               if not (Int.equal cx.errorcode 0) then escape_failed ();
-               process_escape ()
-           (* ---- Single-character special items ---- *)
-           | '^' ->
-               (* pcre2_compile.c:3409-3411 *)
-               buf.(!pp) <- meta_circumflex;
-               incr pp
-           | '$' ->
-               (* pcre2_compile.c:3413-3415 *)
-               buf.(!pp) <- meta_dollar;
-               incr pp
-           | '.' ->
-               (* pcre2_compile.c:3417-3420 *)
-               buf.(!pp) <- meta_dot;
-               incr pp;
-               okquantifier := true
-           (* ---- Single-character quantifiers ---- *)
-           | '*' ->
-               (* pcre2_compile.c:3425-3427 *)
-               meta_quantifier := meta_asterisk;
-               check_quantifier ~min_repeat:0 ~max_repeat:0
-               (* goto CHECK_QUANTIFIER *)
-           | '+' ->
-               (* pcre2_compile.c:3429-3431 *)
-               meta_quantifier := meta_plus;
-               check_quantifier ~min_repeat:0 ~max_repeat:0
-               (* goto CHECK_QUANTIFIER *)
-           | '?' ->
-               (* pcre2_compile.c:3433-3435 *)
-               meta_quantifier := meta_query;
-               check_quantifier ~min_repeat:0 ~max_repeat:0
-               (* goto CHECK_QUANTIFIER *)
-           | '{' ->
-               (* ---- Potential {n,m} quantifier ----
-                  pcre2_compile.c:3440-3449 *)
-               let min_repeat = ref 0 in
-               let max_repeat = ref 0 in
-               if
-                 not
-                   (read_repeat_counts cx ptr (Some min_repeat)
-                      (Some max_repeat))
-               then (
-                 if not (Int.equal cx.errorcode 0) then
-                   raise_notrace Goto_failed (* Error in quantifier *);
-                 parsed_literal !c
-                 (* Not a quantifier; no more quantifier processing *))
-               else (
-                 meta_quantifier := meta_minmax;
-                 (* Fall through *)
-                 check_quantifier ~min_repeat:!min_repeat
-                   ~max_repeat:!max_repeat)
-           | '[' ->
-               (* ---- Character class ---- pcre2_compile.c:3493-3496 *)
-               okquantifier := true;
-
-               (* pcre2_compile.c:3498-3535 — in another (POSIX) regex
-                  library, the ugly syntax [[:<:]] and [[:>:]] is used for
-                  "start of word" and "end of word". As these are otherwise
-                  illegal sequences, we don't break anything by recognizing
-                  them. They are replaced by \b(?=\w) and \b(?<=\w)
-                  respectively. Sequences like [a[:<:]] are erroneous and
-                  are handled by the normal code below. *)
-               if
-                 cx.ptrend - !ptr >= 6
-                 && (strncmp_c8_eq pat !ptr "[:<:]]" 6
-                    || strncmp_c8_eq pat !ptr "[:>:]]" 6)
-               then (
-                 buf.(!pp) <- meta_escape + esc_b;
-                 incr pp;
-                 if Char.equal pat.[!ptr + 2] '<' then (
-                   buf.(!pp) <- meta_lookahead;
-                   incr pp)
-                 else (
-                   buf.(!pp) <- meta_lookbehind;
-                   incr pp;
-                   has_lookbehind := true;
-                   (* The offset is used only for the "non-fixed length"
-                      error; this won't occur here, so just store zero. *)
-                   putoffset buf pp 0);
-                 if Int.equal (!options land Options.ucp) 0 then (
-                   buf.(!pp) <- meta_escape + esc_w;
-                   incr pp)
-                 else (
-                   buf.(!pp) <- meta_escape + esc_p;
-                   incr pp;
-                   buf.(!pp) <- Opcodes.pt_word lsl 16;
-                   incr pp);
-                 buf.(!pp) <- meta_ket;
-                 incr pp;
-                 ptr := !ptr + 6 (* C: break — end of the class item *))
-               else
-                 (* pcre2_compile.c:3537-3546 — PCRE supports POSIX class
-                    stuff inside a class. Perl gives an error if they are
-                    encountered at the top level, so we'll do that too. *)
-                 let tempptr = ref 0 in
-                 if
-                   !ptr < cx.ptrend
-                   && (Char.equal pat.[!ptr] ':'
-                      || Char.equal pat.[!ptr] '.'
-                      || Char.equal pat.[!ptr] '=')
-                   && check_posix_syntax cx !ptr tempptr
-                 then (
-                   (* C: errorcode = ( *ptr-- == CHAR_COLON)? ERR12 : ERR13
-                      — the test reads the old value, then ptr backs up to
-                      the '['. *)
-                   cx.errorcode <-
-                     (if Char.equal pat.[!ptr] ':' then Errors.err12
-                      else Errors.err13);
-                   decr ptr;
-                   raise_notrace Goto_failed);
-
-                 (* pcre2_compile.c:3548-3572 — process a regular character
-                    class. If the first character is '^', set the negation
-                    flag. If the first few characters (either before or
-                    after ^) are \Q\E or \E or space or tab in extended-more
-                    mode, we skip them too. This makes for compatibility
-                    with Perl. *)
-                 let negate_class = ref false in
-                 let broke = ref false in
-                 while (not !broke) && !ptr < cx.ptrend do
-                   c := getcharinctest ();
-                   if Int.equal !c 0x5c (* CHAR_BACKSLASH *) then
-                     if !ptr < cx.ptrend && Char.equal pat.[!ptr] 'E' then
-                       incr ptr
-                     else if
-                       cx.ptrend - !ptr >= 3 && strncmp_c8_eq pat !ptr "Q\\E" 3
-                     then ptr := !ptr + 3
-                     else broke := true
-                   else if
-                     (not (Int.equal (!options land Options.extended_more) 0))
-                     && (Int.equal !c 0x20 || Int.equal !c 0x09)
-                     (* Note: just these two *)
-                   then ()
-                   else if (not !negate_class) && Int.equal !c (Char.code '^')
-                   then negate_class := true
-                   else broke := true
-                 done;
-
-                 (* pcre2_compile.c:3574-3582 — now the real contents of the
-                    class; c has the first "real" character. Empty classes
-                    are permitted only if the option is set. Note the C
-                    tests cb->external_options, not the (?i)-tracked local
-                    options. *)
-                 if
-                   Int.equal !c (Char.code ']')
-                   && not
-                        (Int.equal
-                           (cx.external_options land Options.allow_empty_class)
-                           0)
-                 then (
-                   buf.(!pp) <-
-                     (if !negate_class then meta_class_empty_not
-                      else meta_class_empty);
-                   incr pp (* C: break — end of class processing *))
-                 else (
-                   (* Process a non-empty class
-                      (pcre2_compile.c:3584-3587). *)
-                   buf.(!pp) <-
-                     (if !negate_class then meta_class_not else meta_class);
-                   incr pp;
-                   let class_range_state = ref range_no in
-
-                   (* pcre2_compile.c:3743-3766 — the CLASS_LITERAL label:
-                      handle a literal character, tracking whether values
-                      are literal or escaped for range handling (the
-                      EBCDIC-motivated state machine described at
-                      pcre2_compile.c:3589-3595). *)
-                   let class_literal ~char_is_literal =
-                     if Int.equal !class_range_state range_started then (
-                       if Int.equal !c buf.(!pp - 2) then
-                         decr pp (* Optimize one-char range *)
-                       else if buf.(!pp - 2) > !c then (
-                         (* Check range is in order *)
-                         cx.errorcode <- Errors.err8;
-                         failed_back ())
-                       else (
+                            recovered := true));
+                       if not !recovered then
+                         (* Not a numerical recursion. Perl allows spaces and
+                            tabs after { and before } but not for other
+                            delimiters (pcre2_compile.c:3386-3390). *)
+                         let offset = ref 0 in
+                         let name = ref 0 in
+                         let namelen = ref 0 in
                          if
-                           (not char_is_literal)
-                           && Int.equal buf.(!pp - 1) meta_range_literal
-                         then buf.(!pp - 1) <- meta_range_escaped;
-                         parsed_literal !c);
-                       class_range_state := range_no)
-                     else (
-                       (* Potential start of range *)
-                       class_range_state :=
-                         if char_is_literal then range_ok_literal
-                         else range_ok_escaped;
-                       parsed_literal !c)
-                   in
+                           not
+                             (read_name cx ptr ~utf ~terminator offset name
+                                namelen)
+                         then (
+                           escape_failed () (* goto ESCAPE_FAILED *);
+                           process_escape ())
+                         else if
+                           (* pcre2_compile.c:3392-3402 — \k and \g when used
+                              with braces are back references, whereas \g
+                              used with quotes or angle brackets is a
+                              recursion. *)
+                           Int.equal !escape esc_k
+                           || Int.equal terminator (Char.code '}')
+                         then (
+                           buf.(!pp) <- meta_backref_byname;
+                           incr pp;
+                           buf.(!pp) <- !namelen;
+                           incr pp;
+                           putoffset buf pp !offset;
+                           okquantifier := true)
+                         else (
+                           (* META_RECURSE_BYNAME emission (pcre2_compile.c:
+                              3395-3401 — the \g-with-quotes/angle-brackets
+                              arm of the shared ternary store). *)
+                           buf.(!pp) <- meta_recurse_byname;
+                           incr pp;
+                           buf.(!pp) <- !namelen;
+                           incr pp;
+                           putoffset buf pp !offset;
+                           okquantifier := true))
+                   else (
+                     (* pcre2_compile.c:3310-3312 — the C switch's default
+                        case: \A, \B, \b, \G, \K, \Z, \z cannot be
+                        quantified. *)
+                     buf.(!pp) <- meta_escape + !escape;
+                     incr pp)
+                 in
+                 if not (Int.equal cx.errorcode 0) then escape_failed ();
+                 process_escape ()
+             (* ---- Single-character special items ---- *)
+             | '^' ->
+                 (* pcre2_compile.c:3409-3411 *)
+                 buf.(!pp) <- meta_circumflex;
+                 incr pp
+             | '$' ->
+                 (* pcre2_compile.c:3413-3415 *)
+                 buf.(!pp) <- meta_dollar;
+                 incr pp
+             | '.' ->
+                 (* pcre2_compile.c:3417-3420 *)
+                 buf.(!pp) <- meta_dot;
+                 incr pp;
+                 okquantifier := true
+             (* ---- Single-character quantifiers ---- *)
+             | '*' ->
+                 (* pcre2_compile.c:3425-3427 *)
+                 meta_quantifier := meta_asterisk;
+                 check_quantifier ~min_repeat:0 ~max_repeat:0
+                 (* goto CHECK_QUANTIFIER *)
+             | '+' ->
+                 (* pcre2_compile.c:3429-3431 *)
+                 meta_quantifier := meta_plus;
+                 check_quantifier ~min_repeat:0 ~max_repeat:0
+                 (* goto CHECK_QUANTIFIER *)
+             | '?' ->
+                 (* pcre2_compile.c:3433-3435 *)
+                 meta_quantifier := meta_query;
+                 check_quantifier ~min_repeat:0 ~max_repeat:0
+                 (* goto CHECK_QUANTIFIER *)
+             | '{' ->
+                 (* ---- Potential {n,m} quantifier ----
+                    pcre2_compile.c:3440-3449 *)
+                 let min_repeat = ref 0 in
+                 let max_repeat = ref 0 in
+                 if
+                   not
+                     (read_repeat_counts cx ptr (Some min_repeat)
+                        (Some max_repeat))
+                 then (
+                   if not (Int.equal cx.errorcode 0) then
+                     raise_notrace Goto_failed (* Error in quantifier *);
+                   parsed_literal !c
+                   (* Not a quantifier; no more quantifier processing *))
+                 else (
+                   meta_quantifier := meta_minmax;
+                   (* Fall through *)
+                   check_quantifier ~min_repeat:!min_repeat
+                     ~max_repeat:!max_repeat)
+             | '[' ->
+                 (* ---- Character class ---- pcre2_compile.c:3493-3496 *)
+                 okquantifier := true;
 
-                   (* pcre2_compile.c:3597-3904 — loop for the contents of
-                      the class. Every non-failing path through the body
-                      falls through to the shared CLASS_CONTINUE tail at the
-                      bottom of the loop. *)
-                   let class_break = ref false in
-                   while not !class_break do
-                     if !inescq then
-                       if
-                         (* pcre2_compile.c:3601-3614 — inside \Q...\E
-                            everything is literal except \E. char_is_literal
-                            is TRUE here (set at the C loop head). *)
-                         Int.equal !c 0x5c (* CHAR_BACKSLASH *)
-                         && !ptr < cx.ptrend
-                         && Char.equal pat.[!ptr] 'E'
-                       then (
-                         inescq := false (* Reset literal state *);
-                         incr ptr (* Skip the 'E'; goto CLASS_CONTINUE *))
-                       else class_literal ~char_is_literal:true
-                         (* goto CLASS_LITERAL *)
+                 (* pcre2_compile.c:3498-3535 — in another (POSIX) regex
+                    library, the ugly syntax [[:<:]] and [[:>:]] is used for
+                    "start of word" and "end of word". As these are otherwise
+                    illegal sequences, we don't break anything by recognizing
+                    them. They are replaced by \b(?=\w) and \b(?<=\w)
+                    respectively. Sequences like [a[:<:]] are erroneous and
+                    are handled by the normal code below. *)
+                 if
+                   cx.ptrend - !ptr >= 6
+                   && (strncmp_c8_eq pat !ptr "[:<:]]" 6
+                      || strncmp_c8_eq pat !ptr "[:>:]]" 6)
+                 then (
+                   buf.(!pp) <- meta_escape + esc_b;
+                   incr pp;
+                   if Char.equal pat.[!ptr + 2] '<' then (
+                     buf.(!pp) <- meta_lookahead;
+                     incr pp)
+                   else (
+                     buf.(!pp) <- meta_lookbehind;
+                     incr pp;
+                     has_lookbehind := true;
+                     (* The offset is used only for the "non-fixed length"
+                        error; this won't occur here, so just store zero. *)
+                     putoffset buf pp 0);
+                   if Int.equal (!options land Options.ucp) 0 then (
+                     buf.(!pp) <- meta_escape + esc_w;
+                     incr pp)
+                   else (
+                     buf.(!pp) <- meta_escape + esc_p;
+                     incr pp;
+                     buf.(!pp) <- Opcodes.pt_word lsl 16;
+                     incr pp);
+                   buf.(!pp) <- meta_ket;
+                   incr pp;
+                   ptr := !ptr + 6 (* C: break — end of the class item *))
+                 else
+                   (* pcre2_compile.c:3537-3546 — PCRE supports POSIX class
+                      stuff inside a class. Perl gives an error if they are
+                      encountered at the top level, so we'll do that too. *)
+                   let tempptr = ref 0 in
+                   if
+                     !ptr < cx.ptrend
+                     && (Char.equal pat.[!ptr] ':'
+                        || Char.equal pat.[!ptr] '.'
+                        || Char.equal pat.[!ptr] '=')
+                     && check_posix_syntax cx !ptr tempptr
+                   then (
+                     (* C: errorcode = ( *ptr-- == CHAR_COLON)? ERR12 : ERR13
+                        — the test reads the old value, then ptr backs up to
+                        the '['. *)
+                     cx.errorcode <-
+                       (if Char.equal pat.[!ptr] ':' then Errors.err12
+                        else Errors.err13);
+                     decr ptr;
+                     raise_notrace Goto_failed);
+
+                   (* pcre2_compile.c:3548-3572 — process a regular character
+                      class. If the first character is '^', set the negation
+                      flag. If the first few characters (either before or
+                      after ^) are \Q\E or \E or space or tab in extended-more
+                      mode, we skip them too. This makes for compatibility
+                      with Perl. *)
+                   let negate_class = ref false in
+                   let broke = ref false in
+                   while (not !broke) && !ptr < cx.ptrend do
+                     c := getcharinctest ();
+                     if Int.equal !c 0x5c (* CHAR_BACKSLASH *) then
+                       if !ptr < cx.ptrend && Char.equal pat.[!ptr] 'E' then
+                         incr ptr
+                       else if
+                         cx.ptrend - !ptr >= 3
+                         && strncmp_c8_eq pat !ptr "Q\\E" 3
+                       then ptr := !ptr + 3
+                       else broke := true
                      else if
-                       (* pcre2_compile.c:3616-3620 — skip over space and
-                          tab (only) in extended-more mode. *)
                        (not (Int.equal (!options land Options.extended_more) 0))
                        && (Int.equal !c 0x20 || Int.equal !c 0x09)
-                     then () (* goto CLASS_CONTINUE *)
-                     else if
-                       (* pcre2_compile.c:3622-3632 — handle POSIX class
-                          names. Perl allows a negation extension of the
-                          form [:^name:]. A square bracket that doesn't
-                          match the syntax is treated as a literal. We also
-                          recognize the POSIX constructions [.ch.] and
-                          [=ch=] ("collating elements") and fault them, as
-                          Perl 5.6 and 5.8 do. *)
-                       Int.equal !c (Char.code '[')
-                       && cx.ptrend - !ptr >= 3
-                       && (Char.equal pat.[!ptr] ':'
-                          || Char.equal pat.[!ptr] '.'
-                          || Char.equal pat.[!ptr] '=')
-                       && check_posix_syntax cx !ptr tempptr
-                     then (
-                       let posix_negate = ref false in
+                       (* Note: just these two *)
+                     then ()
+                     else if (not !negate_class) && Int.equal !c (Char.code '^')
+                     then negate_class := true
+                     else broke := true
+                   done;
 
-                       (* pcre2_compile.c:3637-3646 — Perl treats a hyphen
-                          before a POSIX class as a literal, not the start
-                          of a range. However, it gives a warning in its
-                          warning mode. PCRE does not have a warning mode,
-                          so we give an error, because this is likely an
-                          error on the user's part. *)
+                   (* pcre2_compile.c:3574-3582 — now the real contents of the
+                      class; c has the first "real" character. Empty classes
+                      are permitted only if the option is set. Note the C
+                      tests cb->external_options, not the (?i)-tracked local
+                      options. *)
+                   if
+                     Int.equal !c (Char.code ']')
+                     && not
+                          (Int.equal
+                             (cx.external_options land Options.allow_empty_class)
+                             0)
+                   then (
+                     buf.(!pp) <-
+                       (if !negate_class then meta_class_empty_not
+                        else meta_class_empty);
+                     incr pp (* C: break — end of class processing *))
+                   else (
+                     (* Process a non-empty class
+                        (pcre2_compile.c:3584-3587). *)
+                     buf.(!pp) <-
+                       (if !negate_class then meta_class_not else meta_class);
+                     incr pp;
+                     let class_range_state = ref range_no in
+
+                     (* pcre2_compile.c:3743-3766 — the CLASS_LITERAL label:
+                        handle a literal character, tracking whether values
+                        are literal or escaped for range handling (the
+                        EBCDIC-motivated state machine described at
+                        pcre2_compile.c:3589-3595). *)
+                     let class_literal ~char_is_literal =
                        if Int.equal !class_range_state range_started then (
-                         cx.errorcode <- Errors.err50;
-                         raise_notrace Goto_failed);
-
-                       (* pcre2_compile.c:3648-3652 *)
-                       if not (Char.equal pat.[!ptr] ':') then (
-                         cx.errorcode <- Errors.err13;
-                         failed_back ());
-
-                       (* pcre2_compile.c:3654-3658 — if ( *(++ptr) == '^').
-                          Safe: check_posix_syntax proved a terminator
-                          sequence at tempptr >= ptr + 1, so ptr + 1 is in
-                          bounds. *)
-                       incr ptr;
-                       if Char.equal pat.[!ptr] '^' then (
-                         posix_negate := true;
-                         incr ptr);
-
-                       (* pcre2_compile.c:3660-3666 *)
-                       let posix_class =
-                         check_posix_name cx !ptr (!tempptr - !ptr)
-                       in
-                       if posix_class < 0 then (
-                         cx.errorcode <- Errors.err30;
-                         raise_notrace Goto_failed);
-                       ptr := !tempptr + 2;
-
-                       (* pcre2_compile.c:3668-3679 — Perl treats a hyphen
-                          after a POSIX class as a literal, not the start
-                          of a range, warning unless the hyphen is the last
-                          character in the class. PCRE gives an error. *)
-                       if
-                         !ptr < cx.ptrend - 1
-                         && Char.equal pat.[!ptr] '-'
-                         && not (Char.equal pat.[!ptr + 1] ']')
-                       then (
-                         cx.errorcode <- Errors.err50;
-                         raise_notrace Goto_failed);
-
-                       (* pcre2_compile.c:3681-3687 — set "a hyphen is not
-                          the start of a range" for the -] case, and also
-                          in case the POSIX class is followed by \E or \Q\E
-                          (possibly repeated) and *then* a hyphen. *)
-                       class_range_state := range_no;
-
-                       (* pcre2_compile.c:3689-3722 — when PCRE2_UCP is
-                          set, unless PCRE2_EXTRA_ASCII_POSIX is set, some
-                          of the POSIX classes are converted to use Unicode
-                          properties \p or \P or, in one case, \h or \H
-                          (via posix_substitutes). A negative type with a
-                          zero value falls through to behave like a non-UCP
-                          POSIX class. SUPPORT_UNICODE is defined in the
-                          reference configuration, so this block is always
-                          compiled. *)
-                       let ucp_done =
-                         if
-                           (not (Int.equal (!options land Options.ucp) 0))
-                           && Int.equal
-                                (!xoptions land Options.extra_ascii_posix)
-                                0
-                           && not
-                                ((not
-                                    (Int.equal
-                                       (!xoptions land Options.extra_ascii_digit)
-                                       0))
-                                && (Int.equal posix_class pc_digit
-                                   || Int.equal posix_class pc_xdigit))
-                         then
-                           let ptype = posix_substitutes.(2 * posix_class) in
-                           let pvalue =
-                             posix_substitutes.((2 * posix_class) + 1)
-                           in
-                           if ptype >= 0 then (
-                             buf.(!pp) <-
-                               (meta_escape
-                               + if !posix_negate then esc_big_p else esc_p);
-                             incr pp;
-                             buf.(!pp) <- (ptype lsl 16) lor pvalue;
-                             incr pp;
-                             true (* goto CLASS_CONTINUE *))
-                           else if not (Int.equal pvalue 0) then (
-                             buf.(!pp) <-
-                               (meta_escape
-                               + if !posix_negate then esc_big_h else esc_h);
-                             incr pp;
-                             true (* goto CLASS_CONTINUE *))
-                           else false (* Fall through *)
-                         else false
-                       in
-
-                       (* pcre2_compile.c:3724-3727 — non-UCP POSIX
-                          class. *)
-                       if not ucp_done then (
-                         buf.(!pp) <-
-                           (if !posix_negate then meta_posix_neg else meta_posix);
-                         incr pp;
-                         buf.(!pp) <- posix_class;
-                         incr pp))
-                     else if
-                       (* pcre2_compile.c:3730-3737 — handle potential
-                          start of range. *)
-                       Int.equal !c (Char.code '-')
-                       && !class_range_state >= range_ok_escaped
-                     then (
-                       buf.(!pp) <-
-                         (if Int.equal !class_range_state range_ok_literal then
-                            meta_range_literal
-                          else meta_range_escaped);
-                       incr pp;
-                       class_range_state := range_started)
-                     else if not (Int.equal !c 0x5c (* CHAR_BACKSLASH *)) then
-                       (* pcre2_compile.c:3739-3741 — handle a literal
-                          character. *)
-                       class_literal ~char_is_literal:true
-                     else (
-                       (* pcre2_compile.c:3769-3787 — handle escapes in a
-                          class. *)
-                       tempptr := !ptr;
-                       let escape =
-                         ref
-                           (check_escape cx ptr c ~options:!options
-                              ~xoptions:!xoptions ~isclass:true (Some cx))
-                       in
-                       if not (Int.equal cx.errorcode 0) then (
-                         if
-                           Int.equal
-                             (!xoptions land Options.extra_bad_escape_is_literal)
-                             0
-                         then raise_notrace Goto_failed;
-                         ptr := !tempptr;
-                         if !ptr >= cx.ptrend then
-                           c := 0x5c (* CHAR_BACKSLASH *)
-                         else c := getcharinctest ()
-                           (* Get character value, increment pointer *);
-                         escape := 0 (* Treat as literal character *));
-
-                       (* pcre2_compile.c:3789-3813 — first switch on the
-                          escape value. *)
-                       if Int.equal !escape 0 then
-                         (* Escaped character code point is in c *)
-                         class_literal ~char_is_literal:false
-                         (* goto CLASS_LITERAL *)
-                       else if Int.equal !escape esc_b then (
-                         c := 0x08 (* CHAR_BS: \b is backspace in a class *);
-                         class_literal ~char_is_literal:false)
-                       else if Int.equal !escape esc_big_q then inescq := true
-                         (* Enter literal mode; goto CLASS_CONTINUE *)
-                       else if Int.equal !escape esc_big_e then ()
-                         (* Ignore orphan \E; goto CLASS_CONTINUE *)
-                       else if
-                         Int.equal !escape esc_big_b
-                         || Int.equal !escape esc_big_r
-                         || Int.equal !escape esc_big_x
-                       then (
-                         (* Always an error in a class *)
-                         cx.errorcode <- Errors.err7;
-                         decr ptr;
-                         raise_notrace Goto_failed)
+                         if Int.equal !c buf.(!pp - 2) then
+                           decr pp (* Optimize one-char range *)
+                         else if buf.(!pp - 2) > !c then (
+                           (* Check range is in order *)
+                           cx.errorcode <- Errors.err8;
+                           failed_back ())
+                         else (
+                           if
+                             (not char_is_literal)
+                             && Int.equal buf.(!pp - 1) meta_range_literal
+                           then buf.(!pp - 1) <- meta_range_escaped;
+                           parsed_literal !c);
+                         class_range_state := range_no)
                        else (
-                         (* pcre2_compile.c:3815-3825 — the second part of
-                            a range can be a single-character escape
-                            sequence (detected above), but not any of the
-                            other escapes. Perl treats a hyphen as a
-                            literal in such circumstances but warns; PCRE
-                            faults it. *)
+                         (* Potential start of range *)
+                         class_range_state :=
+                           if char_is_literal then range_ok_literal
+                           else range_ok_escaped;
+                         parsed_literal !c)
+                     in
+
+                     (* pcre2_compile.c:3597-3904 — loop for the contents of
+                        the class. Every non-failing path through the body
+                        falls through to the shared CLASS_CONTINUE tail at the
+                        bottom of the loop. *)
+                     let class_break = ref false in
+                     while not !class_break do
+                       if !inescq then
+                         if
+                           (* pcre2_compile.c:3601-3614 — inside \Q...\E
+                              everything is literal except \E. char_is_literal
+                              is TRUE here (set at the C loop head). *)
+                           Int.equal !c 0x5c (* CHAR_BACKSLASH *)
+                           && !ptr < cx.ptrend
+                           && Char.equal pat.[!ptr] 'E'
+                         then (
+                           inescq := false (* Reset literal state *);
+                           incr ptr (* Skip the 'E'; goto CLASS_CONTINUE *))
+                         else class_literal ~char_is_literal:true
+                           (* goto CLASS_LITERAL *)
+                       else if
+                         (* pcre2_compile.c:3616-3620 — skip over space and
+                            tab (only) in extended-more mode. *)
+                         (not
+                            (Int.equal (!options land Options.extended_more) 0))
+                         && (Int.equal !c 0x20 || Int.equal !c 0x09)
+                       then () (* goto CLASS_CONTINUE *)
+                       else if
+                         (* pcre2_compile.c:3622-3632 — handle POSIX class
+                            names. Perl allows a negation extension of the
+                            form [:^name:]. A square bracket that doesn't
+                            match the syntax is treated as a literal. We also
+                            recognize the POSIX constructions [.ch.] and
+                            [=ch=] ("collating elements") and fault them, as
+                            Perl 5.6 and 5.8 do. *)
+                         Int.equal !c (Char.code '[')
+                         && cx.ptrend - !ptr >= 3
+                         && (Char.equal pat.[!ptr] ':'
+                            || Char.equal pat.[!ptr] '.'
+                            || Char.equal pat.[!ptr] '=')
+                         && check_posix_syntax cx !ptr tempptr
+                       then (
+                         let posix_negate = ref false in
+
+                         (* pcre2_compile.c:3637-3646 — Perl treats a hyphen
+                            before a POSIX class as a literal, not the start
+                            of a range. However, it gives a warning in its
+                            warning mode. PCRE does not have a warning mode,
+                            so we give an error, because this is likely an
+                            error on the user's part. *)
                          if Int.equal !class_range_state range_started then (
                            cx.errorcode <- Errors.err50;
-                           raise_notrace Goto_failed (* Always an error here *));
-
-                         (* pcre2_compile.c:3827-3881 — of the remaining
-                            escapes, only those that define characters are
-                            allowed in a class. None may start a range. *)
-                         class_range_state := range_no;
-                         if Int.equal !escape esc_big_n then (
-                           cx.errorcode <- Errors.err71;
-                           raise_notrace Goto_failed)
-                         else if
-                           Int.equal !escape esc_big_h
-                           || Int.equal !escape esc_h
-                           || Int.equal !escape esc_big_v
-                           || Int.equal !escape esc_v
-                         then (
-                           buf.(!pp) <- meta_escape + !escape;
-                           incr pp)
-                         else if
-                           Int.equal !escape esc_d
-                           || Int.equal !escape esc_big_d
-                           || Int.equal !escape esc_s
-                           || Int.equal !escape esc_big_s
-                           || Int.equal !escape esc_w
-                           || Int.equal !escape esc_big_w
-                         then
-                           (* These escapes may be converted to Unicode
-                              property tests when PCRE2_UCP is set. *)
-                           pp :=
-                             handle_escdsw cx !escape !pp ~options:!options
-                               ~xoptions:!xoptions
-                         else if
-                           Int.equal !escape esc_big_p
-                           || Int.equal !escape esc_p
-                         then (
-                           (* pcre2_compile.c:3857-3875 — explicit Unicode
-                              property matching needs get_ucp(): deferred
-                              to M7 with the freestanding \p arm
-                              (pcre2_compile.c:3327-3346). *)
-                           cx.errorcode <- err_deferred;
-                           raise_notrace Goto_failed)
-                         else (
-                           (* All others are not allowed in a class *)
-                           cx.errorcode <- Errors.err7;
-                           decr ptr;
                            raise_notrace Goto_failed);
 
-                         (* pcre2_compile.c:3883-3891 — Perl gives a
-                            warning unless a following hyphen is the last
-                            character in the class. PCRE throws an
-                            error. *)
+                         (* pcre2_compile.c:3648-3652 *)
+                         if not (Char.equal pat.[!ptr] ':') then (
+                           cx.errorcode <- Errors.err13;
+                           failed_back ());
+
+                         (* pcre2_compile.c:3654-3658 — if ( *(++ptr) == '^').
+                            Safe: check_posix_syntax proved a terminator
+                            sequence at tempptr >= ptr + 1, so ptr + 1 is in
+                            bounds. *)
+                         incr ptr;
+                         if Char.equal pat.[!ptr] '^' then (
+                           posix_negate := true;
+                           incr ptr);
+
+                         (* pcre2_compile.c:3660-3666 *)
+                         let posix_class =
+                           check_posix_name cx !ptr (!tempptr - !ptr)
+                         in
+                         if posix_class < 0 then (
+                           cx.errorcode <- Errors.err30;
+                           raise_notrace Goto_failed);
+                         ptr := !tempptr + 2;
+
+                         (* pcre2_compile.c:3668-3679 — Perl treats a hyphen
+                            after a POSIX class as a literal, not the start
+                            of a range, warning unless the hyphen is the last
+                            character in the class. PCRE gives an error. *)
                          if
                            !ptr < cx.ptrend - 1
                            && Char.equal pat.[!ptr] '-'
                            && not (Char.equal pat.[!ptr + 1] ']')
                          then (
                            cx.errorcode <- Errors.err50;
-                           raise_notrace Goto_failed)));
+                           raise_notrace Goto_failed);
 
-                     (* CLASS_CONTINUE: pcre2_compile.c:3894-3903 — proceed
-                        to next thing in the class. *)
-                     if !ptr >= cx.ptrend then (
-                       cx.errorcode <- Errors.err6;
-                       (* Missing terminating ']' *)
-                       raise_notrace Goto_failed);
-                     c := getcharinctest ();
-                     if Int.equal !c (Char.code ']') && not !inescq then
-                       class_break := true
-                   done;
+                         (* pcre2_compile.c:3681-3687 — set "a hyphen is not
+                            the start of a range" for the -] case, and also
+                            in case the POSIX class is followed by \E or \Q\E
+                            (possibly repeated) and *then* a hyphen. *)
+                         class_range_state := range_no;
 
-                   (* pcre2_compile.c:3906-3915 — -] at the end of a class
-                      is a literal '-'. *)
-                   if Int.equal !class_range_state range_started then (
-                     buf.(!pp - 1) <- Char.code '-';
-                     class_range_state := range_no);
-                   buf.(!pp) <- meta_class_end;
-                   incr pp)
-           | '(' ->
-               (* ---- Opening parenthesis ---- pcre2_compile.c:3918-3921 *)
-               if !ptr >= cx.ptrend then unclosed_parenthesis ();
-               (* If ( is not followed by ? it is either a capture or a
-                  special verb or an alpha assertion or a positive
-                  non-atomic lookahead (pcre2_compile.c:3923-3926). *)
-               if not (Char.equal pat.[!ptr] '?') then (
-                 if not (Char.equal pat.[!ptr] '*') then (
-                   (* pcre2_compile.c:3930-3947 — handle capturing brackets
-                      (or non-capturing if auto-capture is turned off). *)
-                   nest_depth := !nest_depth + 1;
-                   if Int.equal (!options land Options.no_auto_capture) 0 then (
-                     if cx.bracount >= Limits.max_group_number then (
-                       cx.errorcode <- Errors.err97;
-                       raise_notrace Goto_failed);
-                     cx.bracount <- cx.bracount + 1;
-                     buf.(!pp) <- meta_capture lor cx.bracount;
+                         (* pcre2_compile.c:3689-3722 — when PCRE2_UCP is
+                            set, unless PCRE2_EXTRA_ASCII_POSIX is set, some
+                            of the POSIX classes are converted to use Unicode
+                            properties \p or \P or, in one case, \h or \H
+                            (via posix_substitutes). A negative type with a
+                            zero value falls through to behave like a non-UCP
+                            POSIX class. SUPPORT_UNICODE is defined in the
+                            reference configuration, so this block is always
+                            compiled. *)
+                         let ucp_done =
+                           if
+                             (not (Int.equal (!options land Options.ucp) 0))
+                             && Int.equal
+                                  (!xoptions land Options.extra_ascii_posix)
+                                  0
+                             && not
+                                  ((not
+                                      (Int.equal
+                                         (!xoptions
+                                        land Options.extra_ascii_digit)
+                                         0))
+                                  && (Int.equal posix_class pc_digit
+                                     || Int.equal posix_class pc_xdigit))
+                           then
+                             let ptype = posix_substitutes.(2 * posix_class) in
+                             let pvalue =
+                               posix_substitutes.((2 * posix_class) + 1)
+                             in
+                             if ptype >= 0 then (
+                               buf.(!pp) <-
+                                 (meta_escape
+                                 + if !posix_negate then esc_big_p else esc_p);
+                               incr pp;
+                               buf.(!pp) <- (ptype lsl 16) lor pvalue;
+                               incr pp;
+                               true (* goto CLASS_CONTINUE *))
+                             else if not (Int.equal pvalue 0) then (
+                               buf.(!pp) <-
+                                 (meta_escape
+                                 + if !posix_negate then esc_big_h else esc_h);
+                               incr pp;
+                               true (* goto CLASS_CONTINUE *))
+                             else false (* Fall through *)
+                           else false
+                         in
+
+                         (* pcre2_compile.c:3724-3727 — non-UCP POSIX
+                            class. *)
+                         if not ucp_done then (
+                           buf.(!pp) <-
+                             (if !posix_negate then meta_posix_neg
+                              else meta_posix);
+                           incr pp;
+                           buf.(!pp) <- posix_class;
+                           incr pp))
+                       else if
+                         (* pcre2_compile.c:3730-3737 — handle potential
+                            start of range. *)
+                         Int.equal !c (Char.code '-')
+                         && !class_range_state >= range_ok_escaped
+                       then (
+                         buf.(!pp) <-
+                           (if Int.equal !class_range_state range_ok_literal
+                            then meta_range_literal
+                            else meta_range_escaped);
+                         incr pp;
+                         class_range_state := range_started)
+                       else if not (Int.equal !c 0x5c (* CHAR_BACKSLASH *)) then
+                         (* pcre2_compile.c:3739-3741 — handle a literal
+                            character. *)
+                         class_literal ~char_is_literal:true
+                       else (
+                         (* pcre2_compile.c:3769-3787 — handle escapes in a
+                            class. *)
+                         tempptr := !ptr;
+                         let escape =
+                           ref
+                             (check_escape cx ptr c ~options:!options
+                                ~xoptions:!xoptions ~isclass:true (Some cx))
+                         in
+                         if not (Int.equal cx.errorcode 0) then (
+                           if
+                             Int.equal
+                               (!xoptions
+                              land Options.extra_bad_escape_is_literal)
+                               0
+                           then raise_notrace Goto_failed;
+                           ptr := !tempptr;
+                           if !ptr >= cx.ptrend then
+                             c := 0x5c (* CHAR_BACKSLASH *)
+                           else c := getcharinctest ()
+                             (* Get character value, increment pointer *);
+                           escape := 0 (* Treat as literal character *));
+
+                         (* pcre2_compile.c:3789-3813 — first switch on the
+                            escape value. *)
+                         if Int.equal !escape 0 then
+                           (* Escaped character code point is in c *)
+                           class_literal ~char_is_literal:false
+                           (* goto CLASS_LITERAL *)
+                         else if Int.equal !escape esc_b then (
+                           c := 0x08 (* CHAR_BS: \b is backspace in a class *);
+                           class_literal ~char_is_literal:false)
+                         else if Int.equal !escape esc_big_q then inescq := true
+                           (* Enter literal mode; goto CLASS_CONTINUE *)
+                         else if Int.equal !escape esc_big_e then ()
+                           (* Ignore orphan \E; goto CLASS_CONTINUE *)
+                         else if
+                           Int.equal !escape esc_big_b
+                           || Int.equal !escape esc_big_r
+                           || Int.equal !escape esc_big_x
+                         then (
+                           (* Always an error in a class *)
+                           cx.errorcode <- Errors.err7;
+                           decr ptr;
+                           raise_notrace Goto_failed)
+                         else (
+                           (* pcre2_compile.c:3815-3825 — the second part of
+                              a range can be a single-character escape
+                              sequence (detected above), but not any of the
+                              other escapes. Perl treats a hyphen as a
+                              literal in such circumstances but warns; PCRE
+                              faults it. *)
+                           if Int.equal !class_range_state range_started then (
+                             cx.errorcode <- Errors.err50;
+                             raise_notrace
+                               Goto_failed (* Always an error here *));
+
+                           (* pcre2_compile.c:3827-3881 — of the remaining
+                              escapes, only those that define characters are
+                              allowed in a class. None may start a range. *)
+                           class_range_state := range_no;
+                           if Int.equal !escape esc_big_n then (
+                             cx.errorcode <- Errors.err71;
+                             raise_notrace Goto_failed)
+                           else if
+                             Int.equal !escape esc_big_h
+                             || Int.equal !escape esc_h
+                             || Int.equal !escape esc_big_v
+                             || Int.equal !escape esc_v
+                           then (
+                             buf.(!pp) <- meta_escape + !escape;
+                             incr pp)
+                           else if
+                             Int.equal !escape esc_d
+                             || Int.equal !escape esc_big_d
+                             || Int.equal !escape esc_s
+                             || Int.equal !escape esc_big_s
+                             || Int.equal !escape esc_w
+                             || Int.equal !escape esc_big_w
+                           then
+                             (* These escapes may be converted to Unicode
+                                property tests when PCRE2_UCP is set. *)
+                             pp :=
+                               handle_escdsw cx !escape !pp ~options:!options
+                                 ~xoptions:!xoptions
+                           else if
+                             Int.equal !escape esc_big_p
+                             || Int.equal !escape esc_p
+                           then (
+                             (* pcre2_compile.c:3857-3875 — explicit Unicode
+                                property matching needs get_ucp(): deferred
+                                to M7 with the freestanding \p arm
+                                (pcre2_compile.c:3327-3346). *)
+                             cx.errorcode <- err_deferred;
+                             raise_notrace Goto_failed)
+                           else (
+                             (* All others are not allowed in a class *)
+                             cx.errorcode <- Errors.err7;
+                             decr ptr;
+                             raise_notrace Goto_failed);
+
+                           (* pcre2_compile.c:3883-3891 — Perl gives a
+                              warning unless a following hyphen is the last
+                              character in the class. PCRE throws an
+                              error. *)
+                           if
+                             !ptr < cx.ptrend - 1
+                             && Char.equal pat.[!ptr] '-'
+                             && not (Char.equal pat.[!ptr + 1] ']')
+                           then (
+                             cx.errorcode <- Errors.err50;
+                             raise_notrace Goto_failed)));
+
+                       (* CLASS_CONTINUE: pcre2_compile.c:3894-3903 — proceed
+                          to next thing in the class. *)
+                       if !ptr >= cx.ptrend then (
+                         cx.errorcode <- Errors.err6;
+                         (* Missing terminating ']' *)
+                         raise_notrace Goto_failed);
+                       c := getcharinctest ();
+                       if Int.equal !c (Char.code ']') && not !inescq then
+                         class_break := true
+                     done;
+
+                     (* pcre2_compile.c:3906-3915 — -] at the end of a class
+                        is a literal '-'. *)
+                     if Int.equal !class_range_state range_started then (
+                       buf.(!pp - 1) <- Char.code '-';
+                       class_range_state := range_no);
+                     buf.(!pp) <- meta_class_end;
                      incr pp)
-                   else (
-                     buf.(!pp) <- meta_nocapture;
-                     incr pp))
-                 else if cx.ptrend - !ptr <= 1 || Char.equal pat.[!ptr + 1] ')'
-                 then
-                   (* pcre2_compile.c:3949-3953 — do nothing for ( * followed
-                      by end of pattern or ) so it gives a "bad quantifier"
-                      error rather than "(*MARK) must have an argument".
-                      (The C also assigns c = ptr[1] here; c is dead
-                      afterwards.) *)
-                   ()
-                 else if
-                   (* CHMAX_255(c) is always true for an 8-bit code unit. *)
-                   not
-                     (Int.equal
-                        (Chartables.ctypes (Char.code pat.[!ptr + 1])
-                        land Chartables.ctype_lcletter)
-                        0)
-                 then (
-                   (* pcre2_compile.c:3955-3972 — handle "alpha assertions"
-                      such as ( *pla:...). Most of these are synonyms for
-                      the historical symbolic assertions, but the script
-                      run and non-atomic lookaround ones are new. They are
-                      distinguished by starting with a lower case letter.
-                      Checking both ends of the alphabet makes this work in
-                      all character codes. *)
-                   let offset = ref 0 in
-                   let name = ref 0 in
-                   let namelen = ref 0 in
-                   if
-                     not
-                       (read_name cx ptr ~utf ~terminator:0 offset name namelen)
-                   then raise_notrace Goto_failed;
-                   if !ptr >= cx.ptrend || not (Char.equal pat.[!ptr] ':') then (
-                     cx.errorcode <- Errors.err95 (* Malformed *);
-                     raise_notrace Goto_failed);
-
-                   (* pcre2_compile.c:3974-3988 — scan the table of alpha
-                      assertion names. *)
-                   let i = ref 0 in
-                   while
-                     !i < alascount
-                     && not
-                          (Int.equal !namelen
-                             (String.length (fst alasmeta.(!i)))
-                          && strncmp_c8_eq pat !name
-                               (fst alasmeta.(!i))
-                               !namelen)
-                   do
-                     incr i
-                   done;
-                   if !i >= alascount then (
-                     cx.errorcode <-
-                       Errors.err95 (* Alpha assertion not recognized *);
-                     raise_notrace Goto_failed);
-
-                   (* pcre2_compile.c:3990-4000 — check for expecting an
-                      assertion condition. If so, only atomic lookaround
-                      assertions are valid. *)
-                   let meta = snd alasmeta.(!i) in
-                   if
-                     prev_expect_cond_assert > 0
-                     && (meta < meta_lookahead || meta > meta_lookbehindnot)
-                   then (
-                     cx.errorcode <-
-                       (if
-                          Int.equal meta meta_lookahead_na
-                          || Int.equal meta meta_lookbehind_na
-                        then Errors.err98
-                        else Errors.err28)
-                     (* (Atomic) assertion expected *);
-                     raise_notrace Goto_failed);
-
-                   (* pcre2_compile.c:4002-4060 — the lookaround alphabetic
-                      synonyms can mostly be handled by jumping to the code
-                      that handles the traditional symbolic forms (the
-                      switch's default case — ERR89, "should never occur
-                      because the meta values come from a table above" — is
-                      the final else here). *)
-                   if Int.equal meta meta_atomic then atomic_group ()
-                   else if Int.equal meta meta_lookahead then
-                     positive_look_ahead ~prev_expect_cond_assert
-                   else if Int.equal meta meta_lookahead_na then
-                     positive_nonatomic_look_ahead ~prev_expect_cond_assert
-                   else if Int.equal meta meta_lookaheadnot then
-                     negative_look_ahead ~prev_expect_cond_assert
-                   else if
-                     Int.equal meta meta_lookbehind
-                     || Int.equal meta meta_lookbehindnot
-                     || Int.equal meta meta_lookbehind_na
-                   then (
-                     buf.(!pp) <- meta;
-                     incr pp;
-                     decr ptr;
-                     post_lookbehind ~prev_expect_cond_assert)
-                   else if
-                     Int.equal meta meta_script_run
-                     || Int.equal meta meta_atomic_script_run
-                   then (
-                     (* pcre2_compile.c:4030-4059 — ( *sr: ( *asr:
-                        ( *script_run: ( *atomic_script_run: — the script
-                        run facilities: deferred (M8,
-                        docs/ocaml-engine/08-ucp.md). *)
-                     cx.errorcode <- err_deferred;
-                     raise_notrace Goto_failed)
-                   else (
-                     (* pcre2_compile.c:4007-4009 *)
-                     cx.errorcode <- Errors.err89;
-                     raise_notrace Goto_failed))
-                 else
-                   (* ---- Handle ( *VERB) and ( *VERB:NAME) ----
-                      pcre2_compile.c:4064-4076 *)
-                   let offset = ref 0 in
-                   let name = ref 0 in
-                   let namelen = ref 0 in
-                   if
-                     not
-                       (read_name cx ptr ~utf ~terminator:0 offset name namelen)
-                   then raise_notrace Goto_failed;
-                   if
-                     !ptr >= cx.ptrend
-                     || (not (Char.equal pat.[!ptr] ':'))
-                        && not (Char.equal pat.[!ptr] ')')
-                   then (
-                     cx.errorcode <- Errors.err60 (* Malformed *);
-                     raise_notrace Goto_failed);
-
-                   (* pcre2_compile.c:4078-4092 — scan the table of verb
-                      names. *)
-                   let i = ref 0 in
-                   while
-                     !i < verbcount
-                     && not
-                          (let vname, _, _ = verbs.(!i) in
-                           Int.equal !namelen (String.length vname)
-                           && strncmp_c8_eq pat !name vname !namelen)
-                   do
-                     incr i
-                   done;
-                   if !i >= verbcount then (
-                     cx.errorcode <- Errors.err60 (* Verb not recognized *);
-                     raise_notrace Goto_failed);
-                   let _, verb_meta, verb_has_arg = verbs.(!i) in
-
-                   (* pcre2_compile.c:4094-4098 — an empty argument is
-                      treated as no argument. *)
-                   if
-                     Char.equal pat.[!ptr] ':'
-                     && !ptr + 1 < cx.ptrend
-                     && Char.equal pat.[!ptr + 1] ')'
-                   then incr ptr (* Advance to the closing parens *);
-
-                   (* pcre2_compile.c:4100-4106 — check for mandatory
-                      non-empty argument; this is ( *MARK). *)
-                   if verb_has_arg > 0 && not (Char.equal pat.[!ptr] ':') then (
-                     cx.errorcode <- Errors.err66;
-                     raise_notrace Goto_failed);
-
-                   (* pcre2_compile.c:4108-4112 — remember where this verb,
-                      possibly with a preceding ( *MARK), starts, for
-                      handling quantified ( *ACCEPT). *)
-                   verbstartptr := !pp;
-                   okquantifier := Int.equal verb_meta meta_accept;
-
-                   (* pcre2_compile.c:4114-4151 — it appears that Perl
-                      allows any characters whatsoever, other than a closing
-                      parenthesis, to appear in arguments ("names"), so we
-                      no longer insist on letters, digits, and underscores.
-                      Perl does not, however, do any interpretation within
-                      arguments, and has no means of including a closing
-                      parenthesis. PCRE supports escape processing but only
-                      when it is requested by an option. We set inverbname
-                      true here, and let the main loop take care of this so
-                      that escape and \x processing is done by the main code
-                      above. The C's `if ( *ptr++ == CHAR_COLON)` reads the
-                      delimiter, then skips past it. *)
-                   let was_colon = Char.equal pat.[!ptr] ':' in
-                   incr ptr (* Skip past : or ) *);
-                   if was_colon then (
-                     (* Some optional arguments can be treated as a
-                        preceding ( *MARK) (pcre2_compile.c:4125-4131) *)
-                     if verb_has_arg < 0 then (
-                       add_after_mark := verb_meta;
-                       buf.(!pp) <- meta_mark;
+             | '(' ->
+                 (* ---- Opening parenthesis ---- pcre2_compile.c:3918-3921 *)
+                 if !ptr >= cx.ptrend then unclosed_parenthesis ();
+                 (* If ( is not followed by ? it is either a capture or a
+                    special verb or an alpha assertion or a positive
+                    non-atomic lookahead (pcre2_compile.c:3923-3926). *)
+                 if not (Char.equal pat.[!ptr] '?') then (
+                   if not (Char.equal pat.[!ptr] '*') then (
+                     (* pcre2_compile.c:3930-3947 — handle capturing brackets
+                        (or non-capturing if auto-capture is turned off). *)
+                     nest_depth := !nest_depth + 1;
+                     if Int.equal (!options land Options.no_auto_capture) 0 then (
+                       if cx.bracount >= Limits.max_group_number then (
+                         cx.errorcode <- Errors.err97;
+                         raise_notrace Goto_failed);
+                       cx.bracount <- cx.bracount + 1;
+                       buf.(!pp) <- meta_capture lor cx.bracount;
                        incr pp)
                      else (
-                       (* The remaining verbs with arguments (except *MARK)
-                          need a different opcode
-                          (pcre2_compile.c:4133-4140). *)
-                       buf.(!pp) <-
-                         (verb_meta
-                         +
-                         if not (Int.equal verb_meta meta_mark) then 0x0001_0000
-                         else 0);
-                       incr pp);
+                       buf.(!pp) <- meta_nocapture;
+                       incr pp))
+                   else if
+                     cx.ptrend - !ptr <= 1 || Char.equal pat.[!ptr + 1] ')'
+                   then
+                     (* pcre2_compile.c:3949-3953 — do nothing for ( * followed
+                        by end of pattern or ) so it gives a "bad quantifier"
+                        error rather than "(*MARK) must have an argument".
+                        (The C also assigns c = ptr[1] here; c is dead
+                        afterwards.) *)
+                     ()
+                   else if
+                     (* CHMAX_255(c) is always true for an 8-bit code unit. *)
+                     not
+                       (Int.equal
+                          (Chartables.ctypes (Char.code pat.[!ptr + 1])
+                          land Chartables.ctype_lcletter)
+                          0)
+                   then (
+                     (* pcre2_compile.c:3955-3972 — handle "alpha assertions"
+                        such as ( *pla:...). Most of these are synonyms for
+                        the historical symbolic assertions, but the script
+                        run and non-atomic lookaround ones are new. They are
+                        distinguished by starting with a lower case letter.
+                        Checking both ends of the alphabet makes this work in
+                        all character codes. *)
+                     let offset = ref 0 in
+                     let name = ref 0 in
+                     let namelen = ref 0 in
+                     if
+                       not
+                         (read_name cx ptr ~utf ~terminator:0 offset name
+                            namelen)
+                     then raise_notrace Goto_failed;
+                     if !ptr >= cx.ptrend || not (Char.equal pat.[!ptr] ':')
+                     then (
+                       cx.errorcode <- Errors.err95 (* Malformed *);
+                       raise_notrace Goto_failed);
 
-                     (* Set up for reading the name in the main loop
-                        (pcre2_compile.c:4142-4147). *)
-                     verblengthptr := !pp;
-                     incr pp;
-                     verbnamestart := !ptr;
-                     inverbname := true)
-                   else (
-                     (* No verb "name" argument
-                        (pcre2_compile.c:4148-4151) *)
-                     buf.(!pp) <- verb_meta;
-                     incr pp) (* End of ( *VERB) handling *))
-               else (
-                 (* ---- Items starting (? ---- pcre2_compile.c:4157-4167.
-                    The type of item is determined by what follows (?.
-                    Handle (?| and option changes under "default" (the last
-                    arm here) because both need a new block on the nest
-                    stack. Comments starting with (?# were handled above.
-                    Note the ambiguity of (?-: a digit after it means a
-                    relative recursion or subroutine call, otherwise it is
-                    an option unsetting. *)
-                 incr ptr;
-                 if !ptr >= cx.ptrend then unclosed_parenthesis ();
-                 match pat.[!ptr] with
-                 | 'P' ->
-                     (* ---- Python syntax support ----
-                        pcre2_compile.c:4355-4387 *)
-                     incr ptr;
-                     if !ptr >= cx.ptrend then unclosed_parenthesis ();
-                     (* (?P<name> is the same as (?<name>, which defines a
-                        named group (pcre2_compile.c:4360-4366). *)
-                     if Char.equal pat.[!ptr] '<' then
-                       define_name ~terminator:(Char.code '>')
-                       (* goto DEFINE_NAME *)
-                     else if Char.equal pat.[!ptr] '>' then
-                       (* (?P>name) is the same as (?&name), which is a
-                          recursion or subroutine call: goto RECURSE_BY_NAME
-                          (pcre2_compile.c:4368-4371). *)
-                       recurse_by_name ()
-                     else if not (Char.equal pat.[!ptr] '=') then (
-                       (* (?P=name) is the same as \k<name>, a back
-                          reference by name. Anything else after (?P is an
-                          error (pcre2_compile.c:4373-4380). *)
-                       cx.errorcode <- Errors.err41;
+                     (* pcre2_compile.c:3974-3988 — scan the table of alpha
+                        assertion names. *)
+                     let i = ref 0 in
+                     while
+                       !i < alascount
+                       && not
+                            (Int.equal !namelen
+                               (String.length (fst alasmeta.(!i)))
+                            && strncmp_c8_eq pat !name
+                                 (fst alasmeta.(!i))
+                                 !namelen)
+                     do
+                       incr i
+                     done;
+                     if !i >= alascount then (
+                       cx.errorcode <-
+                         Errors.err95 (* Alpha assertion not recognized *);
+                       raise_notrace Goto_failed);
+
+                     (* pcre2_compile.c:3990-4000 — check for expecting an
+                        assertion condition. If so, only atomic lookaround
+                        assertions are valid. *)
+                     let meta = snd alasmeta.(!i) in
+                     if
+                       prev_expect_cond_assert > 0
+                       && (meta < meta_lookahead || meta > meta_lookbehindnot)
+                     then (
+                       cx.errorcode <-
+                         (if
+                            Int.equal meta meta_lookahead_na
+                            || Int.equal meta meta_lookbehind_na
+                          then Errors.err98
+                          else Errors.err28)
+                       (* (Atomic) assertion expected *);
+                       raise_notrace Goto_failed);
+
+                     (* pcre2_compile.c:4002-4060 — the lookaround alphabetic
+                        synonyms can mostly be handled by jumping to the code
+                        that handles the traditional symbolic forms (the
+                        switch's default case — ERR89, "should never occur
+                        because the meta values come from a table above" — is
+                        the final else here). *)
+                     if Int.equal meta meta_atomic then atomic_group ()
+                     else if Int.equal meta meta_lookahead then
+                       positive_look_ahead ~prev_expect_cond_assert
+                     else if Int.equal meta meta_lookahead_na then
+                       positive_nonatomic_look_ahead ~prev_expect_cond_assert
+                     else if Int.equal meta meta_lookaheadnot then
+                       negative_look_ahead ~prev_expect_cond_assert
+                     else if
+                       Int.equal meta meta_lookbehind
+                       || Int.equal meta meta_lookbehindnot
+                       || Int.equal meta meta_lookbehind_na
+                     then (
+                       buf.(!pp) <- meta;
+                       incr pp;
+                       decr ptr;
+                       post_lookbehind ~prev_expect_cond_assert)
+                     else if
+                       Int.equal meta meta_script_run
+                       || Int.equal meta meta_atomic_script_run
+                     then (
+                       (* pcre2_compile.c:4030-4059 — ( *sr: ( *asr:
+                          ( *script_run: ( *atomic_script_run: — the script
+                          run facilities: deferred (M8,
+                          docs/ocaml-engine/08-ucp.md). *)
+                       cx.errorcode <- err_deferred;
                        raise_notrace Goto_failed)
-                     else
-                       (* pcre2_compile.c:4381-4387 *)
-                       let offset = ref 0 in
-                       let name = ref 0 in
-                       let namelen = ref 0 in
-                       if
-                         not
-                           (read_name cx ptr ~utf ~terminator:(Char.code ')')
-                              offset name namelen)
-                       then raise_notrace Goto_failed;
-                       buf.(!pp) <- meta_backref_byname;
-                       incr pp;
-                       buf.(!pp) <- !namelen;
-                       incr pp;
-                       putoffset buf pp !offset;
-                       okquantifier := true (* End of (?P processing *)
-                 | 'R' ->
-                     (* ---- Recursion/subroutine calls by number ----
-                        pcre2_compile.c:4390-4400 — (?R) == (?R0). *)
-                     incr ptr;
-                     if !ptr >= cx.ptrend || not (Char.equal pat.[!ptr] ')')
+                     else (
+                       (* pcre2_compile.c:4007-4009 *)
+                       cx.errorcode <- Errors.err89;
+                       raise_notrace Goto_failed))
+                   else
+                     (* ---- Handle ( *VERB) and ( *VERB:NAME) ----
+                        pcre2_compile.c:4064-4076 *)
+                     let offset = ref 0 in
+                     let name = ref 0 in
+                     let namelen = ref 0 in
+                     if
+                       not
+                         (read_name cx ptr ~utf ~terminator:0 offset name
+                            namelen)
+                     then raise_notrace Goto_failed;
+                     if
+                       !ptr >= cx.ptrend
+                       || (not (Char.equal pat.[!ptr] ':'))
+                          && not (Char.equal pat.[!ptr] ')')
                      then (
-                       cx.errorcode <- Errors.err58;
+                       cx.errorcode <- Errors.err60 (* Malformed *);
                        raise_notrace Goto_failed);
-                     set_recursion ~i:0
-                 | '+' ->
-                     (* pcre2_compile.c:4402-4411 — an item starting (?-
-                        followed by a digit comes here via the "default"
-                        case because (?- followed by a non-digit is an
-                        options setting. *)
-                     if cx.ptrend - !ptr < 2 || not (is_digit pat.[!ptr + 1])
-                     then (
-                       cx.errorcode <- Errors.err29 (* Missing number *);
+
+                     (* pcre2_compile.c:4078-4092 — scan the table of verb
+                        names. *)
+                     let i = ref 0 in
+                     while
+                       !i < verbcount
+                       && not
+                            (let vname, _, _ = verbs.(!i) in
+                             Int.equal !namelen (String.length vname)
+                             && strncmp_c8_eq pat !name vname !namelen)
+                     do
+                       incr i
+                     done;
+                     if !i >= verbcount then (
+                       cx.errorcode <- Errors.err60 (* Verb not recognized *);
                        raise_notrace Goto_failed);
-                     (* Fall through *)
-                     recursion_bynumber ()
-                 | '0' .. '9' ->
-                     (* pcre2_compile.c:4413-4434 *)
-                     recursion_bynumber ()
-                 | '&' ->
-                     (* ---- Recursion/subroutine calls by name ----
-                        pcre2_compile.c:4437-4446 *)
-                     recurse_by_name ()
-                 | 'C' ->
-                     (* pcre2_compile.c:4448-4563 — callouts with numerical
-                        or string argument: deferred (M5; the callout API
-                        itself stays type-only per the architecture doc). *)
-                     cx.errorcode <- err_deferred;
-                     raise_notrace Goto_failed
-                 | '(' ->
-                     (* ---- Conditional group ----
-                        pcre2_compile.c:4566-4738 — a condition can be an
-                        assertion, a number (referring to a numbered group's
-                        having been set), a name (referring to a named
-                        group), or 'R', referring to overall recursion.
-                        R<digits> and R&name are also permitted for
-                        recursion state tests. Numbers may be preceded by +
-                        or - to specify a relative group number.
+                     let _, verb_meta, verb_has_arg = verbs.(!i) in
 
-                        There are several syntaxes for testing a named
-                        group: (?(name)) is used by Python; Perl 5.10
-                        onwards uses (?(<name>) or (?('name')).
+                     (* pcre2_compile.c:4094-4098 — an empty argument is
+                        treated as no argument. *)
+                     if
+                       Char.equal pat.[!ptr] ':'
+                       && !ptr + 1 < cx.ptrend
+                       && Char.equal pat.[!ptr + 1] ')'
+                     then incr ptr (* Advance to the closing parens *);
 
-                        There are two unfortunate ambiguities. 'R' can be
-                        the recursive thing or the name 'R' (and similarly
-                        for 'R' followed by digits). 'DEFINE' can be the
-                        Perl DEFINE feature or the Python named test. We
-                        look for a name first; if not found, we try the
-                        other case.
+                     (* pcre2_compile.c:4100-4106 — check for mandatory
+                        non-empty argument; this is ( *MARK). *)
+                     if verb_has_arg > 0 && not (Char.equal pat.[!ptr] ':') then (
+                       cx.errorcode <- Errors.err66;
+                       raise_notrace Goto_failed);
 
-                        For compatibility with auto-callouts, we allow a
-                        callout to be specified before a condition that is
-                        an assertion. *)
-                     incr ptr;
-                     if !ptr >= cx.ptrend then unclosed_parenthesis ();
-                     nest_depth := !nest_depth + 1;
+                     (* pcre2_compile.c:4108-4112 — remember where this verb,
+                        possibly with a preceding ( *MARK), starts, for
+                        handling quantified ( *ACCEPT). *)
+                     verbstartptr := !pp;
+                     okquantifier := Int.equal verb_meta meta_accept;
 
-                     (* pcre2_compile.c:4589-4603 — if the next character
-                        is ? or * there must be an assertion next
-                        (optionally preceded by a callout). We do not check
-                        this here, but instead we set expect_cond_assert to
-                        2. If this is still greater than zero (callouts
-                        decrement it) when the next assertion is read, it
-                        will be marked as a condition that must not be
-                        repeated. A value greater than zero also causes
-                        checking that an assertion (possibly with callout)
-                        follows. *)
-                     if Char.equal pat.[!ptr] '?' || Char.equal pat.[!ptr] '*'
-                     then (
-                       buf.(!pp) <- meta_cond_assert;
+                     (* pcre2_compile.c:4114-4151 — it appears that Perl
+                        allows any characters whatsoever, other than a closing
+                        parenthesis, to appear in arguments ("names"), so we
+                        no longer insist on letters, digits, and underscores.
+                        Perl does not, however, do any interpretation within
+                        arguments, and has no means of including a closing
+                        parenthesis. PCRE supports escape processing but only
+                        when it is requested by an option. We set inverbname
+                        true here, and let the main loop take care of this so
+                        that escape and \x processing is done by the main code
+                        above. The C's `if ( *ptr++ == CHAR_COLON)` reads the
+                        delimiter, then skips past it. *)
+                     let was_colon = Char.equal pat.[!ptr] ':' in
+                     incr ptr (* Skip past : or ) *);
+                     if was_colon then (
+                       (* Some optional arguments can be treated as a
+                          preceding ( *MARK) (pcre2_compile.c:4125-4131) *)
+                       if verb_has_arg < 0 then (
+                         add_after_mark := verb_meta;
+                         buf.(!pp) <- meta_mark;
+                         incr pp)
+                       else (
+                         (* The remaining verbs with arguments (except *MARK)
+                            need a different opcode
+                            (pcre2_compile.c:4133-4140). *)
+                         buf.(!pp) <-
+                           (verb_meta
+                           +
+                           if not (Int.equal verb_meta meta_mark) then
+                             0x0001_0000
+                           else 0);
+                         incr pp);
+
+                       (* Set up for reading the name in the main loop
+                          (pcre2_compile.c:4142-4147). *)
+                       verblengthptr := !pp;
                        incr pp;
-                       decr ptr
-                       (* Pull pointer back to the opening parenthesis. *);
-                       expect_cond_assert := 2 (* break: end of conditional *))
-                     else
-                       (* pcre2_compile.c:4605-4619 — handle
-                          (?([+-]number)... *)
-                       let i = ref 0 in
-                       (if
-                          read_number cx ptr ~allow_sign:cx.bracount
-                            ~max_value:Limits.max_group_number
-                            ~max_error:Errors.err61 i
-                        then (
-                          if !i <= 0 then (
-                            cx.errorcode <- Errors.err15;
-                            raise_notrace Goto_failed);
-                          buf.(!pp) <- meta_cond_number;
-                          incr pp;
-                          let offset = !ptr - 2 in
-                          (* ptr - cb->start_pattern - 2 *)
-                          putoffset buf pp offset;
-                          buf.(!pp) <- !i;
-                          incr pp)
-                        else if not (Int.equal cx.errorcode 0) then
-                          raise_notrace Goto_failed (* Number too big *)
-                        else if
-                          (* pcre2_compile.c:4622-4663 — no number found.
-                             Handle the special case
-                             (?(VERSION[>]=n.m)... *)
-                          cx.ptrend - !ptr >= 10
-                          && strncmp_c8_eq pat !ptr "VERSION" 7
-                          && not (Char.equal pat.[!ptr + 7] ')')
-                        then (
-                          let ge = ref 0 in
-                          let major = ref 0 in
-                          let minor = ref 0 in
-                          ptr := !ptr + 7;
-                          if Char.equal pat.[!ptr] '>' then (
-                            ge := 1;
-                            incr ptr);
-
-                          (* pcre2_compile.c:4639-4643 — NOTE: cannot write
-                             IS_DIGIT( *(++ptr)) here because IS_DIGIT
-                             references its argument twice. *)
-                          if not (Char.equal pat.[!ptr] '=') then
-                            bad_version_condition ()
-                          else (
-                            incr ptr;
-                            if not (is_digit pat.[!ptr]) then
-                              bad_version_condition ());
-
-                          if
-                            not
-                              (read_number cx ptr ~allow_sign:(-1)
-                                 ~max_value:1000 ~max_error:Errors.err79 major)
-                          then raise_notrace Goto_failed;
-
-                          if !ptr >= cx.ptrend then bad_version_condition ();
-                          if Char.equal pat.[!ptr] '.' then (
-                            incr ptr;
-                            if !ptr >= cx.ptrend || not (is_digit pat.[!ptr])
-                            then bad_version_condition ();
-                            minor := (Char.code pat.[!ptr] - Char.code '0') * 10;
-                            incr ptr;
-                            if !ptr >= cx.ptrend then bad_version_condition ();
-                            if is_digit pat.[!ptr] then (
-                              minor :=
-                                !minor + Char.code pat.[!ptr] - Char.code '0';
-                              incr ptr);
-                            if
-                              !ptr >= cx.ptrend
-                              || not (Char.equal pat.[!ptr] ')')
-                            then bad_version_condition ());
-
-                          buf.(!pp) <- meta_cond_version;
-                          incr pp;
-                          buf.(!pp) <- !ge;
-                          incr pp;
-                          buf.(!pp) <- !major;
-                          incr pp;
-                          buf.(!pp) <- !minor;
-                          incr pp)
-                        else
-                          (* pcre2_compile.c:4665-4728 — all the remaining
-                             cases now require us to read a name. We cannot
-                             at this stage distinguish ambiguous cases such
-                             as (?(R12) which might be a recursion test by
-                             number or a name, because the named groups
-                             have not yet all been identified. Those cases
-                             are treated as names, but given a different
-                             META code. *)
-                          let was_r_ampersand = ref false in
-                          let terminator =
-                            if
-                              Char.equal pat.[!ptr] 'R'
-                              && cx.ptrend - !ptr > 1
-                              && Char.equal pat.[!ptr + 1] '&'
-                            then (
-                              was_r_ampersand := true;
-                              incr ptr;
-                              Char.code ')')
-                            else if Char.equal pat.[!ptr] '<' then Char.code '>'
-                            else if Char.equal pat.[!ptr] '\'' then
-                              Char.code '\''
-                            else (
-                              decr ptr (* Point to char before name *);
-                              Char.code ')')
-                          in
-                          let offset = ref 0 in
-                          let name = ref 0 in
-                          let namelen = ref 0 in
-                          if
-                            not
-                              (read_name cx ptr ~utf ~terminator offset name
-                                 namelen)
-                          then raise_notrace Goto_failed;
-
-                          (* pcre2_compile.c:4693-4699 — handle
-                             (?(R&name) *)
-                          if !was_r_ampersand then (
-                            buf.(!pp) <- meta_cond_rname;
-                            decr ptr (* Back to closing parens *))
-                          else if Int.equal terminator (Char.code ')') then (
-                            (* pcre2_compile.c:4701-4717 — handle (?(name).
-                               If the name is "DEFINE" we identify it with
-                               a special code. Likewise if the name
-                               consists of R followed only by digits.
-                               Otherwise, handle it like a quoted name. *)
-                            (if
-                               Int.equal !namelen 6
-                               && strncmp_c8_eq pat !name "DEFINE" 6
-                             then buf.(!pp) <- meta_cond_define
-                             else
-                               let i = ref 1 in
-                               while
-                                 !i < !namelen && is_digit pat.[!name + !i]
-                               do
-                                 incr i
-                               done;
-                               buf.(!pp) <-
-                                 (if
-                                    Char.equal pat.[!name] 'R' && !i >= !namelen
-                                  then meta_cond_rnumber
-                                  else meta_cond_name));
-                            decr ptr (* Back to closing parens *))
-                          else
-                            (* pcre2_compile.c:4719-4721 — handle
-                               (?('name') or (?(<name>) *)
-                            buf.(!pp) <- meta_cond_name;
-
-                          (* pcre2_compile.c:4723-4727 — all these cases
-                             except DEFINE end with the name length and
-                             offset; DEFINE just has an offset (for the
-                             "too many branches" error). *)
-                          let stored = buf.(!pp) in
-                          incr pp;
-                          if not (Int.equal stored meta_cond_define) then (
-                            buf.(!pp) <- !namelen;
-                            incr pp);
-                          putoffset buf pp !offset
-                          (* End cases that read a name *));
-
-                       (* pcre2_compile.c:4730-4737 — check the closing
-                          parenthesis of the condition. *)
+                       verbnamestart := !ptr;
+                       inverbname := true)
+                     else (
+                       (* No verb "name" argument
+                          (pcre2_compile.c:4148-4151) *)
+                       buf.(!pp) <- verb_meta;
+                       incr pp) (* End of ( *VERB) handling *))
+                 else (
+                   (* ---- Items starting (? ---- pcre2_compile.c:4157-4167.
+                      The type of item is determined by what follows (?.
+                      Handle (?| and option changes under "default" (the last
+                      arm here) because both need a new block on the nest
+                      stack. Comments starting with (?# were handled above.
+                      Note the ambiguity of (?-: a digit after it means a
+                      relative recursion or subroutine call, otherwise it is
+                      an option unsetting. *)
+                   incr ptr;
+                   if !ptr >= cx.ptrend then unclosed_parenthesis ();
+                   match pat.[!ptr] with
+                   | 'P' ->
+                       (* ---- Python syntax support ----
+                          pcre2_compile.c:4355-4387 *)
+                       incr ptr;
+                       if !ptr >= cx.ptrend then unclosed_parenthesis ();
+                       (* (?P<name> is the same as (?<name>, which defines a
+                          named group (pcre2_compile.c:4360-4366). *)
+                       if Char.equal pat.[!ptr] '<' then
+                         define_name ~terminator:(Char.code '>')
+                         (* goto DEFINE_NAME *)
+                       else if Char.equal pat.[!ptr] '>' then
+                         (* (?P>name) is the same as (?&name), which is a
+                            recursion or subroutine call: goto RECURSE_BY_NAME
+                            (pcre2_compile.c:4368-4371). *)
+                         recurse_by_name ()
+                       else if not (Char.equal pat.[!ptr] '=') then (
+                         (* (?P=name) is the same as \k<name>, a back
+                            reference by name. Anything else after (?P is an
+                            error (pcre2_compile.c:4373-4380). *)
+                         cx.errorcode <- Errors.err41;
+                         raise_notrace Goto_failed)
+                       else
+                         (* pcre2_compile.c:4381-4387 *)
+                         let offset = ref 0 in
+                         let name = ref 0 in
+                         let namelen = ref 0 in
+                         if
+                           not
+                             (read_name cx ptr ~utf ~terminator:(Char.code ')')
+                                offset name namelen)
+                         then raise_notrace Goto_failed;
+                         buf.(!pp) <- meta_backref_byname;
+                         incr pp;
+                         buf.(!pp) <- !namelen;
+                         incr pp;
+                         putoffset buf pp !offset;
+                         okquantifier := true (* End of (?P processing *)
+                   | 'R' ->
+                       (* ---- Recursion/subroutine calls by number ----
+                          pcre2_compile.c:4390-4400 — (?R) == (?R0). *)
+                       incr ptr;
                        if !ptr >= cx.ptrend || not (Char.equal pat.[!ptr] ')')
                        then (
-                         cx.errorcode <- Errors.err24;
+                         cx.errorcode <- Errors.err58;
                          raise_notrace Goto_failed);
-                       incr ptr (* End of condition processing *)
-                 | '>' ->
-                     (* ---- Atomic group ---- pcre2_compile.c:4741-4748 *)
-                     atomic_group ()
-                 | '=' ->
-                     (* ---- Lookahead assertions ----
-                        pcre2_compile.c:4753-4757 *)
-                     positive_look_ahead ~prev_expect_cond_assert
-                 | '*' ->
-                     (* pcre2_compile.c:4759-4763 — the (?* non-atomic
-                        form. *)
-                     positive_nonatomic_look_ahead ~prev_expect_cond_assert
-                 | '!' ->
-                     (* pcre2_compile.c:4765-4769 *)
-                     negative_look_ahead ~prev_expect_cond_assert
-                 | '<' ->
-                     (* ---- Lookbehind assertions ----
-                        pcre2_compile.c:4774-4785 — (?< followed by = or !
-                        or * is a lookbehind assertion. Otherwise (?< is the
-                        start of the name of a capturing group. *)
-                     if
-                       cx.ptrend - !ptr <= 1
-                       || (not (Char.equal pat.[!ptr + 1] '='))
-                          && (not (Char.equal pat.[!ptr + 1] '!'))
-                          && not (Char.equal pat.[!ptr + 1] '*')
-                     then define_name ~terminator:(Char.code '>')
-                       (* goto DEFINE_NAME *)
-                     else (
-                       (* pcre2_compile.c:4786-4795 *)
-                       buf.(!pp) <-
-                         (if Char.equal pat.[!ptr + 1] '=' then meta_lookbehind
-                          else if Char.equal pat.[!ptr + 1] '!' then
-                            meta_lookbehindnot
-                          else meta_lookbehind_na);
-                       incr pp;
-                       post_lookbehind ~prev_expect_cond_assert)
-                 | '\'' ->
-                     (* ---- Define a named group ----
-                        pcre2_compile.c:4824-4831 — a named group may be
-                        defined as (?'name') or (?<name>); DEFINE_NAME with
-                        the terminator set to the apostrophe. *)
-                     define_name ~terminator:(Char.code '\'')
-                 | _ ->
-                     (* pcre2_compile.c:4169-4352 — the C switch's default
-                        case (first in the source): (?-digit relative
-                        recursion, else (?| or a (possibly empty) option
-                        setting, optionally followed by a non-capturing
-                        group. *)
-                     if
-                       Char.equal pat.[!ptr] '-'
-                       && cx.ptrend - !ptr > 1
-                       && is_digit pat.[!ptr + 1]
-                     then
-                       (* goto RECURSION_BYNUMBER (the + case is handled by
-                          CHAR_PLUS above, pcre2_compile.c:4170-4171). *)
+                       set_recursion ~i:0
+                   | '+' ->
+                       (* pcre2_compile.c:4402-4411 — an item starting (?-
+                          followed by a digit comes here via the "default"
+                          case because (?- followed by a non-digit is an
+                          options setting. *)
+                       if cx.ptrend - !ptr < 2 || not (is_digit pat.[!ptr + 1])
+                       then (
+                         cx.errorcode <- Errors.err29 (* Missing number *);
+                         raise_notrace Goto_failed);
+                       (* Fall through *)
                        recursion_bynumber ()
-                     else (
-                       (* pcre2_compile.c:4176-4186 *)
+                   | '0' .. '9' ->
+                       (* pcre2_compile.c:4413-4434 *)
+                       recursion_bynumber ()
+                   | '&' ->
+                       (* ---- Recursion/subroutine calls by name ----
+                          pcre2_compile.c:4437-4446 *)
+                       recurse_by_name ()
+                   | 'C' ->
+                       (* pcre2_compile.c:4448-4563 — callouts with numerical
+                          or string argument: deferred (M5; the callout API
+                          itself stays type-only per the architecture doc). *)
+                       cx.errorcode <- err_deferred;
+                       raise_notrace Goto_failed
+                   | '(' ->
+                       (* ---- Conditional group ----
+                          pcre2_compile.c:4566-4738 — a condition can be an
+                          assertion, a number (referring to a numbered group's
+                          having been set), a name (referring to a named
+                          group), or 'R', referring to overall recursion.
+                          R<digits> and R&name are also permitted for
+                          recursion state tests. Numbers may be preceded by +
+                          or - to specify a relative group number.
+
+                          There are several syntaxes for testing a named
+                          group: (?(name)) is used by Python; Perl 5.10
+                          onwards uses (?(<name>) or (?('name')).
+
+                          There are two unfortunate ambiguities. 'R' can be
+                          the recursive thing or the name 'R' (and similarly
+                          for 'R' followed by digits). 'DEFINE' can be the
+                          Perl DEFINE feature or the Python named test. We
+                          look for a name first; if not found, we try the
+                          other case.
+
+                          For compatibility with auto-callouts, we allow a
+                          callout to be specified before a condition that is
+                          an assertion. *)
+                       incr ptr;
+                       if !ptr >= cx.ptrend then unclosed_parenthesis ();
                        nest_depth := !nest_depth + 1;
-                       if Int.equal !top_nest (-1) then top_nest := 0
-                       else (
-                         incr top_nest;
-                         if !top_nest >= nest_slots then (
-                           cx.errorcode <- Errors.err84;
-                           raise_notrace Goto_failed));
-                       let tn = nests.(!top_nest) in
-                       tn.nest_depth <- !nest_depth;
-                       tn.flags <- 0;
-                       tn.options <- !options land parse_tracked_options;
-                       tn.xoptions <- !xoptions land parse_tracked_extra_options;
 
-                       if Char.equal pat.[!ptr] '|' then (
-                         (* pcre2_compile.c:4188-4199 — start of a
-                            non-capturing group that resets the capture count
-                            for each branch. *)
-                         tn.reset_group <- cx.bracount;
-                         tn.max_group <- cx.bracount;
-                         tn.flags <- tn.flags lor nsf_reset;
-                         cx.external_flags <- cx.external_flags lor dupcapused;
-                         buf.(!pp) <- meta_nocapture;
+                       (* pcre2_compile.c:4589-4603 — if the next character
+                          is ? or * there must be an assertion next
+                          (optionally preceded by a callout). We do not check
+                          this here, but instead we set expect_cond_assert to
+                          2. If this is still greater than zero (callouts
+                          decrement it) when the next assertion is read, it
+                          will be marked as a condition that must not be
+                          repeated. A value greater than zero also causes
+                          checking that an assertion (possibly with callout)
+                          follows. *)
+                       if Char.equal pat.[!ptr] '?' || Char.equal pat.[!ptr] '*'
+                       then (
+                         buf.(!pp) <- meta_cond_assert;
                          incr pp;
-                         incr ptr)
+                         decr ptr
+                         (* Pull pointer back to the opening parenthesis. *);
+                         expect_cond_assert := 2 (* break: end of conditional *))
                        else
-                         (* pcre2_compile.c:4201-4351 — scan for options
-                            imnrsxJU (and the two-character a.. sequences) to
-                            be set or unset. The C's optset/xoptset
-                            accumulator pointers become the [setting] selector
-                            consulted by add_opt/add_xopt. *)
-                         let hyphenok = ref true in
-                         let oldoptions = !options in
-                         let oldxoptions = !xoptions in
-                         tn.reset_group <- 0;
-                         tn.max_group <- 0;
-                         let set = ref 0 in
-                         let unset = ref 0 in
-                         let xset = ref 0 in
-                         let xunset = ref 0 in
-                         let setting = ref true in
-                         (* optset = &set; xoptset = &xset *)
-                         let add_opt v =
-                           if !setting then set := !set lor v
-                           else unset := !unset lor v
-                         in
-                         let add_xopt v =
-                           if !setting then xset := !xset lor v
-                           else xunset := !xunset lor v
-                         in
+                         (* pcre2_compile.c:4605-4619 — handle
+                            (?([+-]number)... *)
+                         let i = ref 0 in
+                         (if
+                            read_number cx ptr ~allow_sign:cx.bracount
+                              ~max_value:Limits.max_group_number
+                              ~max_error:Errors.err61 i
+                          then (
+                            if !i <= 0 then (
+                              cx.errorcode <- Errors.err15;
+                              raise_notrace Goto_failed);
+                            buf.(!pp) <- meta_cond_number;
+                            incr pp;
+                            let offset = !ptr - 2 in
+                            (* ptr - cb->start_pattern - 2 *)
+                            putoffset buf pp offset;
+                            buf.(!pp) <- !i;
+                            incr pp)
+                          else if not (Int.equal cx.errorcode 0) then
+                            raise_notrace Goto_failed (* Number too big *)
+                          else if
+                            (* pcre2_compile.c:4622-4663 — no number found.
+                               Handle the special case
+                               (?(VERSION[>]=n.m)... *)
+                            cx.ptrend - !ptr >= 10
+                            && strncmp_c8_eq pat !ptr "VERSION" 7
+                            && not (Char.equal pat.[!ptr + 7] ')')
+                          then (
+                            let ge = ref 0 in
+                            let major = ref 0 in
+                            let minor = ref 0 in
+                            ptr := !ptr + 7;
+                            if Char.equal pat.[!ptr] '>' then (
+                              ge := 1;
+                              incr ptr);
 
-                         (* pcre2_compile.c:4216-4225 — ^ at the start unsets
-                            irmnsx and disables the subsequent use of -. *)
-                         if !ptr < cx.ptrend && Char.equal pat.[!ptr] '^' then (
-                           options :=
-                             !options
-                             land lnot
-                                    (Options.caseless lor Options.multiline
-                                   lor Options.no_auto_capture
-                                   lor Options.dotall lor Options.extended
-                                   lor Options.extended_more);
-                           xoptions :=
-                             !xoptions land lnot Options.extra_caseless_restrict;
-                           hyphenok := false;
-                           incr ptr);
+                            (* pcre2_compile.c:4639-4643 — NOTE: cannot write
+                               IS_DIGIT( *(++ptr)) here because IS_DIGIT
+                               references its argument twice. *)
+                            if not (Char.equal pat.[!ptr] '=') then
+                              bad_version_condition ()
+                            else (
+                              incr ptr;
+                              if not (is_digit pat.[!ptr]) then
+                                bad_version_condition ());
 
-                         (* pcre2_compile.c:4227-4313 *)
-                         while
-                           !ptr < cx.ptrend
-                           && (not (Char.equal pat.[!ptr] ')'))
-                           && not (Char.equal pat.[!ptr] ':')
-                         do
-                           (* switch ( *ptr++ ) *)
-                           let ch = pat.[!ptr] in
-                           incr ptr;
-                           match ch with
-                           | '-' ->
-                               (* pcre2_compile.c:4232-4242 *)
-                               if not !hyphenok then (
-                                 cx.errorcode <- Errors.err94;
-                                 decr ptr (* Correct the offset *);
-                                 raise_notrace Goto_failed);
-                               setting := false
-                               (* optset = &unset; xoptset = &xunset *);
-                               hyphenok := false
-                           | 'a' ->
-                               (* pcre2_compile.c:4244-4283 — there are some
-                                  two-character sequences that start with 'a';
-                                  a bare 'a' sets all the ASCII options
-                                  together. *)
-                               let matched2 =
-                                 !ptr < cx.ptrend
-                                 &&
-                                 match pat.[!ptr] with
-                                 | 'D' ->
-                                     add_xopt Options.extra_ascii_bsd;
-                                     incr ptr;
-                                     true
-                                 | 'P' ->
-                                     add_xopt
-                                       (Options.extra_ascii_posix
-                                      lor Options.extra_ascii_digit);
-                                     incr ptr;
-                                     true
-                                 | 'S' ->
-                                     add_xopt Options.extra_ascii_bss;
-                                     incr ptr;
-                                     true
-                                 | 'T' ->
-                                     add_xopt Options.extra_ascii_digit;
-                                     incr ptr;
-                                     true
-                                 | 'W' ->
-                                     add_xopt Options.extra_ascii_bsw;
-                                     incr ptr;
-                                     true
-                                 | _ -> false
-                               in
-                               if not matched2 then
-                                 add_xopt
-                                   (Options.extra_ascii_bsd
-                                  lor Options.extra_ascii_bss
-                                  lor Options.extra_ascii_bsw
-                                  lor Options.extra_ascii_digit
-                                  lor Options.extra_ascii_posix)
-                           | 'J' ->
-                               (* pcre2_compile.c:4285-4288 — record that it
-                                  changed in the external options. *)
-                               add_opt Options.dupnames;
-                               cx.external_flags <-
-                                 cx.external_flags lor jchanged
-                           | 'i' -> add_opt Options.caseless
-                           | 'm' -> add_opt Options.multiline
-                           | 'n' -> add_opt Options.no_auto_capture
-                           | 'r' -> add_xopt Options.extra_caseless_restrict
-                           | 's' -> add_opt Options.dotall
-                           | 'U' -> add_opt Options.ungreedy
-                           | 'x' ->
-                               (* pcre2_compile.c:4297-4306 — if x appears
-                                  twice it sets the extended extended
-                                  option. *)
-                               add_opt Options.extended;
-                               if !ptr < cx.ptrend && Char.equal pat.[!ptr] 'x'
-                               then (
-                                 add_opt Options.extended_more;
-                                 incr ptr)
-                           | _ ->
-                               (* pcre2_compile.c:4308-4311 *)
-                               cx.errorcode <- Errors.err11;
-                               decr ptr (* Correct the offset *);
-                               raise_notrace Goto_failed
-                         done;
+                            if
+                              not
+                                (read_number cx ptr ~allow_sign:(-1)
+                                   ~max_value:1000 ~max_error:Errors.err79 major)
+                            then raise_notrace Goto_failed;
 
-                         (* pcre2_compile.c:4315-4324 — if we are setting
-                            extended without extended-more, ensure that any
-                            existing extended-more gets unset. Also, unsetting
-                            extended must also unset extended-more. *)
-                         if
-                           Int.equal
-                             (!set
-                             land (Options.extended lor Options.extended_more))
-                             Options.extended
-                           || not (Int.equal (!unset land Options.extended) 0)
-                         then unset := !unset lor Options.extended_more;
+                            if !ptr >= cx.ptrend then bad_version_condition ();
+                            if Char.equal pat.[!ptr] '.' then (
+                              incr ptr;
+                              if !ptr >= cx.ptrend || not (is_digit pat.[!ptr])
+                              then bad_version_condition ();
+                              minor :=
+                                (Char.code pat.[!ptr] - Char.code '0') * 10;
+                              incr ptr;
+                              if !ptr >= cx.ptrend then bad_version_condition ();
+                              if is_digit pat.[!ptr] then (
+                                minor :=
+                                  !minor + Char.code pat.[!ptr] - Char.code '0';
+                                incr ptr);
+                              if
+                                !ptr >= cx.ptrend
+                                || not (Char.equal pat.[!ptr] ')')
+                              then bad_version_condition ());
 
-                         options := !options lor !set land lnot !unset;
-                         xoptions := !xoptions lor !xset land lnot !xunset;
+                            buf.(!pp) <- meta_cond_version;
+                            incr pp;
+                            buf.(!pp) <- !ge;
+                            incr pp;
+                            buf.(!pp) <- !major;
+                            incr pp;
+                            buf.(!pp) <- !minor;
+                            incr pp)
+                          else
+                            (* pcre2_compile.c:4665-4728 — all the remaining
+                               cases now require us to read a name. We cannot
+                               at this stage distinguish ambiguous cases such
+                               as (?(R12) which might be a recursion test by
+                               number or a name, because the named groups
+                               have not yet all been identified. Those cases
+                               are treated as names, but given a different
+                               META code. *)
+                            let was_r_ampersand = ref false in
+                            let terminator =
+                              if
+                                Char.equal pat.[!ptr] 'R'
+                                && cx.ptrend - !ptr > 1
+                                && Char.equal pat.[!ptr + 1] '&'
+                              then (
+                                was_r_ampersand := true;
+                                incr ptr;
+                                Char.code ')')
+                              else if Char.equal pat.[!ptr] '<' then
+                                Char.code '>'
+                              else if Char.equal pat.[!ptr] '\'' then
+                                Char.code '\''
+                              else (
+                                decr ptr (* Point to char before name *);
+                                Char.code ')')
+                            in
+                            let offset = ref 0 in
+                            let name = ref 0 in
+                            let namelen = ref 0 in
+                            if
+                              not
+                                (read_name cx ptr ~utf ~terminator offset name
+                                   namelen)
+                            then raise_notrace Goto_failed;
 
-                         (* pcre2_compile.c:4326-4341 — if the options ended
-                            with ')' this is not the start of a nested group
-                            with option changes, so the options change at this
-                            level: if the previous level set up a nest block,
-                            discard the one just created, otherwise adjust it
-                            for the previous level. If the options ended with
-                            ':' we are starting a non-capturing group,
-                            possibly with an options setting. *)
-                         if !ptr >= cx.ptrend then unclosed_parenthesis ();
-                         let term = pat.[!ptr] in
-                         incr ptr (* *ptr++ *);
-                         if Char.equal term ')' then (
-                           nest_depth := !nest_depth - 1;
-                           (* This is not a nested group after all. *)
-                           if
-                             !top_nest > 0
-                             && Int.equal nests.(!top_nest - 1).nest_depth
-                                  !nest_depth
-                           then decr top_nest
-                           else nests.(!top_nest).nest_depth <- !nest_depth)
-                         else (
-                           buf.(!pp) <- meta_nocapture;
-                           incr pp);
+                            (* pcre2_compile.c:4693-4699 — handle
+                               (?(R&name) *)
+                            if !was_r_ampersand then (
+                              buf.(!pp) <- meta_cond_rname;
+                              decr ptr (* Back to closing parens *))
+                            else if Int.equal terminator (Char.code ')') then (
+                              (* pcre2_compile.c:4701-4717 — handle (?(name).
+                                 If the name is "DEFINE" we identify it with
+                                 a special code. Likewise if the name
+                                 consists of R followed only by digits.
+                                 Otherwise, handle it like a quoted name. *)
+                              (if
+                                 Int.equal !namelen 6
+                                 && strncmp_c8_eq pat !name "DEFINE" 6
+                               then buf.(!pp) <- meta_cond_define
+                               else
+                                 let i = ref 1 in
+                                 while
+                                   !i < !namelen && is_digit pat.[!name + !i]
+                                 do
+                                   incr i
+                                 done;
+                                 buf.(!pp) <-
+                                   (if
+                                      Char.equal pat.[!name] 'R'
+                                      && !i >= !namelen
+                                    then meta_cond_rnumber
+                                    else meta_cond_name));
+                              decr ptr (* Back to closing parens *))
+                            else
+                              (* pcre2_compile.c:4719-4721 — handle
+                                 (?('name') or (?(<name>) *)
+                              buf.(!pp) <- meta_cond_name;
 
-                         (* pcre2_compile.c:4343-4350 — if nothing changed, no
-                            need to record. *)
-                         if
-                           (not (Int.equal !options oldoptions))
-                           || not (Int.equal !xoptions oldxoptions)
+                            (* pcre2_compile.c:4723-4727 — all these cases
+                               except DEFINE end with the name length and
+                               offset; DEFINE just has an offset (for the
+                               "too many branches" error). *)
+                            let stored = buf.(!pp) in
+                            incr pp;
+                            if not (Int.equal stored meta_cond_define) then (
+                              buf.(!pp) <- !namelen;
+                              incr pp);
+                            putoffset buf pp !offset
+                            (* End cases that read a name *));
+
+                         (* pcre2_compile.c:4730-4737 — check the closing
+                            parenthesis of the condition. *)
+                         if !ptr >= cx.ptrend || not (Char.equal pat.[!ptr] ')')
                          then (
-                           buf.(!pp) <- meta_options;
+                           cx.errorcode <- Errors.err24;
+                           raise_notrace Goto_failed);
+                         incr ptr (* End of condition processing *)
+                   | '>' ->
+                       (* ---- Atomic group ---- pcre2_compile.c:4741-4748 *)
+                       atomic_group ()
+                   | '=' ->
+                       (* ---- Lookahead assertions ----
+                          pcre2_compile.c:4753-4757 *)
+                       positive_look_ahead ~prev_expect_cond_assert
+                   | '*' ->
+                       (* pcre2_compile.c:4759-4763 — the (?* non-atomic
+                          form. *)
+                       positive_nonatomic_look_ahead ~prev_expect_cond_assert
+                   | '!' ->
+                       (* pcre2_compile.c:4765-4769 *)
+                       negative_look_ahead ~prev_expect_cond_assert
+                   | '<' ->
+                       (* ---- Lookbehind assertions ----
+                          pcre2_compile.c:4774-4785 — (?< followed by = or !
+                          or * is a lookbehind assertion. Otherwise (?< is the
+                          start of the name of a capturing group. *)
+                       if
+                         cx.ptrend - !ptr <= 1
+                         || (not (Char.equal pat.[!ptr + 1] '='))
+                            && (not (Char.equal pat.[!ptr + 1] '!'))
+                            && not (Char.equal pat.[!ptr + 1] '*')
+                       then define_name ~terminator:(Char.code '>')
+                         (* goto DEFINE_NAME *)
+                       else (
+                         (* pcre2_compile.c:4786-4795 *)
+                         buf.(!pp) <-
+                           (if Char.equal pat.[!ptr + 1] '=' then
+                              meta_lookbehind
+                            else if Char.equal pat.[!ptr + 1] '!' then
+                              meta_lookbehindnot
+                            else meta_lookbehind_na);
+                         incr pp;
+                         post_lookbehind ~prev_expect_cond_assert)
+                   | '\'' ->
+                       (* ---- Define a named group ----
+                          pcre2_compile.c:4824-4831 — a named group may be
+                          defined as (?'name') or (?<name>); DEFINE_NAME with
+                          the terminator set to the apostrophe. *)
+                       define_name ~terminator:(Char.code '\'')
+                   | _ ->
+                       (* pcre2_compile.c:4169-4352 — the C switch's default
+                          case (first in the source): (?-digit relative
+                          recursion, else (?| or a (possibly empty) option
+                          setting, optionally followed by a non-capturing
+                          group. *)
+                       if
+                         Char.equal pat.[!ptr] '-'
+                         && cx.ptrend - !ptr > 1
+                         && is_digit pat.[!ptr + 1]
+                       then
+                         (* goto RECURSION_BYNUMBER (the + case is handled by
+                            CHAR_PLUS above, pcre2_compile.c:4170-4171). *)
+                         recursion_bynumber ()
+                       else (
+                         (* pcre2_compile.c:4176-4186 *)
+                         nest_depth := !nest_depth + 1;
+                         if Int.equal !top_nest (-1) then top_nest := 0
+                         else (
+                           incr top_nest;
+                           if !top_nest >= nest_slots then (
+                             cx.errorcode <- Errors.err84;
+                             raise_notrace Goto_failed));
+                         let tn = nests.(!top_nest) in
+                         tn.nest_depth <- !nest_depth;
+                         tn.flags <- 0;
+                         tn.options <- !options land parse_tracked_options;
+                         tn.xoptions <-
+                           !xoptions land parse_tracked_extra_options;
+
+                         if Char.equal pat.[!ptr] '|' then (
+                           (* pcre2_compile.c:4188-4199 — start of a
+                              non-capturing group that resets the capture count
+                              for each branch. *)
+                           tn.reset_group <- cx.bracount;
+                           tn.max_group <- cx.bracount;
+                           tn.flags <- tn.flags lor nsf_reset;
+                           cx.external_flags <- cx.external_flags lor dupcapused;
+                           buf.(!pp) <- meta_nocapture;
                            incr pp;
-                           buf.(!pp) <- !options;
-                           incr pp;
-                           buf.(!pp) <- !xoptions;
-                           incr pp)))
-           (* ---- Branch terminators ---- *)
-           | '|' ->
-               (* pcre2_compile.c:4929-4942 — alternation: reset the capture
-                  count if we are in a (?| group. *)
-               if
-                 !top_nest >= 0
-                 && Int.equal nests.(!top_nest).nest_depth !nest_depth
-                 && not (Int.equal (nests.(!top_nest).flags land nsf_reset) 0)
-               then (
-                 if cx.bracount > nests.(!top_nest).max_group then
-                   nests.(!top_nest).max_group <- cx.bracount;
-                 cx.bracount <- nests.(!top_nest).reset_group);
-               buf.(!pp) <- meta_alt;
-               incr pp
-           | ')' ->
-               (* pcre2_compile.c:4944-4975 — end of group; reset the
-                  capture count to the maximum if we are in a (?| group
-                  and/or reset the options that are tracked during parsing.
-                  Disallow quantifier for a condition that is an
-                  assertion. *)
-               okquantifier := true;
-               if
-                 !top_nest >= 0
-                 && Int.equal nests.(!top_nest).nest_depth !nest_depth
-               then (
-                 let tn = nests.(!top_nest) in
-                 options :=
-                   !options land lnot parse_tracked_options lor tn.options;
-                 xoptions :=
-                   !xoptions
-                   land lnot parse_tracked_extra_options
-                   lor tn.xoptions;
+                           incr ptr)
+                         else
+                           (* pcre2_compile.c:4201-4351 — scan for options
+                              imnrsxJU (and the two-character a.. sequences) to
+                              be set or unset. The C's optset/xoptset
+                              accumulator pointers become the [setting] selector
+                              consulted by add_opt/add_xopt. *)
+                           let hyphenok = ref true in
+                           let oldoptions = !options in
+                           let oldxoptions = !xoptions in
+                           tn.reset_group <- 0;
+                           tn.max_group <- 0;
+                           let set = ref 0 in
+                           let unset = ref 0 in
+                           let xset = ref 0 in
+                           let xunset = ref 0 in
+                           let setting = ref true in
+                           (* optset = &set; xoptset = &xset *)
+                           let add_opt v =
+                             if !setting then set := !set lor v
+                             else unset := !unset lor v
+                           in
+                           let add_xopt v =
+                             if !setting then xset := !xset lor v
+                             else xunset := !xunset lor v
+                           in
+
+                           (* pcre2_compile.c:4216-4225 — ^ at the start unsets
+                              irmnsx and disables the subsequent use of -. *)
+                           if !ptr < cx.ptrend && Char.equal pat.[!ptr] '^' then (
+                             options :=
+                               !options
+                               land lnot
+                                      (Options.caseless lor Options.multiline
+                                     lor Options.no_auto_capture
+                                     lor Options.dotall lor Options.extended
+                                     lor Options.extended_more);
+                             xoptions :=
+                               !xoptions
+                               land lnot Options.extra_caseless_restrict;
+                             hyphenok := false;
+                             incr ptr);
+
+                           (* pcre2_compile.c:4227-4313 *)
+                           while
+                             !ptr < cx.ptrend
+                             && (not (Char.equal pat.[!ptr] ')'))
+                             && not (Char.equal pat.[!ptr] ':')
+                           do
+                             (* switch ( *ptr++ ) *)
+                             let ch = pat.[!ptr] in
+                             incr ptr;
+                             match ch with
+                             | '-' ->
+                                 (* pcre2_compile.c:4232-4242 *)
+                                 if not !hyphenok then (
+                                   cx.errorcode <- Errors.err94;
+                                   decr ptr (* Correct the offset *);
+                                   raise_notrace Goto_failed);
+                                 setting := false
+                                 (* optset = &unset; xoptset = &xunset *);
+                                 hyphenok := false
+                             | 'a' ->
+                                 (* pcre2_compile.c:4244-4283 — there are some
+                                    two-character sequences that start with 'a';
+                                    a bare 'a' sets all the ASCII options
+                                    together. *)
+                                 let matched2 =
+                                   !ptr < cx.ptrend
+                                   &&
+                                   match pat.[!ptr] with
+                                   | 'D' ->
+                                       add_xopt Options.extra_ascii_bsd;
+                                       incr ptr;
+                                       true
+                                   | 'P' ->
+                                       add_xopt
+                                         (Options.extra_ascii_posix
+                                        lor Options.extra_ascii_digit);
+                                       incr ptr;
+                                       true
+                                   | 'S' ->
+                                       add_xopt Options.extra_ascii_bss;
+                                       incr ptr;
+                                       true
+                                   | 'T' ->
+                                       add_xopt Options.extra_ascii_digit;
+                                       incr ptr;
+                                       true
+                                   | 'W' ->
+                                       add_xopt Options.extra_ascii_bsw;
+                                       incr ptr;
+                                       true
+                                   | _ -> false
+                                 in
+                                 if not matched2 then
+                                   add_xopt
+                                     (Options.extra_ascii_bsd
+                                    lor Options.extra_ascii_bss
+                                    lor Options.extra_ascii_bsw
+                                    lor Options.extra_ascii_digit
+                                    lor Options.extra_ascii_posix)
+                             | 'J' ->
+                                 (* pcre2_compile.c:4285-4288 — record that it
+                                    changed in the external options. *)
+                                 add_opt Options.dupnames;
+                                 cx.external_flags <-
+                                   cx.external_flags lor jchanged
+                             | 'i' -> add_opt Options.caseless
+                             | 'm' -> add_opt Options.multiline
+                             | 'n' -> add_opt Options.no_auto_capture
+                             | 'r' -> add_xopt Options.extra_caseless_restrict
+                             | 's' -> add_opt Options.dotall
+                             | 'U' -> add_opt Options.ungreedy
+                             | 'x' ->
+                                 (* pcre2_compile.c:4297-4306 — if x appears
+                                    twice it sets the extended extended
+                                    option. *)
+                                 add_opt Options.extended;
+                                 if
+                                   !ptr < cx.ptrend && Char.equal pat.[!ptr] 'x'
+                                 then (
+                                   add_opt Options.extended_more;
+                                   incr ptr)
+                             | _ ->
+                                 (* pcre2_compile.c:4308-4311 *)
+                                 cx.errorcode <- Errors.err11;
+                                 decr ptr (* Correct the offset *);
+                                 raise_notrace Goto_failed
+                           done;
+
+                           (* pcre2_compile.c:4315-4324 — if we are setting
+                              extended without extended-more, ensure that any
+                              existing extended-more gets unset. Also, unsetting
+                              extended must also unset extended-more. *)
+                           if
+                             Int.equal
+                               (!set
+                               land (Options.extended lor Options.extended_more)
+                               )
+                               Options.extended
+                             || not (Int.equal (!unset land Options.extended) 0)
+                           then unset := !unset lor Options.extended_more;
+
+                           options := !options lor !set land lnot !unset;
+                           xoptions := !xoptions lor !xset land lnot !xunset;
+
+                           (* pcre2_compile.c:4326-4341 — if the options ended
+                              with ')' this is not the start of a nested group
+                              with option changes, so the options change at this
+                              level: if the previous level set up a nest block,
+                              discard the one just created, otherwise adjust it
+                              for the previous level. If the options ended with
+                              ':' we are starting a non-capturing group,
+                              possibly with an options setting. *)
+                           if !ptr >= cx.ptrend then unclosed_parenthesis ();
+                           let term = pat.[!ptr] in
+                           incr ptr (* *ptr++ *);
+                           if Char.equal term ')' then (
+                             nest_depth := !nest_depth - 1;
+                             (* This is not a nested group after all. *)
+                             if
+                               !top_nest > 0
+                               && Int.equal nests.(!top_nest - 1).nest_depth
+                                    !nest_depth
+                             then decr top_nest
+                             else nests.(!top_nest).nest_depth <- !nest_depth)
+                           else (
+                             buf.(!pp) <- meta_nocapture;
+                             incr pp);
+
+                           (* pcre2_compile.c:4343-4350 — if nothing changed, no
+                              need to record. *)
+                           if
+                             (not (Int.equal !options oldoptions))
+                             || not (Int.equal !xoptions oldxoptions)
+                           then (
+                             buf.(!pp) <- meta_options;
+                             incr pp;
+                             buf.(!pp) <- !options;
+                             incr pp;
+                             buf.(!pp) <- !xoptions;
+                             incr pp)))
+             (* ---- Branch terminators ---- *)
+             | '|' ->
+                 (* pcre2_compile.c:4929-4942 — alternation: reset the capture
+                    count if we are in a (?| group. *)
                  if
-                   (not (Int.equal (tn.flags land nsf_reset) 0))
-                   && tn.max_group > cx.bracount
-                 then cx.bracount <- tn.max_group;
-                 if not (Int.equal (tn.flags land nsf_condassert) 0) then
-                   okquantifier := false;
-                 if not (Int.equal (tn.flags land nsf_atomicsr) 0) then (
-                   buf.(!pp) <- meta_ket;
-                   incr pp);
-                 if Int.equal !top_nest 0 then top_nest := -1 else decr top_nest);
-               if Int.equal !nest_depth 0 then (
-                 (* Unmatched closing parenthesis *)
-                 cx.errorcode <- Errors.err22;
-                 failed_back ());
-               nest_depth := !nest_depth - 1;
-               buf.(!pp) <- meta_ket;
-               incr pp
-           | _ ->
-               (* pcre2_compile.c:3197-3199 — non-special character (the C
-                  switch's default case, first in the source). *)
-               parsed_literal !c
+                   !top_nest >= 0
+                   && Int.equal nests.(!top_nest).nest_depth !nest_depth
+                   && not (Int.equal (nests.(!top_nest).flags land nsf_reset) 0)
+                 then (
+                   if cx.bracount > nests.(!top_nest).max_group then
+                     nests.(!top_nest).max_group <- cx.bracount;
+                   cx.bracount <- nests.(!top_nest).reset_group);
+                 buf.(!pp) <- meta_alt;
+                 incr pp
+             | ')' ->
+                 (* pcre2_compile.c:4944-4975 — end of group; reset the
+                    capture count to the maximum if we are in a (?| group
+                    and/or reset the options that are tracked during parsing.
+                    Disallow quantifier for a condition that is an
+                    assertion. *)
+                 okquantifier := true;
+                 if
+                   !top_nest >= 0
+                   && Int.equal nests.(!top_nest).nest_depth !nest_depth
+                 then (
+                   let tn = nests.(!top_nest) in
+                   options :=
+                     !options land lnot parse_tracked_options lor tn.options;
+                   xoptions :=
+                     !xoptions
+                     land lnot parse_tracked_extra_options
+                     lor tn.xoptions;
+                   if
+                     (not (Int.equal (tn.flags land nsf_reset) 0))
+                     && tn.max_group > cx.bracount
+                   then cx.bracount <- tn.max_group;
+                   if not (Int.equal (tn.flags land nsf_condassert) 0) then
+                     okquantifier := false;
+                   if not (Int.equal (tn.flags land nsf_atomicsr) 0) then (
+                     buf.(!pp) <- meta_ket;
+                     incr pp);
+                   if Int.equal !top_nest 0 then top_nest := -1
+                   else decr top_nest);
+                 if Int.equal !nest_depth 0 then (
+                   (* Unmatched closing parenthesis *)
+                   cx.errorcode <- Errors.err22;
+                   failed_back ());
+                 nest_depth := !nest_depth - 1;
+                 buf.(!pp) <- meta_ket;
+                 incr pp
+             | _ ->
+                 (* pcre2_compile.c:3197-3199 — non-special character (the C
+                    switch's default case, first in the source). *)
+                 parsed_literal !c
          with Loop_continue -> ()
        done;
 

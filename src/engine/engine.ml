@@ -340,3 +340,51 @@ let () =
       match exec re "a" 0 0x00000100l with
       | Result.Error e -> assert (Int.equal e Errors.error_badoption)
       | Ok _ -> assert false)
+
+(* PCRE2_NO_UTF_CHECK with an invalid UTF pattern: the C documents this as
+   undefined; the port pins it to defined VALUES (never an escaping
+   exception, port-conventions §5/§6) via Utf.peek's clamped reads and
+   Ucd.record_index's code-point clamp — both DEVIATION-documented at
+   their definitions. With the check ON, the valid_utf error codes surface
+   unchanged. All option combinations here are public compile bits, so
+   every case is reachable end-to-end through this seam. *)
+let () =
+  let uopts = Int32.of_int (Options.utf lor Options.no_utf_check) in
+  let copts =
+    Int32.of_int (Options.utf lor Options.no_utf_check lor Options.caseless)
+  in
+  (* Truncated 2-byte lead at pattern end: decodes with a clamped 0
+     continuation byte (= the C's NUL read) to U+00C0 and compiles. *)
+  (match compile "\xc3" uopts with
+  | Ok _ -> ()
+  | Result.Error _ -> assert false);
+  (* 5-byte form: decodes to 0x200000 (> MAX_UTF_CODE_POINT), compiles as
+     an ord2utf-encoded literal; with caseless, the UCD lookups hit the
+     record_index clamp instead of overrunning stage1. *)
+  (match compile "\xf8\x88\x80\x80\x80" uopts with
+  | Ok _ -> ()
+  | Result.Error _ -> assert false);
+  (match compile "\xf8\x88\x80\x80\x80" copts with
+  | Ok _ -> ()
+  | Result.Error _ -> assert false);
+  (* Caseless classes containing the garbage code point: the one-char
+     class caseset probe, and a range walked by get_othercase_range. *)
+  (match compile "[\xf8\x88\x80\x80\x80]" copts with
+  | Ok _ -> ()
+  | Result.Error _ -> assert false);
+  (match compile "[\xf8\x88\x80\x80\x80-\xf8\x88\x80\x80\x81]" copts with
+  | Ok _ -> ()
+  | Result.Error _ -> assert false);
+  (* Caseless class with the truncated tail: the clamped decode eats the
+     missing continuation byte and the unterminated class is ERR6, with
+     the same past-the-end offset the C reports after reading its NUL. *)
+  (match compile_ctx "(?i)[\xc3" uopts with
+  | Result.Error (e, o) ->
+      assert (Int.equal e Errors.err6);
+      assert (Int.equal o 7)
+  | Ok _ -> assert false);
+  (* WITH the UTF check (no NO_UTF_CHECK): the PRIV(valid_utf) error is
+     unchanged (testoutput10:9 shape). *)
+  match compile "\xc3(" (Int32.of_int Options.utf) with
+  | Result.Error e -> assert (Int.equal e Errors.error_utf8_err6)
+  | Ok _ -> assert false

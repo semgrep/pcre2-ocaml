@@ -37,61 +37,12 @@ let char_ff = 0x0c (* pcre2_internal.h:698 — CHAR_FF *)
 let char_cr = 0x0d (* pcre2_internal.h:699 — CHAR_CR *)
 let char_nel = 0x85 (* pcre2_internal.h:680 — CHAR_NEL *)
 
-(* GETCHAR (pcre2_intmodedep.h:301-303) + GETUTF8 (pcre2_internal.h:283-300)
-   — get the UTF-8 character starting at [pos], not advancing the pointer.
-   Called only in UTF-8 mode, on the first code unit of a character of a
-   subject already validated as UTF-8 (the macro's contract), so the
-   continuation bytes read below are in bounds. The 5- and 6-byte arms are
-   transcribed from GETUTF8 even though a valid subject never reaches them
-   (UTF-8 characters are at most 4 code units); all results fit an OCaml
-   int, matching the C's uint32 arithmetic with no wraparound. utf.ml (M6)
-   is the long-term owner of this helper (naming map: the GETCHAR macro
-   family belongs to module Utf); it lives here until that module lands. *)
-let getchar (subject : string) (pos : int) : int =
-  let c = Char.code subject.[pos] in
-  if c >= 0xc0 then
-    if Int.equal (c land 0x20) 0 then
-      (* pcre2_internal.h:285-286 — two-byte character *)
-      ((c land 0x1f) lsl 6) lor (Char.code subject.[pos + 1] land 0x3f)
-    else if Int.equal (c land 0x10) 0 then
-      (* pcre2_internal.h:287-288 — three-byte character *)
-      ((c land 0x0f) lsl 12)
-      lor ((Char.code subject.[pos + 1] land 0x3f) lsl 6)
-      lor (Char.code subject.[pos + 2] land 0x3f)
-    else if Int.equal (c land 0x08) 0 then
-      (* pcre2_internal.h:289-291 — four-byte character *)
-      ((c land 0x07) lsl 18)
-      lor ((Char.code subject.[pos + 1] land 0x3f) lsl 12)
-      lor ((Char.code subject.[pos + 2] land 0x3f) lsl 6)
-      lor (Char.code subject.[pos + 3] land 0x3f)
-    else if Int.equal (c land 0x04) 0 then
-      (* pcre2_internal.h:292-295 — five-byte character (invalid UTF-8) *)
-      ((c land 0x03) lsl 24)
-      lor ((Char.code subject.[pos + 1] land 0x3f) lsl 18)
-      lor ((Char.code subject.[pos + 2] land 0x3f) lsl 12)
-      lor ((Char.code subject.[pos + 3] land 0x3f) lsl 6)
-      lor (Char.code subject.[pos + 4] land 0x3f)
-    else
-      (* pcre2_internal.h:296-299 — six-byte character (invalid UTF-8) *)
-      ((c land 0x01) lsl 30)
-      lor ((Char.code subject.[pos + 1] land 0x3f) lsl 24)
-      lor ((Char.code subject.[pos + 2] land 0x3f) lsl 18)
-      lor ((Char.code subject.[pos + 3] land 0x3f) lsl 12)
-      lor ((Char.code subject.[pos + 4] land 0x3f) lsl 6)
-      lor (Char.code subject.[pos + 5] land 0x3f)
-  else c
-
-(* BACKCHAR (pcre2_intmodedep.h:345) — if the pointer is not at the start
-   of a character, move it back until it is. Called only in UTF-8 mode on a
-   validated subject, so the loop stops at the character's leading code
-   unit before running off the front of the string. Long-term owner:
-   utf.ml (M6), as for [getchar]. *)
-let backchar (subject : string) (pos : int) : int =
-  let p = ref pos in
-  while Int.equal (Char.code subject.[!p] land 0xc0) 0x80 do
-    decr p
-  done;
-  !p
+(* GETCHAR (pcre2_intmodedep.h:298-303) and BACKCHAR
+   (pcre2_intmodedep.h:341-345) — the GETCHAR macro family belongs to
+   module Utf (naming map); these aliases keep this module's existing
+   callers and asserts in the C's vocabulary. *)
+let getchar = Utf.getchar
+let backchar = Utf.backchar
 
 (* pcre2_newline.c:59-145 — PRIV(is_newline): check for a newline at the
    given position. Called only via the IS_NEWLINE macro, which does so only
