@@ -191,27 +191,44 @@ and rm225 = 225
    arms and RM resume labels whose bodies are not yet ported. It is NOT a
    PCRE2 error code and cannot collide with one (public codes stay above
    -66, the MATCH_xxx internals below -993). Every stub is replaced by its
-   owning chunk; until the pcre2_match driver chunk wires Engine.exec, the
-   only caller is the test-only [match_internal], so the marker never
-   crosses the engine boundary. *)
+   owning chunk. Now that the pcre2_match driver below wires Engine.exec,
+   a pattern that compiles but reaches an unported arm surfaces this code
+   at the seam ([Engine.Error -979]) — deliberately loud, and impossible
+   to mistake for a real PCRE2 code. *)
 let error_unported = -979
 
 (* ---------- The match data block (result surface) ---------- *)
 
 (* pcre2_intmodedep.h:656-672 — pcre2_real_match_data, reduced to what the
-   match() core reads and writes: oveccount (669) and ovector (671). The
-   other C fields have these owners:
-   - subject, mark, startchar, leftchar, rightchar, rc, subject_length,
-     flags, matchedby: the pcre2_match driver chunk
-     (pcre2_match.c:6530-7777) writes them after match() returns;
-   - heapframes / heapframes_size: Frames.t (frames.ml DEVIATION: no
-     cached vector across matches);
-   - memctl: dropped (GC). *)
+   match() core and the pcre2_match() driver read and write: rc (670),
+   mark (660), startchar (666), leftchar (664), rightchar (665),
+   oveccount (669) and ovector (671). The other C fields have these owners:
+   - subject / subject_length (659, 663): the subject string travels
+     alongside at the OCaml seam (no pointer to return);
+   - flags (668) / matchedby (667): PCRE2_MD_COPIED_SUBJECT and the
+     matched-by tag have no meaning without the C ABI — dropped;
+   - code (658): dropped (the caller keeps its own [re]);
+   - heapframes / heapframes_size (661-662): Frames.t (frames.ml
+     DEVIATION: no cached vector across matches);
+   - memctl (657): dropped (GC). *)
 type match_data = {
   ovector : int array;
       (* PCRE2_SIZE ovector[]: oveccount pairs of subject offsets; unset
          pair = (-1, -1) (Frames.unset) *)
   oveccount : int; (* uint16_t oveccount: number of pairs *)
+  mutable rc : int; (* int rc (670): the match result code *)
+  mutable startchar : int;
+      (* PCRE2_SIZE startchar (666): offset where the match attempt
+         started (pcre2_get_startchar) *)
+  mutable leftchar : int;
+      (* PCRE2_SIZE leftchar (664): offset of the leftmost character
+         consulted *)
+  mutable rightchar : int;
+      (* PCRE2_SIZE rightchar (665): offset of the rightmost character
+         consulted *)
+  mutable mark : int;
+      (* PCRE2_SPTR mark (665): mark name to pass back — an offset into
+         the compiled code (as in the frames; -1 = NULL) *)
 }
 
 (* ---------- The match block ("static" data) ---------- *)
@@ -224,14 +241,14 @@ type match_data = {
    [start_code].
 
    Invariants relied on by the dispatch loop (established by the caller —
-   the test-only [match_internal] here, the pcre2_match driver chunk
-   later):
+   the [pcre2_match] driver below, or the test-only [match_internal]):
    - 0 <= start_subject <= end_subject <= true_end_subject
                                         <= String.length subject;
    - 0 <= start_eptr <= end_subject at [match_] entry — enforced by the
-     caller's BADOFFSET check (pcre2_match.c:6610; [match_internal]
-     validates [start] before calling [match_], the driver chunk performs
-     the identical check). Subject positions in frame slots then never go
+     caller's BADOFFSET check (pcre2_match.c:6610; both [pcre2_match] and
+     [match_internal] validate the start offset before calling [match_],
+     and the driver's bump-along loop never moves start_match past
+     end_subject). Subject positions in frame slots then never go
      negative (eptr advances from start_eptr in the live arms; the repeat
      maximize backtrack loops decrement it, but never below the saved
      Lstart_eptr, itself a former eptr >= start_eptr); the char arms'
@@ -425,8 +442,10 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
               (Char.code (String.unsafe_get mb.subject (p - mb.nllen + 1)))
               mb.nl1)
   in
-  (* pcre2_match.c:609 — PCRE2_SPTR branch_end = NULL: a match()-local
-     that is NOT preserved over RMATCH (607). OP_ALT records the end of
+  (* pcre2_match.c:609 — PCRE2_SPTR branch_end = NULL: a match()-local;
+     C:607 says such locals do not NEED to survive RMATCH, but this one in
+     fact persists for the whole match() invocation — and must (the
+     ALT->KET adjacency protocol reads it after resumes). OP_ALT records the end of
      the matched branch in it (5895); the OP_KET branch_start scan
      consumes and resets it (5913-5917). -1 = NULL (code offsets are
      >= 0). Preallocated once per match, like [nl_scratch], so the
@@ -3205,18 +3224,836 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
   (* Saved frame of most recent group *);
   (new_frame [@tailcall]) 0 start_ecode 0
 
+(* ---------- Match a Regular Expression (the driver) ---------- *)
+
+(* pcre2_internal.h:537 — PCRE2_HASTHEN: the pattern contains ( *THEN).
+   Compile does not set this bit until the M5 verbs chunk; the other
+   re->flags bits the driver reads live in Compile (firstset & co). *)
+let flag_hasthen = 0x00001000
+
+(* pcre2_internal.h:566-575 — REQ_CU_MAX, 8-bit library: the maximum
+   remaining length of subject we are prepared to search for a req_unit
+   match from an anchored pattern (memchr() is used and is fast in 8-bit
+   mode). *)
+let req_cu_max = 5000
+
+(* memchr(p, c, n) over the subject: the offset of the first occurrence of
+   code unit [c] in subject[p .. p+n), or -1 (the C's NULL). Caller
+   contract: 0 <= p and p + n <= String.length subject (every driver call
+   site passes n = e - p for some e <= end_subject <= String.length
+   subject and p >= 0). *)
+let memchr_subject (subject : string) (p : int) (c : int) (n : int) : int =
+  let e = p + n in
+  let rec scan (i : int) : int =
+    if i >= e then -1
+    else if
+      (* safe: p <= i < e <= String.length subject and p >= 0 (caller
+         contract above) *)
+      Int.equal (Char.code (String.unsafe_get subject i)) c
+    then i
+    else (scan [@tailcall]) (i + 1)
+  in
+  scan p
+
+(* pcre2_match.c:6505-6532 — pcre2_match(): apply a compiled pattern to a
+   subject string and pick out portions of the string if it matches. Two
+   elements in the vector are set for each substring: the offsets to the
+   start and end of the substring.
+
+   Arguments (6513-6520; length is String.length subject at this seam):
+     re            the compiled expression
+     subject       the subject string
+     start_offset  where to start in the subject string
+     options       option bits (widened once at the seam, Options.of_int32)
+     match_data    the match data block (results)
+
+   Returns (6522-6527): > 0 => success; value is the number of ovector
+   pairs filled; = 0 => success, but ovector is not big enough; -1 =>
+   failed to match (PCRE2_ERROR_NOMATCH); -2 => partial match
+   (PCRE2_ERROR_PARTIAL); < -2 => some kind of unexpected problem.
+
+   Boundary notes for the OCaml seam (locals and early checks, 6534-6619):
+   - there is no JIT in this port: use_jit (6563-6565) and the whole JIT
+     matching block (6639-6646, 6691-6788) do not exist;
+   - subject == NULL / code == NULL / match_data == NULL (6591-6599): N/A,
+     none can be NULL at this seam (PCRE2_ERROR_NULL is unreachable);
+   - length == PCRE2_ZERO_TERMINATED (6603-6607): N/A, the seam always
+     passes an explicit-length string;
+   - magic_number (6612-6614) and the code unit width check (6616-6619):
+     N/A, [re] is a typed Compile.re. *)
+let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
+    ~(options : int) (match_data : match_data) : int =
+  let length = String.length subject in
+  (* pcre2_match.c:6595-6597 — plausibility checks: undefined public match
+     option bits (port-conventions §5: -34 at match time). *)
+  if not (Int.equal (options land lnot Options.public_match_options) 0) then
+    Errors.error_badoption
+  else if
+    (* pcre2_match.c:6601-6610 — start_match/req_cu_ptr become the
+       bump-along loop's starting state below; start_offset is PCRE2_SIZE
+       (unsigned), so a negative OCaml int is a huge unsigned value, also
+       > length (port-conventions §5: negative start offset, or offset >
+       subject length -> -33). This is the check that establishes the
+       0 <= start_eptr <= end_subject invariant [match_] relies on. *)
+    start_offset < 0 || start_offset > length
+  then Errors.error_badoffset
+  else
+    (* pcre2_match.c:6608 *)
+    let true_end_subject = length in
+    (* pcre2_match.c:6621-6637 — transfer the pattern's ( *NOTEMPTY) /
+       ( *NOTEMPTY_ATSTART) flag bits into the options for this function:
+       options |= (re->flags & FF) / ((FF & (~FF+1)) / (OO & (~OO+1))).
+       x & (~x+1) extracts the lowest set bit (= x land (-x) on OCaml
+       ints): the divisor is 0x10000 / 4 = 0x4000. *)
+    let ff = Compile.notempty_set lor Compile.ne_atst_set in
+    let oo = Options.notempty lor Options.notempty_atstart in
+    let options =
+      options lor (re.Compile.flags land ff / (ff land -ff / (oo land -oo)))
+    in
+    (* pcre2_match.c:6648-6654 — initialize UTF/UCP parameters.
+       allow_invalid (6652, PCRE2_MATCH_INVALID_UTF) is M6 with the rest of
+       the invalid-UTF machinery. *)
+    let utf = not (Int.equal (re.Compile.overall_options land Options.utf) 0) in
+    let ucp = not (Int.equal (re.Compile.overall_options land Options.ucp) 0) in
+    (* pcre2_match.c:6656-6659 — convert the partial matching flags into an
+       integer. *)
+    let partial =
+      if not (Int.equal (options land Options.partial_hard) 0) then 2
+      else if not (Int.equal (options land Options.partial_soft) 0) then 1
+      else 0
+    in
+    if
+      (* pcre2_match.c:6661-6666 — partial matching and PCRE2_ENDANCHORED
+         are currently not allowed at the same time. *)
+      (not (Int.equal partial 0))
+      && not
+           (Int.equal
+              (re.Compile.overall_options lor options land Options.endanchored)
+              0)
+    then Errors.error_badoption
+    else (
+      (* pcre2_match.c:6668-6673 — an offset limit without
+         PCRE2_USE_OFFSET_LIMIT is PCRE2_ERROR_BADOFFSETLIMIT. No match
+         context exists at this seam yet (the mcontext knobs are M8+), so
+         mcontext == NULL and the check cannot fire. *)
+      (* pcre2_match.c:6675-6684 — PCRE2_MD_COPIED_SUBJECT bookkeeping and
+         match_data->subject = NULL: dropped (GC strings, no subject
+         pointer in the OCaml match_data). *)
+      (* pcre2_match.c:6686-6688 — zero the error offset in case the first
+         code unit is invalid UTF. *)
+      match_data.startchar <- 0;
+      (* pcre2_match.c:6691-6788 — JIT matching: no JIT in this port. *)
+      (* pcre2_match.c:6795 + 6813-6929 — mb->check_subject and the UTF
+         subject validity check. DEFERRED (M6, docs/ocaml-engine/07-utf8.md):
+         PCRE2_UTF patterns do not yet compile (Parse defers them), so no
+         UTF subject reaches this point. The M6 chunk ports PRIV(valid_utf),
+         the max_lookbehind walk-back, PCRE2_ERROR_BADUTFOFFSET, the
+         invalid-UTF fragment protocol (FRAGMENT_RESTART, 7140/7646-7701)
+         and fragment_options, and owns the mb->check_subject field. *)
+      (* pcre2_match.c:6931-6939 — a NULL match context means "use a
+         default context"; the memory control functions are dropped (GC). *)
+      (* pcre2_match.c:6941-6945 *)
+      let anchored =
+        not
+          (Int.equal
+             (re.Compile.overall_options lor options land Options.anchored)
+             0)
+      in
+      let firstline =
+        (not anchored)
+        && not (Int.equal (re.Compile.overall_options land Options.firstline) 0)
+      in
+      let startline =
+        not (Int.equal (re.Compile.flags land Compile.startline) 0)
+      in
+      (* mcontext->offset_limit is PCRE2_UNSET in the default match context
+         (the offset-limit knob is M8+). *)
+      let bumpalong_limit = true_end_subject in
+      (* pcre2_match.c:6947-6960 — the callout block and the mb callout
+         fields: callout support is M8; no callout block exists (see the
+         RETURN_SWITCH note in [backtrack]). *)
+      (* pcre2_match.c:6981-7017 — process the \R and newline settings
+         (bsr goes straight into the mb literal below). The C switch's
+         default returns PCRE2_ERROR_INTERNAL. *)
+      let nltype = ref Newline.nltype_fixed in
+      let nllen = ref 0 in
+      let nl0 = ref 0 in
+      let nl1 = ref 0 in
+      let nl_valid = ref true in
+      let nlc = re.Compile.newline_convention in
+      if Int.equal nlc Options.newline_cr then (
+        nllen := 1;
+        nl0 := Newline.char_cr)
+      else if Int.equal nlc Options.newline_lf then (
+        nllen := 1;
+        nl0 := Newline.char_lf)
+      else if Int.equal nlc Options.newline_nul then (
+        nllen := 1;
+        nl0 := 0 (* CHAR_NUL *))
+      else if Int.equal nlc Options.newline_crlf then (
+        nllen := 2;
+        nl0 := Newline.char_cr;
+        nl1 := Newline.char_lf)
+      else if Int.equal nlc Options.newline_any then
+        nltype := Newline.nltype_any
+      else if Int.equal nlc Options.newline_anycrlf then
+        nltype := Newline.nltype_anycrlf
+      else nl_valid := false;
+      if not !nl_valid then Errors.error_internal
+      else
+        (* pcre2_match.c:7036-7046 — limits set in the pattern override the
+           match context only if they are smaller. The default match
+           context carries the build defaults (module Limits); the
+           re->limit_xxx fields are 0xffff_ffff unless ( *LIMIT_...=) set
+           them, so the unsigned < holds on plain ints. *)
+        let heap_limit =
+          if Limits.heap_limit < re.Compile.limit_heap then Limits.heap_limit
+          else re.Compile.limit_heap
+        in
+        let match_limit =
+          if Limits.match_limit < re.Compile.limit_match then Limits.match_limit
+          else re.Compile.limit_match
+        in
+        let match_limit_depth =
+          if Limits.match_limit_depth < re.Compile.limit_depth then
+            Limits.match_limit_depth
+          else re.Compile.limit_depth
+        in
+        (* pcre2_match.c:7019-7034 + 7048-7083 — frame_size, the initial
+           frames-vector sizing under the heap limit, and the frame-0
+           ovector unset fill all live in Frames.create. DEVIATION
+           (frames.ml): no frames vector is cached across matches, so the
+           keep-if-big-enough path (7062-7077) always reallocates. *)
+        match Frames.create ~top_bracket:re.Compile.top_bracket ~heap_limit with
+        | Error e -> e
+        | Ok a ->
+            (* pcre2_match.c:6956-6979 + 6658 + 6983 + 7039-7046 — fill in
+               the fields of the match block, except for moptions,
+               start_used_ptr, last_used_ptr, match_call_count and
+               end_offset_top, which are set per attempt (7499-7508).
+               mb->ignore_skip_arg (6970) and mb->skip_arg_count are M5
+               fields (see the match_block comment). *)
+            let mb =
+              {
+                match_limit;
+                match_limit_depth;
+                match_call_count = 0;
+                hitend = false;
+                hasthen =
+                  not (Int.equal (re.Compile.flags land flag_hasthen) 0)
+                  (* 6966 *);
+                allowemptypartial =
+                  re.Compile.max_lookbehind > 0
+                  || not
+                       (Int.equal (re.Compile.flags land Compile.match_empty) 0)
+                  (* 6967-6968 *);
+                subject;
+                start_offset (* 6963 *);
+                end_offset_top = 0;
+                partial (* 6658-6659 *);
+                bsr_convention = re.Compile.bsr_convention (* 6983 *);
+                name_count = re.Compile.name_count (* 6977 *);
+                name_entry_size = re.Compile.name_entry_size (* 6978 *);
+                name_table = re.Compile.name_table (* 6976 *);
+                start_code = re.Compile.code (* 6979: codestart = offset 0 *);
+                start_subject = 0 (* 6962 *);
+                end_subject =
+                  length (* 6964; M6 shortens this for invalid-UTF fragments *);
+                true_end_subject (* 6965 *);
+                end_match_ptr = 0;
+                start_used_ptr = 0;
+                last_used_ptr = 0;
+                mark = Frames.unset;
+                nomatch_mark = Frames.unset (* 6971: in case never set *);
+                moptions = 0 (* 6956-6957: gets set later, per attempt *);
+                poptions = re.Compile.overall_options (* 6969 *);
+                nltype = !nltype;
+                nllen = !nllen;
+                nl0 = !nl0;
+                nl1 = !nl1;
+              }
+            in
+            (* pcre2_internal.h:496-521 — IS_NEWLINE(p) / WAS_NEWLINE(p)
+               for the driver's own scan sites (7176/7184, 7328/7336,
+               7588): the same transcription as inside [match_] (NLBLOCK is
+               mb, PSEND is end_subject, PSSTART is start_subject,
+               pcre2_match.c:60-66), with PRIV(is_newline)'s out-parameter
+               copied to mb.nllen on TRUE returns only. *)
+            let nl_scratch = ref 0 in
+            let is_newline_at (p : int) : bool =
+              if not (Int.equal mb.nltype Newline.nltype_fixed) then (
+                p < mb.end_subject
+                &&
+                let hit =
+                  Newline.is_newline mb.subject mb.nltype p mb.end_subject
+                    nl_scratch utf
+                in
+                if hit then mb.nllen <- !nl_scratch;
+                hit)
+              else
+                p <= mb.end_subject - mb.nllen
+                && Int.equal (Char.code subject.[p]) mb.nl0
+                && (Int.equal mb.nllen 1
+                   || Int.equal (Char.code subject.[p + 1]) mb.nl1)
+            in
+            let was_newline_at (p : int) : bool =
+              if not (Int.equal mb.nltype Newline.nltype_fixed) then (
+                p > mb.start_subject
+                &&
+                let hit =
+                  Newline.was_newline mb.subject mb.nltype p mb.start_subject
+                    nl_scratch utf
+                in
+                if hit then mb.nllen <- !nl_scratch;
+                hit)
+              else
+                p >= mb.start_subject + mb.nllen
+                && Int.equal (Char.code subject.[p - mb.nllen]) mb.nl0
+                && (Int.equal mb.nllen 1
+                   || Int.equal (Char.code subject.[p - mb.nllen + 1]) mb.nl1)
+            in
+            (* pcre2_match.c:7085-7089 — pointers to the individual
+               character tables: dropped, this port always reads the
+               default tables through Chartables (as in Compile). *)
+            (* pcre2_match.c:7091-7112 — set up the first code unit to
+               match, if available. If there's no first code unit there may
+               be a bitmap of possible first characters (filled in by
+               PRIV(study) — M5; PCRE2_FIRSTMAPSET is never set until
+               then). first_cu/first_cu2 are PCRE2_UCHAR: the C assignments
+               truncate to the code-unit width (land 0xff). *)
+            let has_first_cu =
+              not (Int.equal (re.Compile.flags land Compile.firstset) 0)
+            in
+            let first_cu, first_cu2 =
+              if has_first_cu then
+                let fc = re.Compile.first_codeunit land 0xff (* 7097 cast *) in
+                if
+                  not
+                    (Int.equal (re.Compile.flags land Compile.firstcaseless) 0)
+                then
+                  let fc2 = Chartables.fcc fc in
+                  (* pcre2_match.c:7101-7107 — 8-bit library: the UCD other
+                     case applies only when UCP is set without UTF. *)
+                  let fc2 =
+                    if fc > 127 && ucp && not utf then
+                      Ucd.othercase fc land 0xff (* PCRE2_UCHAR truncation *)
+                    else fc2
+                  in
+                  (fc, fc2)
+                else (fc, fc)
+              else (0, 0)
+            in
+            let use_start_bits =
+              (not has_first_cu) && (not startline)
+              && not (Int.equal (re.Compile.flags land Compile.firstmapset) 0)
+            in
+            (* pcre2_match.c:7114-7131 — there may also be a "last known
+               required character" set. *)
+            let has_req_cu =
+              not (Int.equal (re.Compile.flags land Compile.lastset) 0)
+            in
+            let req_cu, req_cu2 =
+              if has_req_cu then
+                let rc_ = re.Compile.last_codeunit land 0xff (* 7119 cast *) in
+                if
+                  not (Int.equal (re.Compile.flags land Compile.lastcaseless) 0)
+                then
+                  let rc2 = Chartables.fcc rc_ in
+                  (* pcre2_match.c:7123-7129 — as for first_cu2 above. *)
+                  let rc2 =
+                    if rc_ > 127 && ucp && not utf then
+                      Ucd.othercase rc_ land 0xff (* PCRE2_UCHAR truncation *)
+                    else rc2
+                  in
+                  (rc_, rc2)
+                else (rc_, rc_)
+              else (0, 0)
+            in
+            (* pcre2_match.c:7136-7149 — loop state for the unanchored
+               bump-along attempts. FRAGMENT_RESTART (7140) is the M6
+               invalid-UTF re-entry point. start_partial/match_partial are
+               subject positions with -1 = NULL; the 8-bit memchr caches
+               likewise. *)
+            let start_partial = ref (-1) in
+            let match_partial = ref (-1) in
+            mb.hitend <- false (* 7144 *);
+            let memchr_found_first_cu = ref (-1) in
+            let memchr_found_first_cu2 = ref (-1) in
+            (* pcre2_match.c:7151-7617 + 7637-7768 — the bump-along for(;;)
+               loop and its ENDLOOP epilogue, as mutually tail-recursive
+               functions (port-conventions §2): [bump_top] is the loop head
+               (the start-of-match optimizations, 7155-7481);
+               [first_cu_tail] the shared "required first code unit not
+               found" break check (7300-7315, 7368-7374); [tail_opts] the
+               minlength/req_cu block (7378-7481); [attempt] the bumpalong
+               limit check, per-attempt resets, match() call and rc switch
+               (7485-7577); [bump_bottom] the loop bottom (7579-7616);
+               [endloop] the epilogue (7637-7768). Every C `break` /
+               `goto ENDLOOP` with rc becomes a tail call to [endloop]. *)
+            let rec bump_top (start_match : int) (req_cu_ptr : int) : int =
+              (* pcre2_match.c:7155-7162 — the start-of-match optimizations
+                 can be disabled at compile time. *)
+              if
+                not
+                  (Int.equal
+                     (re.Compile.overall_options land Options.no_start_optimize)
+                     0)
+              then (attempt [@tailcall]) start_match req_cu_ptr
+              else
+                (* pcre2_match.c:7164-7186 — if firstline is TRUE, the
+                   start of the match is constrained to the first line of a
+                   multiline string: temporarily adjust end_subject so that
+                   the first-code-unit scans stop at a newline. *)
+                let end_subject =
+                  if firstline then (
+                    let t = ref start_match in
+                    if utf then
+                      while !t < mb.end_subject && not (is_newline_at !t) do
+                        incr t;
+                        (* ACROSSCHAR(t < end_subject, t, t++) (7179) *)
+                        while
+                          !t < mb.end_subject
+                          && Int.equal (Char.code subject.[!t] land 0xc0) 0x80
+                        do
+                          incr t
+                        done
+                      done
+                    else
+                      while !t < mb.end_subject && not (is_newline_at !t) do
+                        incr t
+                      done;
+                    !t)
+                  else mb.end_subject
+                in
+                if anchored then
+                  (* pcre2_match.c:7188-7215 — anchored: check the first
+                     code unit if one is recorded. This may seem pointless
+                     but it can help in detecting a no match case without
+                     scanning for the required code unit. *)
+                  if has_first_cu || use_start_bits then
+                    let ok = start_match < end_subject in
+                    let ok =
+                      if ok then
+                        let c = Char.code subject.[start_match] in
+                        let ok =
+                          has_first_cu
+                          && (Int.equal c first_cu || Int.equal c first_cu2)
+                        in
+                        if (not ok) && use_start_bits then
+                          not
+                            (Int.equal
+                               (Char.code
+                                  (Bytes.get re.Compile.start_bitmap (c lsr 3))
+                               land (1 lsl (c land 7)))
+                               0)
+                        else ok
+                      else false
+                    in
+                    if not ok then
+                      (endloop [@tailcall]) match_nomatch start_match
+                    else (tail_opts [@tailcall]) start_match req_cu_ptr
+                  else (tail_opts [@tailcall]) start_match req_cu_ptr
+                else if
+                  (* pcre2_match.c:7217-7221 — not anchored: advance to a
+                     unique first code unit if there is one. *)
+                  has_first_cu
+                then
+                  if not (Int.equal first_cu first_cu2) then
+                    (* pcre2_match.c:7223-7284 — caseless: in 8-bit mode
+                       memchr() is called twice to find the earliest
+                       occurrence of the code unit in either of its cases,
+                       with caching of previously found positions (a huge
+                       difference when only one case is present in a very
+                       long subject). *)
+                    let searchlength = end_subject - start_match in
+                    (* pcre2_match.c:7246-7261 — if we haven't got a
+                       previously found position for first_cu, or if the
+                       current starting position is later, do a search; a
+                       miss is cached as end_subject. If the start is
+                       before a previously found position, reuse it (NULL
+                       if that previous search failed). *)
+                    let pp1 =
+                      if
+                        !memchr_found_first_cu < 0
+                        || start_match > !memchr_found_first_cu
+                      then (
+                        let r =
+                          memchr_subject subject start_match first_cu
+                            searchlength
+                        in
+                        memchr_found_first_cu :=
+                          if r < 0 then end_subject else r;
+                        r)
+                      else if Int.equal !memchr_found_first_cu end_subject then
+                        -1
+                      else !memchr_found_first_cu
+                    in
+                    (* pcre2_match.c:7263-7273 — the same for the other
+                       case. *)
+                    let pp2 =
+                      if
+                        !memchr_found_first_cu2 < 0
+                        || start_match > !memchr_found_first_cu2
+                      then (
+                        let r =
+                          memchr_subject subject start_match first_cu2
+                            searchlength
+                        in
+                        memchr_found_first_cu2 :=
+                          if r < 0 then end_subject else r;
+                        r)
+                      else if Int.equal !memchr_found_first_cu2 end_subject then
+                        -1
+                      else !memchr_found_first_cu2
+                    in
+                    (* pcre2_match.c:7275-7281 — set the start to the end
+                       of the subject if neither case was found; otherwise
+                       use the earlier found point. *)
+                    let start_match =
+                      if pp1 < 0 then if pp2 < 0 then end_subject else pp2
+                      else if pp2 < 0 || pp1 < pp2 then pp1
+                      else pp2
+                    in
+                    (first_cu_tail [@tailcall]) start_match req_cu_ptr
+                  else
+                    (* pcre2_match.c:7286-7298 — the caseful case is much
+                       simpler. *)
+                    let r =
+                      memchr_subject subject start_match first_cu
+                        (end_subject - start_match)
+                    in
+                    let start_match = if r < 0 then end_subject else r in
+                    (first_cu_tail [@tailcall]) start_match req_cu_ptr
+                else if startline then (
+                  (* pcre2_match.c:7318-7349 — if there's no first code
+                     unit, advance to just after a linebreak for a
+                     multiline match if required. *)
+                  let sm = ref start_match in
+                  if !sm > mb.start_subject + start_offset then (
+                    if utf then
+                      while !sm < end_subject && not (was_newline_at !sm) do
+                        incr sm;
+                        (* ACROSSCHAR (7331) *)
+                        while
+                          !sm < end_subject
+                          && Int.equal (Char.code subject.[!sm] land 0xc0) 0x80
+                        do
+                          incr sm
+                        done
+                      done
+                    else
+                      while !sm < end_subject && not (was_newline_at !sm) do
+                        incr sm
+                      done;
+                    (* pcre2_match.c:7339-7347 — if we have just passed a
+                       CR and the newline option is ANY or ANYCRLF, and we
+                       are now at a LF, advance the match position by one
+                       more code unit. *)
+                    if
+                      Int.equal (Char.code subject.[!sm - 1]) Newline.char_cr
+                      && (Int.equal mb.nltype Newline.nltype_any
+                         || Int.equal mb.nltype Newline.nltype_anycrlf)
+                      && !sm < end_subject
+                      && Int.equal (Char.code subject.[!sm]) Newline.char_lf
+                    then incr sm);
+                  (tail_opts [@tailcall]) !sm req_cu_ptr)
+                else if use_start_bits then (
+                  (* pcre2_match.c:7351-7375 — if there's no first code
+                     unit or a requirement for a multiline line start,
+                     advance to a non-unique first code unit if any have
+                     been identified (the bitmap contains only 256 bits;
+                     8-bit code units index it directly). *)
+                  let sm = ref start_match in
+                  let hit = ref false in
+                  while (not !hit) && !sm < end_subject do
+                    let c = Char.code subject.[!sm] in
+                    if
+                      not
+                        (Int.equal
+                           (Char.code
+                              (Bytes.get re.Compile.start_bitmap (c lsr 3))
+                           land (1 lsl (c land 7)))
+                           0)
+                    then hit := true
+                    else incr sm
+                  done;
+                  (* pcre2_match.c:7368-7374 — see the comment in
+                     [first_cu_tail]. *)
+                  (first_cu_tail [@tailcall]) !sm req_cu_ptr)
+                else (tail_opts [@tailcall]) start_match req_cu_ptr
+            and first_cu_tail (start_match : int) (req_cu_ptr : int) : int =
+              (* pcre2_match.c:7300-7315 (and 7368-7374) — if we can't find
+                 the required first code unit, having reached the true end
+                 of the subject, break the bumpalong loop to force a match
+                 failure, except when doing partial matching (consider
+                 /(?<=abc)def/ partially matching "abc"). If we have not
+                 reached the true end of the subject (PCRE2_FIRSTLINE
+                 temporarily modified end_subject) we also let the cycle
+                 run: the matching string is legitimately allowed to start
+                 with the first code unit of a newline. *)
+              if Int.equal mb.partial 0 && start_match >= mb.end_subject then
+                (endloop [@tailcall]) match_nomatch start_match
+              else (tail_opts [@tailcall]) start_match req_cu_ptr
+            and tail_opts (start_match : int) (req_cu_ptr : int) : int =
+              (* pcre2_match.c:7378-7380 — restore fudged end_subject: from
+                 here on every use reads mb.end_subject. *)
+              (* pcre2_match.c:7382-7397 — the following two optimizations
+                 must be disabled for partial matching. The minimum
+                 matching length is a lower bound; no string of that length
+                 (treated as code units) may actually match. *)
+              if Int.equal mb.partial 0 then
+                if mb.end_subject - start_match < re.Compile.minlength then
+                  (endloop [@tailcall]) match_nomatch start_match
+                else
+                  (* pcre2_match.c:7399-7427 — if req_cu is set, that code
+                     unit must appear in the subject for the (non-partial)
+                     match to succeed. If the first code unit is set,
+                     req_cu must be later in the subject. The search can be
+                     skipped if the code unit was found later than the
+                     current starting point in a previous iteration of the
+                     bumpalong loop; and it is not done at all when the
+                     remaining subject is very long (REQ_CU_MAX for
+                     anchored patterns, REQ_CU_MAX * 1000 otherwise). *)
+                  let p = start_match + if has_first_cu then 1 else 0 in
+                  if has_req_cu && p > req_cu_ptr then
+                    let check_length = mb.end_subject - start_match in
+                    if
+                      check_length < req_cu_max
+                      || ((not anchored) && check_length < req_cu_max * 1000)
+                    then
+                      let p =
+                        if not (Int.equal req_cu req_cu2) then
+                          (* pcre2_match.c:7429-7446 — caseless: memchr for
+                             each case in turn (only presence matters, not
+                             the first occurrence). *)
+                          let pp = p in
+                          let r =
+                            memchr_subject subject pp req_cu
+                              (mb.end_subject - pp)
+                          in
+                          if r < 0 then
+                            let r2 =
+                              memchr_subject subject pp req_cu2
+                                (mb.end_subject - pp)
+                            in
+                            if r2 < 0 then mb.end_subject else r2
+                          else r
+                        else
+                          (* pcre2_match.c:7448-7462 — the caseful case. *)
+                          let r =
+                            memchr_subject subject p req_cu (mb.end_subject - p)
+                          in
+                          if r < 0 then mb.end_subject else r
+                      in
+                      if p >= mb.end_subject then
+                        (* pcre2_match.c:7464-7471 — if we can't find the
+                           required code unit, break the bumpalong loop,
+                           forcing a match failure. *)
+                        (endloop [@tailcall]) match_nomatch start_match
+                      else
+                        (* pcre2_match.c:7473-7478 — save the point where
+                           we found it, so that we don't search again next
+                           time round the loop if the start hasn't yet
+                           passed this code unit. *)
+                        (attempt [@tailcall]) start_match p
+                    else (attempt [@tailcall]) start_match req_cu_ptr
+                  else (attempt [@tailcall]) start_match req_cu_ptr
+              else (attempt [@tailcall]) start_match req_cu_ptr
+            and attempt (start_match : int) (req_cu_ptr : int) : int =
+              (* pcre2_match.c:7485-7491 — give no match if we have passed
+                 the bumpalong limit. *)
+              if start_match > bumpalong_limit then
+                (endloop [@tailcall]) match_nomatch start_match
+              else (
+                (* pcre2_match.c:7493-7497 — cb.start_match and
+                   PCRE2_CALLOUT_STARTMATCH: callouts are M8. *)
+                (* pcre2_match.c:7499-7508 — per-attempt mb resets.
+                   fragment_options (7502) is M6; mb->skip_arg_count (7508)
+                   is an M5 field. *)
+                mb.start_used_ptr <- start_match;
+                mb.last_used_ptr <- start_match;
+                mb.moptions <- options;
+                mb.match_call_count <- 0;
+                mb.end_offset_top <- 0;
+                (* pcre2_match.c:7514-7515 — run the match. *)
+                let rc =
+                  match_ ~start_eptr:start_match ~start_ecode:0
+                    ~top_bracket:re.Compile.top_bracket a match_data mb
+                in
+                (* pcre2_match.c:7521-7525 — if "hitend" is set, remember
+                   the first starting point for which a partial match was
+                   found. *)
+                if mb.hitend && !start_partial < 0 then (
+                  start_partial := mb.start_used_ptr;
+                  match_partial := start_match);
+                (* pcre2_match.c:7527-7577 — switch (rc). The
+                   MATCH_SKIP_ARG (7529-7539) and MATCH_SKIP (7541-7550)
+                   cases are produced only by the ( *SKIP) verb arms — the
+                   M5 verbs chunk, which also owns mb->verb_skip_ptr and
+                   mb->ignore_skip_arg; until then those codes cannot reach
+                   here (the verb arms are stubs) and would take the
+                   default arm. *)
+                if
+                  Int.equal rc match_nomatch || Int.equal rc match_prune
+                  || Int.equal rc match_then
+                then (
+                  (* pcre2_match.c:7552-7565 — NOMATCH and PRUNE advance by
+                     one character; THEN at this level acts exactly like
+                     PRUNE. (Unset ignore SKIP-with-argument: M5 field.) *)
+                  let new_start_match = ref (start_match + 1) in
+                  if utf then
+                    (* ACROSSCHAR(new_start_match < end_subject, ...)
+                       (7561-7563) *)
+                    while
+                      !new_start_match < mb.end_subject
+                      && Int.equal
+                           (Char.code subject.[!new_start_match] land 0xc0)
+                           0x80
+                    do
+                      incr new_start_match
+                    done;
+                  (bump_bottom [@tailcall]) start_match !new_start_match
+                    req_cu_ptr)
+                else if Int.equal rc match_commit then
+                  (* pcre2_match.c:7567-7571 — COMMIT disables the
+                     bumpalong, but otherwise behaves as NOMATCH. *)
+                  (endloop [@tailcall]) match_nomatch start_match
+                else
+                  (* pcre2_match.c:7573-7576 — any other return is either a
+                     match, or some kind of error. *)
+                  (endloop [@tailcall]) rc start_match)
+            and bump_bottom (start_match : int) (new_start_match : int)
+                (req_cu_ptr : int) : int =
+              (* pcre2_match.c:7579-7582 — control reaches here for the
+                 various types of "no match at this point" result; the C
+                 resets rc to MATCH_NOMATCH, which every onward path here
+                 passes explicitly. *)
+              (* pcre2_match.c:7584-7588 — if PCRE2_FIRSTLINE is set, the
+                 match must happen before or at the first newline in the
+                 subject (though it may continue over the newline).
+                 Therefore, if we have just failed to match, starting at a
+                 newline, do not continue. *)
+              if firstline && is_newline_at start_match then
+                (endloop [@tailcall]) match_nomatch start_match
+              else
+                (* pcre2_match.c:7590-7592 — advance to new matching
+                   position. *)
+                let start_match = new_start_match in
+                (* pcre2_match.c:7594-7597 — break the loop if the pattern
+                   is anchored or if we have passed the end of the
+                   subject. *)
+                if anchored || start_match > mb.end_subject then
+                  (endloop [@tailcall]) match_nomatch start_match
+                else
+                  (* pcre2_match.c:7599-7614 — if we have just passed a CR
+                     and we are now at a LF, and the pattern does not
+                     contain any explicit matches for \r or \n, and the
+                     newline option is CRLF or ANY or ANYCRLF, advance the
+                     match position by one more code unit. In normal
+                     matching start_match will always be greater than the
+                     first position at this stage, but a failed *SKIP can
+                     cause a return at the same point, which is why the
+                     first test exists. *)
+                  let start_match =
+                    if
+                      start_match > mb.start_subject + start_offset
+                      && Int.equal
+                           (Char.code subject.[start_match - 1])
+                           Newline.char_cr
+                      && start_match < mb.end_subject
+                      && Int.equal
+                           (Char.code subject.[start_match])
+                           Newline.char_lf
+                      && Int.equal (re.Compile.flags land Compile.hascrorlf) 0
+                      && (Int.equal mb.nltype Newline.nltype_any
+                         || Int.equal mb.nltype Newline.nltype_anycrlf
+                         || Int.equal mb.nllen 2)
+                    then start_match + 1
+                    else start_match
+                  in
+                  (* pcre2_match.c:7616 — reset for start of next match
+                     attempt. *)
+                  mb.mark <- Frames.unset;
+                  (bump_top [@tailcall]) start_match req_cu_ptr
+            and endloop (rc : int) (start_match : int) : int =
+              (* pcre2_match.c:7637-7701 — ENDLOOP. The invalid-UTF
+                 fragment carry-on (7646-7701) is M6: until then
+                 end_subject == true_end_subject always holds here. *)
+              (* pcre2_match.c:7703-7707 — fill in fields that are always
+                 returned in the match data (code and matchedby have no
+                 meaning at this seam). *)
+              match_data.mark <- mb.mark;
+              if Int.equal rc match_match then (
+                (* pcre2_match.c:7709-7735 — handle a fully successful
+                   match: the return code is the number of captured
+                   strings, or 0 if there were too many to fit into the
+                   ovector. PCRE2_COPY_MATCHED_SUBJECT (7723-7732) is a
+                   no-op at this seam (GC strings; subject_length is
+                   dropped with the subject pointer). *)
+                match_data.rc <-
+                  (if mb.end_offset_top >= 2 * match_data.oveccount then 0
+                   else (mb.end_offset_top / 2) + 1);
+                match_data.startchar <- start_match (* 7719 *);
+                match_data.leftchar <- mb.start_used_ptr (* 7720 *);
+                match_data.rightchar <-
+                  (if mb.last_used_ptr > mb.end_match_ptr then mb.last_used_ptr
+                   else mb.end_match_ptr)
+                (* 7721-7722 *);
+                match_data.rc)
+              else (
+                (* pcre2_match.c:7737-7741 — a partial match, an error, or
+                   failure at all permitted starting positions: any mark
+                   data is in the nomatch_mark field. *)
+                match_data.mark <- mb.nomatch_mark;
+                if
+                  (not (Int.equal rc match_nomatch))
+                  && not (Int.equal rc Errors.error_partial)
+                then (
+                  (* pcre2_match.c:7743-7745 — for anything other than
+                     nomatch or partial match, just return the code. *)
+                  match_data.rc <- rc;
+                  match_data.rc)
+                else if !match_partial >= 0 then (
+                  (* pcre2_match.c:7747-7762 — handle a partial match. If a
+                     "soft" partial match was requested, searching for a
+                     complete match will have continued, and rc here is
+                     MATCH_NOMATCH; for a "hard" one it is already
+                     PCRE2_ERROR_PARTIAL. *)
+                  match_data.ovector.(0) <- !match_partial;
+                  match_data.ovector.(1) <- mb.end_subject;
+                  match_data.startchar <- !match_partial;
+                  match_data.leftchar <- !start_partial;
+                  match_data.rightchar <- mb.end_subject;
+                  match_data.rc <- Errors.error_partial;
+                  match_data.rc)
+                else (
+                  (* pcre2_match.c:7764-7766 — else this is the classic
+                     nomatch case. *)
+                  match_data.rc <- Errors.error_nomatch;
+                  match_data.rc))
+            in
+            (* pcre2_match.c:6601-6602 + 7151 — enter the bumpalong loop:
+               start_match = subject + start_offset, req_cu_ptr one before
+               it. *)
+            (bump_top [@tailcall]) start_offset (start_offset - 1))
+
 (* ---------- Test-only single-attempt entry ---------- *)
 
-(* TEST-ONLY (this chunk): run ONE match attempt of [code] against
-   [subject] starting at [start], returning (rc, ovector). This is the
-   scaffolding the pcre2_match driver chunk (pcre2_match.c:6530-7777)
-   replaces: the ONLY argument validation is the BADOFFSET check on
-   [start] (pre-staged from pcre2_match.c:6610 — it establishes the
+(* TEST-ONLY: run ONE match attempt of [code] against [subject] starting
+   at [start], returning [match_]'s raw (rc, ovector) — MATCH_MATCH (1) /
+   MATCH_NOMATCH (0) / negative codes, NOT the driver's pair-count
+   protocol. The real driver is [pcre2_match] above; this single-attempt
+   entry is kept because the module-initialization asserts below pin
+   [match_]'s per-attempt semantics against the C oracle at exact
+   positions (DEVIATION from the chunk plan, which wanted this to delegate
+   to the driver: the driver's bump-along loop and its rc mapping would
+   change every hand-derived expected value — anchored-attempt NOMATCHes
+   become bumped-along searches, soft partials become -2 — so the asserts'
+   entry keeps calling [match_] directly). The ONLY argument validation is
+   the BADOFFSET check on [start] (pcre2_match.c:6610 — it establishes the
    0 <= start_eptr <= end_subject invariant [match_] relies on); there is
    NO bump-along loop, NO anchored/startline/first-cu start optimization
-   and NO NOTEMPTY retry here — callers position [start] themselves. It
-   exists so the module-initialization asserts below (and the next opcode
-   chunks) can drive [match_] end to end before Engine.exec is wired.
+   and NO NOTEMPTY retry here — callers position [start] themselves.
 
    The mb configuration transcribes the driver's field setup sites:
    partial from moptions (6658-6659), field block (6962-6979), fixed-LF
@@ -3233,8 +4070,18 @@ let match_internal ?(moptions = 0) ?(poptions = 0) ?start_offset
   let start_offset = match start_offset with Some o -> o | None -> start in
   let match_data =
     (* Test-only init: all-unset so a nomatch is distinguishable. The
-       driver chunk owns the real match_data lifecycle. *)
-    { ovector = Array.make (2 * oveccount) Frames.unset; oveccount }
+       driver-written fields (rc/startchar/leftchar/rightchar/mark) are
+       dead here: this entry returns [match_]'s raw rc, not the driver
+       protocol. *)
+    {
+      ovector = Array.make (2 * oveccount) Frames.unset;
+      oveccount;
+      rc = 0;
+      startchar = 0;
+      leftchar = 0;
+      rightchar = 0;
+      mark = Frames.unset;
+    }
   in
   (* pcre2_match.c:6610 — if (start_offset > length) return
      PCRE2_ERROR_BADOFFSET. start_offset is PCRE2_SIZE (unsigned), so a
@@ -3749,7 +4596,15 @@ let () =
     | Error _ -> assert false
     | Ok a ->
         match_ ~start_eptr:mb.start_used_ptr ~start_ecode:0 ~top_bracket:0 a
-          { ovector = Array.make 2 Frames.unset; oveccount = 1 }
+          {
+            ovector = Array.make 2 Frames.unset;
+            oveccount = 1;
+            rc = 0;
+            startchar = 0;
+            leftchar = 0;
+            rightchar = 0;
+            mark = Frames.unset;
+          }
           mb
   in
   (* Soft partial on "ab": rc NOMATCH but hitend set (SCHECK_PARTIAL,
@@ -4335,3 +5190,190 @@ let () =
       assert (Int.equal ov.(1) 2);
       assert (Int.equal ov.(2) 0);
       assert (Int.equal ov.(3) 1)
+
+(* Driver checks (pcre2_match, this chunk): the bump-along protocol, rc
+   conventions, option/offset validation, partial bookkeeping and the
+   start-of-match optimizations over whole compiled patterns. Expected
+   values pinned against the C oracle (pcre2test on the real 10.44
+   library). *)
+let () =
+  let compile pat =
+    match Compile.pcre2_compile pat ~options:0 with
+    | Error _ -> assert false
+    | Ok re -> re
+  in
+  let run ?(options = 0) ?oveccount (re : Compile.re) subj start =
+    let oveccount =
+      match oveccount with Some c -> c | None -> re.Compile.top_bracket + 1
+    in
+    let m =
+      {
+        ovector = Array.make (2 * oveccount) Frames.unset;
+        oveccount;
+        rc = 0;
+        startchar = 0;
+        leftchar = 0;
+        rightchar = 0;
+        mark = Frames.unset;
+      }
+    in
+    let rc = pcre2_match re ~subject:subj ~start_offset:start ~options m in
+    (rc, m)
+  in
+  let abc = compile "abc" in
+  (* Bump-along success: /abc/ finds the match away from the start; rc is
+     the pair count (1), startchar the attempt start (pcre2_match.c:7716-
+     7719). first_cu 'a' is set, so this also runs the caseful memchr
+     advance (7286-7298). *)
+  (match run abc "xxabcy" 0 with
+  | rc, m ->
+      assert (Int.equal rc 1);
+      assert (Int.equal m.ovector.(0) 2);
+      assert (Int.equal m.ovector.(1) 5);
+      assert (Int.equal m.startchar 2);
+      assert (Int.equal m.leftchar 2);
+      assert (Int.equal m.rightchar 5));
+  (* Classic nomatch (7764-7766). *)
+  (match run abc "abd" 0 with
+  | rc, _ -> assert (Int.equal rc Errors.error_nomatch));
+  (* Undefined match option bits -> -34 (6595-6597); PCRE2_SUBSTITUTE_GLOBAL
+     is not a public match option. *)
+  (match run ~options:0x00000100 abc "abc" 0 with
+  | rc, _ -> assert (Int.equal rc Errors.error_badoption));
+  (* Partial + ENDANCHORED -> -34 (6661-6666). *)
+  (match
+     run ~options:(Options.partial_hard lor Options.endanchored) abc "abc" 0
+   with
+  | rc, _ -> assert (Int.equal rc Errors.error_badoption));
+  (* BADOFFSET, both unsigned shapes (6610). *)
+  (match run abc "abc" 4 with
+  | rc, _ -> assert (Int.equal rc Errors.error_badoffset));
+  (match run abc "abc" (-1) with
+  | rc, _ -> assert (Int.equal rc Errors.error_badoffset));
+  (* PCRE2_ANCHORED as a match option: one attempt only (7594-7597). *)
+  (match run ~options:Options.anchored abc "xabc" 0 with
+  | rc, _ -> assert (Int.equal rc Errors.error_nomatch));
+  (match run ~options:Options.anchored abc "abcx" 0 with
+  | rc, m ->
+      assert (Int.equal rc 1);
+      assert (Int.equal m.ovector.(1) 3));
+  (* Soft partial: the bump-along continues after hitend; ENDLOOP promotes
+     the remembered first partial position (7521-7525, 7747-7762): oracle
+     "Partial match: ab" at 1..3. *)
+  (match run ~options:Options.partial_soft abc "xab" 0 with
+  | rc, m ->
+      assert (Int.equal rc Errors.error_partial);
+      assert (Int.equal m.ovector.(0) 1);
+      assert (Int.equal m.ovector.(1) 3);
+      assert (Int.equal m.startchar 1);
+      assert (Int.equal m.leftchar 1);
+      assert (Int.equal m.rightchar 3));
+  (* Hard partial: match_ returns PCRE2_ERROR_PARTIAL immediately; same
+     result surface. *)
+  (match run ~options:Options.partial_hard abc "xab" 0 with
+  | rc, m ->
+      assert (Int.equal rc Errors.error_partial);
+      assert (Int.equal m.ovector.(0) 1);
+      assert (Int.equal m.ovector.(1) 3));
+  (* A partial position found mid-bump is remembered and promoted at
+     ENDLOOP after the remaining attempts fail (7521-7525, 7747-7762):
+     oracle /abcd/ partial_soft on "xyz ab" -> Partial match: ab (4..6). *)
+  (match run ~options:Options.partial_soft (compile "abcd") "xyz ab" 0 with
+  | rc, m ->
+      assert (Int.equal rc Errors.error_partial);
+      assert (Int.equal m.ovector.(0) 4);
+      assert (Int.equal m.ovector.(1) 6);
+      assert (Int.equal m.startchar 4));
+  (* rc is end_offset_top/2 + 1, counting unset middle groups below the
+     high-water mark (7716-7717): oracle /(a)|(b)/ on "b" prints 0..2 with
+     1: <unset>. *)
+  (match run (compile "(a)|(b)") "b" 0 with
+  | rc, m ->
+      assert (Int.equal rc 3);
+      assert (Int.equal m.ovector.(0) 0);
+      assert (Int.equal m.ovector.(1) 1);
+      assert (Int.equal m.ovector.(2) Frames.unset);
+      assert (Int.equal m.ovector.(3) Frames.unset);
+      assert (Int.equal m.ovector.(4) 0);
+      assert (Int.equal m.ovector.(5) 1));
+  (* ...and stops at the highest CLOSED group: /(a)(b)?/ on "a" -> rc 2,
+     the group-2 pair unset-filled by the OP_END copy-out (934-939). *)
+  (match run (compile "(a)(b)?") "a" 0 with
+  | rc, m ->
+      assert (Int.equal rc 2);
+      assert (Int.equal m.ovector.(2) 0);
+      assert (Int.equal m.ovector.(3) 1);
+      assert (Int.equal m.ovector.(4) Frames.unset);
+      assert (Int.equal m.ovector.(5) Frames.unset));
+  (* Ovector too small: rc = 0 (7716-7717). *)
+  (match run ~oveccount:1 (compile "(a)(b)") "ab" 0 with
+  | rc, m ->
+      assert (Int.equal rc 0);
+      assert (Int.equal m.rc 0);
+      assert (Int.equal m.ovector.(0) 0);
+      assert (Int.equal m.ovector.(1) 2));
+  (* startchar is the attempt start, NOT ovector[0] (\K moves the latter
+     only): oracle /a\Kbc/ on "xabc" -> 0: bc with startchar 1. *)
+  (match run (compile "a\\Kbc") "xabc" 0 with
+  | rc, m ->
+      assert (Int.equal rc 1);
+      assert (Int.equal m.ovector.(0) 2);
+      assert (Int.equal m.ovector.(1) 4);
+      assert (Int.equal m.startchar 1));
+  (* ( *NOTEMPTY) flag transfer into the match options (6621-6635): a*
+     never returns the empty match, so "b" is a nomatch but "ab" matches
+     the "a". *)
+  (let ne = compile "(*NOTEMPTY)a*" in
+   (match run ne "b" 0 with
+   | rc, _ -> assert (Int.equal rc Errors.error_nomatch));
+   match run ne "ab" 0 with
+   | rc, m ->
+       assert (Int.equal rc 1);
+       assert (Int.equal m.ovector.(0) 0);
+       assert (Int.equal m.ovector.(1) 1));
+  (* PCRE2_FIRSTLINE: the match must start at or before the first newline
+     (7164-7186 clamp + 7584-7588 break): oracle nomatch on "ab\nabc",
+     match on "abc\nx". *)
+  (let fl =
+     match Compile.pcre2_compile "abc" ~options:Options.firstline with
+     | Error _ -> assert false
+     | Ok re -> re
+   in
+   (match run fl "ab\nabc" 0 with
+   | rc, _ -> assert (Int.equal rc Errors.error_nomatch));
+   match run fl "abc\nx" 0 with
+   | rc, m ->
+       assert (Int.equal rc 1);
+       assert (Int.equal m.ovector.(1) 3));
+  (* PCRE2_STARTLINE bump (7318-7349): /^abc/m has no first_cu; the
+     startline scan advances straight past the newline. *)
+  (let ml =
+     match Compile.pcre2_compile "^abc" ~options:Options.multiline with
+     | Error _ -> assert false
+     | Ok re -> re
+   in
+   assert (not (Int.equal (ml.Compile.flags land Compile.startline) 0));
+   match run ml "xyz\nabc" 0 with
+   | rc, m ->
+       assert (Int.equal rc 1);
+       assert (Int.equal m.ovector.(0) 4);
+       assert (Int.equal m.ovector.(1) 7));
+  (* ( *LIMIT_MATCH=n): per-attempt limit -> PCRE2_ERROR_MATCHLIMIT
+     surfaces through the default switch arm (7575-7576). NO_START_OPT is
+     needed: with it off, the req_cu search for the absent 'z' would
+     break the loop with NOMATCH before any attempt (oracle confirmed
+     both behaviors). *)
+  (match
+     run (compile "(*LIMIT_MATCH=10)(*NO_START_OPT)(a+)+z") "aaaaaaaaaaaa" 0
+   with
+  | rc, _ -> assert (Int.equal rc Errors.error_matchlimit));
+  (match run (compile "(*LIMIT_MATCH=10)(a+)+z") "aaaaaaaaaaaa" 0 with
+  | rc, _ -> assert (Int.equal rc Errors.error_nomatch));
+  (* NOTEMPTY_ATSTART: only the start-of-match empty match is rejected
+     (881-895 read mb.start_offset): oracle /a*/ on "bc" with
+     notempty_atstart matches "" at 1. *)
+  match run ~options:Options.notempty_atstart (compile "a*") "bc" 0 with
+  | rc, m ->
+      assert (Int.equal rc 1);
+      assert (Int.equal m.ovector.(0) 1);
+      assert (Int.equal m.ovector.(1) 1)

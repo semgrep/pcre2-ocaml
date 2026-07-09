@@ -1,7 +1,6 @@
-; Off the default @runtest until gate G1 (M1: core compile+match) — the pure
-; engine skeleton fails every compile by design. Run with:
-;   dune build @pure-tests
-; Re-attach to runtest when G1 is reached (01/02 milestone docs).
+; Gate G1 (M1 core compile+match) reached: the pure engine passes the full
+; OUnit suite for both Interp and Jit, so this suite runs on the default
+; @runtest again (the @pure-tests alias is kept for targeted runs).
 
 (executable
  (name pcre2_tests)
@@ -18,3 +17,8 @@
  (dev
   (flags
    (:standard -w -27))))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./pcre2_tests.exe)))

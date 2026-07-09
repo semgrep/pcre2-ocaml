@@ -24,28 +24,27 @@ type exec_result = {
   startchar : int;
 }
 
-(* rc mirrors pcre2_match return conventions: >0 = (index of highest set
-   pair) + 1, 0 = ovector too small — never produced here because the engine
-   returns a full-size ovector (like the oracle stub; the harness emulates
-   pcre2test's finite match-data ovector on top).
-
-   TODO(M1 wiring): once exec_full returns real matches, rc must come from
-   the engine's end_offset_top (rc = offset_top/2 + 1, as pcre2_match sets
-   match_data->rc): unset middle groups BELOW offset_top still count in C,
-   so scanning for the highest set pair is only a shape-correct placeholder
-   for the skeleton (exec_full never returns Match yet). *)
-let rc_of_ovector (ovector : int array) : int =
-  let rec highest i =
-    if i < 0 then 0
-    else if ovector.(2 * i) <> -1 || ovector.((2 * i) + 1) <> -1 then i + 1
-    else highest (i - 1)
-  in
-  highest ((Array.length ovector / 2) - 1)
-
+(* rc mirrors pcre2_match return conventions: the engine seam encodes the
+   C's match count (match_data->rc = end_offset_top/2 + 1, which counts
+   unset middle groups below the high-water mark) as the LENGTH of the
+   Match ovector — 2*rc entries, with everything at and above rc unset in
+   the match data. Rebuild the match-data ovector at its
+   created-from-pattern size (oveccount = capture_count + 1, exactly the
+   oracle stub's pcre2_match_data_create_from_pattern shape) by padding
+   with -1. rc = 0 (ovector too small) is never produced at this seam; the
+   harness emulates pcre2test's finite match-data ovector on top. *)
 let exec ?(options = 0) ~subject ~offset code : exec_result =
   match E.exec_full code subject offset (Int32.of_int options) with
   | E.Match { ovector; mark; start_char } ->
-      { rc = rc_of_ovector ovector; ovector; mark; startchar = start_char }
+      let oveccount = (E.info code).E.capture_count + 1 in
+      let full = Array.make (2 * oveccount) (-1) in
+      Array.blit ovector 0 full 0 (Array.length ovector);
+      {
+        rc = Array.length ovector / 2;
+        ovector = full;
+        mark;
+        startchar = start_char;
+      }
   | E.No_match ->
       { rc = Flags.error_nomatch; ovector = [||]; mark = None; startchar = 0 }
   | E.Partial { start; mark } ->

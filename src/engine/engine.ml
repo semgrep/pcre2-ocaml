@@ -1,10 +1,9 @@
 (* Boundary of the pure-OCaml PCRE2 10.44 engine (see engine.mli).
 
    The compile side is wired to the real pipeline (Compile.pcre2_compile,
-   pcre2_compile.c:10096-10993); [t] is the compiled pattern record.
-   exec/exec_full still fail with a real PCRE2 code until the M1
-   interpreter chunks land (docs/ocaml-engine/02-core-compile-match.md,
-   match phase). *)
+   pcre2_compile.c:10096-10993); [t] is the compiled pattern record. The
+   match side is wired to the real driver (Interpreter.pcre2_match,
+   pcre2_match.c:6530-7777) via [exec_full]. *)
 
 type t = Compile.re
 
@@ -19,9 +18,7 @@ type exec_result =
    (port-conventions §3); unknown bits yield error 117 inside the driver
    (§5). This entry point drops the error offset (pcre2_stubs.c shape). *)
 let compile (pattern : string) (options : int32) : (t, int) result =
-  match
-    Compile.pcre2_compile pattern ~options:(Options.of_int32 options)
-  with
+  match Compile.pcre2_compile pattern ~options:(Options.of_int32 options) with
   | Ok re -> Ok re
   | Result.Error (errorcode, _erroroffset) -> Result.Error errorcode
 
@@ -45,8 +42,7 @@ let compile_ctx ?(newline = 0) ?(bsr = 0) ?(extra = 0) (pattern : string)
       extra_options = extra;
     }
   in
-  Compile.pcre2_compile ~ccontext pattern
-    ~options:(Options.of_int32 options)
+  Compile.pcre2_compile ~ccontext pattern ~options:(Options.of_int32 options)
 
 type info = {
   argoptions : int;
@@ -93,9 +89,72 @@ let capture_groups (re : t) : (string * int) array =
       done;
       (Bytes.sub_string re.Compile.name_table start !len, number))
 
-let exec_full (_re : t) (_subject : string) (_offset : int) (_options : int32) :
+(* mb->mark / mb->nomatch_mark reach the match data as pointers to the
+   mark name stored inline in the compiled code: a verb name is emitted
+   with a terminating zero (pcre2_compile.c:6571-6572), and the OP_MARK
+   arm points Fmark at it (pcre2_match.c:6341, Fecode + 2). -1 = NULL ->
+   None. Dormant until the M5 verbs chunk makes the interpreter set
+   mb->mark. *)
+let mark_of_offset (re : t) (off : int) : string option =
+  if off < 0 then None
+  else
+    let len = ref 0 in
+    while not (Char.equal (Bytes.get re.Compile.code (off + !len)) '\000') do
+      incr len
+    done;
+    Some (Bytes.sub_string re.Compile.code off !len)
+
+(* pcre2_match.c:6530-7777 via Interpreter.pcre2_match, with the match
+   data created from the pattern (pcre2_match_data_create_from_pattern:
+   oveccount = re->top_bracket + 1 — the shape the conformance oracle stub
+   uses) and its ovector preset to PCRE2_UNSET.
+
+   Result mapping (port-conventions §5):
+   - rc > 0 -> [Match]. DEVIATION (seam encoding): [exec_result] carries
+     no rc field, so the C's pair count travels as the ovector LENGTH —
+     the returned array is the match-data ovector truncated to rc pairs.
+     Nothing is lost: the C driver leaves every slot >= 2*rc unset
+     (ovector copy-out + tail fill, pcre2_match.c:934-939, and
+     rc = end_offset_top/2 + 1 at 7716-7717), so callers reconstruct the
+     full match data by padding with (-1, -1). The clip-to-0 case
+     (end_offset_top >= 2*oveccount) cannot occur here because
+     end_offset_top <= 2*top_bracket < 2*oveccount.
+   - -1 (NOMATCH) -> [No_match]; -2 (PARTIAL) -> [Partial] with
+     startchar = the partial start (= ovector[0], pcre2_match.c:7756-7758);
+     any other negative code -> [Error]. *)
+let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
     exec_result =
-  Error Errors.error_internal
+  let oveccount = re.Compile.top_bracket + 1 in
+  let md =
+    {
+      Interpreter.ovector = Array.make (2 * oveccount) (-1);
+      oveccount;
+      rc = 0;
+      startchar = 0;
+      leftchar = 0;
+      rightchar = 0;
+      mark = -1;
+    }
+  in
+  let rc =
+    Interpreter.pcre2_match re ~subject ~start_offset:offset
+      ~options:(Options.of_int32 options) md
+  in
+  if rc > 0 then
+    Match
+      {
+        ovector = Array.sub md.Interpreter.ovector 0 (2 * rc);
+        mark = mark_of_offset re md.Interpreter.mark;
+        start_char = md.Interpreter.startchar;
+      }
+  else if Int.equal rc Errors.error_nomatch then No_match
+  else if Int.equal rc Errors.error_partial then
+    Partial
+      {
+        start = md.Interpreter.startchar;
+        mark = mark_of_offset re md.Interpreter.mark;
+      }
+  else Error rc
 
 let exec (re : t) (subject : string) (offset : int) (options : int32) :
     ((int * int) option, int) result =
@@ -109,10 +168,13 @@ let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
   match exec_full re subject offset options with
   | Match { ovector; _ } ->
       let n = re.Compile.top_bracket + 1 in
+      (* The Match ovector holds rc pairs (see exec_full); groups at and
+         above rc are unset in the C match data — pad with (-1, -1). *)
+      let len = Array.length ovector in
       let pairs =
         Array.init n (fun i ->
-            let s = ovector.(2 * i) and e = ovector.((2 * i) + 1) in
-            (s, e))
+            if (2 * i) + 1 < len then (ovector.(2 * i), ovector.((2 * i) + 1))
+            else (-1, -1))
       in
       Ok (Some (pairs, capture_groups re))
   | No_match | Partial _ -> Ok None
@@ -178,8 +240,8 @@ let () =
   | Ok re -> assert (Int.equal (info re).newline Options.newline_cr)
   | Result.Error _ -> assert false);
   (* compile_ctx newline/bsr knobs; 0 = build default. *)
-  (match compile_ctx ~newline:Options.newline_crlf ~bsr:Options.bsr_anycrlf
-           "a" 0l
+  (match
+     compile_ctx ~newline:Options.newline_crlf ~bsr:Options.bsr_anycrlf "a" 0l
    with
   | Ok re ->
       let i = info re in
@@ -206,11 +268,67 @@ let () =
           assert (String.equal n1 "y");
           assert (Int.equal g1 2))
   | Result.Error _ -> assert false);
-  (* exec on a compiled pattern still reports the interpreter gap as a
-     real PCRE2 error code (matcher chunks are next). *)
-  match compile "a" 0l with
-  | Ok re -> (
-      match exec re "a" 0 0l with
-      | Result.Error e -> assert (Int.equal e Errors.error_internal)
-      | Ok _ -> assert false)
+  (* The wired match boundary (Interpreter.pcre2_match via exec_full).
+     Expected values verified against pcre2test on the real 10.44
+     library. *)
+  match compile "(a)(b)?" 0l with
   | Result.Error _ -> assert false
+  | Ok re -> (
+      (* Bump-along match: exec folds to the group-0 pair. *)
+      (match exec re "xab" 0 0l with
+      | Ok (Some (1, 3)) -> ()
+      | _ -> assert false);
+      (* exec_full: rc = 2 pairs -> ovector length 4; startchar = attempt
+         start. *)
+      (match exec_full re "xa" 0 0l with
+      | Match { ovector; mark = None; start_char = 1 } ->
+          assert (Int.equal (Array.length ovector) 4);
+          assert (Int.equal ovector.(0) 1);
+          assert (Int.equal ovector.(1) 2);
+          assert (Int.equal ovector.(2) 1);
+          assert (Int.equal ovector.(3) 2)
+      | _ -> assert false);
+      (* exec_captures pads unset tail groups with (-1, -1)
+         (port-conventions §5). *)
+      (match exec_captures re "a" 0 0l with
+      | Ok (Some (pairs, _)) -> (
+          assert (Int.equal (Array.length pairs) 3);
+          match pairs with
+          | [| (0, 1); (0, 1); (-1, -1) |] -> ()
+          | _ -> assert false)
+      | _ -> assert false);
+      (* NOMATCH -> Ok None. *)
+      (match exec re "x" 0 0l with Ok None -> () | _ -> assert false);
+      (* PARTIAL -> Ok None at the exec seam (§5), Partial at exec_full.
+         Hard partial returns as soon as the subject end is hit mid-attempt
+         (oracle: "Partial match: a"), while soft partial lets the complete
+         match win (oracle: 0: a, 1: a). *)
+      (match exec re "xa" 0 (Int32.of_int Options.partial_hard) with
+      | Ok None -> ()
+      | _ -> assert false);
+      (match exec_full re "xa" 0 (Int32.of_int Options.partial_hard) with
+      | Partial { start = 1; mark = None } -> ()
+      | _ -> assert false);
+      (match exec re "xa" 0 (Int32.of_int Options.partial_soft) with
+      | Ok (Some (1, 2)) -> ()
+      | _ -> assert false);
+      (match compile "abc" 0l with
+      | Result.Error _ -> assert false
+      | Ok re3 -> (
+          (match exec re3 "xab" 0 (Int32.of_int Options.partial_hard) with
+          | Ok None -> ()
+          | _ -> assert false);
+          match exec_full re3 "xab" 0 (Int32.of_int Options.partial_hard) with
+          | Partial { start = 1; mark = None } -> ()
+          | _ -> assert false));
+      (* BADOFFSET (-33) for negative or beyond-end offsets; unknown match
+         option bits -> BADOPTION (-34) (§5). *)
+      (match exec re "a" 5 0l with
+      | Result.Error e -> assert (Int.equal e Errors.error_badoffset)
+      | Ok _ -> assert false);
+      (match exec re "a" (-1) 0l with
+      | Result.Error e -> assert (Int.equal e Errors.error_badoffset)
+      | Ok _ -> assert false);
+      match exec re "a" 0 0x00000100l with
+      | Result.Error e -> assert (Int.equal e Errors.error_badoption)
+      | Ok _ -> assert false)

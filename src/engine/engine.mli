@@ -13,6 +13,11 @@ type t
 
 type exec_result =
   | Match of { ovector : int array; mark : string option; start_char : int }
+      (** [ovector] holds pcre2_match's rc pairs (rc = its positive return,
+          so [Array.length ovector = 2 * rc]); groups at and above rc are
+          unset in the match data — pad with (-1, -1) to reconstruct it.
+          [start_char] is pcre2_get_startchar (the attempt start; \K can
+          move [ovector.(0)] past it). *)
   | No_match
   | Partial of { start : int; mark : string option }
   | Error of int  (** negative PCRE2 error code *)

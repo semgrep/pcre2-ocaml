@@ -9,6 +9,12 @@ error until M6; UCP until M7).
 
 **Gate G1** (verbatim from plan): OUnit green (Interp + Jit, pure); ~45–55% of testinput1.
 
+**GATE MET 2026-07-08** — pure OUnit 41/41 for both Interp and Jit (re-attached to
+@runtest); engine-mode conformance: testinput1 664/1290 (51.5%), overall 1044 units
+(engine baseline 182 → 1044 with the pcre2_match driver). Frontier: testinput1:28
+(lookahead — M3). Remaining M1-doc item "debug_printer.ml first cut" lands as a
+follow-up chunk (dev tooling; not gate-blocking).
+
 ## Chunks
 
 Line ranges are 10.44 vendor estimates; pin exact boundaries when dispatching (§4 of
@@ -87,10 +93,14 @@ Match phase (`interpreter.ml`, `frames.ml`, `newline.ml`):
   SKIPZERO, resume labels RM1/RM2/RM6/RM7/RM9/RM10
   (pcre2_match.c:5224-5246, 5349-5411, 5893-6127; OP_KETRPOS and the condassert/
   assertion/ONCE/script-run/recursion ket actions stubbed loudly for M3/M4/M5/M7)
-- [ ] pcre2_match driver: arg validation, BADOFFSET, option masking (−34), anchored/
-  startline logic, start-of-match bump loop, NOTEMPTY/FIRSTLINE handling
-  (pcre2_match.c:6530-7777, JIT/start-optimization branches reduced per M5/M9 notes)
-- [ ] engine.ml: wire compile/exec through the real pipeline; debug_printer.ml first cut
+- [x] pcre2_match driver: (this commit) arg validation, BADOFFSET, option masking (−34),
+  anchored/startline logic, start-of-match bump loop (first_cu/startline/start_bits/
+  req_cu incl. the 8-bit memchr caching), NOTEMPTY/FIRSTLINE handling, partial
+  bookkeeping, result fill (rc/startchar/leftchar/rightchar/mark)
+  (pcre2_match.c:6530-7777; JIT absent, UTF-validity M6, callout/mcontext knobs M5/M8);
+  exec/exec_full/exec_captures wired (engine.ml exec half of the item below)
+- [ ] engine.ml: ~~wire compile/exec through the real pipeline~~ (done: compile in the
+  driver chunk, exec in the pcre2_match driver chunk); debug_printer.ml first cut
   (pcre2_printint.c) for differential debugging
 
 ## Rough LOC estimate
