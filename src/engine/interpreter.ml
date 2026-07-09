@@ -47,8 +47,10 @@
    RM2/RM8/RM11 resumes (5202-5211, 5305-5313, 5401-5407, 5471-5488) and
    the driver's verb rc switch (7527-7577) —
    the UTF-mode machinery — the subject validity check with
-   mb->check_subject and PCRE2_ERROR_BADUTFOFFSET (6795-6929; the
-   PCRE2_MATCH_INVALID_UTF fragment protocol stays loudly deferred) and
+   mb->check_subject and PCRE2_ERROR_BADUTFOFFSET (6795-6929), the
+   PCRE2_MATCH_INVALID_UTF fragment protocol (skipped_bad_start
+   6828-6836, the fragment validation loop 6889-6928, FRAGMENT_RESTART
+   7139-7148 and the ENDLOOP fragment carry-on 7646-7701) and
    the bump-along/FIRSTLINE/STARTLINE ACROSSCHAR stepping (7174-7180,
    7326-7332, 7561-7563) —
    and the match_block structure (pcre2_intmodedep.h:864-906).
@@ -327,15 +329,18 @@ type match_block = {
          are offsets into it, offset 0 = the C's mb->start_code
          (pcre2_match.c:6979 = Compile.re.code offset 0) *)
   start_subject : int; (* PCRE2_SPTR start_subject (884) *)
-  check_subject : int;
+  mutable check_subject : int;
       (* PCRE2_SPTR check_subject (885): where UTF-checked from — equal to
          start_subject except in UTF mode with a nonzero start offset,
          where the driver backs it up over the maximum lookbehind
          (pcre2_match.c:6795, 6851, 6862-6871); lookbehinds and the
-         word-boundary previous-character probe stop here. The
-         MATCH_INVALID_UTF fragment loop also mutates it — deferred with
-         the rest of that machinery (see [pcre2_match] below). *)
-  end_subject : int; (* PCRE2_SPTR end_subject (886): usable end *)
+         word-boundary previous-character probe stop here. Mutable
+         because the MATCH_INVALID_UTF fragment carry-on re-points it at
+         each new fragment's start (pcre2_match.c:7674). *)
+  mutable end_subject : int;
+      (* PCRE2_SPTR end_subject (886): usable end; mutable because the
+         MATCH_INVALID_UTF fragment carry-on shortens/restores it per
+         fragment (pcre2_match.c:7682, 7692) *)
   true_end_subject : int; (* PCRE2_SPTR true_end_subject (887): actual end *)
   mutable end_match_ptr : int;
       (* PCRE2_SPTR end_match_ptr (888): subject position at end match *)
@@ -6852,6 +6857,16 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
          code unit is invalid UTF. *)
       match_data.startchar <- 0;
       (* pcre2_match.c:6691-6788 — JIT matching: no JIT in this port. *)
+      (* pcre2_match.c:6601 + 6608 — start_match and end_subject are the
+         C driver locals; refs because the invalid-UTF handling below
+         (and, for end_subject, the fragment carry-on's mb writes)
+         mutates them. *)
+      let start_match = ref start_offset in
+      let end_subject = ref length in
+      (* pcre2_match.c:6575 — uint32_t fragment_options = 0; set to
+         NOTEOL / NOTBOL / NOTBOL|NOTEOL per fragment when handling
+         invalid UTF, OR-ed into mb->moptions per attempt (7502). *)
+      let fragment_options = ref 0 in
       (* pcre2_match.c:6795 — proceed with non-JIT matching: the default
          is to allow lookbehinds to the start of the subject
          (mb->check_subject = subject); a UTF check with a non-zero
@@ -6868,60 +6883,105 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
           utf
           && (Int.equal (options land Options.no_utf_check) 0 || allow_invalid)
         then (
-          if allow_invalid then
-            (* DEVIATION (loud deferral): the PCRE2_MATCH_INVALID_UTF
-               machinery — skipped_bad_start (6828-6836), the fragment
-               validation loop (6893-6928), FRAGMENT_RESTART and the
-               ENDLOOP fragment carry-on (7140, 7646-7701) — is
-               substantial and stays deferred; surfaced as the
-               unported-arm marker so it cannot be mistaken for a real
-               result. *)
-            error_unported
-          else if
-            (* pcre2_match.c:6837-6845 — check that the first code unit
-               is a valid character start; give an appropriate error
-               otherwise (start_match = subject + start_offset). *)
-            start_offset < length
-            && Utf.not_firstcu (Char.code subject.[start_offset])
-          then
-            if start_offset > 0 then Errors.error_badutfoffset
-            else Errors.error_utf8_err20 (* isolated 0x80 byte *)
+          (* pcre2_match.c:6820-6845 — for 8-bit UTF, check that the
+             first code unit is a valid character start. If we are
+             handling invalid UTF, just skip over such code units.
+             Otherwise, give an appropriate error. *)
+          let skipped_bad_start = ref false in
+          let first_cu_err =
+            if allow_invalid then (
+              (* pcre2_match.c:6828-6836 *)
+              while
+                !start_match < !end_subject
+                && Utf.not_firstcu (Char.code subject.[!start_match])
+              do
+                incr start_match;
+                skipped_bad_start := true
+              done;
+              0)
+            else if
+              (* pcre2_match.c:6837-6845 — check that the first code unit
+                 is a valid character start; give an appropriate error
+                 otherwise (start_match = subject + start_offset). *)
+              !start_match < !end_subject
+              && Utf.not_firstcu (Char.code subject.[!start_match])
+            then
+              if start_offset > 0 then Errors.error_badutfoffset
+              else Errors.error_utf8_err20 (* isolated 0x80 byte *)
+            else 0
+          in
+          if first_cu_err < 0 then first_cu_err
           else
             (* pcre2_match.c:6847-6851 — the mb->check_subject field
                points to the start of UTF checking; lookbehinds can go
                back no further than this. *)
-            let cs = ref start_offset in
-            (* pcre2_match.c:6853-6871 — move back by the maximum
+            let cs = ref !start_match in
+            (* pcre2_match.c:6853-6872 — move back by the maximum
                lookbehind, just in case it happens at the very start of
-               matching: for (i = re->max_lookbehind; i > 0 &&
+               matching, but don't do this if we skipped bad code units
+               above: for (i = re->max_lookbehind; i > 0 &&
                mb->check_subject > subject; i--) step back one character
                (skipping continuation bytes). *)
-            let i = ref re.Compile.max_lookbehind in
-            while !i > 0 && !cs > 0 do
-              decr cs;
-              while
-                !cs > 0 && Int.equal (Char.code subject.[!cs] land 0xc0) 0x80
-              do
-                decr cs
-              done;
-              decr i
-            done;
-            (* pcre2_match.c:6889-6928 — validate the relevant portion of
-               the subject (the loop around this call is the deferred
-               invalid-UTF fragment handling; with allow_invalid excluded
-               above it runs exactly once). On error, adjust the offset
-               to be absolute in the whole string and return the error
-               (match_data->rc and startchar carry it, 6893-6903). *)
-            let erroroffset = ref 0 in
-            let rc =
-              Valid_utf.valid_utf subject ~start:!cs ~length:(length - !cs)
-                erroroffset
+            if not !skipped_bad_start then (
+              let i = ref re.Compile.max_lookbehind in
+              while !i > 0 && !cs > 0 do
+                decr cs;
+                while
+                  !cs > 0 && Int.equal (Char.code subject.[!cs] land 0xc0) 0x80
+                do
+                  decr cs
+                done;
+                decr i
+              done);
+            (* pcre2_match.c:6885-6928 — validate the relevant portion of
+               the subject. There's a loop in case we encounter bad UTF
+               in the characters preceding start_match which we are
+               scanning because of a lookbehind. Returns 0 to proceed
+               with the match, < 0 to fail with that error. *)
+            let rec validate () : int =
+              let erroroffset = ref 0 in
+              let rc =
+                Valid_utf.valid_utf subject ~start:!cs ~length:(length - !cs)
+                  erroroffset
+              in
+              match_data.rc <- rc (* 6891: the out variable *);
+              if Int.equal rc 0 then 0 (* valid UTF string (6894) *)
+              else (
+                (* pcre2_match.c:6896-6903 — invalid UTF string: adjust
+                   the offset to be absolute in the whole string. If we
+                   are handling invalid UTF strings, set end_subject to
+                   stop before the bad code unit; otherwise return the
+                   error. The C's `match_data->rc > 0` guard cannot
+                   fire: valid_utf returns 0 or a negative UTF8_ERR
+                   code. *)
+                match_data.startchar <- !erroroffset + !cs;
+                if not allow_invalid then rc
+                else (
+                  end_subject := match_data.startchar;
+                  if !end_subject < !start_match then (
+                    (* pcre2_match.c:6905-6918 — the end precedes
+                       start_match: there is invalid UTF in the extra
+                       code units we reversed over because of a
+                       lookbehind. Advance past the first bad code unit,
+                       then skip invalid character starting code units,
+                       and try again with the original end point. *)
+                    cs := !end_subject + 1;
+                    while
+                      !cs < !start_match
+                      && Utf.not_firstcu (Char.code subject.[!cs])
+                    do
+                      incr cs
+                    done;
+                    end_subject := true_end_subject;
+                    (validate [@tailcall]) ())
+                  else (
+                    (* pcre2_match.c:6920-6926 — otherwise, set the not
+                       end of line option, and do the match. *)
+                    fragment_options := Options.noteol;
+                    0)))
             in
-            if Int.equal rc 0 then !cs
-            else (
-              match_data.rc <- rc;
-              match_data.startchar <- !erroroffset + !cs;
-              rc))
+            let v = validate () in
+            if v < 0 then v else !cs)
         else 0 (* mb->check_subject = subject (6795) *)
       in
       if check_subject_or_err < 0 then check_subject_or_err
@@ -7042,9 +7102,9 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                   start_subject = 0 (* 6962 *);
                   check_subject (* 6795 / 6851: computed above *);
                   end_subject =
-                    length
-                    (* 6964; the deferred invalid-UTF fragment machinery
-                       shortens this *);
+                    !end_subject
+                    (* 6964; shortened to the first fragment's end above
+                       when handling invalid UTF *);
                   true_end_subject (* 6965 *);
                   end_match_ptr = 0;
                   start_used_ptr = 0;
@@ -7172,27 +7232,46 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                 else (0, 0)
               in
               (* pcre2_match.c:7136-7149 — loop state for the unanchored
-                 bump-along attempts. FRAGMENT_RESTART (7140) is the M6
-                 invalid-UTF re-entry point. start_partial/match_partial are
-                 subject positions with -1 = NULL; the 8-bit memchr caches
-                 likewise. *)
+                 bump-along attempts, reset at FRAGMENT_RESTART (7140).
+                 start_partial/match_partial are subject positions with
+                 -1 = NULL; the 8-bit memchr caches likewise. The initial
+                 values here are dead: [fragment_restart] (re)sets them
+                 on entry. *)
               let start_partial = ref (-1) in
               let match_partial = ref (-1) in
-              mb.hitend <- false (* 7144 *);
               let memchr_found_first_cu = ref (-1) in
               let memchr_found_first_cu2 = ref (-1) in
               (* pcre2_match.c:7151-7617 + 7637-7768 — the bump-along for(;;)
                  loop and its ENDLOOP epilogue, as mutually tail-recursive
-                 functions (port-conventions §2): [bump_top] is the loop head
+                 functions (port-conventions §2): [fragment_restart] is the
+                 FRAGMENT_RESTART label + fall-through loop-state resets
+                 (7139-7148); [bump_top] is the loop head
                  (the start-of-match optimizations, 7155-7481);
                  [first_cu_tail] the shared "required first code unit not
                  found" break check (7300-7315, 7368-7374); [tail_opts] the
                  minlength/req_cu block (7378-7481); [attempt] the bumpalong
                  limit check, per-attempt resets, match() call and rc switch
                  (7485-7577); [bump_bottom] the loop bottom (7579-7616);
-                 [endloop] the epilogue (7637-7768). Every C `break` /
-                 `goto ENDLOOP` with rc becomes a tail call to [endloop]. *)
-              let rec bump_top (start_match : int) (req_cu_ptr : int) : int =
+                 [endloop] the ENDLOOP invalid-UTF fragment carry-on check
+                 (7639-7648) with [next_fragment] as its for(;;) body
+                 (7650-7699); [endloop_tail] the epilogue proper
+                 (7703-7768). Every C `break` / `goto ENDLOOP` with rc
+                 becomes a tail call to [endloop]; req_cu_ptr is threaded
+                 through it because the C local survives a
+                 `goto FRAGMENT_RESTART`. *)
+              let rec fragment_restart (start_match : int) (req_cu_ptr : int) :
+                  int =
+                (* pcre2_match.c:7139-7148 — FRAGMENT_RESTART: (re)set the
+                   per-fragment loop state, then enter the bump-along
+                   loop. Also the initial entry point (the C falls
+                   through the label). *)
+                start_partial := -1;
+                match_partial := -1;
+                mb.hitend <- false (* 7144 *);
+                memchr_found_first_cu := -1;
+                memchr_found_first_cu2 := -1;
+                (bump_top [@tailcall]) start_match req_cu_ptr
+              and bump_top (start_match : int) (req_cu_ptr : int) : int =
                 (* pcre2_match.c:7155-7162 — the start-of-match optimizations
                    can be disabled at compile time. *)
                 if
@@ -7253,7 +7332,7 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                         else false
                       in
                       if not ok then
-                        (endloop [@tailcall]) match_nomatch start_match
+                        (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
                       else (tail_opts [@tailcall]) start_match req_cu_ptr
                     else (tail_opts [@tailcall]) start_match req_cu_ptr
                   else if
@@ -7397,7 +7476,7 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                    run: the matching string is legitimately allowed to start
                    with the first code unit of a newline. *)
                 if Int.equal mb.partial 0 && start_match >= mb.end_subject then
-                  (endloop [@tailcall]) match_nomatch start_match
+                  (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
                 else (tail_opts [@tailcall]) start_match req_cu_ptr
               and tail_opts (start_match : int) (req_cu_ptr : int) : int =
                 (* pcre2_match.c:7378-7380 — restore fudged end_subject: from
@@ -7408,7 +7487,7 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                    (treated as code units) may actually match. *)
                 if Int.equal mb.partial 0 then
                   if mb.end_subject - start_match < re.Compile.minlength then
-                    (endloop [@tailcall]) match_nomatch start_match
+                    (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
                   else
                     (* pcre2_match.c:7399-7427 — if req_cu is set, that code
                        unit must appear in the subject for the (non-partial)
@@ -7455,7 +7534,7 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                           (* pcre2_match.c:7464-7471 — if we can't find the
                              required code unit, break the bumpalong loop,
                              forcing a match failure. *)
-                          (endloop [@tailcall]) match_nomatch start_match
+                          (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
                         else
                           (* pcre2_match.c:7473-7478 — save the point where
                              we found it, so that we don't search again next
@@ -7469,15 +7548,15 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                 (* pcre2_match.c:7485-7491 — give no match if we have passed
                    the bumpalong limit. *)
                 if start_match > bumpalong_limit then
-                  (endloop [@tailcall]) match_nomatch start_match
+                  (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
                 else (
                   (* pcre2_match.c:7493-7497 — cb.start_match and
                      PCRE2_CALLOUT_STARTMATCH: callouts are M8. *)
-                  (* pcre2_match.c:7499-7508 — per-attempt mb resets.
-                     fragment_options (7502) is M6. *)
+                  (* pcre2_match.c:7499-7508 — per-attempt mb resets;
+                     mb->moptions = options | fragment_options (7502). *)
                   mb.start_used_ptr <- start_match;
                   mb.last_used_ptr <- start_match;
-                  mb.moptions <- options;
+                  mb.moptions <- options lor !fragment_options;
                   mb.match_call_count <- 0;
                   mb.end_offset_top <- 0;
                   mb.skip_arg_count <- 0;
@@ -7540,11 +7619,11 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                   else if Int.equal rc match_commit then
                     (* pcre2_match.c:7567-7571 — COMMIT disables the
                        bumpalong, but otherwise behaves as NOMATCH. *)
-                    (endloop [@tailcall]) match_nomatch start_match
+                    (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
                   else
                     (* pcre2_match.c:7573-7576 — any other return is either a
                        match, or some kind of error. *)
-                    (endloop [@tailcall]) rc start_match)
+                    (endloop [@tailcall]) rc start_match req_cu_ptr)
               and bump_bottom (start_match : int) (new_start_match : int)
                   (req_cu_ptr : int) : int =
                 (* pcre2_match.c:7579-7582 — control reaches here for the
@@ -7557,7 +7636,7 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                    Therefore, if we have just failed to match, starting at a
                    newline, do not continue. *)
                 if firstline && is_newline_at start_match then
-                  (endloop [@tailcall]) match_nomatch start_match
+                  (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
                 else
                   (* pcre2_match.c:7590-7592 — advance to new matching
                      position. *)
@@ -7566,7 +7645,7 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                      is anchored or if we have passed the end of the
                      subject. *)
                   if anchored || start_match > mb.end_subject then
-                    (endloop [@tailcall]) match_nomatch start_match
+                    (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
                   else
                     (* pcre2_match.c:7599-7614 — if we have just passed a CR
                        and we are now at a LF, and the pattern does not
@@ -7598,10 +7677,77 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                        attempt. *)
                     mb.mark <- Frames.unset;
                     (bump_top [@tailcall]) start_match req_cu_ptr
-              and endloop (rc : int) (start_match : int) : int =
-                (* pcre2_match.c:7637-7701 — ENDLOOP. The invalid-UTF
-                   fragment carry-on (7646-7701) is M6: until then
-                   end_subject == true_end_subject always holds here. *)
+              and endloop (rc : int) (start_match : int) (req_cu_ptr : int) :
+                  int =
+                (* pcre2_match.c:7637-7648 — ENDLOOP. If end_subject !=
+                   true_end_subject, it means we are handling invalid UTF,
+                   and have just processed a non-terminal fragment. If
+                   this resulted in no match or a partial match we must
+                   carry on to the next fragment (a partial match is
+                   returned to the caller only at the very end of the
+                   subject). *)
+                if
+                  utf
+                  && (not (Int.equal mb.end_subject true_end_subject))
+                  && (Int.equal rc match_nomatch
+                     || Int.equal rc Errors.error_partial)
+                then (next_fragment [@tailcall]) mb.end_subject req_cu_ptr
+                else (endloop_tail [@tailcall]) rc start_match
+              and next_fragment (frag_end : int) (req_cu_ptr : int) : int =
+                (* pcre2_match.c:7650-7699 — the fragment carry-on
+                   for(;;): a loop is used to avoid trying to match
+                   against empty fragments; if the pattern can match an
+                   empty string it would have done so already. Each
+                   iteration enters with the previous fragment's end in
+                   [frag_end] (the C's end_subject). *)
+                (* pcre2_match.c:7652-7659 — advance past the first bad
+                   code unit, and then skip invalid character starting
+                   code units in 8-bit mode. *)
+                let sm = ref (frag_end + 1) in
+                while
+                  !sm < true_end_subject
+                  && Utf.not_firstcu (Char.code subject.[!sm])
+                do
+                  incr sm
+                done;
+                if !sm >= true_end_subject then (
+                  (* pcre2_match.c:7662-7670 — we have hit the end of the
+                     subject: there isn't another non-empty fragment, so
+                     give up. rc = MATCH_NOMATCH in case it was partial;
+                     match_partial = NULL. *)
+                  match_partial := -1;
+                  (endloop_tail [@tailcall]) match_nomatch !sm)
+                else (
+                  (* pcre2_match.c:7672-7676 — check the rest of the
+                     subject. *)
+                  mb.check_subject <- !sm;
+                  let erroroffset = ref 0 in
+                  let vrc =
+                    Valid_utf.valid_utf subject ~start:!sm
+                      ~length:(length - !sm) erroroffset
+                  in
+                  if Int.equal vrc 0 then (
+                    (* pcre2_match.c:7678-7685 — the rest of the subject
+                       is valid UTF. *)
+                    mb.end_subject <- true_end_subject;
+                    fragment_options := Options.notbol;
+                    (fragment_restart [@tailcall]) !sm req_cu_ptr)
+                  else (
+                    (* pcre2_match.c:7687-7698 — a subsequent UTF error
+                       has been found (valid_utf returns 0 or a negative
+                       code, so the C's rc-sign split is 0 / < 0): if the
+                       next fragment is non-empty, set up to process it;
+                       otherwise let the loop advance. The C wrote the
+                       fragment-relative error offset into
+                       match_data->startchar through the out-pointer at
+                       7675-7676 (dead unless an error return follows). *)
+                    match_data.startchar <- !erroroffset;
+                    mb.end_subject <- !sm + !erroroffset;
+                    if mb.end_subject > !sm then (
+                      fragment_options := Options.notbol lor Options.noteol;
+                      (fragment_restart [@tailcall]) !sm req_cu_ptr)
+                    else (next_fragment [@tailcall]) mb.end_subject req_cu_ptr))
+              and endloop_tail (rc : int) (start_match : int) : int =
                 (* pcre2_match.c:7703-7707 — fill in fields that are always
                    returned in the match data (code and matchedby have no
                    meaning at this seam). *)
@@ -7656,10 +7802,13 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                     match_data.rc <- Errors.error_nomatch;
                     match_data.rc))
               in
-              (* pcre2_match.c:6601-6602 + 7151 — enter the bumpalong loop:
-                 start_match = subject + start_offset, req_cu_ptr one before
-                 it. *)
-              (bump_top [@tailcall]) start_offset (start_offset - 1))
+              (* pcre2_match.c:6601-6602 + 7139-7151 — enter the bumpalong
+                 loop through the FRAGMENT_RESTART fall-through resets:
+                 start_match is subject + start_offset possibly advanced
+                 past bad starting code units (6828-6836); req_cu_ptr is
+                 one before the ORIGINAL start_match (6602, set before
+                 the UTF checks). *)
+              (fragment_restart [@tailcall]) !start_match (start_offset - 1))
 
 (* ---------- Test-only single-attempt entry ---------- *)
 
@@ -9786,3 +9935,106 @@ let () =
   expect_ov
     (compile ~options:(u lor Options.no_start_optimize) "x")
     "\xc3\xa9\xc3\xa9x" [| 4; 5 |]
+
+(* PCRE2_MATCH_INVALID_UTF (this chunk): the driver's invalid-UTF
+   fragment machinery — skipped_bad_start (pcre2_match.c:6828-6836), the
+   fragment validation loop (6889-6928), FRAGMENT_RESTART (7139-7148) and
+   the ENDLOOP fragment carry-on (7646-7701) — through whole compiled
+   patterns. EVERY expected value below is pinned against the C oracle
+   (pcre2test on the real 10.44 library, via
+   test/pcre2test/pcre2test_ml.exe --driver=oracle). *)
+let () =
+  let compile ?(options = 0) pat =
+    match Compile.pcre2_compile pat ~options with
+    | Error _ -> assert false
+    | Ok re -> re
+  in
+  let run ?(options = 0) (re : Compile.re) subj start =
+    let oveccount = re.Compile.top_bracket + 1 in
+    let m =
+      {
+        ovector = Array.make (2 * oveccount) Frames.unset;
+        oveccount;
+        rc = 0;
+        startchar = 0;
+        leftchar = 0;
+        rightchar = 0;
+        mark = Frames.unset;
+      }
+    in
+    let rc = pcre2_match re ~subject:subj ~start_offset:start ~options m in
+    (rc, m)
+  in
+  let expect_ov_at ?options re subj start expected =
+    match run ?options re subj start with
+    | rc, m ->
+        assert (rc > 0);
+        Array.iteri (fun i e -> assert (Int.equal m.ovector.(i) e)) expected
+  in
+  let expect_nomatch_at ?options re subj start =
+    match run ?options re subj start with
+    | rc, _ -> assert (Int.equal rc Errors.error_nomatch)
+  in
+  let miu = Options.utf lor Options.match_invalid_utf in
+  (* Match in a later fragment (the ENDLOOP carry-on advances past the
+     bad code unit and restarts) — oracle /abc/utf,match_invalid_utf on
+     "ab\x80abc": 0: abc at (3,6). MATCH_INVALID_UTF implies UTF at
+     compile (pcre2_compile.c:10201-10203), so the bare-option pattern
+     behaves identically. NOMATCH when the subject is only bad code
+     units (skipped_bad_start consumes everything) — oracle: no match. *)
+  (let re = compile ~options:miu "abc" in
+   expect_ov_at re "ab\x80abc" 0 [| 3; 6 |];
+   expect_nomatch_at re "\x80\x80\x80" 0);
+  (let re = compile ~options:Options.match_invalid_utf "abc" in
+   expect_ov_at re "ab\x80abc" 0 [| 3; 6 |]);
+  (* A start offset inside a bad fragment is NOT BADUTFOFFSET under
+     MATCH_INVALID_UTF: the skipped_bad_start loop (6828-6836) just
+     advances past bad starting code units — oracle: 0: abc for both
+     offset=2 into "ab\x80abc" (on the bad byte) and offset=1 into
+     "\x80\x80abc" (inside a leading bad run). *)
+  (let re = compile ~options:miu "abc" in
+   expect_ov_at re "ab\x80abc" 2 [| 3; 6 |];
+   expect_ov_at re "\x80\x80abc" 1 [| 2; 5 |]);
+  (* ^ does not match at later fragment starts: OP_CIRC demands the true
+     subject start (and NOTBOL is set for every fragment after the
+     first, 7683/7695) — oracle /^X/utf,match_invalid_utf: no match on
+     "\x80X" (skipped-bad start) and on "A\x80X" (carry-on fragment);
+     the FIRST fragment does start the subject — oracle
+     /^A/utf,match_invalid_utf on "A\x80X": 0: A. *)
+  (let re = compile ~options:miu "^X" in
+   expect_nomatch_at re "\x80X" 0;
+   expect_nomatch_at re "A\x80X" 0);
+  expect_ov_at (compile ~options:miu "^A") "A\x80X" 0 [| 0; 1 |];
+  (* Partial interplay: a hard partial in the TERMINAL fragment is
+     returned (ovector = the fragment tail) — oracle
+     /.a/utf,match_invalid_utf on "b\xf0\x91\x88b" ph: Partial match: b
+     at (4,5) — but a partial in a NON-terminal fragment is discarded by
+     the carry-on (match_partial = NULL, 7665-7670) — oracle
+     /.a$/utf,match_invalid_utf on "b\xf0\x91\x98" ph: no match. *)
+  (match
+     run ~options:Options.partial_hard
+       (compile ~options:miu ".a")
+       "b\xf0\x91\x88b" 0
+   with
+  | rc, m ->
+      assert (Int.equal rc Errors.error_partial);
+      assert (Int.equal m.ovector.(0) 4);
+      assert (Int.equal m.ovector.(1) 5));
+  (match
+     run ~options:Options.partial_hard
+       (compile ~options:miu ".a$")
+       "b\xf0\x91\x98" 0
+   with
+  | rc, _ -> assert (Int.equal rc Errors.error_nomatch));
+  (* Per-fragment NOTEOL: $ cannot match at a non-terminal fragment's
+     end (fragment_options = NOTEOL, 6924 / NOTBOL|NOTEOL, 7695) but can
+     at the true subject end — oracle /ab$/utf,match_invalid_utf:
+     "ab\x80cdeab" -> 0: ab at (6,8); "ab\x80cde" -> no match. *)
+  (let re = compile ~options:miu "ab$" in
+   expect_ov_at re "ab\x80cdeab" 0 [| 6; 8 |];
+   expect_nomatch_at re "ab\x80cde" 0);
+  (* Empty-fragment advance in the carry-on loop (0xff is a character
+     STARTING code unit for NOT_FIRSTCU but its fragment is empty, so
+     the for(;;) advances again, 7687-7698) — oracle
+     /X/utf,match_invalid_utf on "AB\xfe\xffXY": 0: X at (4,5). *)
+  expect_ov_at (compile ~options:miu "X") "AB\xfe\xffXY" 0 [| 4; 5 |]

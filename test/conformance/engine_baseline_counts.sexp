@@ -6,4 +6,4 @@
  (testinput5 215 419)
  (testinput8 0 0)
  (testinput9 10 10)
- (testinput10 27 44))
+ (testinput10 44 44))
