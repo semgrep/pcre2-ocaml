@@ -9,6 +9,10 @@ COMMIT/MARK/partial matching; MARK output through the harness (`MK:` lines).
 **Gate G5** (verbatim from plan): testinput1 100% minus skip-list; ≥85% of in-scope
 testinput2 (non-UTF).
 
+**GATE MET 2026-07-09** — testinput1 1290/1290 (100%, no skip-list entries needed);
+testinput2 722/746 = 96.8% of in-scope (≥85% target; all 24 remaining failures are
+M8 callout units); testinput9 10/10 (MARK output byte-exact).
+
 ## Chunks
 
 - [x] parse: verb recognition incl. verb args and name-quoting rules, `(*LIMIT_MATCH=)/
@@ -17,18 +21,18 @@ testinput2 (non-UTF).
 - [x] compile: OP_MARK/OP_PRUNE(_ARG)/OP_SKIP(_ARG)/OP_THEN(_ARG)/OP_COMMIT(_ARG)/
   OP_ACCEPT/OP_FAIL emission; \K → OP_SET_SOM + error 199 check
   (pcre2_compile.c: verb arms in compile_branch 6812-8370)
-- [ ] match: verb opcodes + backtrack-verb semantics threaded through the frame unwind
+- [x] match: verb opcodes + backtrack-verb semantics threaded through the frame unwind
   (mark propagation, skip-to-mark, THEN group scoping, COMMIT/ACCEPT cut points)
   (pcre2_match.c:6340-6475 + verb handling in the return dispatch 6479-6527 and
   pcre2_match driver)
-- [ ] match: partial matching — PARTIAL_SOFT/HARD rules, start_used_offset tracking,
+- [x] match: partial matching (reconciled: shipped across M1 — SCHECK_PARTIAL sites in every interpreter chunk, driver partial promotion + match_partial protocol; exercised by the passing partial units in t1/t2) — PARTIAL_SOFT/HARD rules, start_used_offset tracking,
   `Partial of {start; mark}` surfaced via exec_full → harness `Partial match:` lines
   (pcre2_match.c: partial logic in driver 6530-7777 + OP_END arm)
-- [ ] study (basic): first code unit (+caseless), last req code unit scaffold OFF by
+- [x] study (basic): first code unit (reconciled: shipped in the M1 compile driver — find_firstassertedcu + REQ_CASELESS merge + match-driver optimization block incl. had_pruneorskip suppression; verb-corpus no-attempt sites match the oracle, two pinned by asserts) (+caseless), last req code unit scaffold OFF by
   default, minlength walk; PCRE2_NO_START_OPTIMIZE plumbed so verbs/partial see identical
   observable behavior to C (pcre2_study.c: first-cu/minlength portions of 1-1915;
   pcre2_match.c driver start-optimization block)
-- [ ] harness/skiplist: enable MARK output assertions and verb sections; drop `deferred m5`
+- [x] harness/skiplist: (reconciled: MARK output live since G0; no deferred-m5 skiplist entries ever existed) enable MARK output assertions and verb sections; drop `deferred m5`
   rows; re-baseline
 
 ## Rough LOC estimate

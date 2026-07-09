@@ -45,8 +45,10 @@ let exec ?(options = 0) ~subject ~offset code : exec_result =
         mark;
         startchar = start_char;
       }
-  | E.No_match ->
-      { rc = Flags.error_nomatch; ovector = [||]; mark = None; startchar = 0 }
+  | E.No_match { mark } ->
+      (* pcre2_get_mark after a failed match returns mb->nomatch_mark
+         (pcre2_match.c:7741) — pcre2test's "No match, mark = X" line. *)
+      { rc = Flags.error_nomatch; ovector = [||]; mark; startchar = 0 }
   | E.Partial { start; mark } ->
       (* pcre2_match PARTIAL: ovector[0] = start of the partial match,
          ovector[1] = end of the inspected subject (its length: a partial

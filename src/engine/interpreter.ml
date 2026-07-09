@@ -37,6 +37,12 @@
    steppers OP_REVERSE/OP_VREVERSE with resume label RM37 (5787-5888,
    non-UTF arms), and their ket actions including OP_KETRPOS and the
    ONCE/assertion backtrack discard (5990-6098) —
+   the backtracking-verb family — OP_CLOSE/OP_ACCEPT (800-874, sharing
+   the OP_END tail), the verb opcodes OP_MARK/OP_COMMIT(_ARG)/
+   OP_PRUNE(_ARG)/OP_SKIP(_ARG)/OP_THEN(_ARG) with resume labels
+   RM12-RM19/RM36 (6336-6442), the MATCH_THEN branch-scope checks in the
+   RM2/RM8/RM11 resumes (5202-5211, 5305-5313, 5401-5407, 5471-5488) and
+   the driver's verb rc switch (7527-7577) —
    and the match_block structure (pcre2_intmodedep.h:864-906).
    Every other opcode
    that the C switch handles gets an exhaustive STUB arm returning the
@@ -282,9 +288,6 @@ type match_data = {
      always reads the default tables through Chartables (same DEVIATION
      as Compile.compile_block);
    - PCRE2_SPTR check_subject (885) — M6 invalid-UTF fragment matching;
-   - PCRE2_SPTR verb_ecode_ptr / verb_skip_ptr (893-894), uint32_t
-     verb_current_recurse (895), uint32_t skip_arg_count /
-     ignore_skip_arg (898-899) — M5 verbs chunk;
    - pcre2_callout_block *cb (903), void *callout_data (904),
      int ( *callout)(...) (905) — callout support chunk (M8); no callout
      block exists until then, see the RETURN_SWITCH note in [backtrack]. *)
@@ -331,11 +334,38 @@ type match_block = {
   mutable nomatch_mark : int;
       (* PCRE2_SPTR nomatch_mark (892): mark to pass back on failure;
          -1 = NULL *)
+  mutable verb_ecode_ptr : int;
+      (* PCRE2_SPTR verb_ecode_ptr (893): for passing back info — the
+         code offset of the OP_THEN/OP_THEN_ARG opcode that triggered a
+         MATCH_THEN return (pcre2_match.c:6432/6440); -1 = never set (the
+         C leaves it uninitialized; it is only read after a MATCH_THEN
+         set it) *)
+  mutable verb_skip_ptr : int;
+      (* PCRE2_SPTR verb_skip_ptr (894): for passing back a ( *SKIP)
+         position or name. Dual use, exactly as the C: a SUBJECT offset
+         while a MATCH_SKIP is being passed back (pcre2_match.c:6354,
+         6395, consumed by the driver at 7545-7547), a CODE offset of the
+         skip name while a MATCH_SKIP_ARG is (6422, consumed by the
+         OP_MARK resume at 6351-6352); -1 = never set *)
+  mutable verb_current_recurse : int;
+      (* uint32_t verb_current_recurse (895): current recursion group
+         when a ( *VERB) backtrack return happens — set alongside every
+         MATCH_COMMIT..MATCH_THEN return, consumed by the OP_RECURSE
+         resume (pcre2_match.c:5481-5482) *)
   mutable moptions : int;
       (* uint32_t moptions (896): match options; mutable because the
          driver's bump-along loop resets it per attempt
          (pcre2_match.c:7502-7504) *)
   poptions : int; (* uint32_t poptions (897): pattern options *)
+  mutable skip_arg_count : int;
+      (* uint32_t skip_arg_count (898): for counting SKIP_ARGs — reset
+         per attempt by the driver (pcre2_match.c:7508), bumped by the
+         OP_SKIP_ARG arm (6408) *)
+  mutable ignore_skip_arg : int;
+      (* uint32_t ignore_skip_arg (899): for re-run when a SKIP arg name
+         was not found — 0 at driver entry (pcre2_match.c:6970), set to
+         skip_arg_count when a MATCH_SKIP_ARG reaches the top (7538),
+         reset to 0 on a normal bump-along (7558) *)
   nltype : int; (* uint32_t nltype (900): newline type *)
   mutable nllen : int;
       (* uint32_t nllen (901): newline string length; mutable because
@@ -493,6 +523,18 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
     Char.code
       (Bytes.get mb.start_code (fr.(fb + Frames.slot_temp_sptr_1) + (fc lsr 3)))
     land (1 lsl (fc land 7))
+  in
+  (* pcre2_string_utils.c:101-112 — PRIV(strcmp) over two zero-terminated
+     verb names stored in the compiled code, consulted only for equality
+     (the `== 0` test at the OP_MARK resume, pcre2_match.c:6351-6352).
+     Terminates: verb names are emitted with a terminating zero
+     (pcre2_compile.c:6571-6572; mb complete-program invariant). *)
+  let rec strcmp_code_eq (p1 : int) (p2 : int) : bool =
+    let c1 = Char.code (Bytes.get mb.start_code p1) in
+    let c2 = Char.code (Bytes.get mb.start_code p2) in
+    if Int.equal c1 0 && Int.equal c2 0 then true
+    else if not (Int.equal c1 c2) then false
+    else (strcmp_code_eq [@tailcall]) (p1 + 1) (p2 + 1)
   in
   (* Bounds contract shared by the three match_ref compare loops below
      ([match_ref] establishes it): [p] ranges over the captured substring
@@ -678,11 +720,43 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
        owning chunk. *)
     match op with
     | 166 ->
-        (* OP_CLOSE (pcre2_match.c:800-829) — STUB: M5 verbs chunk
-           (OP_CLOSE is only compiled before OP_ACCEPT, to close open
-           capturing brackets; both arms ride together, including their
-           Fcurrent_recurse gates). *)
-        error_unported
+        (* OP_CLOSE (pcre2_match.c:800-829) — before OP_ACCEPT there may
+           be any number of OP_CLOSE opcodes, to close any currently open
+           capturing brackets. Unlike reaching the end of a group, we have
+           to search back for the relevant frame in case other types of
+           group that use chained frames have intervened (multiple
+           OP_CLOSEs always come innermost first, matching the chain
+           order). Ignored in a recursion, because captures are not
+           passed out of recursions. *)
+        if Int.equal fr.(fb + Frames.slot_current_recurse) Frames.recurse_unset
+        then (
+          let number = Compile.get2 mb.start_code (ecode + 1) in
+          let p =
+            close_frame_scan
+              fr.(fb + Frames.slot_last_group_offset)
+              (Frames.gf_capture lor number)
+          in
+          if p < 0 then p (* PCRE2_ERROR_INTERNAL: return, NOT RRETURN (816) *)
+          else
+            (* pcre2_match.c:822-826 — record the capture. In bounds:
+               1 <= number <= top_bracket in a compiled program (mb
+               invariant), so offset + 1 <= 2 * top_bracket - 1, within
+               the frame's ovector region. *)
+            let offset = (number lsl 1) - 2 in
+            fr.(fb + Frames.slot_capture_last) <- number;
+            fr.(fb + Frames.slot_ovector + offset) <-
+              fr.(Frames.base a p + Frames.slot_eptr) - mb.start_subject;
+            fr.(fb + Frames.slot_ovector + offset + 1) <-
+              fr.(fb + Frames.slot_eptr) - mb.start_subject;
+            if offset >= fr.(fb + Frames.slot_offset_top) then
+              fr.(fb + Frames.slot_offset_top) <- offset + 2;
+            (* pcre2_match.c:828-829 *)
+            fr.(fb + Frames.slot_ecode) <- ecode + Opcodes.op_lengths.(op);
+            (dispatch [@tailcall]) f)
+        else (
+          (* pcre2_match.c:828-829 *)
+          fr.(fb + Frames.slot_ecode) <- ecode + Opcodes.op_lengths.(op);
+          (dispatch [@tailcall]) f)
     | 165 ->
         (* OP_ASSERT_ACCEPT (pcre2_match.c:832-840) — real or forced end
            of the pattern, assertion, or recursion: in an assertion ACCEPT,
@@ -693,74 +767,41 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         assert_accept_frame := f;
         (backtrack [@tailcall]) f match_accept
     | 164 ->
-        (* OP_ACCEPT (pcre2_match.c:842-874) — STUB: M5 verbs chunk. In
-           the C this arm falls through into the OP_END code (874); when
-           it lands it must share the OP_END arm's body below from the
-           empty-match check onwards. *)
-        error_unported
-    | 0 ->
-        (* OP_END (pcre2_match.c:876-940). *)
-        (* fallthrough target: OP_ACCEPT (not in a recursion) enters here
-           in the C (874-877). *)
-        (* pcre2_match.c:881-895 — fail for an empty string match if
-           PCRE2_NOTEMPTY is set, or if PCRE2_NOTEMPTY_ATSTART is set and
-           we have matched at the start of the subject; backtracking will
-           then try other alternatives, if any. *)
+        (* OP_ACCEPT (pcre2_match.c:842-874) — for ACCEPT within a
+           recursion, we have to find the most recent recursion. If not
+           in a recursion, fall through to code that is common with
+           OP_END. *)
         if
-          Int.equal fr.(fb + Frames.slot_eptr) fr.(fb + Frames.slot_start_match)
-          && ((not (Int.equal (mb.moptions land Options.notempty) 0))
-             || (not (Int.equal (mb.moptions land Options.notempty_atstart) 0))
-                && Int.equal
-                     fr.(fb + Frames.slot_start_match)
-                     (mb.start_subject + mb.start_offset))
-        then (backtrack [@tailcall]) f match_nomatch
-          (* pcre2_match.c:897-917 — fail if PCRE2_ENDANCHORED is set and
-             the end of the match is not the end of the subject. After
-             ( *ACCEPT) we fail the entire match at this position (direct
-             return) but backtrack if we've reached the end of the
-             pattern. *)
-        else if
-          fr.(fb + Frames.slot_eptr) < mb.end_subject
-          && not
-               (Int.equal
-                  (mb.moptions lor mb.poptions land Options.endanchored)
-                  0)
-        then
-          if Int.equal fr.(fb + Frames.slot_op) Opcodes.op_end then
-            (backtrack [@tailcall]) f match_nomatch
-          else match_nomatch (* ( *ACCEPT): return, NOT RRETURN (916) *)
-        else (
-          (* pcre2_match.c:919-940 — a successful match of the whole
-             pattern: record the result and return directly. Pairs that
-             follow the highest-numbered captured string but are less
-             than the number of capturing groups are set to PCRE2_UNSET;
-             "gaps" below offset_top were already set dynamically. *)
-          mb.end_match_ptr <- fr.(fb + Frames.slot_eptr);
-          mb.end_offset_top <- fr.(fb + Frames.slot_offset_top);
-          mb.mark <- fr.(fb + Frames.slot_mark);
-          if fr.(fb + Frames.slot_eptr) > mb.last_used_ptr then
-            mb.last_used_ptr <- fr.(fb + Frames.slot_eptr);
-          match_data.ovector.(0) <-
-            fr.(fb + Frames.slot_start_match) - mb.start_subject;
-          match_data.ovector.(1) <-
-            fr.(fb + Frames.slot_eptr) - mb.start_subject;
-          (* pcre2_match.c:934-939 — i = the smaller of the external and
-             frame ovector sizes (in slots); copy the frame captures, then
-             unset the tail down to Foffset_top + 2. *)
-          let i =
-            2
-            *
-            if top_bracket + 1 > match_data.oveccount then match_data.oveccount
-            else top_bracket + 1
-          in
-          Array.blit fr (fb + Frames.slot_ovector) match_data.ovector 2 (i - 2);
-          let i = ref i in
-          decr i;
-          while !i >= fr.(fb + Frames.slot_offset_top) + 2 do
-            match_data.ovector.(!i) <- Frames.unset;
-            decr i
-          done;
-          match_match (* return MATCH_MATCH — note: NOT RRETURN (940) *))
+          not
+            (Int.equal
+               fr.(fb + Frames.slot_current_recurse)
+               Frames.recurse_unset)
+        then (
+          let p = accept_frame_scan fr.(fb + Frames.slot_last_group_offset) in
+          if p < 0 then p (* PCRE2_ERROR_INTERNAL: return, NOT RRETURN (855) *)
+          else
+            (* pcre2_match.c:862-872 — [p] (the C's P) is the frame that
+               dispatched OP_RECURSE (the frame before the GF_RECURSE
+               frame): go back there, copying the current subject
+               position and mark, and the start_match position (\K might
+               have changed it), and then move on past the OP_RECURSE
+               (P->ecode still points at it — RMATCH stored the branch
+               start in the NEW frame only). *)
+            let pb = Frames.base a p in
+            fr.(pb + Frames.slot_eptr) <- fr.(fb + Frames.slot_eptr);
+            fr.(pb + Frames.slot_mark) <- fr.(fb + Frames.slot_mark);
+            fr.(pb + Frames.slot_start_match) <-
+              fr.(fb + Frames.slot_start_match);
+            fr.(pb + Frames.slot_ecode) <-
+              fr.(pb + Frames.slot_ecode) + 1 + Limits.link_size;
+            (dispatch [@tailcall]) p)
+        else (* fallthrough to OP_END in C (874) *)
+          (op_end_tail [@tailcall]) f
+    | 0 ->
+        (* OP_END (pcre2_match.c:876-940) — OP_END itself can never be
+           reached within a recursion because that is picked up when the
+           OP_KET that always precedes OP_END is reached. *)
+        (op_end_tail [@tailcall]) f
     | 12 ->
         (* OP_ANY (pcre2_match.c:947-958) — match any single character
            type except newline; have to take care with CRLF newlines and
@@ -2140,16 +2181,81 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
               (not
                  (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0))
     | 154 ->
-        (* OP_MARK (pcre2_match.c:6340-6356) — STUB: M5 verbs chunk. *)
-        error_unported
+        (* OP_MARK (pcre2_match.c:6340-6342) — backtracking ( *VERB)s,
+           with and without arguments: if the pattern is successfully
+           matched, we do not come back from RMATCH. Fmark =
+           mb->nomatch_mark = Fecode + 2; the RM12 resume handles the
+           returned-MATCH_SKIP_ARG interception. *)
+        fr.(fb + Frames.slot_mark) <- ecode + 2;
+        mb.nomatch_mark <- ecode + 2;
+        (rmatch [@tailcall]) f
+          (ecode + Opcodes.op_lengths.(op)
+          + Char.code (Bytes.get mb.start_code (ecode + 1)))
+          rm12 0
     | 163 ->
         (* OP_FAIL (pcre2_match.c:6359-6360) — RRETURN(MATCH_NOMATCH). *)
         (backtrack [@tailcall]) f match_nomatch
-    | 161 | 162 | 155 | 156 | 157 | 158 | 159 | 160 ->
-        (* OP_COMMIT, OP_COMMIT_ARG, OP_PRUNE, OP_PRUNE_ARG, OP_SKIP,
-           OP_SKIP_ARG, OP_THEN, OP_THEN_ARG (pcre2_match.c:6366-6442) —
-           STUB: M5 verbs chunk. *)
-        error_unported
+    | 161 ->
+        (* OP_COMMIT (pcre2_match.c:6362-6370) — the RM13 resume records
+           the current recursing group number in mb->verb_current_recurse
+           when the MATCH_COMMIT backtracking return is given, enabling
+           the recurse processing to catch verbs from within the
+           recursion. *)
+        (rmatch [@tailcall]) f (ecode + Opcodes.op_lengths.(op)) rm13 0
+    | 162 ->
+        (* OP_COMMIT_ARG (pcre2_match.c:6372-6377) — as OP_COMMIT but
+           with a mark argument. *)
+        fr.(fb + Frames.slot_mark) <- ecode + 2;
+        mb.nomatch_mark <- ecode + 2;
+        (rmatch [@tailcall]) f
+          (ecode + Opcodes.op_lengths.(op)
+          + Char.code (Bytes.get mb.start_code (ecode + 1)))
+          rm36 0
+    | 155 ->
+        (* OP_PRUNE (pcre2_match.c:6379-6383). *)
+        (rmatch [@tailcall]) f (ecode + Opcodes.op_lengths.(op)) rm14 0
+    | 156 ->
+        (* OP_PRUNE_ARG (pcre2_match.c:6385-6390). *)
+        fr.(fb + Frames.slot_mark) <- ecode + 2;
+        mb.nomatch_mark <- ecode + 2;
+        (rmatch [@tailcall]) f
+          (ecode + Opcodes.op_lengths.(op)
+          + Char.code (Bytes.get mb.start_code (ecode + 1)))
+          rm15 0
+    | 157 ->
+        (* OP_SKIP (pcre2_match.c:6392-6397). *)
+        (rmatch [@tailcall]) f (ecode + Opcodes.op_lengths.(op)) rm16 0
+    | 158 ->
+        (* OP_SKIP_ARG (pcre2_match.c:6399-6414) — note that, for Perl
+           compatibility, SKIP with an argument does NOT set
+           nomatch_mark. When a pattern match ends with a SKIP_ARG for
+           which there was no matching mark, the match is re-run with
+           mb->ignore_skip_arg set to the count of the one that failed:
+           SKIP_ARGs up to that count are executed as no-ops. *)
+        mb.skip_arg_count <- mb.skip_arg_count + 1;
+        if mb.skip_arg_count <= mb.ignore_skip_arg then (
+          fr.(fb + Frames.slot_ecode) <-
+            ecode + Opcodes.op_lengths.(op)
+            + Char.code (Bytes.get mb.start_code (ecode + 1));
+          (dispatch [@tailcall]) f)
+        else
+          (rmatch [@tailcall]) f
+            (ecode + Opcodes.op_lengths.(op)
+            + Char.code (Bytes.get mb.start_code (ecode + 1)))
+            rm17 0
+    | 159 ->
+        (* OP_THEN (pcre2_match.c:6426-6434) — the RM18 resume passes
+           back the address of the opcode, so that the branch in which it
+           occurs can be determined. *)
+        (rmatch [@tailcall]) f (ecode + Opcodes.op_lengths.(op)) rm18 0
+    | 160 ->
+        (* OP_THEN_ARG (pcre2_match.c:6436-6442). *)
+        fr.(fb + Frames.slot_mark) <- ecode + 2;
+        mb.nomatch_mark <- ecode + 2;
+        (rmatch [@tailcall]) f
+          (ecode + Opcodes.op_lengths.(op)
+          + Char.code (Bytes.get mb.start_code (ecode + 1)))
+          rm19 0
     | 98 | 99 | 100 | 101 | 102 | 103 | 104 | 105 | 106 | 107 | 108 | 109 | 145
     | 146 | 147 | 148 | 149 | 150 | 168 | _ ->
         (* pcre2_match.c:6445-6450 — default: PCRE2_ERROR_INTERNAL. Like
@@ -2160,6 +2266,104 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            (5641-5700); OP_DEFINE (168) is rewritten to OP_FALSE by the
            compiler. Values >= op_table_length are corrupt patterns. *)
         Errors.error_internal
+  and op_end_tail (f : int) : int =
+    (* pcre2_match.c:876-940 — the OP_END body, shared with OP_ACCEPT
+       (which falls through into it in the C, 874-877). *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    (* pcre2_match.c:881-895 — fail for an empty string match if
+       PCRE2_NOTEMPTY is set, or if PCRE2_NOTEMPTY_ATSTART is set and
+       we have matched at the start of the subject; backtracking will
+       then try other alternatives, if any. *)
+    if
+      Int.equal fr.(fb + Frames.slot_eptr) fr.(fb + Frames.slot_start_match)
+      && ((not (Int.equal (mb.moptions land Options.notempty) 0))
+         || (not (Int.equal (mb.moptions land Options.notempty_atstart) 0))
+            && Int.equal
+                 fr.(fb + Frames.slot_start_match)
+                 (mb.start_subject + mb.start_offset))
+    then (backtrack [@tailcall]) f match_nomatch
+      (* pcre2_match.c:897-917 — fail if PCRE2_ENDANCHORED is set and
+         the end of the match is not the end of the subject. After
+         ( *ACCEPT) we fail the entire match at this position (direct
+         return) but backtrack if we've reached the end of the
+         pattern. *)
+    else if
+      fr.(fb + Frames.slot_eptr) < mb.end_subject
+      && not
+           (Int.equal (mb.moptions lor mb.poptions land Options.endanchored) 0)
+    then
+      if Int.equal fr.(fb + Frames.slot_op) Opcodes.op_end then
+        (backtrack [@tailcall]) f match_nomatch
+      else match_nomatch (* ( *ACCEPT): return, NOT RRETURN (916) *)
+    else (
+      (* pcre2_match.c:919-940 — a successful match of the whole
+         pattern: record the result and return directly. Pairs that
+         follow the highest-numbered captured string but are less
+         than the number of capturing groups are set to PCRE2_UNSET;
+         "gaps" below offset_top were already set dynamically. *)
+      mb.end_match_ptr <- fr.(fb + Frames.slot_eptr);
+      mb.end_offset_top <- fr.(fb + Frames.slot_offset_top);
+      mb.mark <- fr.(fb + Frames.slot_mark);
+      if fr.(fb + Frames.slot_eptr) > mb.last_used_ptr then
+        mb.last_used_ptr <- fr.(fb + Frames.slot_eptr);
+      match_data.ovector.(0) <-
+        fr.(fb + Frames.slot_start_match) - mb.start_subject;
+      match_data.ovector.(1) <- fr.(fb + Frames.slot_eptr) - mb.start_subject;
+      (* pcre2_match.c:934-939 — i = the smaller of the external and
+         frame ovector sizes (in slots); copy the frame captures, then
+         unset the tail down to Foffset_top + 2. *)
+      let i =
+        2
+        *
+        if top_bracket + 1 > match_data.oveccount then match_data.oveccount
+        else top_bracket + 1
+      in
+      Array.blit fr (fb + Frames.slot_ovector) match_data.ovector 2 (i - 2);
+      let i = ref i in
+      decr i;
+      while !i >= fr.(fb + Frames.slot_offset_top) + 2 do
+        match_data.ovector.(!i) <- Frames.unset;
+        decr i
+      done;
+      match_match (* return MATCH_MATCH — note: NOT RRETURN (940) *))
+  and close_frame_scan (offset : int) (want : int) : int =
+    (* pcre2_match.c:813-821 — the OP_CLOSE walk back over the chained
+       group frames (offset is a frame index here, frames.ml DEVIATION;
+       -1 = PCRE2_UNSET): find the frame N whose group_frame_type is
+       exactly [want] (GF_CAPTURE | number) and return its predecessor P
+       (the frame that dispatched the bracket, whose eptr is the subject
+       position at the group start), or PCRE2_ERROR_INTERNAL — a direct
+       return in the C (816), not RRETURN. Terminates: the
+       last_group_offset chain strictly descends to PCRE2_UNSET. *)
+    if Int.equal offset Frames.unset then Errors.error_internal
+    else
+      let fr = a.Frames.frames in
+      if Int.equal fr.(Frames.base a offset + Frames.slot_group_frame_type) want
+      then offset - 1
+      else
+        (close_frame_scan [@tailcall])
+          fr.(Frames.base a (offset - 1) + Frames.slot_last_group_offset)
+          want
+  and accept_frame_scan (offset : int) : int =
+    (* pcre2_match.c:852-860 — the OP_ACCEPT walk back over the chained
+       group frames: find the most recent recursion frame N (any frame
+       whose GF_IDMASK is GF_RECURSE) and return its predecessor P (the
+       frame at the OP_RECURSE position), or PCRE2_ERROR_INTERNAL — a
+       direct return in the C (855), not RRETURN. Terminates as
+       [close_frame_scan]. *)
+    if Int.equal offset Frames.unset then Errors.error_internal
+    else
+      let fr = a.Frames.frames in
+      if
+        Int.equal
+          (Frames.gf_idmask
+             fr.(Frames.base a offset + Frames.slot_group_frame_type))
+          Frames.gf_recurse
+      then offset - 1
+      else
+        (accept_frame_scan [@tailcall])
+          fr.(Frames.base a (offset - 1) + Frames.slot_last_group_offset)
   (* pcre2_match.c:1259-1400 — REPEATCHAR: common code for all repeated
      single-character matches (goto target of the OP_EXACT..OP_MINQUERY
      arms). We first check for the minimum number of characters. If the
@@ -3565,6 +3769,20 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
       + Opcodes.op_lengths.(Char.code (Bytes.get mb.start_code start_branch)))
       rm11
       fr.(fb + Frames.slot_temp_32_0)
+  and recurse_advance_branch (f : int) (next_ecode : int) : int =
+    (* pcre2_match.c:5494-5495 — the RM11 branch walk: Lstart_branch =
+       next_ecode; fail the whole recursion when there is no next
+       alternative. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    fr.(fb + Frames.slot_temp_sptr_0) <- next_ecode (* Lstart_branch *);
+    if
+      not
+        (Int.equal
+           (Char.code (Bytes.get mb.start_code next_ecode))
+           Opcodes.op_alt)
+    then (backtrack [@tailcall]) f match_nomatch
+    else (recurse_loop [@tailcall]) f
   and dnrref_scan (current_recurse : int) (count : int) (slot : int) : bool =
     (* pcre2_match.c:5656-5665 — the OP_DNRREF group-list walk:
        while (count-- > 0) test each group number the name refers to
@@ -3804,11 +4022,29 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
             (bra_loop [@tailcall]) f)
       | 2 ->
           (* L_RM2 (pcre2_match.c:5401-5410) — GROUPLOOP: the branch
-             failed. The MATCH_THEN handling (5401-5407) consults
-             mb->verb_ecode_ptr: M5 verbs chunk — no opcode can return
-             MATCH_THEN until then; site kept for evaluation order. Then
-             advance to the next alternative, failing the group when there
-             is none. *)
+             failed. If the result is MATCH_THEN, check whether the
+             ( *THEN) is within the current branch by comparing the
+             address of the OP_THEN that is passed back with the end of
+             the branch; if it is, and the branch is one of two or more
+             alternatives, convert to NOMATCH so that normal backtracking
+             happens from now on (5202-5211). Then advance to the next
+             alternative, failing the group when there is none. *)
+          let rrc =
+            if Int.equal rrc match_then then
+              let ecode = fr.(fb + Frames.slot_ecode) in
+              let next_ecode = ecode + Compile.get mb.start_code (ecode + 1) in
+              if
+                mb.verb_ecode_ptr < next_ecode
+                && (Int.equal
+                      (Char.code (Bytes.get mb.start_code ecode))
+                      Opcodes.op_alt
+                   || Int.equal
+                        (Char.code (Bytes.get mb.start_code next_ecode))
+                        Opcodes.op_alt)
+              then match_nomatch
+              else rrc
+            else rrc
+          in
           if not (Int.equal rrc match_nomatch) then
             (backtrack [@tailcall]) f rrc
           else
@@ -4312,8 +4548,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
              group. Anything but NOMATCH/THEN passes back; otherwise try
              the next branch, failing the assertion when there is none.
              PCRE2 doesn't allow the effect of ( *THEN) to escape beyond an
-             assertion (M5 verbs; no opcode can return MATCH_THEN until
-             then). *)
+             assertion, so it is treated as NOMATCH (5503-5507). *)
           if Int.equal rrc match_accept then (
             (* pcre2_match.c:5522-5527 — memcpy(Fovector,
                assert_accept_frame->ovector, assert_accept_frame->
@@ -4355,8 +4590,8 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
              (rrc). A match (or assertion ACCEPT) means the assertion
              fails; NOMATCH/THEN try the next branch; COMMIT/SKIP/PRUNE
              force the assertion to fail without checking other branches,
-             which is success for a negative assertion (M5 verbs; sites
-             kept in the C's case order). *)
+             which is success for a negative assertion (sites in the C's
+             case order). *)
           if Int.equal rrc match_accept || Int.equal rrc match_match then
             (* pcre2_match.c:5557-5559 — assertion matched, therefore it
                fails. *)
@@ -4400,11 +4635,10 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
              matched (its frame data was copied back here by the
              OP_KETRPOS ket): unless it was empty (skip to the end to
              forcibly break the loop), start the next iteration from the
-             bracket. The MATCH_THEN handling (5307-5313) consults
-             mb->verb_ecode_ptr: M5 verbs chunk — no opcode can return
-             MATCH_THEN until then; site kept for evaluation order. On
-             NOMATCH, walk to the next alternative, leaving the loop when
-             there is none. *)
+             bracket. A MATCH_THEN from within the current branch of a
+             multi-branch group converts to NOMATCH (5305-5313; see the
+             RM2 comment). On NOMATCH, walk to the next alternative,
+             leaving the loop when there is none. *)
           if Int.equal rrc match_ketrpos then (
             fr.(fb + Frames.slot_temp_32_1) <- 1 (* Lmatched_once = TRUE *);
             if
@@ -4421,23 +4655,44 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
               fr.(fb + Frames.slot_ecode) <- fr.(fb + Frames.slot_temp_sptr_1)
               (* Lstart_group *);
               (possessive_group_loop [@tailcall]) f))
-          else if not (Int.equal rrc match_nomatch) then
-            (* pcre2_match.c:5315 *)
-            (backtrack [@tailcall]) f rrc
           else
-            (* pcre2_match.c:5316-5317 *)
-            let ecode =
-              fr.(fb + Frames.slot_ecode)
-              + Compile.get mb.start_code (fr.(fb + Frames.slot_ecode) + 1)
+            (* pcre2_match.c:5305-5313 — see the comment at RM2 about
+               handling THEN. *)
+            let rrc =
+              if Int.equal rrc match_then then
+                let ecode = fr.(fb + Frames.slot_ecode) in
+                let next_ecode =
+                  ecode + Compile.get mb.start_code (ecode + 1)
+                in
+                if
+                  mb.verb_ecode_ptr < next_ecode
+                  && (Int.equal
+                        (Char.code (Bytes.get mb.start_code ecode))
+                        Opcodes.op_alt
+                     || Int.equal
+                          (Char.code (Bytes.get mb.start_code next_ecode))
+                          Opcodes.op_alt)
+                then match_nomatch
+                else rrc
+              else rrc
             in
-            fr.(fb + Frames.slot_ecode) <- ecode;
-            if
-              not
-                (Int.equal
-                   (Char.code (Bytes.get mb.start_code ecode))
-                   Opcodes.op_alt)
-            then (possessive_group_done [@tailcall]) f
-            else (possessive_group_loop [@tailcall]) f
+            if not (Int.equal rrc match_nomatch) then
+              (* pcre2_match.c:5315 *)
+              (backtrack [@tailcall]) f rrc
+            else
+              (* pcre2_match.c:5316-5317 *)
+              let ecode =
+                fr.(fb + Frames.slot_ecode)
+                + Compile.get mb.start_code (fr.(fb + Frames.slot_ecode) + 1)
+              in
+              fr.(fb + Frames.slot_ecode) <- ecode;
+              if
+                not
+                  (Int.equal
+                     (Char.code (Bytes.get mb.start_code ecode))
+                     Opcodes.op_alt)
+              then (possessive_group_done [@tailcall]) f
+              else (possessive_group_loop [@tailcall]) f
       | 5 ->
           (* L_RM5 (pcre2_match.c:5710-5745) — an assertion-condition
              branch came back: switch (rrc). *)
@@ -4464,8 +4719,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
           else if Int.equal rrc match_nomatch || Int.equal rrc match_then then (
             (* pcre2_match.c:5726-5734 — PCRE doesn't allow the effect of
                ( *THEN) to escape beyond an assertion; it is therefore
-               always treated as NOMATCH (M5 verbs; no opcode can return
-               MATCH_THEN until then). Try the next branch if present;
+               always treated as NOMATCH. Try the next branch if present;
                otherwise condition = !Lpositive (TRUE for a negative
                assertion). *)
             let sb =
@@ -4483,9 +4737,8 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
             || Int.equal rrc match_prune
           then
             (* pcre2_match.c:5736-5742 — these force no match without
-               checking other branches: condition = !Lpositive (M5 verbs;
-               no opcode can return these yet; kept in the C's case
-               order). *)
+               checking other branches: condition = !Lpositive (kept in
+               the C's case order). *)
             (cond_assert_end [@tailcall]) f
               (Int.equal fr.(fb + Frames.slot_temp_32_0) 0)
           else
@@ -4495,36 +4748,120 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
       | 11 ->
           (* L_RM11 (pcre2_match.c:5469-5495) — a recursion branch came
              back: next_ecode = Lstart_branch + GET(Lstart_branch, 1).
-             The backtracking-verb range handling (5471-5488) consults
-             mb->verb_current_recurse / mb->verb_ecode_ptr: M5 verbs
-             chunk — no opcode can return a MATCH_BACKTRACK_MIN..MAX
-             code until then; site kept for evaluation order. Carrying
-             on after ( *ACCEPT) in a recursion is handled in the
-             OP_ACCEPT code; nothing needs to be done here (5490-5491).
-             Anything but NOMATCH passes back; otherwise try the next
-             branch, failing the recursion when there is none. *)
-          if not (Int.equal rrc match_nomatch) then
-            (backtrack [@tailcall]) f rrc
-          else
-            let next_ecode =
-              fr.(fb + Frames.slot_temp_sptr_0)
-              + Compile.get mb.start_code (fr.(fb + Frames.slot_temp_sptr_0) + 1)
-            in
-            fr.(fb + Frames.slot_temp_sptr_0) <- next_ecode (* Lstart_branch *);
+             Handle backtracking verbs, which are defined in a range that
+             can easily be tested for: PCRE does not allow THEN, SKIP,
+             PRUNE or COMMIT to escape beyond a recursion; they cause a
+             NOMATCH for the entire recursion. When one of these verbs
+             triggers, the current recursion group number was recorded in
+             mb->verb_current_recurse: if it matches the recursion we are
+             processing, the verb happened within the recursion and we
+             must deal with it (a THEN within the current branch of a
+             multi-branch recursion just fails that branch — see the RM2
+             comment); otherwise it happened after the recursion
+             completed, and is passed back (5471-5488). Carrying on after
+             ( *ACCEPT) in a recursion is handled in the OP_ACCEPT code;
+             nothing needs to be done here (5490-5491). Anything but
+             NOMATCH passes back; otherwise try the next branch, failing
+             the recursion when there is none. *)
+          let start_branch = fr.(fb + Frames.slot_temp_sptr_0) in
+          let next_ecode =
+            start_branch + Compile.get mb.start_code (start_branch + 1)
+          in
+          if
+            rrc >= match_backtrack_min && rrc <= match_backtrack_max
+            && Int.equal mb.verb_current_recurse
+                 (fr.(fb + Frames.slot_temp_32_0) lxor Frames.gf_recurse)
+          then
             if
-              not
-                (Int.equal
-                   (Char.code (Bytes.get mb.start_code next_ecode))
-                   Opcodes.op_alt)
-            then (backtrack [@tailcall]) f match_nomatch
-            else (recurse_loop [@tailcall]) f
+              Int.equal rrc match_then
+              && mb.verb_ecode_ptr < next_ecode
+              && (Int.equal
+                    (Char.code (Bytes.get mb.start_code start_branch))
+                    Opcodes.op_alt
+                 || Int.equal
+                      (Char.code (Bytes.get mb.start_code next_ecode))
+                      Opcodes.op_alt)
+            then
+              (* rrc = MATCH_NOMATCH (5486): fall into the branch walk
+                 below. *)
+              (recurse_advance_branch [@tailcall]) f next_ecode
+            else (backtrack [@tailcall]) f match_nomatch
+          else if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (recurse_advance_branch [@tailcall]) f next_ecode
       | 35 ->
           (* L_RM35 (pcre2_match.c:5776) — OP_SCOND descend:
              RRETURN(rrc). *)
           (backtrack [@tailcall]) f rrc
-      | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 36 ->
-          (* RM12..RM19 RM36 — STUB: M5 verbs chunk. *)
-          error_unported
+      | 12 ->
+          (* L_RM12 (pcre2_match.c:6344-6357) — OP_MARK: a return of
+             MATCH_SKIP_ARG means that matching failed at SKIP with an
+             argument, and we must check whether that argument matches
+             this MARK's argument (passed back in mb->verb_skip_ptr as a
+             code offset). If it does, return MATCH_SKIP with
+             mb->verb_skip_ptr now pointing to the subject position that
+             corresponds to this mark; otherwise pass back the return
+             code unaltered. *)
+          if
+            Int.equal rrc match_skip_arg
+            && strcmp_code_eq (fr.(fb + Frames.slot_ecode) + 2) mb.verb_skip_ptr
+          then (
+            mb.verb_skip_ptr <- fr.(fb + Frames.slot_eptr)
+            (* pass back current position *);
+            (backtrack [@tailcall]) f match_skip)
+          else (backtrack [@tailcall]) f rrc
+      | 13 | 36 ->
+          (* L_RM13 (pcre2_match.c:6368-6370) — OP_COMMIT — and L_RM36
+             (6375-6377) — OP_COMMIT_ARG: identical resumes. Record the
+             current recursing group number in mb->verb_current_recurse,
+             so that the recurse processing can catch verbs from within
+             the recursion (6362-6364). *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (
+            mb.verb_current_recurse <- fr.(fb + Frames.slot_current_recurse);
+            (backtrack [@tailcall]) f match_commit)
+      | 14 | 15 ->
+          (* L_RM14 (pcre2_match.c:6381-6383) — OP_PRUNE — and L_RM15
+             (6388-6390) — OP_PRUNE_ARG: identical resumes. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (
+            mb.verb_current_recurse <- fr.(fb + Frames.slot_current_recurse);
+            (backtrack [@tailcall]) f match_prune)
+      | 16 ->
+          (* L_RM16 (pcre2_match.c:6394-6397) — OP_SKIP: pass back the
+             current subject position in mb->verb_skip_ptr. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (
+            mb.verb_skip_ptr <- fr.(fb + Frames.slot_eptr);
+            mb.verb_current_recurse <- fr.(fb + Frames.slot_current_recurse);
+            (backtrack [@tailcall]) f match_skip)
+      | 17 ->
+          (* L_RM17 (pcre2_match.c:6415-6424) — OP_SKIP_ARG: pass back
+             the current skip name (a code offset) and return the special
+             MATCH_SKIP_ARG return code. This will either be caught by a
+             matching MARK (the RM12 resume), or get to the top, where it
+             causes a rematch with mb->ignore_skip_arg set to the value
+             of mb->skip_arg_count. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (
+            mb.verb_skip_ptr <- fr.(fb + Frames.slot_ecode) + 2;
+            mb.verb_current_recurse <- fr.(fb + Frames.slot_current_recurse);
+            (backtrack [@tailcall]) f match_skip_arg)
+      | 18 | 19 ->
+          (* L_RM18 (pcre2_match.c:6431-6434) — OP_THEN — and L_RM19
+             (6439-6442) — OP_THEN_ARG: identical resumes. Pass back the
+             address of the opcode, so that the branch in which it occurs
+             can be determined (6426-6428). *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (
+            mb.verb_ecode_ptr <- fr.(fb + Frames.slot_ecode);
+            mb.verb_current_recurse <- fr.(fb + Frames.slot_current_recurse);
+            (backtrack [@tailcall]) f match_then)
       | 100 | 101 ->
           (* RM100 RM101 — STUB: M6 (OP_XCLASS repeats). *)
           error_unported
@@ -4554,11 +4891,6 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
   (new_frame [@tailcall]) 0 start_ecode 0
 
 (* ---------- Match a Regular Expression (the driver) ---------- *)
-
-(* pcre2_internal.h:537 — PCRE2_HASTHEN: the pattern contains ( *THEN).
-   Compile does not set this bit until the M5 verbs chunk; the other
-   re->flags bits the driver reads live in Compile (firstset & co). *)
-let flag_hasthen = 0x00001000
 
 (* pcre2_internal.h:566-575 — REQ_CU_MAX, 8-bit library: the maximum
    remaining length of subject we are prepared to search for a req_unit
@@ -4769,7 +5101,7 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                 match_call_count = 0;
                 hitend = false;
                 hasthen =
-                  not (Int.equal (re.Compile.flags land flag_hasthen) 0)
+                  not (Int.equal (re.Compile.flags land Compile.hasthen) 0)
                   (* 6966 *);
                 allowemptypartial =
                   re.Compile.max_lookbehind > 0
@@ -4794,8 +5126,16 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                 last_used_ptr = 0;
                 mark = Frames.unset;
                 nomatch_mark = Frames.unset (* 6971: in case never set *);
+                verb_ecode_ptr = Frames.unset;
+                verb_skip_ptr = Frames.unset;
+                verb_current_recurse =
+                  Frames.recurse_unset
+                  (* the C leaves these three uninitialized: they are only
+                     read after a verb return has set them *);
                 moptions = 0 (* 6956-6957: gets set later, per attempt *);
                 poptions = re.Compile.overall_options (* 6969 *);
+                skip_arg_count = 0 (* reset per attempt, 7508 *);
+                ignore_skip_arg = 0 (* 6970 *);
                 nltype = !nltype;
                 nllen = !nllen;
                 nl0 = !nl0;
@@ -5197,13 +5537,13 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                 (* pcre2_match.c:7493-7497 — cb.start_match and
                    PCRE2_CALLOUT_STARTMATCH: callouts are M8. *)
                 (* pcre2_match.c:7499-7508 — per-attempt mb resets.
-                   fragment_options (7502) is M6; mb->skip_arg_count (7508)
-                   is an M5 field. *)
+                   fragment_options (7502) is M6. *)
                 mb.start_used_ptr <- start_match;
                 mb.last_used_ptr <- start_match;
                 mb.moptions <- options;
                 mb.match_call_count <- 0;
                 mb.end_offset_top <- 0;
+                mb.skip_arg_count <- 0;
                 (* pcre2_match.c:7514-7515 — run the match. *)
                 let rc =
                   match_ ~start_eptr:start_match ~start_ecode:0
@@ -5215,20 +5555,37 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                 if mb.hitend && !start_partial < 0 then (
                   start_partial := mb.start_used_ptr;
                   match_partial := start_match);
-                (* pcre2_match.c:7527-7577 — switch (rc). The
-                   MATCH_SKIP_ARG (7529-7539) and MATCH_SKIP (7541-7550)
-                   cases are produced only by the ( *SKIP) verb arms — the
-                   M5 verbs chunk, which also owns mb->verb_skip_ptr and
-                   mb->ignore_skip_arg; until then those codes cannot reach
-                   here (the verb arms are stubs) and would take the
-                   default arm. *)
-                if
+                (* pcre2_match.c:7527-7577 — switch (rc). *)
+                if Int.equal rc match_skip_arg then (
+                  (* pcre2_match.c:7529-7539 — if MATCH_SKIP_ARG reaches
+                     this level it means that a MARK that matched the
+                     SKIP's arg was not found. In this circumstance, Perl
+                     ignores the SKIP entirely: re-do the match at the
+                     same point, with a flag to force SKIP with an
+                     argument to be ignored. Just treating this case as
+                     NOMATCH does not work because it does not check
+                     other alternatives in patterns such as
+                     A( *SKIP:A)B|AC when the subject is AC. *)
+                  mb.ignore_skip_arg <- mb.skip_arg_count;
+                  (bump_bottom [@tailcall]) start_match start_match req_cu_ptr)
+                else if
+                  Int.equal rc match_skip && mb.verb_skip_ptr > start_match
+                then
+                  (* pcre2_match.c:7541-7549 — SKIP passes back the next
+                     starting point explicitly; if it is no greater than
+                     the match we have just done, fall through and treat
+                     it as NOMATCH. *)
+                  (bump_bottom [@tailcall]) start_match mb.verb_skip_ptr
+                    req_cu_ptr
+                else if
                   Int.equal rc match_nomatch || Int.equal rc match_prune
                   || Int.equal rc match_then
+                  || Int.equal rc match_skip (* fallthrough from 7550 *)
                 then (
                   (* pcre2_match.c:7552-7565 — NOMATCH and PRUNE advance by
                      one character; THEN at this level acts exactly like
-                     PRUNE. (Unset ignore SKIP-with-argument: M5 field.) *)
+                     PRUNE. Unset ignore SKIP-with-argument. *)
+                  mb.ignore_skip_arg <- 0;
                   let new_start_match = ref (start_match + 1) in
                   if utf then
                     (* ACROSSCHAR(new_start_match < end_subject, ...)
@@ -5451,8 +5808,13 @@ let match_internal ?(moptions = 0) ?(poptions = 0) ?start_offset
         last_used_ptr = start (* pcre2_match.c:7500 *);
         mark = Frames.unset;
         nomatch_mark = Frames.unset (* pcre2_match.c:6971 *);
+        verb_ecode_ptr = Frames.unset;
+        verb_skip_ptr = Frames.unset;
+        verb_current_recurse = Frames.recurse_unset;
         moptions (* pcre2_match.c:7504 *);
         poptions (* pcre2_match.c:6969 *);
+        skip_arg_count = 0 (* pcre2_match.c:7508 *);
+        ignore_skip_arg = 0 (* pcre2_match.c:6970 *);
         (* pcre2_match.c:6984-6995 — fixed-LF newline (the build default);
            the driver chunk ports the full convention switch. *)
         nltype = Newline.nltype_fixed;
@@ -5733,6 +6095,28 @@ let () =
     Int.equal Opcodes.op_lengths.(Opcodes.op_dnrref) (1 + (2 * Limits.imm2_size)));
   assert (Int.equal Opcodes.op_lengths.(Opcodes.op_false) 1);
   assert (Int.equal Opcodes.op_lengths.(Opcodes.op_true) 1);
+  (* Backtracking-verb opcodes now guarding live behavior (verbs match
+     chunk), and the OP_lengths entries the verb dispatch and OP_CLOSE
+     step by (pcre2_internal.h:1805-1810). *)
+  assert (Int.equal Opcodes.op_mark 154);
+  assert (Int.equal Opcodes.op_prune 155);
+  assert (Int.equal Opcodes.op_prune_arg 156);
+  assert (Int.equal Opcodes.op_skip 157);
+  assert (Int.equal Opcodes.op_skip_arg 158);
+  assert (Int.equal Opcodes.op_then 159);
+  assert (Int.equal Opcodes.op_then_arg 160);
+  assert (Int.equal Opcodes.op_commit 161);
+  assert (Int.equal Opcodes.op_commit_arg 162);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_mark) 3);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_prune) 1);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_prune_arg) 3);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_skip) 1);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_skip_arg) 3);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_then) 1);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_then_arg) 3);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_commit) 1);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_commit_arg) 3);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_close) (1 + Limits.imm2_size));
   (* RM label constants match the C enum (pcre2_match.c:155-169). *)
   assert (Int.equal rm1 1);
   assert (Int.equal rm37 37);
@@ -5966,8 +6350,13 @@ let () =
       last_used_ptr = start;
       mark = Frames.unset;
       nomatch_mark = Frames.unset;
+      verb_ecode_ptr = Frames.unset;
+      verb_skip_ptr = Frames.unset;
+      verb_current_recurse = Frames.recurse_unset;
       moptions;
       poptions = 0;
+      skip_arg_count = 0;
+      ignore_skip_arg = 0;
       nltype = Newline.nltype_fixed;
       nllen = 1;
       nl0 = Newline.char_lf;
@@ -7153,3 +7542,169 @@ let () =
   expect_ov (compile "(x)(?1)++y") "xxxy" [| 0; 4; 0; 1 |];
   expect_ov (compile "(x)(?1)?y") "xy" [| 0; 2; 0; 1 |];
   expect_ov (compile "(x)(?1)*y") "xy" [| 0; 2; 0; 1 |]
+
+(* Backtracking verbs (this chunk): the verb dispatch arms OP_MARK/
+   OP_COMMIT(_ARG)/OP_PRUNE(_ARG)/OP_SKIP(_ARG)/OP_THEN(_ARG) with the
+   RM12-RM19/RM36 resumes, the MATCH_THEN branch-scope checks (RM2/RM8/
+   RM11), OP_CLOSE/OP_ACCEPT (incl. the in-recursion ACCEPT walk), and
+   the driver's verb rc switch (MATCH_SKIP new-start, MATCH_SKIP_ARG
+   ignore/re-run, PRUNE/THEN-as-NOMATCH, COMMIT bump suppression). EVERY
+   expected value below is pinned against the C oracle (pcre2test on the
+   real 10.44 library, via test/pcre2test/pcre2test_ml.exe
+   --driver=oracle). *)
+let () =
+  let compile pat =
+    match Compile.pcre2_compile pat ~options:0 with
+    | Error _ -> assert false
+    | Ok re -> re
+  in
+  let run (re : Compile.re) subj =
+    let oveccount = re.Compile.top_bracket + 1 in
+    let m =
+      {
+        ovector = Array.make (2 * oveccount) Frames.unset;
+        oveccount;
+        rc = 0;
+        startchar = 0;
+        leftchar = 0;
+        rightchar = 0;
+        mark = Frames.unset;
+      }
+    in
+    let rc = pcre2_match re ~subject:subj ~start_offset:0 ~options:0 m in
+    (rc, m)
+  in
+  let expect_ov re subj expected =
+    match run re subj with
+    | rc, m ->
+        assert (rc > 0);
+        assert (Int.equal (Array.length m.ovector) (Array.length expected));
+        Array.iteri (fun i e -> assert (Int.equal m.ovector.(i) e)) expected
+  in
+  let expect_nomatch re subj =
+    match run re subj with rc, _ -> assert (Int.equal rc Errors.error_nomatch)
+  in
+  (* The match-data mark decoded to its name: m.mark points past the
+     length code unit of the verb-name item in the compiled code
+     (pcre2_match.c:6341, Fecode + 2), so the length is mark[-1] — the
+     protocol pcre2test's PCHARSV(mark, -1, ...) uses; "" = NULL (never
+     set). *)
+  let mark_name (re : Compile.re) (m : match_data) : string =
+    if m.mark < 0 then ""
+    else
+      Bytes.sub_string re.Compile.code m.mark
+        (Char.code (Bytes.get re.Compile.code (m.mark - 1)))
+  in
+  (* The frontier units (testinput1:833-835 region): verbs backtracked
+     into via ( *FAIL) — oracle: no match for all three. *)
+  expect_nomatch (compile "a+b?(*PRUNE)c+(*FAIL)") "aaabccc";
+  expect_nomatch (compile "a+b?(*COMMIT)c+(*FAIL)") "aaabccc";
+  expect_nomatch (compile "a+b?(*SKIP)c+(*FAIL)") "aaabcccaaabccc";
+  (* COMMIT suppresses the bump-along (the driver's MATCH_COMMIT arm,
+     7567-7571): /a+( *COMMIT)b/ fails outright on "aacaab" where /a+b/
+     bumps along and matches at 3 — oracle: no match / 0: aab. COMMIT is
+     never reached on starts that fail before it — oracle: 0: aab. *)
+  expect_nomatch (compile "a+(*COMMIT)b") "aacaab";
+  expect_ov (compile "a+b") "aacaab" [| 3; 6 |];
+  expect_ov (compile "a+(*COMMIT)b") "xxaab" [| 2; 5 |];
+  (* COMMIT inside a group: branch 2 is still tried when branch 1 fails
+     BEFORE the COMMIT — oracle: 0: Cx, 1: C — but a backtrack through
+     COMMIT kills everything — oracle: no match. *)
+  (let re = compile "(A(*COMMIT)B|C)x" in
+   expect_ov re "Cx" [| 0; 2; 0; 1 |];
+   expect_nomatch re "ABC");
+  (* MARK: both branch paths set the mark (OP_MARK + RM12), and a failed
+     match passes back mb->nomatch_mark (driver 7741) — oracle: 0: a with
+     MK: A / 0: b with MK: B / No match, mark = B. *)
+  (let re = compile "(*MARK:A)a|(*MARK:B)b" in
+   (match run re "a" with
+   | rc, m ->
+       assert (Int.equal rc 1);
+       assert (String.equal (mark_name re m) "A"));
+   (match run re "b" with
+   | rc, m ->
+       assert (Int.equal rc 1);
+       assert (String.equal (mark_name re m) "B"));
+   match run re "c" with
+   | rc, m ->
+       assert (Int.equal rc Errors.error_nomatch);
+       assert (String.equal (mark_name re m) "B"));
+  (* COMMIT_ARG sets the mark on the success path — oracle: 0: a with
+     MK: X; on "b" the first-code-unit optimization means no attempt ever
+     runs, so no mark — oracle: No match (no mark). *)
+  (let re = compile "(*COMMIT:X)a" in
+   (match run re "a" with
+   | rc, m ->
+       assert (Int.equal rc 1);
+       assert (String.equal (mark_name re m) "X"));
+   match run re "b" with
+   | rc, m ->
+       assert (Int.equal rc Errors.error_nomatch);
+       assert (String.equal (mark_name re m) ""));
+  (* The classic PRUNE/THEN distinction: PRUNE abandons the whole start
+     position (no second branch, no bump-along success), THEN only the
+     current alternative — oracle: no match / 0: ac. *)
+  expect_nomatch (compile "a(*PRUNE)b|ac") "ac";
+  expect_ov (compile "a(*THEN)b|ac") "ac" [| 0; 2 |];
+  (* PRUNE_ARG sets the nomatch mark — oracle: No match, mark = A on
+     "ACB"; success mark on "ACAB" — oracle: 0: AB with MK: A. On "AC"
+     the req-cu ('B') optimization means no attempt ever runs, so no
+     mark at all — oracle: No match (no mark). *)
+  (let re = compile "A(*PRUNE:A)B" in
+   (match run re "ACB" with
+   | rc, m ->
+       assert (Int.equal rc Errors.error_nomatch);
+       assert (String.equal (mark_name re m) "A"));
+   (match run re "ACAB" with
+   | rc, m ->
+       assert (Int.equal rc 1);
+       assert (String.equal (mark_name re m) "A"));
+   match run re "AC" with
+   | rc, m ->
+       assert (Int.equal rc Errors.error_nomatch);
+       assert (String.equal (mark_name re m) ""));
+  (* SKIP passes back the new start point (driver 7544-7549): the
+     bump-along jumps to the SKIP position, so the a+c branch is never
+     tried at a start where it could succeed — oracle: no match on both
+     subjects. *)
+  (let re = compile "aaaaa(*SKIP)b|a+c" in
+   expect_nomatch re "aaaaac";
+   expect_nomatch re "aaaaacaaaab");
+  (* SKIP:name matched by a MARK (the RM12 interception turns
+     MATCH_SKIP_ARG into MATCH_SKIP at the mark's subject position, which
+     is not past this start, so it acts like NOMATCH — but the SKIP_ARG
+     return means the second branch is never tried) — oracle: No match,
+     mark = x. *)
+  (let re = compile "(*MARK:x)a(*SKIP:x)b|a+c" in
+   match run re "aaaac" with
+   | rc, m ->
+       assert (Int.equal rc Errors.error_nomatch);
+       assert (String.equal (mark_name re m) "x"));
+  (* SKIP:name with NO matching mark: MATCH_SKIP_ARG reaches the top and
+     the driver re-runs the same start with mb->ignore_skip_arg set
+     (7529-7539), so the SKIP is a no-op and the second branch matches —
+     oracle: 0: aaaac. *)
+  expect_ov (compile "a(*SKIP:x)b|a+c") "aaaac" [| 0; 5 |];
+  (* THEN is bounded by its branch (the RM2 verb_ecode_ptr check): in a
+     multi-branch group a THEN in the last branch just fails the group —
+     oracle: no match on both the anchored and unanchored forms. *)
+  expect_nomatch (compile "^(A(*THEN)B|C(*THEN)D)") "CB";
+  expect_nomatch (compile "(?:A(*THEN)B|C(*THEN)D)") "CB";
+  (* SKIP may not escape a recursion (the RM11 verb-range check turns it
+     into NOMATCH for the entire recursion) — oracle: no match. *)
+  expect_nomatch (compile "(?(DEFINE)(?<t>a|b(*SKIP)c))x(?&t)") "xb";
+  (* ACCEPT in a recursion ends the recursion, not the whole match (the
+     OP_ACCEPT walk over the GF_RECURSE frames), and its captures are
+     discarded on exit like any recursion — oracle: 0: ax, group 1 unset
+     (both shapes). *)
+  expect_ov
+    (compile "(?(DEFINE)(?<f>a(*ACCEPT)z))(?&f)x")
+    "ax" [| 0; 2; -1; -1 |];
+  expect_ov (compile "(?1)x(?:(a(*ACCEPT)zz)){0}") "ax" [| 0; 2; -1; -1 |];
+  (* OP_CLOSE before a top-level ACCEPT writes the still-open captures
+     from the chained group frames (P->eptr .. Feptr) — oracle: 0: AB,
+     1: AB, 2: B, 3: <unset>. *)
+  expect_ov
+    (compile "(A(A|B(*ACCEPT)|C)D)(E)")
+    "AB"
+    [| 0; 2; 0; 2; 1; 2; -1; -1 |]

@@ -18,7 +18,11 @@ type exec_result =
           unset in the match data — pad with (-1, -1) to reconstruct it.
           [start_char] is pcre2_get_startchar (the attempt start; \K can
           move [ovector.(0)] past it). *)
-  | No_match
+  | No_match of { mark : string option }
+      (** [mark] is pcre2_get_mark after a failed match: the C driver
+          stores mb->nomatch_mark in the match data on any non-match
+          return (pcre2_match.c:7741) — pcre2test's "No match, mark = X"
+          line reads it. *)
   | Partial of { start : int; mark : string option }
   | Error of int  (** negative PCRE2 error code *)
 

@@ -9,7 +9,7 @@ type t = Compile.re
 
 type exec_result =
   | Match of { ovector : int array; mark : string option; start_char : int }
-  | No_match
+  | No_match of { mark : string option }
   | Partial of { start : int; mark : string option }
   | Error of int
 
@@ -91,18 +91,18 @@ let capture_groups (re : t) : (string * int) array =
 
 (* mb->mark / mb->nomatch_mark reach the match data as pointers to the
    mark name stored inline in the compiled code: a verb name is emitted
-   with a terminating zero (pcre2_compile.c:6571-6572), and the OP_MARK
-   arm points Fmark at it (pcre2_match.c:6341, Fecode + 2). -1 = NULL ->
-   None. Dormant until the M5 verbs chunk makes the interpreter set
-   mb->mark. *)
+   as a length code unit, the name, and a terminating zero
+   (pcre2_compile.c:6540-6573), and the OP_MARK arm points Fmark past the
+   length byte (pcre2_match.c:6341, Fecode + 2). The name length is the
+   code unit BEFORE the name (mark[-1]) — NOT a NUL scan: verb names can
+   contain binary zeros (pcre2test.c's PCHARSV(mark, -1, ...) reads the
+   preceding length unit, as does oracle/pcre2test_stubs.c:117). -1 =
+   NULL -> None. *)
 let mark_of_offset (re : t) (off : int) : string option =
   if off < 0 then None
   else
-    let len = ref 0 in
-    while not (Char.equal (Bytes.get re.Compile.code (off + !len)) '\000') do
-      incr len
-    done;
-    Some (Bytes.sub_string re.Compile.code off !len)
+    let len = Char.code (Bytes.get re.Compile.code (off - 1)) in
+    Some (Bytes.sub_string re.Compile.code off len)
 
 (* pcre2_match.c:6530-7777 via Interpreter.pcre2_match, with the match
    data created from the pattern (pcre2_match_data_create_from_pattern:
@@ -119,9 +119,11 @@ let mark_of_offset (re : t) (off : int) : string option =
      full match data by padding with (-1, -1). The clip-to-0 case
      (end_offset_top >= 2*oveccount) cannot occur here because
      end_offset_top <= 2*top_bracket < 2*oveccount.
-   - -1 (NOMATCH) -> [No_match]; -2 (PARTIAL) -> [Partial] with
-     startchar = the partial start (= ovector[0], pcre2_match.c:7756-7758);
-     any other negative code -> [Error]. *)
+   - -1 (NOMATCH) -> [No_match] carrying the nomatch mark (the driver
+     stored mb->nomatch_mark in match_data->mark, pcre2_match.c:7741);
+     -2 (PARTIAL) -> [Partial] with startchar = the partial start
+     (= ovector[0], pcre2_match.c:7756-7758); any other negative code ->
+     [Error]. *)
 let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
     exec_result =
   let oveccount = re.Compile.top_bracket + 1 in
@@ -147,7 +149,8 @@ let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
         mark = mark_of_offset re md.Interpreter.mark;
         start_char = md.Interpreter.startchar;
       }
-  else if Int.equal rc Errors.error_nomatch then No_match
+  else if Int.equal rc Errors.error_nomatch then
+    No_match { mark = mark_of_offset re md.Interpreter.mark }
   else if Int.equal rc Errors.error_partial then
     Partial
       {
@@ -160,7 +163,7 @@ let exec (re : t) (subject : string) (offset : int) (options : int32) :
     ((int * int) option, int) result =
   match exec_full re subject offset options with
   | Match { ovector; _ } -> Ok (Some (ovector.(0), ovector.(1)))
-  | No_match | Partial _ -> Ok None (* pcre2_stubs.c: PARTIAL -> Ok None *)
+  | No_match _ | Partial _ -> Ok None (* pcre2_stubs.c: PARTIAL -> Ok None *)
   | Error e -> Result.Error e
 
 let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
@@ -177,7 +180,7 @@ let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
             else (-1, -1))
       in
       Ok (Some (pairs, capture_groups re))
-  | No_match | Partial _ -> Ok None
+  | No_match _ | Partial _ -> Ok None
   | Error e -> Result.Error e
 
 (* Port target is pinned to PCRE2 10.44 (vendor/pcre2/VERSION). *)
