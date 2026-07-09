@@ -168,19 +168,57 @@ CAMLprim value oracle_test_exec(value vcode, value subject, value voffset, value
                 Store_field(ovec_arr, i, Val_long(v));
         }
 
-        PCRE2_SPTR mark = pcre2_get_mark(md);
-        if (mark == NULL) {
-                mark_opt = Val_long(0); /* None */
+        /* match_data->mark is only DEFINED when pcre2_match reached the
+         * post-match-loop epilogue that assigns it -- match_data->mark = mb->mark
+         * for a full match and = mb->nomatch_mark otherwise (pcre2_match.c:7706,
+         * 7741), reached for rc >= 0, PCRE2_ERROR_NOMATCH (-1),
+         * PCRE2_ERROR_PARTIAL (-2), and the resource-limit / internal errors
+         * that flow through `default: goto ENDLOOP` (pcre2_match.c:7575-7576).
+         * The EARLY-return errors -- input/plausibility checks (BADOPTION/NULL/
+         * BADOFFSET/BADMAGIC/BADMODE/BADOFFSETLIMIT, pcre2_match.c:6597-6619,
+         * 6666,6673), BADUTFOFFSET (6839), and the UTF-validity errors
+         * (6841/6902; this stub never JIT-compiles, so the SUPPORT_JIT copies at
+         * 6716/6760 are unreachable here) -- return BEFORE that, leaving
+         * match_data->mark exactly as
+         * pcre2_match_data_create left it: UNINITIALIZED (create sets oveccount/
+         * flags/heapframes only, pcre2_match_data.c:57-72). Usually that garbage
+         * reads as NULL (harmless), occasionally a wild pointer -> reading
+         * mark[-1] is a non-canonical dereference = general protection fault
+         * (heap-state-dependent, so a fresh seed found it: ip=oracle_test_exec
+         * +0x229, pcre2test_stubs.c:178, seed 20260708 @200k; an earlier GPF of
+         * the same shape predates today's work). pcre2test itself reads MARK
+         * only in its match / partial / nomatch output paths (pcre2test.c:
+         * 8128-8136, 8143, 8246) -- a subset of the mark-defined rcs -- so read
+         * mark for exactly rc >= 0 / -1 / -2 and return None otherwise, matching
+         * pcre2test and the engine driver (engine_driver.ml). */
+        if (rc >= 0 || rc == PCRE2_ERROR_NOMATCH || rc == PCRE2_ERROR_PARTIAL) {
+                PCRE2_SPTR mark = pcre2_get_mark(md);
+                if (mark == NULL) {
+                        mark_opt = Val_long(0); /* None */
+                } else {
+                        /* MARK names may contain NULs; the length is stored in
+                         * the code unit preceding the name (pcre2test.c:8131
+                         * prints via PCHARSV(mark, -1, -1, ...) -> pchars8
+                         * length = *p++). */
+                        size_t mark_len = mark[-1];
+                        mark_str = caml_alloc_initialized_string(mark_len, (const char *)mark);
+                        mark_opt = caml_alloc_small(1, 0); /* Some */
+                        Field(mark_opt, 0) = mark_str;
+                }
         } else {
-                /* MARK names may contain NULs; the length is stored in the
-                 * code unit preceding the name (pcre2test.c:8131 prints via
-                 * PCHARSV(mark, -1, -1, ...) -> pchars8 length = *p++). */
-                size_t mark_len = mark[-1];
-                mark_str = caml_alloc_initialized_string(mark_len, (const char *)mark);
-                mark_opt = caml_alloc_small(1, 0); /* Some */
-                Field(mark_opt, 0) = mark_str;
+                mark_opt = Val_long(0); /* None -- mark undefined for early-return rcs */
         }
 
+        /* startchar (an integer, not a pointer -> reading it can never fault)
+         * is zeroed at pcre2_match.c:6688 before the UTF check and match loop,
+         * so it is DEFINED for every rc except the early returns that precede
+         * the zeroing (6597-6619, 6666, 6673); those rcs are never consumed for
+         * startchar by the comparisons (fuzz_diff cmp_exec / harness read
+         * startchar only for a match, PARTIAL, and the UTF-validity errors --
+         * all defined: 7719/7758, 6892/6901 on the non-JIT path this stub
+         * takes (JIT copies 6756/6759 unreachable here); the direct
+         * BADUTFOFFSET/UTF8_ERR20 returns at 6839/6841 leave it at the 6688
+         * zero), so it is left read unconditionally. */
         long startchar = (long)pcre2_get_startchar(md);
         pcre2_match_data_free(md);
 
