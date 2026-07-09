@@ -72,7 +72,7 @@ Match phase (`interpreter.ml`, `frames.ml`, `newline.ml`):
   (pcre2_match.c:100-830)
 - [x] interpreter dispatch skeleton (this commit) + OP_END/OP_ACCEPT/match-oveector copy + backtrack
   return dispatch (pcre2_match.c:837-990, 6479-6527)
-- [ ] chars + char repeats: OP_CHAR/CHARI/NOT/NOTI + their STAR/PLUS/QUERY/UPTO arms
+- [x] chars + char repeats: (this commit) OP_CHAR/CHARI/NOT/NOTI + their STAR/PLUS/QUERY/UPTO arms
   (pcre2_match.c:995-1930)
 - [ ] classes + typed repeats: OP_CLASS/OP_NCLASS, OP_ANY/ALLANY, \d\w\s type ops and
   repeat loops (ASCII arms; pcre2_match.c:1934-5005, UTF/UCP/extuni arms stubbed)
