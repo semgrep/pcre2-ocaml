@@ -1,0 +1,44 @@
+# Nightly perf gate for the pure-OCaml engine (docs/ocaml-engine/10-performance.md,
+# phase M10): bench.exe runs the corpus through the engine, the C oracle (same
+# OCaml API shape, FFI included) and a raw-C reference; compare.exe enforces
+# engine/oracle <= 2.0 (geomean AND per-benchmark) and fails the job otherwise.
+#
+# Deliberately NOT on pull_request/push — benchmarks on shared runners are
+# noisy and slow; this runs nightly and on demand. NOTE: the schedule only
+# fires on the default branch (develop); until the port branch merges, use
+# workflow_dispatch and pick the branch.
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full (5-rep medians) or quick (1-rep smoke)"
+        required: false
+        default: "full"
+  schedule:
+    - cron: "17 3 * * *"
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v14
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - name: Build bench suite
+        run: nix develop -c dune build bench/bench.exe bench/compare.exe
+      - name: Run benchmarks (interleaved reps, medians, count cross-check)
+        run: |
+          nix develop -c dune exec bench/bench.exe -- \
+            ${{ inputs.mode == 'quick' && '--quick' || '' }} \
+            --out bench/results.json
+      - name: Perf gate (engine/oracle <= 2.0 geomean AND per-benchmark)
+        run: nix develop -c dune exec bench/compare.exe -- bench/results.json
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench/results.json
+          if-no-files-found: ignore

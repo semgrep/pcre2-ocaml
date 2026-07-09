@@ -1,0 +1,32 @@
+; Benchmark suite + perf gate for the pure-OCaml engine vs the C oracle
+; (docs/ocaml-engine/10-performance.md, phase M10). Dev-only (package
+; pcre2-dev) — never part of the published pcre2 package.
+;
+; bench.exe   — runs the corpus through BOTH drivers (interleaved reps,
+;               medians, engine/oracle count cross-check) plus a raw-C
+;               reference number, and writes bench/results.json.
+; compare.exe — reads results.json and enforces the M10 gate: engine/oracle
+;               ratio <= 2.0 GEOMEAN and per-benchmark (exit 1 otherwise).
+
+(executables
+ (names bench compare)
+ (public_names pcre2-bench pcre2-bench-compare)
+ (package pcre2-dev)
+ (modules bench compare bench_json)
+ (libraries pcre2.engine pcre2-dev.test-driver unix)
+ (foreign_stubs
+  (language c)
+  (names raw_c_stubs)
+  (flags
+   (:standard)
+   (:include c_flags.sexp)
+   -O2
+   -g)))
+
+; Same pkg-config discovery as oracle/ (libpcre2-8 include paths for
+; raw_c_stubs.c; the link flags themselves come in via pcre2-dev.test-driver).
+
+(rule
+ (targets c_flags.sexp c_library_flags.sexp)
+ (action
+  (run ./config/discover.exe)))

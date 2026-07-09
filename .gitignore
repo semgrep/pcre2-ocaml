@@ -5,3 +5,4 @@ _build
 compile_commands.json
 .cache
 .direnv
+/bench/results*.json

@@ -32,10 +32,11 @@ any exception requires explicit user sign-off); `dune build -p pcre2` dependency
 
 ### Chunks
 
-- [ ] bench corpus: mariomka regex-benchmark trio (email/URI/IPv4 over large text), keyword
+- [x] bench corpus: mariomka regex-benchmark trio (email/URI/IPv4 over large text), keyword
   alternations, bounded repeats, backref-heavy, `\p{L}+` UTF scan, pathological `(a+)+b`
   MATCHLIMIT case, semgrep-style many-small-subjects; compare.exe enforcing the ratio,
-  interleaved 5-rep medians, raw-C honesty number recorded
+  interleaved 5-rep medians, raw-C honesty number recorded (bench/bench.ml, bench/compare.ml,
+  bench/raw_c_stubs.c; nightly workflow .github/workflows/bench.yml)
 - [ ] zero-alloc frame loop: verify with allocation counters (e.g. Gc.minor_words deltas
   per match in a bench mode); eliminate any hot-loop allocation found
 - [ ] unsafe access: `Bytes.unsafe_get`/`Array.unsafe_get` under bounds-proof comments at
