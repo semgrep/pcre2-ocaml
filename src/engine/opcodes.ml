@@ -244,6 +244,35 @@ let last_autotab_right_op = op_dollm
    recursion" condition. *)
 let rref_any = 0xffff
 
+(* pcre2_internal.h:1289-1307 — codes for the different types of Unicode
+   property (stored with OP_PROP/OP_NOTPROP operands and in META_ESCAPE
+   \p/\P data words). If these definitions are changed, the
+   autopossessifying table in pcre2_auto_possess.c must be updated to
+   match. *)
+let pt_any = 0 (* Any property - matches all chars *)
+let pt_lamp = 1 (* L& - the union of Lu, Ll, Lt *)
+let pt_gc = 2 (* Specified general characteristic (e.g. L) *)
+let pt_pc = 3 (* Specified particular characteristic (e.g. Lu) *)
+let pt_sc = 4 (* Script only (e.g. Han) *)
+let pt_scx = 5 (* Script extensions (includes SC) *)
+let pt_alnum = 6 (* Alphanumeric - the union of L and N *)
+let pt_space = 7 (* Perl space - general category Z plus 9,10,12,13 *)
+let pt_pxspace = 8 (* POSIX space - Z plus 9,10,11,12,13 *)
+let pt_word = 9 (* Word - L, N, Mn, or Pc *)
+let pt_clist = 10 (* Pseudo-property: match character list *)
+let pt_ucnc = 11 (* Universal Character nameable character *)
+let pt_bidicl = 12 (* Specified bidi class *)
+let pt_bool = 13 (* Boolean property *)
+let pt_tabsize = 14 (* Size of square table for autopossessify tests *)
+
+(* pcre2_internal.h:1309-1320 — special properties used only in XCLASS
+   items when POSIX classes are specified and PCRE2_UCP is set. They are not
+   available via \p or \P. *)
+let pt_pxgraph = 14 (* [:graph:] - characters that mark the paper *)
+let pt_pxprint = 15 (* [:print:] - [:graph:] plus non-control spaces *)
+let pt_pxpunct = 16 (* [:punct:] - punctuation characters *)
+let pt_pxxdigit = 17 (* [:xdigit:] - hex digits *)
+
 (* pcre2_internal.h:1674-1714 — OP_NAME_LIST: textual names for all the
    opcodes, used only for debugging (pcre2_printint.c fills out the full
    names in many cases). Indexed by opcode. *)

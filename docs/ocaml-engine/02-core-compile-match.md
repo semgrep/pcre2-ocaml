@@ -15,12 +15,16 @@ Line ranges are 10.44 vendor estimates; pin exact boundaries when dispatching (�
 /plan-update).
 
 Parse phase (`parse.ml` ← pcre2_compile.c front half):
-- [ ] parse helpers: read_number/read_repeat_counts (pcre2_compile.c:1325-1520), read_name
+- [x] parse helpers: (manage_callouts completed by parse_regex A) read_number/read_repeat_counts (pcre2_compile.c:1325-1520), read_name
   (2464-2560), check_posix_syntax/name (2377-2435), manage_callouts no-op shim (2595-2625)
 - [x] check_escape (pcre2_compile.c:1551-2160) — ASCII escapes, \x/\o/\c, backslash-digit
   disambiguation (backref emission itself is M2)
-- [ ] parse_regex A — main loop skeleton, literals, \Q..\E, comments, inline option
+- [x] parse_regex A — main loop skeleton, literals, \Q..\E, comments, inline option
   settings (?i)(?-i)(?^), newline conventions (*CR) etc. (pcre2_compile.c:2773-3800)
+  (note: the (*CR)-style start-of-pattern items are owned by pcre2_compile()'s pso
+  loop (pcre2_compile.c:10305-10381), i.e. the "pcre2_compile top-level" chunk below;
+  parse_regex's share — IS_NEWLINE in # comment skipping — is ported with an
+  NLTYPE_FIXED-only deferral to newline.ml)
 - [ ] parse_regex B — character classes incl. POSIX names, ranges, negation
   (pcre2_compile.c:3800-4400 + handle_escdsw 2642-2770)
 - [ ] parse_regex C — quantifiers {n,m} +?*, groups (capturing/non/named), alternation,

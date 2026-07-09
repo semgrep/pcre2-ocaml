@@ -30,6 +30,12 @@ let meta_diff x y = (x - y) lsr 16
    difference is not observable. *)
 let sizeoffset = 1
 
+(* pcre2_compile.c:91-97 — PUTOFFSET(s,p) with the SIZEOFFSET = 1 layout
+   (see the deviation note above): *p++ = s. *)
+let putoffset (buf : int array) (pp : int ref) (offset : int) : unit =
+  buf.(!pp) <- offset;
+  incr pp
+
 (* ---------- META codes for parsed patterns ---------- *)
 
 (* pcre2_compile.c:202-300 — code values for parsed patterns, stored in a
@@ -662,6 +668,13 @@ let escapes =
    compile_block in the compile-phase chunks. *)
 let hasbkporx = 0x0010_0000
 
+(* pcre2_internal.h:535 — PCRE2_JCHANGED: the (?J) option was used in the
+   pattern. *)
+let jchanged = 0x0000_0400
+
+(* pcre2_internal.h:546 — PCRE2_DUPCAPUSED: the pattern contains (?|. *)
+let dupcapused = 0x0020_0000
+
 (* ---------- POSIX class names ---------- *)
 
 (* pcre2_compile.c:693-707 — tables of names of POSIX character classes and
@@ -691,6 +704,19 @@ let posix_name_lengths = [| 5; 5; 5; 5; 5; 5; 5; 5; 5; 5; 5; 5; 4; 6; 0 |]
 
 (* ---------- Parse context ---------- *)
 
+(* pcre2_internal.h:490-492 — newline-convention types. NLTYPE_ANY/ANYCRLF
+   dispatch to PRIV(is_newline) (pcre2_newline.c), which is the newline.ml
+   chunk; the constants live here until that module lands. *)
+let nltype_fixed = 0 (* Newline is a fixed length string *)
+let nltype_any = 1 (* Newline is any Unicode line ending *)
+let nltype_anycrlf = 2 (* Newline is CR, LF, or CRLF *)
+
+(* pcre2.h.generic:482 — PCRE2_UNSET is ~(PCRE2_SIZE)0.
+   DEVIATION: pattern offsets are OCaml ints here; max_int plays the same
+   "larger than any real offset" role for both the == and < comparisons the
+   C performs on PCRE2_UNSET values. *)
+let pcre2_unset = max_int
+
 (* Threads the state the C passes to the parse helpers: the pattern and its
    end (parse_regex's ptr/ptrend over cb->start_pattern..cb->end_pattern),
    the canonical read position (a local `ptr` in parse_regex,
@@ -698,18 +724,36 @@ let posix_name_lengths = [| 5; 5; 5; 5; 5; 5; 5; 5; 5; 5; 5; 5; 4; 6; 0 |]
    (C: *errorcodeptr and cb->erroroffset). The helpers below take an explicit
    `int ref` read pointer exactly as the C passes &ptr / &p / &tempptr, so
    probing calls on temporary pointers work; parse_regex keeps the main
-   position in [ptr]. *)
+   position in a local [ptr]. *)
 type parse_context = {
   pattern : string; (* cb->start_pattern; indices are pattern offsets *)
   ptrend : int; (* one past the last code unit of the pattern *)
-  mutable ptr : int; (* parse_regex's main read position *)
+  mutable ptr : int; (* parse_regex's start position (after skipatstart) *)
   mutable errorcode : int; (* *errorcodeptr *)
   mutable erroroffset : int; (* cb->erroroffset *)
   (* Until the full compile_block record lands (compile-phase chunks),
-     parse_context also carries the two compile_block fields check_escape
-     touches (pcre2_intmodedep.h:735,743): *)
+     parse_context also carries the compile_block / compile-context fields
+     the parse phase touches (pcre2_intmodedep.h:735,743 and neighbours): *)
   mutable bracount : int; (* cb->bracount: capturing groups seen so far *)
   mutable external_flags : int; (* cb->external_flags: hasbkporx etc. *)
+  mutable extra_options : int; (* cb->cx->extra_options *)
+  mutable parens_nest_limit : int; (* cb->cx->parens_nest_limit *)
+  (* cb->nltype/nllen/nl (pcre2_intmodedep.h:751-755). Defaults are the
+     build-default newline convention, NEWLINE_DEFAULT = LF
+     (config.h.generic:230-235); the compile-phase chunk wires the compile
+     context / ( *CR)-style settings through these. *)
+  mutable nltype : int;
+  mutable nllen : int;
+  mutable nl0 : int; (* cb->nl[0] *)
+  mutable nl1 : int; (* cb->nl[1] (only read when nllen = 2) *)
+  (* cb->small_ref_offset — first-occurrence pattern offsets of \1..\9
+     (pcre2_compile.c:10280-10290, initialized to PCRE2_UNSET). *)
+  small_ref_offset : int array;
+  (* cb->parsed_pattern / cb->parsed_pattern_end: the parsed-pattern vector
+     and its end. C pointers become the int array plus an index limit;
+     allocate_parsed_pattern (below) sizes them as pcre2_compile() does. *)
+  mutable parsed_pattern : int array;
+  mutable parsed_pattern_end : int; (* index one past the last element *)
 }
 
 let make_context (pattern : string) : parse_context =
@@ -721,7 +765,29 @@ let make_context (pattern : string) : parse_context =
     erroroffset = 0;
     bracount = 0;
     external_flags = 0;
+    extra_options = 0;
+    parens_nest_limit = Limits.parens_nest_limit;
+    nltype = nltype_fixed;
+    nllen = 1;
+    nl0 = 0x0a (* CHAR_LF *);
+    nl1 = 0;
+    small_ref_offset = Array.make 10 pcre2_unset (* pcre2_compile.c:10290 *);
+    parsed_pattern = [||];
+    parsed_pattern_end = 0;
   }
+
+(* pcre2_internal.h:494-506 — IS_NEWLINE(p), with NLBLOCK = cb and
+   PSEND = end_pattern as pcre2_compile.c sets them up. The non-FIXED arm
+   calls PRIV(is_newline) (pcre2_newline.c), which is the newline.ml chunk;
+   nothing can set a non-fixed nltype until the compile-context plumbing
+   lands, so that arm fails loudly instead of guessing. *)
+let is_newline_at (cx : parse_context) (p : int) : bool =
+  if not (Int.equal cx.nltype nltype_fixed) then
+    failwith "Parse.is_newline_at: NLTYPE_ANY/ANYCRLF pending newline.ml"
+  else
+    p <= cx.ptrend - cx.nllen
+    && Int.equal (Char.code cx.pattern.[p]) cx.nl0
+    && (Int.equal cx.nllen 1 || Int.equal (Char.code cx.pattern.[p + 1]) cx.nl1)
 
 (* Local control-flow exception modeling the C's forward "goto EXIT" /
    "goto FAILED" jumps to a shared function epilogue (port-conventions §2).
@@ -1789,6 +1855,1264 @@ let read_name (cx : parse_context) (ptrptr : int ref) ~(utf : bool)
     ptrptr := !ptr;
     false
 
+(* ---------- Parsed-pattern buffer sizing ---------- *)
+
+(* pcre2_compile.c:10478-10519 — pcre2_compile() sizes the parsed-pattern
+   vector before calling parse_regex(). When PCRE2_AUTO_CALLOUT is not set,
+   the number of unsigned 32-bit ints in the parsed pattern is bounded by
+   the length of the pattern (from cx.ptr, i.e. after the skipped ( *...)
+   start-of-pattern settings) plus one for the terminator, plus four if
+   PCRE2_EXTRA_MATCH_WORD or _LINE is set. With PCRE2_AUTO_CALLOUT a
+   numerical callout (4 elements) is assumed for each character plus one at
+   the end. big32count (pcre2_compile.c:10485-10491) is 32-bit-mode only and
+   is always 0 in this 8-bit port.
+   DEVIATION: the C keeps a 1024-element stack vector for small patterns and
+   allocates on the heap otherwise (pcre2_compile.c:10508-10518); this port
+   always allocates the exact size, which is not observable. *)
+let allocate_parsed_pattern (cx : parse_context) ~(options : int) : unit =
+  let parsed_size_needed = cx.ptrend - cx.ptr in
+  (* pcre2_compile.c:10501-10503 — ccontext->extra_options test. *)
+  let parsed_size_needed =
+    if
+      not
+        (Int.equal
+           (cx.extra_options
+           land (Options.extra_match_word lor Options.extra_match_line))
+           0)
+    then parsed_size_needed + 4
+    else parsed_size_needed
+  in
+  (* pcre2_compile.c:10505-10506 *)
+  let parsed_size_needed =
+    if not (Int.equal (options land Options.auto_callout) 0) then
+      (parsed_size_needed + 1) * 5
+    else parsed_size_needed
+  in
+  (* pcre2_compile.c:10510-10511,10519 — the vector holds
+     parsed_size_needed + 1 elements; parsed_pattern_end is one past it. *)
+  cx.parsed_pattern <- Array.make (parsed_size_needed + 1) 0;
+  cx.parsed_pattern_end <- parsed_size_needed + 1
+
+(* ---------- Manage callouts at start of cycle ---------- *)
+
+(* pcre2_compile.c:2574-2620 — manage_callouts. At the start of a new item
+   in parse_regex() we are able to record the details of the previous item
+   in a prior callout, and also to set up an automatic callout if enabled.
+   Avoid having two adjacent automatic callouts, which would otherwise
+   happen for items such as \Q that contribute nothing to the parsed
+   pattern. The C's uint32_t *previous_callout pointer becomes an index into
+   cx.parsed_pattern, with -1 for NULL.
+
+   Arguments:
+     ptr              current pattern pointer
+     pcalloutptr      the previous-callout index variable (a C
+                      uint32_t pointer-to-pointer)
+     auto_callout     true if auto_callouts are enabled
+     parsed_pattern   the parsed pattern position
+
+   Returns: possibly updated parsed_pattern position. *)
+let manage_callouts (cx : parse_context) (ptr : int) (pcalloutptr : int ref)
+    ~(auto_callout : bool) (parsed_pattern : int) : int =
+  let buf = cx.parsed_pattern in
+  let parsed_pattern = ref parsed_pattern in
+  let previous_callout = ref !pcalloutptr in
+
+  (* pcre2_compile.c:2600-2601 — previous_callout[2] = ptr -
+     cb->start_pattern - previous_callout[1] (the previous item's length;
+     indices here are already pattern offsets). *)
+  if !previous_callout >= 0 then
+    buf.(!previous_callout + 2) <- ptr - buf.(!previous_callout + 1);
+
+  (* pcre2_compile.c:2603-2616 *)
+  if not auto_callout then previous_callout := -1
+  else (
+    if
+      !previous_callout < 0
+      || (not (Int.equal !previous_callout (!parsed_pattern - 4)))
+      || not (Int.equal buf.(!previous_callout + 3) 255)
+    then (
+      previous_callout := !parsed_pattern (* Set up new automatic callout *);
+      parsed_pattern := !parsed_pattern + 4;
+      buf.(!previous_callout) <- meta_callout_number;
+      buf.(!previous_callout + 2) <- 0;
+      buf.(!previous_callout + 3) <- 255);
+    buf.(!previous_callout + 1) <- ptr (* ptr - cb->start_pattern *));
+
+  (* pcre2_compile.c:2618-2619 *)
+  pcalloutptr := !previous_callout;
+  !parsed_pattern
+
+(* ---------- Handle \d, \D, \s, \S, \w, \W ---------- *)
+
+(* pcre2_compile.c:2624-2699 — handle_escdsw. Called from parse_regex(),
+   both for freestanding escapes and those within classes, to handle those
+   escapes that may change when Unicode property support is requested.
+
+   Arguments:
+     escape          the ESC_... value
+     parsed_pattern  where to add the code
+     options         options bits
+     xoptions        extra options bits
+
+   Returns:          updated value of the parsed_pattern position *)
+let handle_escdsw (cx : parse_context) (escape : int) (parsed_pattern : int)
+    ~(options : int) ~(xoptions : int) : int =
+  let buf = cx.parsed_pattern in
+  let pp = ref parsed_pattern in
+  let ascii_option = ref 0 in
+  let prop = ref esc_p in
+
+  (* pcre2_compile.c:2648-2670 — switch(escape): the ESC_D/ESC_S/ESC_W arms
+     set prop = ESC_P and fall through to their lowercase partners. *)
+  if Int.equal escape esc_big_d || Int.equal escape esc_d then (
+    if Int.equal escape esc_big_d then prop := esc_big_p
+      (* fallthrough from ESC_D in C *);
+    ascii_option := Options.extra_ascii_bsd)
+  else if Int.equal escape esc_big_s || Int.equal escape esc_s then (
+    if Int.equal escape esc_big_s then prop := esc_big_p
+      (* fallthrough from ESC_S in C *);
+    ascii_option := Options.extra_ascii_bss)
+  else if Int.equal escape esc_big_w || Int.equal escape esc_w then (
+    if Int.equal escape esc_big_w then prop := esc_big_p
+      (* fallthrough from ESC_W in C *);
+    ascii_option := Options.extra_ascii_bsw);
+
+  (* pcre2_compile.c:2672-2696 *)
+  if
+    Int.equal (options land Options.ucp) 0
+    || not (Int.equal (xoptions land !ascii_option) 0)
+  then (
+    buf.(!pp) <- meta_escape + escape;
+    incr pp)
+  else (
+    buf.(!pp) <- meta_escape + !prop;
+    incr pp;
+    if Int.equal escape esc_d || Int.equal escape esc_big_d then (
+      buf.(!pp) <- (Opcodes.pt_pc lsl 16) lor Ucp.ucp_nd;
+      incr pp)
+    else if Int.equal escape esc_s || Int.equal escape esc_big_s then (
+      buf.(!pp) <- Opcodes.pt_space lsl 16;
+      incr pp)
+    else (
+      (* ESC_w / ESC_W *)
+      buf.(!pp) <- Opcodes.pt_word lsl 16;
+      incr pp));
+  !pp
+
+(* ---------- Parse regex and identify named groups ---------- *)
+
+(* pcre2_compile.c:2723-2732 — a structure for dealing with nested groups.
+   An array of these lives in the compile workspace (see parse_regex). The
+   C's uint16_t fields hold values bounded by MAX_GROUP_NUMBER (65535); the
+   nest_depth counter is uint16_t in C (pcre2_compile.c:2790) and would wrap
+   at 65536 — exact as plain int ONLY while parens_nest_limit <= 65535
+   (hardwired 250 today). If the compile-context chunk ever wires a
+   user-settable limit > 65535, nest_depth must take `land 0xffff` to keep
+   C's wrap-then-ERR22 behavior. *)
+type nest_save = {
+  mutable nest_depth : int; (* uint16_t *)
+  mutable reset_group : int; (* uint16_t *)
+  mutable max_group : int; (* uint16_t *)
+  mutable flags : int; (* uint16_t *)
+  mutable options : int; (* uint32_t *)
+  mutable xoptions : int; (* uint32_t *)
+}
+
+(* pcre2_compile.c:2734-2736 *)
+let nsf_reset = 0x0001
+let nsf_condassert = 0x0002
+let nsf_atomicsr = 0x0004
+
+(* pcre2_compile.c:2738-2749 — options that are changeable within the
+   pattern must be tracked during parsing. Some (e.g. PCRE2_EXTENDED) are
+   implemented entirely during parsing, but all must be tracked so that
+   META_OPTIONS items set the correct values for the main compiling
+   phase. *)
+let parse_tracked_options =
+  Options.caseless lor Options.dotall lor Options.dupnames lor Options.extended
+  lor Options.extended_more lor Options.multiline lor Options.no_auto_capture
+  lor Options.ungreedy
+
+let parse_tracked_extra_options =
+  Options.extra_caseless_restrict lor Options.extra_ascii_bsd
+  lor Options.extra_ascii_bss lor Options.extra_ascii_bsw
+  lor Options.extra_ascii_digit lor Options.extra_ascii_posix
+
+(* DEVIATION: distinctive placeholder error code for parse_regex arms that
+   are deferred to later chunks (character classes -> parse_regex B;
+   quantifiers, groups and named-group definitions -> parse_regex C; named
+   references -> M3; lookarounds/atomic groups -> M4; conditionals,
+   recursion, verbs and callouts -> M5; \p and \P -> M7). PCRE2 compile
+   errors occupy 100..201, so 299 can never collide with a real result;
+   deferred constructs fail loudly instead of misparsing. Every use site
+   below carries a comment naming its chunk. *)
+let err_deferred = 299
+
+(* Local control-flow exceptions for parse_regex (port-conventions §2:
+   compile-time code may use exceptions; the interpreter loop may not).
+   Loop_continue models the C's `continue` statements in the main scan
+   loop; Goto_failed models `goto FAILED` (cx.errorcode is set before the
+   raise; the handler at the end of parse_regex records cx.erroroffset).
+   Neither escapes parse_regex. *)
+exception Loop_continue
+exception Goto_failed
+
+(* pcre2_compile.c:2703-5039 — parse_regex. This function is called first
+   of all. It scans the pattern and (1) identifies capturing groups, and
+   (2) writes a parsed version of the pattern with comments omitted and
+   escapes processed into the parsed_pattern vector.
+
+   This chunk ports the main-loop skeleton: literals, \Q..\E, extended-mode
+   white space and # comments, (?# comments, the escape dispatch (numeric
+   backrefs included), inline option settings (?imnrsxJUa..) / (?^) / (?|,
+   bare capturing/non-capturing parentheses, alternation, group close, and
+   the end-of-pattern epilogue. Arms marked "deferred" fail loudly with
+   err_deferred until their chunks land; the named-group table, verb-name
+   locals (verblengthptr/verbstartptr/verbnamestart, add_after_mark) and
+   the inverbname accumulator block (pcre2_compile.c:2941-3039) are
+   deferred with those arms.
+
+   Arguments:
+     cx              compile block; parsing starts at cx.ptr and the parsed
+                     pattern lands in cx.parsed_pattern (which the caller
+                     sizes with allocate_parsed_pattern, as pcre2_compile()
+                     does)
+     options         compiling dynamic options (may change during the scan)
+     has_lookbehind  set true if a lookbehind is found (only by deferred
+                     arms, so untouched in this chunk)
+
+   Returns: zero on success or a non-zero error code, with the error offset
+            placed in cx.erroroffset. *)
+let parse_regex (cx : parse_context) ~(options : int)
+    (has_lookbehind : bool ref) : int =
+  ignore (has_lookbehind : bool ref);
+  let pat = cx.pattern in
+  let buf = cx.parsed_pattern in
+
+  (* pcre2_compile.c:2776-2808 — local state (the class/verb/named-group
+     locals belong to deferred arms). *)
+  let previous_callout = ref (-1) in
+  (* uint32_t *previous_callout = NULL *)
+  let pp = ref 0 in
+  (* parsed_pattern = cb->parsed_pattern, as an index *)
+  let this_parsed_item = ref (-1) in
+  (* NULL *)
+  let prev_parsed_item = ref (-1) in
+  (* NULL *)
+  let meta_quantifier = ref 0 in
+  let xoptions = ref cx.extra_options in
+  (* cb->cx->extra_options *)
+  let nest_depth = ref 0 in
+  let after_manual_callout = ref 0 in
+  let expect_cond_assert = ref 0 in
+  let options = ref options in
+  let inescq = ref false in
+  let inverbname = ref false in
+  let utf = not (Int.equal (!options land Options.utf) 0) in
+  let auto_callout = not (Int.equal (!options land Options.auto_callout) 0) in
+  let okquantifier = ref false in
+  let ptr = ref cx.ptr in
+
+  cx.errorcode <- 0;
+
+  (* pcre2_intmodedep.h:322-325 — GETCHARINCTEST(c, ptr). M6: in UTF mode
+     this must decode a UTF-8 character; until utf.ml lands the byte read
+     below is the 8-bit non-UTF expansion (UTF compilation is rejected
+     before parse in the current engine, so the utf-true decode is
+     unreachable). *)
+  let getcharinctest () =
+    let ch = Char.code pat.[!ptr] in
+    incr ptr;
+    ch
+  in
+
+  (* pcre2_compile.c:2768 — PARSED_LITERAL(c, p), the 8-bit expansion
+     (literal values cannot reach META_END). *)
+  let parsed_literal ch =
+    buf.(!pp) <- ch;
+    incr pp;
+    okquantifier := true
+  in
+
+  (* Shared error epilogues: UNCLOSED_PARENTHESIS (pcre2_compile.c:
+     5019-5020) and FAILED_BACK (pcre2_compile.c:5028-5032). Both always
+     raise (their return type is polymorphic). *)
+  let unclosed_parenthesis () =
+    cx.errorcode <- Errors.err14;
+    raise_notrace Goto_failed
+  in
+  let failed_back () =
+    decr ptr;
+    raise_notrace Goto_failed
+  in
+
+  try
+    (* pcre2_compile.c:2810-2822 — insert leading items for word and line
+       matching (features provided for the benefit of pcre2grep). *)
+    if not (Int.equal (!xoptions land Options.extra_match_line) 0) then (
+      buf.(!pp) <- meta_circumflex;
+      incr pp;
+      buf.(!pp) <- meta_nocapture;
+      incr pp)
+    else if not (Int.equal (!xoptions land Options.extra_match_word) 0) then (
+      buf.(!pp) <- meta_escape + esc_b;
+      incr pp;
+      buf.(!pp) <- meta_nocapture;
+      incr pp);
+
+    (* pcre2_compile.c:2824-2844 — if the pattern is actually a literal
+       string, process it separately to avoid cluttering up the main loop.
+       The C's `goto PARSED_END` is the fall-through to the shared epilogue
+       after this if/else. *)
+    (if not (Int.equal (!options land Options.literal) 0) then
+       while !ptr < cx.ptrend do
+         if !pp >= cx.parsed_pattern_end then (
+           cx.errorcode <- Errors.err63;
+           (* Internal error (parsed pattern overflow) *)
+           raise_notrace Goto_failed);
+         let thisptr = !ptr in
+         let c = getcharinctest () in
+         if auto_callout then
+           pp := manage_callouts cx thisptr previous_callout ~auto_callout !pp;
+         parsed_literal c
+       done
+     else
+       (* Process a real regex which may contain meta-characters. *)
+
+       (* pcre2_compile.c:2846-2856 — the nest-save stack lives in the
+          compile workspace: COMPILE_WORK_SIZE = 3000*LINK_SIZE 8-bit code
+          units (pcre2_compile.c:166), rounded down so that no nest_save
+          spans the end of the workspace (sizeof(nest_save) = 16 bytes).
+          The C's top_nest/end_nests pointers become an index into [nests],
+          with -1 for NULL. *)
+       let workspace_size = 3000 * Limits.link_size in
+       let sizeof_nest_save = 16 in
+       let nest_slots =
+         (workspace_size - (workspace_size mod sizeof_nest_save))
+         / sizeof_nest_save
+       in
+       let nests =
+         Array.init nest_slots (fun _ ->
+             {
+               nest_depth = 0;
+               reset_group = 0;
+               max_group = 0;
+               flags = 0;
+               options = 0;
+               xoptions = 0;
+             })
+       in
+       let top_nest = ref (-1) in
+
+       (* pcre2_compile.c:2858-2860 — PCRE2_EXTENDED_MORE implies
+          PCRE2_EXTENDED. *)
+       if not (Int.equal (!options land Options.extended_more) 0) then
+         options := !options lor Options.extended;
+
+       (* pcre2_compile.c:2862-2864 — now scan the pattern. *)
+       while !ptr < cx.ptrend do
+         try
+           (* pcre2_compile.c:2876-2880 *)
+           if !pp >= cx.parsed_pattern_end then (
+             cx.errorcode <- Errors.err63;
+             (* Internal error (parsed pattern overflow) *)
+             raise_notrace Goto_failed);
+
+           (* pcre2_compile.c:2882-2886 *)
+           if !nest_depth > cx.parens_nest_limit then (
+             cx.errorcode <- Errors.err19;
+             (* Parentheses too deeply nested *)
+             raise_notrace Goto_failed);
+
+           (* pcre2_compile.c:2888-2897 — if the last time round this loop
+              something was added, parsed_pattern will no longer be equal to
+              this_parsed_item. Remember where the previous item started and
+              reset for the next item. *)
+           if not (Int.equal !this_parsed_item !pp) then (
+             prev_parsed_item := !this_parsed_item;
+             this_parsed_item := !pp);
+
+           (* pcre2_compile.c:2899-2902 — get next input character, save its
+              position for callout handling. *)
+           let thisptr = !ptr in
+           let c = ref (getcharinctest ()) in
+
+           (* pcre2_compile.c:2904-2939 — copy quoted literals until \E,
+              allowing for the possibility of automatic callouts, except
+              when processing a ( *VERB) "name". *)
+           if !inescq then (
+             if
+               Int.equal !c 0x5c (* CHAR_BACKSLASH *)
+               && !ptr < cx.ptrend
+               && Char.equal pat.[!ptr] 'E'
+             then (
+               inescq := false;
+               incr ptr (* Skip E *))
+             else (
+               if !expect_cond_assert > 0 then (
+                 (* A literal is not allowed if we are expecting a
+                    conditional assertion, but an empty \Q\E sequence is
+                    OK. *)
+                 decr ptr;
+                 cx.errorcode <- Errors.err28;
+                 raise_notrace Goto_failed);
+               (if !inverbname then (
+                  (* Don't use parsed_literal (PARSED_LITERAL) because it
+                     sets okquantifier. *)
+                  buf.(!pp) <- !c;
+                  incr pp)
+                else
+                  let amc = !after_manual_callout in
+                  after_manual_callout := amc - 1;
+                  if amc <= 0 then
+                    pp :=
+                      manage_callouts cx thisptr previous_callout ~auto_callout
+                        !pp;
+                  parsed_literal !c);
+               meta_quantifier := 0);
+             raise_notrace Loop_continue (* Next character *));
+
+           (* pcre2_compile.c:2941-3039 — the ( *VERB:NAME) name accumulator
+              block. inverbname is set only by the deferred ( *VERB) arm
+              (M5), so this block is deferred with it and is unreachable
+              here. *)
+
+           (* pcre2_compile.c:3041-3054 — not a verb name character. Process
+              \Q and \E here, so that an item such as A\Q\E+ is treated as
+              A+, as in Perl. An isolated \E is ignored. *)
+           if Int.equal !c 0x5c (* CHAR_BACKSLASH *) && !ptr < cx.ptrend then
+             if Char.equal pat.[!ptr] 'Q' || Char.equal pat.[!ptr] 'E' then (
+               inescq := Char.equal pat.[!ptr] 'Q';
+               incr ptr;
+               raise_notrace Loop_continue);
+
+           (* pcre2_compile.c:3056-3086 — skip over whitespace and #
+              comments in extended mode. The whitespace characters are the
+              "Pattern White Space" set: the isspace() characters plus NEL
+              (0x85, the only extra member reachable as an 8-bit code unit)
+              plus U+200E, U+200F, U+2028, U+2029. *)
+           if not (Int.equal (!options land Options.extended) 0) then (
+             if
+               !c < 256
+               && not
+                    (Int.equal
+                       (Chartables.ctypes !c land Chartables.ctype_space)
+                       0)
+             then raise_notrace Loop_continue;
+             (* SUPPORT_UNICODE branch (pcre2_compile.c:3067-3069); the
+                comparisons above 255 are unreachable until UTF decode lands
+                (M6). *)
+             if
+               Int.equal !c 0x85 (* CHAR_NEL *)
+               || Int.equal (!c lor 1) 0x200f
+               || Int.equal (!c lor 1) 0x2029
+             then raise_notrace Loop_continue;
+             if Int.equal !c (Char.code '#') then (
+               (* pcre2_compile.c:3070-3085 *)
+               let scanning = ref true in
+               while !scanning && !ptr < cx.ptrend do
+                 if is_newline_at cx !ptr then (
+                   (* For non-fixed-length newline cases, IS_NEWLINE sets
+                      cb->nllen. *)
+                   ptr := !ptr + cx.nllen;
+                   scanning := false)
+                 else incr ptr
+                   (* M6: if utf then FORWARDCHARTEST(ptr, ptrend)
+                      (pcre2_compile.c:3080-3082) — byte scan until utf.ml
+                      lands. *)
+               done;
+               raise_notrace Loop_continue (* Next character in pattern *)));
+
+           (* pcre2_compile.c:3088-3101 — skip over bracketed comments. *)
+           if
+             Int.equal !c (Char.code '(')
+             && cx.ptrend - !ptr >= 2
+             && Char.equal pat.[!ptr] '?'
+             && Char.equal pat.[!ptr + 1] '#'
+           then (
+             (* C: while (++ptr < ptrend && *ptr != ')'); *)
+             incr ptr;
+             while !ptr < cx.ptrend && not (Char.equal pat.[!ptr] ')') do
+               incr ptr
+             done;
+             if !ptr >= cx.ptrend then (
+               cx.errorcode <- Errors.err18;
+               (* A special error for missing ) in a comment, to make it
+                  easier to debug. *)
+               raise_notrace Goto_failed);
+             incr ptr;
+             raise_notrace Loop_continue (* Next character in pattern *));
+
+           (* pcre2_compile.c:3103-3117 — if the next item is not a
+              quantifier, fill in length of any previous callout and create
+              an auto callout if required. *)
+           if
+             (not (Int.equal !c (Char.code '*')))
+             && (not (Int.equal !c (Char.code '+')))
+             && (not (Int.equal !c (Char.code '?')))
+             && ((not (Int.equal !c (Char.code '{')))
+                ||
+                let tempptr = ref !ptr in
+                not (read_repeat_counts cx tempptr None None))
+           then (
+             let amc = !after_manual_callout in
+             after_manual_callout := amc - 1;
+             if amc <= 0 then (
+               pp :=
+                 manage_callouts cx thisptr previous_callout ~auto_callout !pp;
+               this_parsed_item := !pp (* New start for current item *)));
+
+           (* pcre2_compile.c:3119-3163 — if expect_cond_assert is 2, we
+              have just passed (?( and are expecting an assertion, possibly
+              preceded by a callout; if 1, we have just had the callout and
+              expect an assertion. (Only the deferred conditional-group arm
+              sets it (M5); the scaffolding is ported so those chunks slot
+              in.) *)
+           (if !expect_cond_assert > 0 then
+              let ok =
+                Int.equal !c (Char.code '(')
+                && cx.ptrend - !ptr >= 3
+                && (Char.equal pat.[!ptr] '?' || Char.equal pat.[!ptr] '*')
+              in
+              let ok =
+                if not ok then false
+                else if Char.equal pat.[!ptr] '*' then
+                  (* New alpha assertion format, possibly. MAX_255(ptr[1]) is
+                     always true in the 8-bit library. *)
+                  not
+                    (Int.equal
+                       (Chartables.ctypes (Char.code pat.[!ptr + 1])
+                       land Chartables.ctype_lcletter)
+                       0)
+                else
+                  (* Traditional symbolic format. *)
+                  match pat.[!ptr + 1] with
+                  | 'C' -> Int.equal !expect_cond_assert 2
+                  | '=' | '!' -> true
+                  | '<' ->
+                      Char.equal pat.[!ptr + 2] '='
+                      || Char.equal pat.[!ptr + 2] '!'
+                  | _ -> false
+              in
+              if not ok then (
+                decr ptr (* Adjust error offset *);
+                cx.errorcode <- Errors.err28;
+                raise_notrace Goto_failed));
+
+           (* pcre2_compile.c:3165-3177 — remember whether we are expecting
+              a conditional assertion and the quantification status of the
+              previous significant item, then set the defaults for this
+              item. prev_expect_cond_assert and prev_okquantifier are
+              consumed by the deferred alpha-assertion and CHECK_QUANTIFIER
+              code (their underscores go away with those chunks). *)
+           let _prev_expect_cond_assert = !expect_cond_assert in
+           expect_cond_assert := 0;
+           let _prev_okquantifier = !okquantifier in
+           let prev_meta_quantifier = !meta_quantifier in
+           okquantifier := false;
+           meta_quantifier := 0;
+
+           (* pcre2_compile.c:3179-3191 — if the previous significant item
+              was a quantifier, adjust the parsed code if there is a
+              following + or ? modifier. The base meta value is always
+              followed by the PLUS and QUERY values, in that order. Done
+              here rather than after reading a quantifier so that
+              intervening comments and /x whitespace can be ignored without
+              replicating code. *)
+           if
+             (not (Int.equal prev_meta_quantifier 0))
+             && (Int.equal !c (Char.code '?') || Int.equal !c (Char.code '+'))
+           then (
+             let idx =
+               !pp
+               + if Int.equal prev_meta_quantifier meta_minmax then -3 else -1
+             in
+             buf.(idx) <-
+               (prev_meta_quantifier
+               +
+               if Int.equal !c (Char.code '?') then 0x0002_0000 else 0x0001_0000
+               );
+             raise_notrace Loop_continue (* Next character in pattern *));
+
+           (* pcre2_compile.c:3193-3195 — process the next item in the main
+              part of a pattern. The C switch's default case (non-special
+              character) comes first in the source and is the last arm of
+              this match; c is a byte here (see getcharinctest), so Char.chr
+              is safe. M6: when getcharinctest decodes UTF, c can exceed 255
+              and MUST route to the default parsed_literal arm (C switch
+              default) — replace Char.chr dispatch with an explicit
+              `if !c > 255` guard when utf.ml lands. *)
+           match Char.chr !c with
+           | '\\' ->
+               (* ---- Escape sequence ---- pcre2_compile.c:3202-3404 *)
+               let tempptr = !ptr in
+               let escape =
+                 ref
+                   (check_escape cx ptr c ~options:!options ~xoptions:!xoptions
+                      ~isclass:false (Some cx))
+               in
+
+               (* pcre2_compile.c:3208-3219 — the ESCAPE_FAILED label: a bad
+                  escape is fatal unless PCRE2_EXTRA_BAD_ESCAPE_IS_LITERAL
+                  is set, in which case the escape sequence is re-read as a
+                  literal character. The C's forward gotos to ESCAPE_FAILED
+                  from the arms below are `escape_failed (); process_escape
+                  ()` here: after recovery escape = 0, so the re-entry takes
+                  the literal path. Note that errorcode is NOT reset,
+                  exactly as in the C. *)
+               let escape_failed () =
+                 if
+                   Int.equal
+                     (!xoptions land Options.extra_bad_escape_is_literal)
+                     0
+                 then raise_notrace Goto_failed;
+                 ptr := tempptr;
+                 if !ptr >= cx.ptrend then c := 0x5c (* CHAR_BACKSLASH *)
+                 else (
+                   (* GETCHARINCTEST — byte read; see getcharinctest. *)
+                   c := Char.code pat.[!ptr];
+                   incr ptr);
+                 escape := 0 (* Treat as literal character *)
+               in
+
+               let rec process_escape () =
+                 if Int.equal !escape 0 then
+                   (* pcre2_compile.c:3221-3226 — the escape was a data
+                      escape or literal character. *)
+                   parsed_literal !c
+                 else if !escape < 0 then (
+                   (* pcre2_compile.c:3228-3250 — a back (or forward)
+                      reference. Keep the offset in order to give a more
+                      useful diagnostic for a bad forward reference. For
+                      references to groups numbered less than 10 no more
+                      than two items can be used in parsed_pattern (they may
+                      be just two characters in the input), so for them the
+                      offset of the first occurrence is held in a special
+                      vector. *)
+                   let offset = !ptr - 1 in
+                   (* ptr - cb->start_pattern - 1 *)
+                   let escape = - !escape in
+                   buf.(!pp) <- meta_backref lor escape;
+                   incr pp;
+                   if escape < 10 then (
+                     if Int.equal cx.small_ref_offset.(escape) pcre2_unset then
+                       cx.small_ref_offset.(escape) <- offset)
+                   else putoffset buf pp offset;
+                   okquantifier := true)
+                 else if Int.equal !escape esc_big_c then
+                   (* pcre2_compile.c:3270-3283 — \C. The NEVER_BACKSLASH_C
+                      build-time switch is not defined in the reference
+                      configuration, so only the PCRE2_NEVER_BACKSLASH_C
+                      option check (ERR83) applies. *)
+                   if
+                     not (Int.equal (!options land Options.never_backslash_c) 0)
+                   then (
+                     cx.errorcode <- Errors.err83;
+                     escape_failed () (* goto ESCAPE_FAILED *);
+                     process_escape ())
+                   else (
+                     okquantifier := true;
+                     buf.(!pp) <- meta_escape + !escape;
+                     incr pp)
+                 else if Int.equal !escape esc_ub then (
+                   (* pcre2_compile.c:3285-3293 — a special return that
+                      happens only in EXTRA_ALT_BSUX mode, when \u{ is not
+                      followed by hex digits and }. It requests two literal
+                      characters, u and {. *)
+                   buf.(!pp) <- Char.code 'u';
+                   incr pp;
+                   parsed_literal (Char.code '{'))
+                 else if
+                   Int.equal !escape esc_big_x
+                   || Int.equal !escape esc_big_h
+                   || Int.equal !escape esc_h
+                   || Int.equal !escape esc_big_n
+                   || Int.equal !escape esc_big_r
+                   || Int.equal !escape esc_big_v
+                   || Int.equal !escape esc_v
+                 then (
+                   (* pcre2_compile.c:3295-3308 — ESC_X (Unicode support is
+                      compiled in, so no ERR45) falls through to
+                      ESC_H/ESC_h/ESC_N/ESC_R/ESC_V/ESC_v in C. *)
+                   okquantifier := true;
+                   buf.(!pp) <- meta_escape + !escape;
+                   incr pp)
+                 else if
+                   Int.equal !escape esc_d
+                   || Int.equal !escape esc_big_d
+                   || Int.equal !escape esc_s
+                   || Int.equal !escape esc_big_s
+                   || Int.equal !escape esc_w
+                   || Int.equal !escape esc_big_w
+                 then (
+                   (* pcre2_compile.c:3314-3325 — escapes that may change in
+                      UCP mode. *)
+                   okquantifier := true;
+                   pp :=
+                     handle_escdsw cx !escape !pp ~options:!options
+                       ~xoptions:!xoptions)
+                 else if Int.equal !escape esc_big_p || Int.equal !escape esc_p
+                 then (
+                   (* pcre2_compile.c:3327-3346 — \P and \p Unicode property
+                      matching needs get_ucp(): deferred to M7. *)
+                   cx.errorcode <- err_deferred;
+                   raise_notrace Goto_failed)
+                 else if Int.equal !escape esc_g || Int.equal !escape esc_k then (
+                   if
+                     (* pcre2_compile.c:3348-3402 — when \g is used with
+                        quotes or angle brackets as delimiters, it is a
+                        numerical or named subroutine call; with brace
+                        delimiters it is a numerical back reference and does
+                        not come here because check_escape() returns it
+                        directly. \k is always a named back reference. The
+                        validation and its error paths are ported; the
+                        accepted cases are deferred (named references M3,
+                        subroutine calls M5). *)
+                     !ptr >= cx.ptrend
+                     || (not (Char.equal pat.[!ptr] '{'))
+                        && (not (Char.equal pat.[!ptr] '<'))
+                        && not (Char.equal pat.[!ptr] '\'')
+                   then (
+                     cx.errorcode <-
+                       (if Int.equal !escape esc_g then Errors.err57
+                        else Errors.err69);
+                     escape_failed () (* goto ESCAPE_FAILED *);
+                     process_escape ())
+                   else
+                     let terminator =
+                       if Char.equal pat.[!ptr] '<' then Char.code '>'
+                       else if Char.equal pat.[!ptr] '\'' then Char.code '\''
+                       else Char.code '}'
+                     in
+                     (* For a non-braced \g, check for a numerical recursion
+                        (pcre2_compile.c:3366-3384). *)
+                     let recovered = ref false in
+                     (if
+                        Int.equal !escape esc_g
+                        && not (Int.equal terminator (Char.code '}'))
+                      then
+                        let p = ref (!ptr + 1) in
+                        let i = ref 0 in
+                        if
+                          read_number cx p ~allow_sign:cx.bracount
+                            ~max_value:Limits.max_group_number
+                            ~max_error:Errors.err61 i
+                        then
+                          if
+                            !p >= cx.ptrend
+                            || not (Int.equal (Char.code pat.[!p]) terminator)
+                          then (
+                            cx.errorcode <- Errors.err57;
+                            escape_failed () (* goto ESCAPE_FAILED *);
+                            process_escape ();
+                            recovered := true)
+                          else (
+                            ptr := !p;
+                            (* goto SET_RECURSION (pcre2_compile.c:4415-4433)
+                               — numerical subroutine calls are the M5
+                               chunk. *)
+                            cx.errorcode <- err_deferred;
+                            raise_notrace Goto_failed)
+                        else if not (Int.equal cx.errorcode 0) then (
+                          escape_failed () (* goto ESCAPE_FAILED *);
+                          process_escape ();
+                          recovered := true));
+                     if not !recovered then
+                       (* Not a numerical recursion. Perl allows spaces and
+                          tabs after { and before } but not for other
+                          delimiters (pcre2_compile.c:3386-3390). *)
+                       let offset = ref 0 in
+                       let name = ref 0 in
+                       let namelen = ref 0 in
+                       if
+                         not
+                           (read_name cx ptr ~utf ~terminator offset name
+                              namelen)
+                       then (
+                         escape_failed () (* goto ESCAPE_FAILED *);
+                         process_escape ())
+                       else (
+                         (* pcre2_compile.c:3392-3402 — emission of
+                            META_BACKREF_BYNAME / META_RECURSE_BYNAME:
+                            deferred (named references M3, subroutine calls
+                            M5). *)
+                         cx.errorcode <- err_deferred;
+                         raise_notrace Goto_failed))
+                 else (
+                   (* pcre2_compile.c:3310-3312 — the C switch's default
+                      case: \A, \B, \b, \G, \K, \Z, \z cannot be
+                      quantified. *)
+                   buf.(!pp) <- meta_escape + !escape;
+                   incr pp)
+               in
+               if not (Int.equal cx.errorcode 0) then escape_failed ();
+               process_escape ()
+           (* ---- Single-character special items ---- *)
+           | '^' ->
+               (* pcre2_compile.c:3409-3411 *)
+               buf.(!pp) <- meta_circumflex;
+               incr pp
+           | '$' ->
+               (* pcre2_compile.c:3413-3415 *)
+               buf.(!pp) <- meta_dollar;
+               incr pp
+           | '.' ->
+               (* pcre2_compile.c:3417-3420 *)
+               buf.(!pp) <- meta_dot;
+               incr pp;
+               okquantifier := true
+           | '*' | '+' | '?' ->
+               (* pcre2_compile.c:3423-3435 — single-character quantifiers,
+                  and 3452-3490 (CHECK_QUANTIFIER shared post-processing):
+                  deferred to the quantifiers/groups chunk (parse_regex
+                  C). *)
+               cx.errorcode <- err_deferred;
+               raise_notrace Goto_failed
+           | '{' ->
+               (* ---- Potential {n,m} quantifier ----
+                  pcre2_compile.c:3438-3447 *)
+               let min_repeat = ref 0 in
+               let max_repeat = ref 0 in
+               if
+                 not
+                   (read_repeat_counts cx ptr (Some min_repeat)
+                      (Some max_repeat))
+               then (
+                 if not (Int.equal cx.errorcode 0) then
+                   raise_notrace Goto_failed (* Error in quantifier *);
+                 parsed_literal !c (* Not a quantifier *))
+               else (
+                 (* pcre2_compile.c:3448-3490 — META_MINMAX and the shared
+                    CHECK_QUANTIFIER post-processing consume min_repeat and
+                    max_repeat: deferred to the quantifiers/groups chunk
+                    (parse_regex C). *)
+                 cx.errorcode <- err_deferred;
+                 raise_notrace Goto_failed)
+           | '[' ->
+               (* pcre2_compile.c:3493-3915 — character classes: deferred to
+                  the classes chunk (parse_regex B). *)
+               cx.errorcode <- err_deferred;
+               raise_notrace Goto_failed
+           | '(' ->
+               (* ---- Opening parenthesis ---- pcre2_compile.c:3918-3921 *)
+               if !ptr >= cx.ptrend then unclosed_parenthesis ();
+               (* If ( is not followed by ? it is either a capture or a
+                  special verb or an alpha assertion or a positive
+                  non-atomic lookahead (pcre2_compile.c:3923-3926). *)
+               if not (Char.equal pat.[!ptr] '?') then
+                 if not (Char.equal pat.[!ptr] '*') then (
+                   (* pcre2_compile.c:3930-3947 — handle capturing brackets
+                      (or non-capturing if auto-capture is turned off). *)
+                   nest_depth := !nest_depth + 1;
+                   if Int.equal (!options land Options.no_auto_capture) 0 then (
+                     if cx.bracount >= Limits.max_group_number then (
+                       cx.errorcode <- Errors.err97;
+                       raise_notrace Goto_failed);
+                     cx.bracount <- cx.bracount + 1;
+                     buf.(!pp) <- meta_capture lor cx.bracount;
+                     incr pp)
+                   else (
+                     buf.(!pp) <- meta_nocapture;
+                     incr pp))
+                 else if cx.ptrend - !ptr <= 1 || Char.equal pat.[!ptr + 1] ')'
+                 then
+                   (* pcre2_compile.c:3949-3953 — do nothing for ( * followed
+                      by end of pattern or ) so it gives a "bad quantifier"
+                      error rather than "(*MARK) must have an argument".
+                      (The C also assigns c = ptr[1] here; c is dead
+                      afterwards.) *)
+                   ()
+                 else if
+                   (* CHMAX_255(c) is always true for an 8-bit code unit. *)
+                   not
+                     (Int.equal
+                        (Chartables.ctypes (Char.code pat.[!ptr + 1])
+                        land Chartables.ctype_lcletter)
+                        0)
+                 then (
+                   (* pcre2_compile.c:3955-4061 — "alpha assertions" such as
+                      ( *pla:...), ( *atomic:...) and ( *script_run:...):
+                      deferred (M4 lookarounds/atomic groups, M8 script
+                      runs). *)
+                   cx.errorcode <- err_deferred;
+                   raise_notrace Goto_failed)
+                 else (
+                   (* pcre2_compile.c:4063-4152 — ( *VERB) and ( *VERB:NAME):
+                      deferred (M5). *)
+                   cx.errorcode <- err_deferred;
+                   raise_notrace Goto_failed)
+               else (
+                 (* ---- Items starting (? ---- pcre2_compile.c:4157-4167.
+                    The type of item is determined by what follows (?.
+                    Handle (?| and option changes under "default" (the last
+                    arm here) because both need a new block on the nest
+                    stack. Comments starting with (?# were handled above.
+                    Note the ambiguity of (?-: a digit after it means a
+                    relative recursion or subroutine call, otherwise it is
+                    an option unsetting. *)
+                 incr ptr;
+                 if !ptr >= cx.ptrend then unclosed_parenthesis ();
+                 match pat.[!ptr] with
+                 | 'P' ->
+                     (* pcre2_compile.c:4355-4387 — Python syntax support:
+                        (?P<name> named-group definition (parse_regex C),
+                        (?P>name) subroutine call (M5), (?P=name) named back
+                        reference (M3). Deferred. *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed
+                 | 'R' | '+' | '0' .. '9' ->
+                     (* pcre2_compile.c:4390-4436 — recursion/subroutine
+                        calls by number (RECURSION_BYNUMBER): deferred
+                        (M5). *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed
+                 | '&' ->
+                     (* pcre2_compile.c:4437-4446 — recursion/subroutine
+                        calls by name (RECURSE_BY_NAME): deferred (M5). *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed
+                 | 'C' ->
+                     (* pcre2_compile.c:4448-4563 — callouts with numerical
+                        or string argument: deferred (M5; the callout API
+                        itself stays type-only per the architecture doc). *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed
+                 | '(' ->
+                     (* pcre2_compile.c:4583-4739 — conditional groups
+                        (these set expect_cond_assert): deferred (M5). *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed
+                 | '>' ->
+                     (* pcre2_compile.c:4741-4747 — atomic groups: deferred
+                        (M4). *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed
+                 | '=' | '!' | '*' ->
+                     (* pcre2_compile.c:4750-4770 — lookahead assertions
+                        (including the (?* non-atomic form): deferred
+                        (M4). *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed
+                 | '<' ->
+                     (* pcre2_compile.c:4773-4802 — lookbehind assertions
+                        (M4) or, when not followed by = ! *, a named-group
+                        definition (parse_regex C): deferred. *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed
+                 | '\'' ->
+                     (* pcre2_compile.c:4828-4926 — named-group definition
+                        (DEFINE_NAME): deferred (parse_regex C). *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed
+                 | _ ->
+                     (* pcre2_compile.c:4169-4352 — the C switch's default
+                        case (first in the source): (?-digit relative
+                        recursion, else (?| or a (possibly empty) option
+                        setting, optionally followed by a non-capturing
+                        group. *)
+                     if
+                       Char.equal pat.[!ptr] '-'
+                       && cx.ptrend - !ptr > 1
+                       && is_digit pat.[!ptr + 1]
+                     then (
+                       (* goto RECURSION_BYNUMBER (the + case is handled by
+                          CHAR_PLUS above): deferred (M5). *)
+                       cx.errorcode <- err_deferred;
+                       raise_notrace Goto_failed);
+
+                     (* pcre2_compile.c:4176-4186 *)
+                     nest_depth := !nest_depth + 1;
+                     if Int.equal !top_nest (-1) then top_nest := 0
+                     else (
+                       incr top_nest;
+                       if !top_nest >= nest_slots then (
+                         cx.errorcode <- Errors.err84;
+                         raise_notrace Goto_failed));
+                     let tn = nests.(!top_nest) in
+                     tn.nest_depth <- !nest_depth;
+                     tn.flags <- 0;
+                     tn.options <- !options land parse_tracked_options;
+                     tn.xoptions <- !xoptions land parse_tracked_extra_options;
+
+                     if Char.equal pat.[!ptr] '|' then (
+                       (* pcre2_compile.c:4188-4199 — start of a
+                          non-capturing group that resets the capture count
+                          for each branch. *)
+                       tn.reset_group <- cx.bracount;
+                       tn.max_group <- cx.bracount;
+                       tn.flags <- tn.flags lor nsf_reset;
+                       cx.external_flags <- cx.external_flags lor dupcapused;
+                       buf.(!pp) <- meta_nocapture;
+                       incr pp;
+                       incr ptr)
+                     else
+                       (* pcre2_compile.c:4201-4351 — scan for options
+                          imnrsxJU (and the two-character a.. sequences) to
+                          be set or unset. The C's optset/xoptset
+                          accumulator pointers become the [setting] selector
+                          consulted by add_opt/add_xopt. *)
+                       let hyphenok = ref true in
+                       let oldoptions = !options in
+                       let oldxoptions = !xoptions in
+                       tn.reset_group <- 0;
+                       tn.max_group <- 0;
+                       let set = ref 0 in
+                       let unset = ref 0 in
+                       let xset = ref 0 in
+                       let xunset = ref 0 in
+                       let setting = ref true in
+                       (* optset = &set; xoptset = &xset *)
+                       let add_opt v =
+                         if !setting then set := !set lor v
+                         else unset := !unset lor v
+                       in
+                       let add_xopt v =
+                         if !setting then xset := !xset lor v
+                         else xunset := !xunset lor v
+                       in
+
+                       (* pcre2_compile.c:4216-4225 — ^ at the start unsets
+                          irmnsx and disables the subsequent use of -. *)
+                       if !ptr < cx.ptrend && Char.equal pat.[!ptr] '^' then (
+                         options :=
+                           !options
+                           land lnot
+                                  (Options.caseless lor Options.multiline
+                                 lor Options.no_auto_capture lor Options.dotall
+                                 lor Options.extended lor Options.extended_more
+                                  );
+                         xoptions :=
+                           !xoptions land lnot Options.extra_caseless_restrict;
+                         hyphenok := false;
+                         incr ptr);
+
+                       (* pcre2_compile.c:4227-4313 *)
+                       while
+                         !ptr < cx.ptrend
+                         && (not (Char.equal pat.[!ptr] ')'))
+                         && not (Char.equal pat.[!ptr] ':')
+                       do
+                         (* switch ( *ptr++ ) *)
+                         let ch = pat.[!ptr] in
+                         incr ptr;
+                         match ch with
+                         | '-' ->
+                             (* pcre2_compile.c:4232-4242 *)
+                             if not !hyphenok then (
+                               cx.errorcode <- Errors.err94;
+                               decr ptr (* Correct the offset *);
+                               raise_notrace Goto_failed);
+                             setting := false
+                             (* optset = &unset; xoptset = &xunset *);
+                             hyphenok := false
+                         | 'a' ->
+                             (* pcre2_compile.c:4244-4283 — there are some
+                                two-character sequences that start with 'a';
+                                a bare 'a' sets all the ASCII options
+                                together. *)
+                             let matched2 =
+                               !ptr < cx.ptrend
+                               &&
+                               match pat.[!ptr] with
+                               | 'D' ->
+                                   add_xopt Options.extra_ascii_bsd;
+                                   incr ptr;
+                                   true
+                               | 'P' ->
+                                   add_xopt
+                                     (Options.extra_ascii_posix
+                                    lor Options.extra_ascii_digit);
+                                   incr ptr;
+                                   true
+                               | 'S' ->
+                                   add_xopt Options.extra_ascii_bss;
+                                   incr ptr;
+                                   true
+                               | 'T' ->
+                                   add_xopt Options.extra_ascii_digit;
+                                   incr ptr;
+                                   true
+                               | 'W' ->
+                                   add_xopt Options.extra_ascii_bsw;
+                                   incr ptr;
+                                   true
+                               | _ -> false
+                             in
+                             if not matched2 then
+                               add_xopt
+                                 (Options.extra_ascii_bsd
+                                lor Options.extra_ascii_bss
+                                lor Options.extra_ascii_bsw
+                                lor Options.extra_ascii_digit
+                                lor Options.extra_ascii_posix)
+                         | 'J' ->
+                             (* pcre2_compile.c:4285-4288 — record that it
+                                changed in the external options. *)
+                             add_opt Options.dupnames;
+                             cx.external_flags <- cx.external_flags lor jchanged
+                         | 'i' -> add_opt Options.caseless
+                         | 'm' -> add_opt Options.multiline
+                         | 'n' -> add_opt Options.no_auto_capture
+                         | 'r' -> add_xopt Options.extra_caseless_restrict
+                         | 's' -> add_opt Options.dotall
+                         | 'U' -> add_opt Options.ungreedy
+                         | 'x' ->
+                             (* pcre2_compile.c:4297-4306 — if x appears
+                                twice it sets the extended extended
+                                option. *)
+                             add_opt Options.extended;
+                             if !ptr < cx.ptrend && Char.equal pat.[!ptr] 'x'
+                             then (
+                               add_opt Options.extended_more;
+                               incr ptr)
+                         | _ ->
+                             (* pcre2_compile.c:4308-4311 *)
+                             cx.errorcode <- Errors.err11;
+                             decr ptr (* Correct the offset *);
+                             raise_notrace Goto_failed
+                       done;
+
+                       (* pcre2_compile.c:4315-4324 — if we are setting
+                          extended without extended-more, ensure that any
+                          existing extended-more gets unset. Also, unsetting
+                          extended must also unset extended-more. *)
+                       if
+                         Int.equal
+                           (!set
+                           land (Options.extended lor Options.extended_more))
+                           Options.extended
+                         || not (Int.equal (!unset land Options.extended) 0)
+                       then unset := !unset lor Options.extended_more;
+
+                       options := !options lor !set land lnot !unset;
+                       xoptions := !xoptions lor !xset land lnot !xunset;
+
+                       (* pcre2_compile.c:4326-4341 — if the options ended
+                          with ')' this is not the start of a nested group
+                          with option changes, so the options change at this
+                          level: if the previous level set up a nest block,
+                          discard the one just created, otherwise adjust it
+                          for the previous level. If the options ended with
+                          ':' we are starting a non-capturing group,
+                          possibly with an options setting. *)
+                       if !ptr >= cx.ptrend then unclosed_parenthesis ();
+                       let term = pat.[!ptr] in
+                       incr ptr (* *ptr++ *);
+                       if Char.equal term ')' then (
+                         nest_depth := !nest_depth - 1;
+                         (* This is not a nested group after all. *)
+                         if
+                           !top_nest > 0
+                           && Int.equal nests.(!top_nest - 1).nest_depth
+                                !nest_depth
+                         then decr top_nest
+                         else nests.(!top_nest).nest_depth <- !nest_depth)
+                       else (
+                         buf.(!pp) <- meta_nocapture;
+                         incr pp);
+
+                       (* pcre2_compile.c:4343-4350 — if nothing changed, no
+                          need to record. *)
+                       if
+                         (not (Int.equal !options oldoptions))
+                         || not (Int.equal !xoptions oldxoptions)
+                       then (
+                         buf.(!pp) <- meta_options;
+                         incr pp;
+                         buf.(!pp) <- !options;
+                         incr pp;
+                         buf.(!pp) <- !xoptions;
+                         incr pp))
+           (* ---- Branch terminators ---- *)
+           | '|' ->
+               (* pcre2_compile.c:4929-4942 — alternation: reset the capture
+                  count if we are in a (?| group. *)
+               if
+                 !top_nest >= 0
+                 && Int.equal nests.(!top_nest).nest_depth !nest_depth
+                 && not (Int.equal (nests.(!top_nest).flags land nsf_reset) 0)
+               then (
+                 if cx.bracount > nests.(!top_nest).max_group then
+                   nests.(!top_nest).max_group <- cx.bracount;
+                 cx.bracount <- nests.(!top_nest).reset_group);
+               buf.(!pp) <- meta_alt;
+               incr pp
+           | ')' ->
+               (* pcre2_compile.c:4944-4975 — end of group; reset the
+                  capture count to the maximum if we are in a (?| group
+                  and/or reset the options that are tracked during parsing.
+                  Disallow quantifier for a condition that is an
+                  assertion. *)
+               okquantifier := true;
+               if
+                 !top_nest >= 0
+                 && Int.equal nests.(!top_nest).nest_depth !nest_depth
+               then (
+                 let tn = nests.(!top_nest) in
+                 options :=
+                   !options land lnot parse_tracked_options lor tn.options;
+                 xoptions :=
+                   !xoptions
+                   land lnot parse_tracked_extra_options
+                   lor tn.xoptions;
+                 if
+                   (not (Int.equal (tn.flags land nsf_reset) 0))
+                   && tn.max_group > cx.bracount
+                 then cx.bracount <- tn.max_group;
+                 if not (Int.equal (tn.flags land nsf_condassert) 0) then
+                   okquantifier := false;
+                 if not (Int.equal (tn.flags land nsf_atomicsr) 0) then (
+                   buf.(!pp) <- meta_ket;
+                   incr pp);
+                 if Int.equal !top_nest 0 then top_nest := -1 else decr top_nest);
+               if Int.equal !nest_depth 0 then (
+                 (* Unmatched closing parenthesis *)
+                 cx.errorcode <- Errors.err22;
+                 failed_back ());
+               nest_depth := !nest_depth - 1;
+               buf.(!pp) <- meta_ket;
+               incr pp
+           | _ ->
+               (* pcre2_compile.c:3197-3199 — non-special character (the C
+                  switch's default case, first in the source). *)
+               parsed_literal !c
+         with Loop_continue -> ()
+       done;
+
+       (* pcre2_compile.c:4979-4985 — end of pattern reached. Check for
+          missing ) at the end of a verb name. *)
+       if !inverbname && !ptr >= cx.ptrend then (
+         cx.errorcode <- Errors.err60;
+         raise_notrace Goto_failed));
+
+    (* PARSED_END: pcre2_compile.c:4987-5017 — manage callout for the final
+       item, insert trailing items for word and line matching, terminate
+       the parsed pattern, then return success if all groups are closed. *)
+    pp := manage_callouts cx !ptr previous_callout ~auto_callout !pp;
+
+    if not (Int.equal (!xoptions land Options.extra_match_line) 0) then (
+      buf.(!pp) <- meta_ket;
+      incr pp;
+      buf.(!pp) <- meta_dollar;
+      incr pp)
+    else if not (Int.equal (!xoptions land Options.extra_match_word) 0) then (
+      buf.(!pp) <- meta_ket;
+      incr pp;
+      buf.(!pp) <- meta_escape + esc_b;
+      incr pp);
+
+    if !pp >= cx.parsed_pattern_end then (
+      cx.errorcode <- Errors.err63;
+      (* Internal error (parsed pattern overflow) *)
+      raise_notrace Goto_failed);
+
+    buf.(!pp) <- meta_end (* C: *parsed_pattern = META_END, no increment *);
+    if Int.equal !nest_depth 0 then 0 else unclosed_parenthesis ()
+  with Goto_failed ->
+    (* FAILED: pcre2_compile.c:5022-5026 — come here for all failures. *)
+    cx.erroroffset <- !ptr;
+    cx.errorcode
+
 (* ---------- Inline sanity checks (module-initialization asserts) ---------- *)
 
 (* META encoding scheme. *)
@@ -2088,3 +3412,223 @@ let () =
   assert (eq (run "L" ~sub:true) (0, -1, 0, Errors.err3));
   assert (eq (run "x41" ~sub:true) (0, 0x41, 3, 0));
   assert (eq (run "x4" ~sub:true ~options:Options.alt_bsux) (0, 4, 2, 0))
+
+(* parse_regex sanity checks. Every expected parsed-pattern stream and
+   (errorcode, erroroffset) pair below was traced against
+   pcre2_compile.c:2773-5039. run_parse mirrors pcre2_compile()'s driver
+   steps: size the vector, then parse from offset 0. *)
+let () =
+  let run_parse ?(options = 0) ?(extra = 0) pat =
+    let cx = make_context pat in
+    cx.extra_options <- extra;
+    allocate_parsed_pattern cx ~options;
+    let hlb = ref false in
+    let rc = parse_regex cx ~options hlb in
+    (cx, rc)
+  in
+  let expect ?options ?extra pat expected =
+    let cx, rc = run_parse ?options ?extra pat in
+    assert (Int.equal rc 0);
+    Array.iteri (fun i v -> assert (Int.equal cx.parsed_pattern.(i) v)) expected
+  in
+  let expect_err ?options ?extra pat code offset =
+    let cx, rc = run_parse ?options ?extra pat in
+    assert (Int.equal rc code);
+    assert (Int.equal cx.erroroffset offset)
+  in
+
+  (* Literals and META_END. *)
+  expect "abc" [| 0x61; 0x62; 0x63; meta_end |];
+  expect "" [| meta_end |];
+
+  (* Alternation. *)
+  expect "a|b" [| 0x61; meta_alt; 0x62; meta_end |];
+
+  (* \Q..\E quoting; an isolated \E is ignored. *)
+  expect "\\Qa.b\\E." [| 0x61; 0x2e; 0x62; meta_dot; meta_end |];
+  expect "a\\Eb" [| 0x61; 0x62; meta_end |];
+
+  (* Comments: (?#...) always; # only in extended mode. *)
+  expect "a(?#c)b" [| 0x61; 0x62; meta_end |];
+  expect_err "a(?#b" Errors.err18 5;
+  expect ~options:Options.extended "a b # c\n d"
+    [| 0x61; 0x62; 0x64; meta_end |];
+  (* PCRE2_EXTENDED_MORE implies PCRE2_EXTENDED (pcre2_compile.c:2858-2860). *)
+  expect ~options:Options.extended_more "a\tb" [| 0x61; 0x62; meta_end |];
+
+  (* PCRE2_LITERAL mode: metacharacters are data. *)
+  expect ~options:Options.literal "a*b" [| 0x61; 0x2a; 0x62; meta_end |];
+
+  (* Anchors and dot. *)
+  expect "^a$." [| meta_circumflex; 0x61; meta_dollar; meta_dot; meta_end |];
+
+  (* Escape dispatch: type escapes, non-quantifiable escapes, data
+     escapes. *)
+  expect "\\d\\s\\w"
+    [|
+      meta_escape + esc_d; meta_escape + esc_s; meta_escape + esc_w; meta_end;
+    |];
+  expect "\\A\\b\\R\\C"
+    [|
+      meta_escape + esc_big_a;
+      meta_escape + esc_b;
+      meta_escape + esc_big_r;
+      meta_escape + esc_big_c;
+      meta_end;
+    |];
+  expect "\\x41\\n" [| 0x41; 0x0a; meta_end |];
+  (* UCP mode rewrites \d/\S via handle_escdsw; an ASCII extra option keeps
+     the non-property form. *)
+  expect ~options:Options.ucp "\\d"
+    [| meta_escape + esc_p; (Opcodes.pt_pc lsl 16) lor Ucp.ucp_nd; meta_end |];
+  expect ~options:Options.ucp "\\S"
+    [| meta_escape + esc_big_p; Opcodes.pt_space lsl 16; meta_end |];
+  expect ~options:Options.ucp ~extra:Options.extra_ascii_bsw "\\w"
+    [| meta_escape + esc_w; meta_end |];
+  (* \C under PCRE2_NEVER_BACKSLASH_C. *)
+  expect_err ~options:Options.never_backslash_c "\\C" Errors.err83 2;
+  (* Bad escapes: fatal, or a literal under
+     PCRE2_EXTRA_BAD_ESCAPE_IS_LITERAL (ESCAPE_FAILED recovery). *)
+  expect_err "\\j" Errors.err3 1;
+  expect ~extra:Options.extra_bad_escape_is_literal "\\j" [| 0x6a; meta_end |];
+
+  (* Numeric back references: \1..\9 record their first offset in
+     small_ref_offset; \g{12} stores the offset in the parsed pattern. *)
+  let cx, rc = run_parse "()\\1" in
+  assert (Int.equal rc 0);
+  assert (Int.equal cx.parsed_pattern.(0) (meta_capture lor 1));
+  assert (Int.equal cx.parsed_pattern.(1) meta_ket);
+  assert (Int.equal cx.parsed_pattern.(2) (meta_backref lor 1));
+  assert (Int.equal cx.parsed_pattern.(3) meta_end);
+  assert (Int.equal cx.small_ref_offset.(1) 3);
+  assert (Int.equal cx.small_ref_offset.(2) pcre2_unset);
+  expect "\\g{12}" [| meta_backref lor 12; 5; meta_end |];
+
+  (* Groups: capturing, non-capturing via option, (?:, and (?|. *)
+  expect "(a)" [| meta_capture lor 1; 0x61; meta_ket; meta_end |];
+  expect ~options:Options.no_auto_capture "(a)"
+    [| meta_nocapture; 0x61; meta_ket; meta_end |];
+  expect "(?:a)" [| meta_nocapture; 0x61; meta_ket; meta_end |];
+  expect "(?|a|b)"
+    [| meta_nocapture; 0x61; meta_alt; 0x62; meta_ket; meta_end |];
+  let cx, rc = run_parse "(?|(a)|(b)(c))(d)" in
+  assert (Int.equal rc 0);
+  assert (Int.equal cx.bracount 3);
+  assert (Int.equal (cx.external_flags land dupcapused) dupcapused);
+
+  (* Inline option settings and their scope. *)
+  expect "(?i)x" [| meta_options; Options.caseless; 0; 0x78; meta_end |];
+  expect "(?i)a(?-i)b"
+    [|
+      meta_options;
+      Options.caseless;
+      0;
+      0x61;
+      meta_options;
+      0;
+      0;
+      0x62;
+      meta_end;
+    |];
+  expect "(?-i)a" [| 0x61; meta_end |];
+  (* (?i: emits META_NOCAPTURE before META_OPTIONS; ) restores the tracked
+     options from the nest stack. *)
+  expect "(?i:a)b"
+    [|
+      meta_nocapture;
+      meta_options;
+      Options.caseless;
+      0;
+      0x61;
+      meta_ket;
+      0x62;
+      meta_end;
+    |];
+  expect "((?i)a)"
+    [|
+      meta_capture lor 1;
+      meta_options;
+      Options.caseless;
+      0;
+      0x61;
+      meta_ket;
+      meta_end;
+    |];
+  (* (?xx) inside the pattern turns on extended-more whitespace skipping. *)
+  expect "(?xx)a b"
+    [|
+      meta_options;
+      Options.extended lor Options.extended_more;
+      0;
+      0x61;
+      0x62;
+      meta_end;
+    |];
+  (* (?^) unsets imnsx; from multiline it is a change worth recording. *)
+  expect ~options:Options.multiline "(?^)a"
+    [| meta_options; 0; 0; 0x61; meta_end |];
+  expect_err "(?^-i)" Errors.err94 3;
+  expect_err "(?z)" Errors.err11 2;
+
+  (* Parenthesis bookkeeping errors. *)
+  expect_err "(" Errors.err14 1;
+  expect_err "(a" Errors.err14 2;
+  expect_err "(?i" Errors.err14 3;
+  expect_err ")" Errors.err22 0;
+  expect_err (String.make 252 '(') Errors.err19 251;
+
+  (* Quantifier errors detected by this chunk ({n,m} syntax); a
+     non-quantifier brace is a literal. *)
+  expect_err "a{2,1}" Errors.err4 5;
+  expect "a{,}b" [| 0x61; 0x7b; 0x2c; 0x7d; 0x62; meta_end |];
+
+  (* PCRE2_EXTRA_MATCH_LINE / _WORD leading and trailing items. *)
+  expect ~extra:Options.extra_match_line "a"
+    [| meta_circumflex; meta_nocapture; 0x61; meta_ket; meta_dollar; meta_end |];
+  expect ~extra:Options.extra_match_word "a"
+    [|
+      meta_escape + esc_b;
+      meta_nocapture;
+      0x61;
+      meta_ket;
+      meta_escape + esc_b;
+      meta_end;
+    |];
+
+  (* PCRE2_AUTO_CALLOUT via manage_callouts: a numerical callout (255)
+     before every item and at the end, with [1] = pattern offset and
+     [2] = length of the preceding item. *)
+  expect ~options:Options.auto_callout "ab"
+    [|
+      meta_callout_number;
+      0;
+      1;
+      255;
+      0x61;
+      meta_callout_number;
+      1;
+      1;
+      255;
+      0x62;
+      meta_callout_number;
+      2;
+      0;
+      255;
+      meta_end;
+    |];
+
+  (* Deferred arms fail loudly with the placeholder code (never a real
+     PCRE2 error number). *)
+  assert (err_deferred > 201);
+  expect_err "a*" err_deferred 2 (* quantifiers: parse_regex C *);
+  expect_err "a{2,3}" err_deferred 6 (* quantifiers: parse_regex C *);
+  expect_err "[a]" err_deferred 1 (* classes: parse_regex B *);
+  expect_err "(?<n>a)" err_deferred 2 (* named groups: parse_regex C *);
+  expect_err "(?=a)" err_deferred 2 (* lookaheads: M4 *);
+  expect_err "(?>a)" err_deferred 2 (* atomic groups: M4 *);
+  expect_err "(?(1)a)" err_deferred 2 (* conditionals: M5 *);
+  expect_err "(?R)" err_deferred 2 (* recursion: M5 *);
+  expect_err "(*FAIL)" err_deferred 1 (* verbs: M5 *);
+  expect_err "\\p{L}" err_deferred 2 (* properties: M7 *);
+  expect_err "\\k<n>" err_deferred 5 (* named references: M3 *);
+  expect_err "\\g<1>" err_deferred 4 (* subroutine calls: M5 *)

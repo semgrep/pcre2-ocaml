@@ -27,8 +27,14 @@ let err2 = compile_error_base + 2 (* \c at end of pattern *)
 let err3 = compile_error_base + 3 (* unrecognized character follows \ *)
 let err4 = compile_error_base + 4 (* numbers out of order in {} quantifier *)
 let err5 = compile_error_base + 5 (* number too big in {} quantifier *)
+let err11 = compile_error_base + 11 (* unrecognized character after (? or (?- *)
+let err14 = compile_error_base + 14 (* missing closing parenthesis *)
 let err15 = compile_error_base + 15 (* reference to non-existent subpattern *)
+let err18 = compile_error_base + 18 (* missing ) after (?# comment *)
+let err19 = compile_error_base + 19 (* parentheses are too deeply nested *)
+let err22 = compile_error_base + 22 (* unmatched closing parenthesis *)
 let err26 = compile_error_base + 26 (* a relative value of zero not allowed *)
+let err28 = compile_error_base + 28 (* assertion expected after (?( or (?(?C) *)
 let err34 = compile_error_base + 34 (* code point in \x{} or \o{} too large *)
 
 let err37 =
@@ -46,9 +52,16 @@ let err57 = compile_error_base + 57 (* \g not followed by name/number *)
 let err60 = compile_error_base + 60 (* ( *VERB) not recognized or malformed *)
 let err61 = compile_error_base + 61 (* subpattern number is too big *)
 let err62 = compile_error_base + 62 (* subpattern name expected *)
+
+let err63 =
+  compile_error_base + 63 (* internal error: parsed pattern overflow *)
+
 let err64 = compile_error_base + 64 (* non-octal character in \o{} *)
 let err67 = compile_error_base + 67 (* non-hex character in \x{} *)
 let err68 = compile_error_base + 68 (* \c must be followed by printable ASCII *)
+
+let err69 =
+  compile_error_base + 69 (* \k not followed by braced/bracketed name *)
 
 let err73 =
   compile_error_base + 73 (* disallowed Unicode code point (surrogate) *)
@@ -59,7 +72,15 @@ let err77 =
 let err78 =
   compile_error_base + 78 (* digits missing in \x{} or \o{} or \N{U+} *)
 
+let err83 =
+  compile_error_base + 83 (* using \C is disabled by the application *)
+
+let err84 =
+  compile_error_base + 84 (* (?| / (?J: / (?x: parens too deeply nested *)
+
 let err93 = compile_error_base + 93 (* \N{U+dddd} only in Unicode (UTF) mode *)
+let err94 = compile_error_base + 94 (* invalid hyphen in option setting *)
+let err97 = compile_error_base + 97 (* too many capturing groups (max 65535) *)
 
 (* "Expected" matching error codes: pcre2.h.generic:327-328. *)
 let error_nomatch = -1
