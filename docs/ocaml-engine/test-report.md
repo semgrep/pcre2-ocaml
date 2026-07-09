@@ -57,6 +57,8 @@ Upstream-reportable C bugs: **3** (#5–7), report at `upstream-pcre2-bugs.md`.
 
 ## 5. Performance (engine / C-oracle interpreter, release profile, 5-rep medians)
 
+Narrative + causes (closure churn, arena allocation) in `performance-report.md`.
+
 ### Campaign ladder (geomean)
 
 | stage | geomean | note |
