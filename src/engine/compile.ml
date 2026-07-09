@@ -1807,9 +1807,7 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                track some properties of the class: class_has_8bitchar will
                be non-zero if the class contains at least one character
                with a code point less than 256; xclass_has_prop will be
-               TRUE if Unicode property checks are present in the class
-               (the \p/\P producer is M7-deferred, so it stays false until
-               docs/ocaml-engine/08-ucp.md lands). *)
+               TRUE if Unicode property checks are present in the class. *)
             let class_has_8bitchar = ref 0 in
             let xclass_has_prop = ref false in
 
@@ -1901,105 +1899,128 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                      escape sequences that use Unicode properties \p or \P
                      (done at parse time, Parse.posix_substitutes). Others
                      that are not available via \p or \P have to generate
-                     XCL_PROP/XCL_NOTPROP directly, which is done here. *)
-                  if
-                    (not (Int.equal (!options land Options.ucp) 0))
-                    && Int.equal (!xoptions land Options.extra_ascii_posix) 0
-                  then
+                     XCL_PROP/XCL_NOTPROP directly, which is done here.
+                     [ucp_prop_done] = the C's `goto CONTINUE_CLASS` out of
+                     the graph/print/punct arm, skipping the bitmap code
+                     below. *)
+                  let ucp_prop_done =
                     if
-                      Int.equal !posix_class pc_graph
-                      || Int.equal !posix_class pc_print
-                      || Int.equal !posix_class pc_punct
-                    then (
-                      (* pcre2_compile.c:6061-6070 — XCL_PROP/XCL_NOTPROP
-                         PT_PXGRAPH/PT_PXPRINT/PT_PXPUNCT emission.
-                         DEVIATION: Unicode property classes are M7
-                         (docs/ocaml-engine/08-ucp.md); fails loudly, both
-                         phases. *)
-                      errorcodeptr := Parse.err_deferred;
-                      return_from_branch 0)
-                    else if utf then
-                      (* pcre2_compile.c:6072-6093 — for the other POSIX
-                         classes (ex: ascii) we fall through to the
-                         non-UCP case and build a bit map for characters
-                         with code points less than 256. In a negated
-                         POSIX class, characters with code points greater
-                         than 255 must either all match or all not match;
-                         setting this flag causes an explicit range to be
-                         generated later when it is known that OP_XCLASS
-                         is required. In the 8-bit library this is
-                         relevant only in utf mode. *)
-                      match_all_or_no_wide_chars :=
-                        !match_all_or_no_wide_chars || local_negate;
-
-                  (* pcre2_compile.c:6098-6109 — in the non-UCP case, or
-                     when UCP makes no difference, we build the bit map
-                     for the POSIX class in a chunk of local store because
-                     we may be adding and subtracting from it, and we
-                     don't want to subtract bits that may be in the main
-                     map already. At the end we or the result into the bit
-                     map that is being built. Copy in the first table
-                     (always present). *)
-                  let posix_class = !posix_class * 3 in
-                  let pbits = Bytes.make 32 '\000' in
-                  for i = 0 to 31 do
-                    Bytes.set pbits i
-                      (Char.chr
-                         (Chartables.cbits (i + posix_class_maps.(posix_class))))
-                  done;
-
-                  (* pcre2_compile.c:6111-6122 — if there is a second
-                     table, add or remove it as required. *)
-                  let taboffset = posix_class_maps.(posix_class + 1) in
-                  let tabopt = posix_class_maps.(posix_class + 2) in
-                  if taboffset >= 0 then
-                    if tabopt >= 0 then
-                      for i = 0 to 31 do
-                        Bytes.set pbits i
+                      (not (Int.equal (!options land Options.ucp) 0))
+                      && Int.equal (!xoptions land Options.extra_ascii_posix) 0
+                    then
+                      if
+                        Int.equal !posix_class pc_graph
+                        || Int.equal !posix_class pc_print
+                        || Int.equal !posix_class pc_punct
+                      then (
+                        (* pcre2_compile.c:6061-6070 — XCL_PROP/XCL_NOTPROP
+                           with PT_PXGRAPH/PT_PXPRINT/PT_PXPUNCT and a zero
+                           data unit. *)
+                        Bytes.set cb.start_code !class_uchardata
                           (Char.chr
-                             (Char.code (Bytes.get pbits i)
-                             lor Chartables.cbits (i + taboffset)))
+                             (if local_negate then Opcodes.xcl_notprop
+                              else Opcodes.xcl_prop));
+                        incr class_uchardata;
+                        Bytes.set cb.start_code !class_uchardata
+                          (Char.chr
+                             (if Int.equal !posix_class pc_graph then
+                                Opcodes.pt_pxgraph
+                              else if Int.equal !posix_class pc_print then
+                                Opcodes.pt_pxprint
+                              else Opcodes.pt_pxpunct));
+                        incr class_uchardata;
+                        Bytes.set cb.start_code !class_uchardata '\000';
+                        incr class_uchardata;
+                        xclass_has_prop := true;
+                        true (* goto CONTINUE_CLASS *))
+                      else (
+                        (* pcre2_compile.c:6072-6093 — for the other POSIX
+                           classes (ex: ascii) we fall through to the
+                           non-UCP case and build a bit map for characters
+                           with code points less than 256. In a negated
+                           POSIX class, characters with code points greater
+                           than 255 must either all match or all not match;
+                           setting this flag causes an explicit range to be
+                           generated later when it is known that OP_XCLASS
+                           is required. In the 8-bit library this is
+                           relevant only in utf mode. *)
+                        if utf then
+                          match_all_or_no_wide_chars :=
+                            !match_all_or_no_wide_chars || local_negate;
+                        false)
+                    else false
+                  in
+
+                  if not ucp_prop_done then (
+                    (* pcre2_compile.c:6098-6109 — in the non-UCP case, or
+                       when UCP makes no difference, we build the bit map
+                       for the POSIX class in a chunk of local store because
+                       we may be adding and subtracting from it, and we
+                       don't want to subtract bits that may be in the main
+                       map already. At the end we or the result into the bit
+                       map that is being built. Copy in the first table
+                       (always present). *)
+                    let posix_class = !posix_class * 3 in
+                    let pbits = Bytes.make 32 '\000' in
+                    for i = 0 to 31 do
+                      Bytes.set pbits i
+                        (Char.chr
+                           (Chartables.cbits
+                              (i + posix_class_maps.(posix_class))))
+                    done;
+
+                    (* pcre2_compile.c:6111-6122 — if there is a second
+                       table, add or remove it as required. *)
+                    let taboffset = posix_class_maps.(posix_class + 1) in
+                    let tabopt = posix_class_maps.(posix_class + 2) in
+                    if taboffset >= 0 then
+                      if tabopt >= 0 then
+                        for i = 0 to 31 do
+                          Bytes.set pbits i
+                            (Char.chr
+                               (Char.code (Bytes.get pbits i)
+                               lor Chartables.cbits (i + taboffset)))
+                        done
+                      else
+                        for i = 0 to 31 do
+                          Bytes.set pbits i
+                            (Char.chr
+                               (Char.code (Bytes.get pbits i)
+                               land (lnot (Chartables.cbits (i + taboffset))
+                                    land 0xff)))
+                        done;
+
+                    (* pcre2_compile.c:6124-6129 — now see if we need to
+                       remove any special characters. An option value of 1
+                       removes vertical space and 2 removes underscore. *)
+                    let tabopt = if tabopt < 0 then -tabopt else tabopt in
+                    if Int.equal tabopt 1 then
+                      Bytes.set pbits 1
+                        (Char.chr (Char.code (Bytes.get pbits 1) land lnot 0x3c))
+                    else if Int.equal tabopt 2 then
+                      Bytes.set pbits 11
+                        (Char.chr (Char.code (Bytes.get pbits 11) land 0x7f));
+
+                    (* pcre2_compile.c:6131-6141 — add the POSIX table or
+                       its complement into the main table that is being
+                       built and we are done. Every class contains at least
+                       one < 256 character. *)
+                    if local_negate then
+                      for i = 0 to 31 do
+                        Bytes.set classbits i
+                          (Char.chr
+                             (Char.code (Bytes.get classbits i)
+                             lor (lnot (Char.code (Bytes.get pbits i))
+                                 land 0xff)))
                       done
                     else
                       for i = 0 to 31 do
-                        Bytes.set pbits i
+                        Bytes.set classbits i
                           (Char.chr
-                             (Char.code (Bytes.get pbits i)
-                             land (lnot (Chartables.cbits (i + taboffset))
-                                  land 0xff)))
+                             (Char.code (Bytes.get classbits i)
+                             lor Char.code (Bytes.get pbits i)))
                       done;
-
-                  (* pcre2_compile.c:6124-6129 — now see if we need to
-                     remove any special characters. An option value of 1
-                     removes vertical space and 2 removes underscore. *)
-                  let tabopt = if tabopt < 0 then -tabopt else tabopt in
-                  if Int.equal tabopt 1 then
-                    Bytes.set pbits 1
-                      (Char.chr (Char.code (Bytes.get pbits 1) land lnot 0x3c))
-                  else if Int.equal tabopt 2 then
-                    Bytes.set pbits 11
-                      (Char.chr (Char.code (Bytes.get pbits 11) land 0x7f));
-
-                  (* pcre2_compile.c:6131-6141 — add the POSIX table or
-                     its complement into the main table that is being
-                     built and we are done. Every class contains at least
-                     one < 256 character. *)
-                  if local_negate then
-                    for i = 0 to 31 do
-                      Bytes.set classbits i
-                        (Char.chr
-                           (Char.code (Bytes.get classbits i)
-                           lor (lnot (Char.code (Bytes.get pbits i)) land 0xff)
-                           ))
-                    done
-                  else
-                    for i = 0 to 31 do
-                      Bytes.set classbits i
-                        (Char.chr
-                           (Char.code (Bytes.get classbits i)
-                           lor Char.code (Bytes.get pbits i)))
-                    done;
-                  class_has_8bitchar := 1
+                    class_has_8bitchar := 1)
                   (* goto CONTINUE_CLASS — end of POSIX handling *))
                 else if Int.equal item Parse.meta_bigvalue then (
                   (* pcre2_compile.c:6148-6152 — other than POSIX classes,
@@ -2107,14 +2128,31 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                     Int.equal escape Parse.esc_p
                     || Int.equal escape Parse.esc_big_p
                   then (
-                    (* pcre2_compile.c:6243-6256 — \p and \P in a class:
-                       XCL_PROP/XCL_NOTPROP extra data, xclass_has_prop,
-                       and the class_has_8bitchar-- undo. DEVIATION:
-                       Unicode property classes are M7
-                       (docs/ocaml-engine/08-ucp.md); fails loudly, both
-                       phases. *)
-                    errorcodeptr := Parse.err_deferred;
-                    return_from_branch 0)
+                    (* pcre2_compile.c:6243-6255 — \p and \P in a class:
+                       XCL_PROP/XCL_NOTPROP with the two property data
+                       units, note xclass_has_prop, and undo the
+                       class_has_8bitchar increment made for every class
+                       escape above. *)
+                    pptr := !pptr + 1;
+                    let ptype = cb.parsed_pattern.(!pptr) lsr 16 in
+                    let pdata = cb.parsed_pattern.(!pptr) land 0xffff in
+                    Bytes.set cb.start_code !class_uchardata
+                      (Char.chr
+                         (if Int.equal escape Parse.esc_p then Opcodes.xcl_prop
+                          else Opcodes.xcl_notprop));
+                    incr class_uchardata;
+                    (* *class_uchardata++ = ptype / pdata: PCRE2_UCHAR is
+                       uint8_t in the 8-bit library (values are ucp/PT
+                       enums < 256; the mask mirrors the C's uint8_t
+                       store). *)
+                    Bytes.set cb.start_code !class_uchardata
+                      (Char.chr (ptype land 0xff));
+                    incr class_uchardata;
+                    Bytes.set cb.start_code !class_uchardata
+                      (Char.chr (pdata land 0xff));
+                    incr class_uchardata;
+                    xclass_has_prop := true;
+                    class_has_8bitchar := !class_has_8bitchar - 1 (* Undo! *))
                   (* no other escape reaches a class item: the C switch
                      has no default and falls through to CONTINUE_CLASS
                      with only the class_has_8bitchar increment above *))
@@ -3780,11 +3818,25 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
 
         if Int.equal meta_arg Parse.esc_big_p || Int.equal meta_arg Parse.esc_p
         then (
-          (* pcre2_compile.c:8136-8157 — \P and \p (OP_PROP/OP_NOTPROP and
-             the \p{Any} OP_ALLANY special case) plus their extra data
-             word: docs/ocaml-engine/08-ucp.md. Deferred loudly. *)
-          errorcodeptr := Parse.err_deferred;
-          return_from_branch 0)
+          (* pcre2_compile.c:8136-8156 — \P and \p with their extra data
+             word (ptype << 16) | pdata (SUPPORT_UNICODE is defined in the
+             reference configuration). *)
+          pptr := !pptr + 1;
+          let ptype = cb.parsed_pattern.(!pptr) lsr 16 in
+          let pdata = cb.parsed_pattern.(!pptr) land 0xffff in
+
+          (* pcre2_compile.c:8142-8148 — the special case of \p{Any} is
+             compiled to OP_ALLANY so as to benefit from the auto-anchoring
+             code. *)
+          if Int.equal meta_arg Parse.esc_p && Int.equal ptype Opcodes.pt_any
+          then emit_cu Opcodes.op_allany
+          else (
+            emit_cu
+              (if Int.equal meta_arg Parse.esc_p then Opcodes.op_prop
+               else Opcodes.op_notprop);
+            emit_cu ptype;
+            emit_cu pdata)
+          (* break: end META_ESCAPE *))
         else (
           (* pcre2_compile.c:8159-8167 — \K is forbidden in lookarounds
              since 10.38 because that's what Perl has done. However,
@@ -6709,23 +6761,6 @@ let () =
       (fun i v -> assert (Int.equal (Char.code (Bytes.get cb.start_code i)) v))
       expected
   in
-  (* Deferred arms fail loudly with Parse.err_deferred, identically in the
-     pre-compile and real phases. *)
-  let expect_deferred ?(options = 0) ?(extra = 0) pat =
-    let cx = parse ~options ~extra pat in
-    let cb = make_cb ~options pat cx in
-    let rc, err, _, _, _, _, _, _, _ =
-      run_branch ~options ~extra cb (Some (ref 0))
-    in
-    assert (Int.equal rc 0);
-    assert (Int.equal err Parse.err_deferred);
-    let cb = make_cb ~options pat cx in
-    cb.start_code <- Bytes.make 64 '\000';
-    let rc, err, _, _, _, _, _, _, _ = run_branch ~options ~extra cb None in
-    assert (Int.equal rc 0);
-    assert (Int.equal err Parse.err_deferred)
-  in
-
   (* Literals: OP_CHAR chain, firstcu/reqcu protocol, and the
      must-match-a-character return +1 (pcre2_compile.c:5800-5804,
      8226-8336). *)
@@ -7954,10 +7989,104 @@ let () =
   assert (Int.equal rcuf 0);
   assert (Int.equal (Bytes.length cb.start_code) 24);
 
-  (* Deferred arms fail loudly in both phases: \p-produced Unicode
-     property classes (M7). *)
-  expect_deferred ~options:Options.ucp "[\\d]"
-  (* parse substitutes \p{Nd} under UCP: ESC_p in a class = XCL_PROP (M7) *);
+  (* \p and \P in a class (pcre2_compile.c:6243-6255): parse substitutes
+     \p{Nd} for \d under UCP, so /[\d]/ucp = OP_XCLASS with no bitmap
+     (class_has_8bitchar undone), flags = XCL_HASPROP, one XCL_PROP item.
+     Oracle dump `[\p{Nd}]`, item spanning offsets 3-11 (length 8). *)
+  let cb, rc, _, _, _, _, _, _ = compile2 ~options:Options.ucp "[\\d]" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_xclass;
+      0;
+      8;
+      Opcodes.xcl_hasprop;
+      Opcodes.xcl_prop;
+      Opcodes.pt_pc;
+      Ucp.ucp_nd;
+      Opcodes.xcl_end;
+    ];
+  (* /[\p{L}\d]/utf: bitmap (0-9) + XCL_PROP; flags = XCL_MAP lor
+     XCL_HASPROP. Oracle dump `[0-9\p{L}]`, item spanning offsets 3-43
+     (length 40). *)
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~options:Options.utf "[\\p{L}\\d]"
+  in
+  assert (Int.equal (Bytes.length cb.start_code) 40);
+  assert (Int.equal (Char.code (Bytes.get cb.start_code 0)) Opcodes.op_xclass);
+  assert (Int.equal (get cb.start_code 1) 40);
+  assert
+    (Int.equal
+       (Char.code (Bytes.get cb.start_code 3))
+       (Opcodes.xcl_map lor Opcodes.xcl_hasprop));
+  (* The 32-byte map covers 0x30-0x39 ('0' bit set, 'a' clear)... *)
+  assert
+    (Int.equal (Char.code (Bytes.get cb.start_code (4 + (0x30 / 8)))) 0xff);
+  assert (Int.equal (Char.code (Bytes.get cb.start_code (4 + (0x61 / 8)))) 0);
+  (* ...followed by the property item and XCL_END. *)
+  List.iteri
+    (fun i v ->
+      assert (Int.equal (Char.code (Bytes.get cb.start_code (36 + i))) v))
+    [ Opcodes.xcl_prop; Opcodes.pt_gc; Ucp.ucp_l; Opcodes.xcl_end ];
+  (* UCP POSIX graph/print/punct classes (pcre2_compile.c:6061-6070):
+     /[[:graph:]]/ucp = XCLASS with XCL_PROP PT_PXGRAPH 0; the negated
+     /[^[:^print:]]/ucp = XCL_NOT lor XCL_HASPROP with XCL_NOTPROP
+     PT_PXPRINT 0. Oracle items span offsets 3-11 (length 8). *)
+  let cb, _, _, _, _, _, _, _ = compile2 ~options:Options.ucp "[[:graph:]]" in
+  assert_code cb
+    [
+      Opcodes.op_xclass;
+      0;
+      8;
+      Opcodes.xcl_hasprop;
+      Opcodes.xcl_prop;
+      Opcodes.pt_pxgraph;
+      0;
+      Opcodes.xcl_end;
+    ];
+  let cb, _, _, _, _, _, _, _ =
+    compile2 ~options:Options.ucp "[^[:^print:]]"
+  in
+  assert_code cb
+    [
+      Opcodes.op_xclass;
+      0;
+      8;
+      Opcodes.xcl_not lor Opcodes.xcl_hasprop;
+      Opcodes.xcl_notprop;
+      Opcodes.pt_pxprint;
+      0;
+      Opcodes.xcl_end;
+    ];
+  (* Freestanding \p/\P (pcre2_compile.c:8136-8156): OP_PROP/OP_NOTPROP
+     with type and value; \p{Any} = OP_ALLANY (auto-anchoring benefit);
+     repeats go through the property branch of OUTPUT_SINGLE_REPEAT
+     (7776-7780: /\p{Nd}{2,}/ = TYPEEXACT{2} PROP Nd + TYPESTAR PROP Nd,
+     oracle dump `prop Nd {2}` / `prop Nd *+` before auto-possess). *)
+  let cb, rc, _, _, _, fcuf, _, _ = compile2 "\\p{Greek}" in
+  assert (Int.equal rc 1);
+  assert (Int.equal fcuf req_none);
+  assert_code cb [ Opcodes.op_prop; Opcodes.pt_scx; Ucp.ucp_greek ];
+  let cb, _, _, _, _, _, _, _ = compile2 "\\p{^L}" in
+  assert_code cb [ Opcodes.op_notprop; Opcodes.pt_gc; Ucp.ucp_l ];
+  let cb, _, _, _, _, _, _, _ = compile2 "\\P{Nd}" in
+  assert_code cb [ Opcodes.op_notprop; Opcodes.pt_pc; Ucp.ucp_nd ];
+  let cb, _, _, _, _, _, _, _ = compile2 "\\p{Any}" in
+  assert_code cb [ Opcodes.op_allany ];
+  let cb, _, _, _, _, _, _, _ = compile2 "\\p{Nd}{2,}" in
+  assert_code cb
+    [
+      Opcodes.op_typeexact;
+      0;
+      2;
+      Opcodes.op_prop;
+      Opcodes.pt_pc;
+      Ucp.ucp_nd;
+      Opcodes.op_typestar;
+      Opcodes.op_prop;
+      Opcodes.pt_pc;
+      Ucp.ucp_nd;
+    ];
 
   (* UTF / Unicode-caseless compile_branch arms, pinned against `pcre2test
      -q` + fullbincode on the real 10.44 library (testoutput-style dumps

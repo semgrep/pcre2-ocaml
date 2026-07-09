@@ -1775,6 +1775,172 @@ let check_escape (cx : parse_context) (ptrptr : int ref) (chptr : int ref)
       !escape
     with Return_zero -> 0
 
+(* ---------- Handle \P and \p ---------- *)
+
+(* pcre2_compile.c:2145-2326 — get_ucp. This function is called after \P or
+   \p has been encountered (Unicode support is always compiled in the
+   reference configuration, so no SUPPORT_UNICODE guard). On entry ptrptr
+   points after the P or p; on exit it is left pointing after the final
+   code unit of the escape sequence.
+
+   Arguments:
+     cx        errorcode plumbing (the C's errorcodeptr and cb)
+     ptrptr    the pattern position pointer
+     negptr    set true for negation ({^...}) else false
+     ptypeptr  set to the PT_* type value (C: uint16_t)
+     pdataptr  set to the detailed property value (C: uint16_t)
+
+   Returns: true if the type value was found, or false for an invalid
+   type. *)
+let get_ucp (cx : parse_context) (ptrptr : int ref) (negptr : bool ref)
+    (ptypeptr : int ref) (pdataptr : int ref) : bool =
+  let pat = cx.pattern in
+  let ptr = ref !ptrptr in
+  (* pcre2_compile.c:2173-2175 — PCRE2_UCHAR name[50]; PCRE2_UCHAR *vptr =
+     NULL (a pointer into name[], here the index with -1 for NULL);
+     uint16_t ptscript = PT_NOTSCRIPT. [i] mirrors the C's loop index: one
+     past the last stored name character when the loop ends. *)
+  let name = Bytes.make 50 '\000' in
+  let i = ref 0 in
+  let vptr = ref (-1) in
+  let ptscript = ref Opcodes.pt_notscript in
+  let exception Error_return in
+  try
+    if !ptr >= cx.ptrend then raise_notrace Error_return;
+    let c = ref (Char.code pat.[!ptr]) in
+    incr ptr;
+    negptr := false;
+
+    (* pcre2_compile.c:2181-2215 — \P or \p can be followed by a name in
+       {}, optionally preceded by ^ for negation. *)
+    if Int.equal !c (Char.code '{') then (
+      if !ptr >= cx.ptrend then raise_notrace Error_return;
+      if Char.equal pat.[!ptr] '^' then (
+        negptr := true;
+        incr ptr);
+      (* for (i = 0; i < sizeof(name)/sizeof(PCRE2_UCHAR) - 1; i++) *)
+      let broke = ref false in
+      while (not !broke) && !i < Bytes.length name - 1 do
+        if !ptr >= cx.ptrend then raise_notrace Error_return;
+        c := Char.code pat.[!ptr];
+        incr ptr;
+        (* while (c == '_' || c == '-' || isspace(c)) — C-locale isspace()
+           holds for 0x20 and 0x09-0x0d only. *)
+        while
+          Int.equal !c (Char.code '_')
+          || Int.equal !c (Char.code '-')
+          || Int.equal !c 0x20
+          || (!c >= 0x09 && !c <= 0x0d)
+        do
+          if !ptr >= cx.ptrend then raise_notrace Error_return;
+          c := Char.code pat.[!ptr];
+          incr ptr
+        done;
+        if Int.equal !c 0 (* CHAR_NUL *) then raise_notrace Error_return;
+        if Int.equal !c (Char.code '}') then broke := true
+        else (
+          (* name[i] = tolower(c) — C-locale tolower() folds only A-Z. *)
+          Bytes.set name !i
+            (Char.chr
+               (if !c >= Char.code 'A' && !c <= Char.code 'Z' then !c + 32
+                else !c));
+          if
+            (Int.equal !c (Char.code ':') || Int.equal !c (Char.code '='))
+            && Int.equal !vptr (-1)
+          then vptr := !i;
+          incr i)
+      done;
+      if not (Int.equal !c (Char.code '}')) then raise_notrace Error_return
+      (* name[i] = 0 — the length [i] delimits the name below. *))
+    else if
+      (* pcre2_compile.c:2217-2225 — if { doesn't follow \p or \P there is
+         just one following character, which must be an ASCII letter.
+         MAX_255(c) always holds for an 8-bit code unit. *)
+      not (Int.equal (Chartables.ctypes !c land Chartables.ctype_letter) 0)
+    then (
+      Bytes.set name 0
+        (Char.chr
+           (if !c >= Char.code 'A' && !c <= Char.code 'Z' then !c + 32 else !c));
+      i := 1)
+    else raise_notrace Error_return;
+
+    ptrptr := !ptr;
+
+    (* pcre2_compile.c:2229-2277 — if the property contains ':' or '=' we
+       have class name and value separately specified. Supported:
+       Bidi_Class (synonym bc), for which the property names are
+       "bidi<name>"; Script (synonym sc), for which the property name is
+       the script name; Script_Extensions (synonym scx), ditto. For both
+       script properties, a PT_xxx value is set so that (1) they can be
+       distinguished and (2) invalid script names that happen to be the
+       name of another property can be diagnosed. The C's in-place
+       memmoves (2273-2276) become string concatenation on the value
+       part. *)
+    let lookup_name =
+      if not (Int.equal !vptr (-1)) then (
+        let prop = Bytes.sub_string name 0 !vptr in
+        let value = Bytes.sub_string name (!vptr + 1) (!i - !vptr - 1) in
+        if String.equal prop "bidiclass" || String.equal prop "bc" then
+          Some ("bidi" ^ value)
+        else if String.equal prop "script" || String.equal prop "sc" then (
+          ptscript := Opcodes.pt_sc;
+          Some value)
+        else if String.equal prop "scriptextensions" || String.equal prop "scx"
+        then (
+          ptscript := Opcodes.pt_scx;
+          Some value)
+        else None (* ERR47 (pcre2_compile.c:2267-2271) *))
+      else Some (Bytes.sub_string name 0 !i)
+    in
+    match lookup_name with
+    | None ->
+        cx.errorcode <- Errors.err47;
+        false
+    | Some lookup_name ->
+        (* pcre2_compile.c:2279-2317 — search for a recognized property
+           using binary chop over Ucptables.utt (strcmp_c8 and
+           String.compare agree on these ASCII names). *)
+        let found = ref false in
+        let searching = ref true in
+        let bot = ref 0 in
+        let top = ref (Array.length Ucptables.utt) in
+        while !searching && !bot < !top do
+          let m = (!bot + !top) lsr 1 in
+          let entry_name, entry_type, entry_value = Ucptables.utt.(m) in
+          let r = String.compare lookup_name entry_name in
+          if Int.equal r 0 then (
+            (* pcre2_compile.c:2290-2314 — when a matching property is
+               found, some extra checking is needed when the \p{xx:yy}
+               syntax is used and xx is either sc or scx. *)
+            pdataptr := entry_value;
+            if Int.equal !vptr (-1) || Int.equal !ptscript Opcodes.pt_notscript
+            then (
+              ptypeptr := entry_type;
+              found := true;
+              searching := false)
+            else if Int.equal entry_type Opcodes.pt_sc then (
+              ptypeptr := Opcodes.pt_sc;
+              found := true;
+              searching := false)
+            else if Int.equal entry_type Opcodes.pt_scx then (
+              ptypeptr := !ptscript;
+              found := true;
+              searching := false)
+            else searching := false (* break: non-script found *))
+          else if r > 0 then bot := m + 1
+          else top := m
+        done;
+        if !found then true
+        else (
+          (* pcre2_compile.c:2319-2320 — unrecognized property. *)
+          cx.errorcode <- Errors.err47;
+          false)
+  with Error_return ->
+    (* pcre2_compile.c:2322-2325 — malformed \P or \p. *)
+    cx.errorcode <- Errors.err46;
+    ptrptr := !ptr;
+    false
+
 (* ---------- Check for POSIX class syntax ---------- *)
 
 (* pcre2_compile.c:2331-2399 — check_posix_syntax. Called when the sequence
@@ -2245,10 +2411,10 @@ let parse_tracked_extra_options =
 
 (* DEVIATION: distinctive placeholder error code for parse_regex arms that
    are deferred to later chunks (conditionals, recursion, subroutine calls,
-   verbs and callouts -> M5; \p and \P -> M7; script runs -> M8). PCRE2
-   compile errors occupy 100..201, so 299 can never collide with a real
-   result; deferred constructs fail loudly instead of misparsing. Every use
-   site below carries a comment naming its chunk. *)
+   verbs and callouts -> M5; script runs -> M8). PCRE2 compile errors
+   occupy 100..201, so 299 can never collide with a real result; deferred
+   constructs fail loudly instead of misparsing. Every use site below
+   carries a comment naming its chunk. *)
 let err_deferred = 299
 
 (* Local control-flow exceptions for parse_regex (port-conventions §2:
@@ -3138,10 +3304,26 @@ let parse_regex (cx : parse_context) ~(options : int)
                    else if
                      Int.equal !escape esc_big_p || Int.equal !escape esc_p
                    then (
-                     (* pcre2_compile.c:3327-3346 — \P and \p Unicode property
-                        matching needs get_ucp(): deferred to M7. *)
-                     cx.errorcode <- err_deferred;
-                     raise_notrace Goto_failed)
+                     (* pcre2_compile.c:3327-3346 — \P and \p Unicode
+                        property matching (SUPPORT_UNICODE is defined in
+                        the reference configuration, so the ERR45 arm does
+                        not apply). *)
+                     let negated = ref false in
+                     let ptype = ref 0 in
+                     let pdata = ref 0 in
+                     if not (get_ucp cx ptr negated ptype pdata) then (
+                       escape_failed () (* goto ESCAPE_FAILED *);
+                       process_escape ())
+                     else (
+                       if !negated then
+                         escape :=
+                           (if Int.equal !escape esc_big_p then esc_p
+                            else esc_big_p);
+                       buf.(!pp) <- meta_escape + !escape;
+                       incr pp;
+                       buf.(!pp) <- (!ptype lsl 16) lor !pdata;
+                       incr pp;
+                       okquantifier := true (* End \P and \p *)))
                    else if Int.equal !escape esc_g || Int.equal !escape esc_k
                    then (
                      if
@@ -3690,12 +3872,24 @@ let parse_regex (cx : parse_context) ~(options : int)
                              Int.equal !escape esc_big_p
                              || Int.equal !escape esc_p
                            then (
-                             (* pcre2_compile.c:3857-3875 — explicit Unicode
-                                property matching needs get_ucp(): deferred
-                                to M7 with the freestanding \p arm
-                                (pcre2_compile.c:3327-3346). *)
-                             cx.errorcode <- err_deferred;
-                             raise_notrace Goto_failed)
+                             (* pcre2_compile.c:3857-3875 — explicit
+                                Unicode property matching. A get_ucp()
+                                failure here is `goto FAILED` (not the
+                                ESCAPE_FAILED recovery the freestanding arm
+                                uses). *)
+                             let negated = ref false in
+                             let ptype = ref 0 in
+                             let pdata = ref 0 in
+                             if not (get_ucp cx ptr negated ptype pdata) then
+                               raise_notrace Goto_failed;
+                             if !negated then
+                               escape :=
+                                 (if Int.equal !escape esc_big_p then esc_p
+                                  else esc_big_p);
+                             buf.(!pp) <- meta_escape + !escape;
+                             incr pp;
+                             buf.(!pp) <- (!ptype lsl 16) lor !pdata;
+                             incr pp (* End \P and \p *))
                            else (
                              (* All others are not allowed in a class *)
                              cx.errorcode <- Errors.err7;
@@ -5244,8 +5438,29 @@ let () =
   expect_err "[[:alpha:]-a]" Errors.err50 10;
   expect_err "[\\d-x]" Errors.err50 3;
   expect_err "[a-\\d]" Errors.err50 5;
-  (* \p inside a class defers to M7 like the freestanding arm. *)
-  expect_err "[\\p{L}]" err_deferred 3;
+  (* \p and \P inside a class (pcre2_compile.c:3857-3875): META_ESCAPE +
+     ESC_p/ESC_P followed by the (ptype << 16) | pdata word. In-class
+     get_ucp failures are `goto FAILED` — no BAD_ESCAPE_IS_LITERAL
+     recovery (oracle: /[\p{Zz}]/ fails even with bad_escape_is_literal). *)
+  expect "[\\p{L}]"
+    [|
+      meta_class;
+      meta_escape + esc_p;
+      (Opcodes.pt_gc lsl 16) lor Ucp.ucp_l;
+      meta_class_end;
+      meta_end;
+    |];
+  expect "[\\P{Nd}]"
+    [|
+      meta_class;
+      meta_escape + esc_big_p;
+      (Opcodes.pt_pc lsl 16) lor Ucp.ucp_nd;
+      meta_class_end;
+      meta_end;
+    |];
+  expect_err "[\\p{Zz}]" Errors.err47 7;
+  expect_err ~extra:Options.extra_bad_escape_is_literal "[\\p{Zz}]" Errors.err47
+    7;
 
   (* [[:>:]] also sets the has_lookbehind flag and stores a zero offset. *)
   (let cx = make_context "[[:>:]]" in
@@ -5584,7 +5799,129 @@ let () =
      PCRE2 error number). *)
   assert (err_deferred > 201);
   expect_err "(*script_run:a)" err_deferred 12 (* script runs: M8 *);
-  expect_err "\\p{L}" err_deferred 2 (* properties: M7 *)
+
+  (* Freestanding \p and \P (pcre2_compile.c:3327-3346): META_ESCAPE +
+     ESC_p/ESC_P followed by (ptype << 16) | pdata; {^...} flips the
+     escape (3337). Error codes and offsets pinned against pcre2test
+     10.44. *)
+  expect "\\p{L}"
+    [| meta_escape + esc_p; (Opcodes.pt_gc lsl 16) lor Ucp.ucp_l; meta_end |];
+  expect "\\pL"
+    [| meta_escape + esc_p; (Opcodes.pt_gc lsl 16) lor Ucp.ucp_l; meta_end |];
+  expect "\\PL"
+    [|
+      meta_escape + esc_big_p; (Opcodes.pt_gc lsl 16) lor Ucp.ucp_l; meta_end;
+    |];
+  expect "\\p{^L}"
+    [|
+      meta_escape + esc_big_p; (Opcodes.pt_gc lsl 16) lor Ucp.ucp_l; meta_end;
+    |];
+  expect "\\P{^L}"
+    [| meta_escape + esc_p; (Opcodes.pt_gc lsl 16) lor Ucp.ucp_l; meta_end |];
+  expect "\\p{Any}" [| meta_escape + esc_p; Opcodes.pt_any lsl 16; meta_end |];
+  (* A quantifier is allowed after \p (okquantifier, 3340). *)
+  expect "\\p{Nd}+"
+    [|
+      meta_escape + esc_p;
+      (Opcodes.pt_pc lsl 16) lor Ucp.ucp_nd;
+      meta_plus;
+      meta_end;
+    |];
+  (* Errors: ERR46 malformed, ERR47 unknown property; offsets after the
+     failing escape (oracle: 146 at 2 for /\p/, 146 at 3 for /\p1/, 147 at
+     6 for /\p{Zz}/, 147 at 4 for /\p{}/, 147 at 9 for /\p{sc:Zz}/, 147 at
+     11 for /\p{foo=bar}/). *)
+  expect_err "\\p" Errors.err46 2;
+  expect_err "\\p1" Errors.err46 3;
+  expect_err "\\p{Zz}" Errors.err47 6;
+  expect_err "\\p{}" Errors.err47 4;
+  expect_err "\\p{sc:Zz}" Errors.err47 9;
+  expect_err "\\p{foo=bar}" Errors.err47 11;
+  (* The freestanding arm recovers under BAD_ESCAPE_IS_LITERAL
+     (ESCAPE_FAILED; oracle matches "p{Zz}" literally). *)
+  expect ~extra:Options.extra_bad_escape_is_literal "\\p{Zz}"
+    [| 0x70; 0x7b; 0x5a; 0x7a; 0x7d; meta_end |]
+
+(* get_ucp (pcre2_compile.c:2145-2326) over the utt table: loose matching
+   (case folding and _ - space stripping), the sc=/scx: forms, bidi
+   classes, boolean properties, and the error paths. Expected PT_*/ucp_*
+   pairs pinned against the 10.44 tables (ucptables.ml). *)
+let () =
+  let probe s =
+    let cx = make_context s in
+    let ptr = ref 0 in
+    let neg = ref false in
+    let ptype = ref (-1) in
+    let pdata = ref (-1) in
+    let ok = get_ucp cx ptr neg ptype pdata in
+    (ok, !neg, !ptype, !pdata, cx.errorcode, !ptr)
+  in
+  let expect_ok s neg ptype pdata =
+    match probe s with
+    | true, n, t, d, err, _ ->
+        assert (Bool.equal n neg);
+        assert (Int.equal t ptype);
+        assert (Int.equal d pdata);
+        assert (Int.equal err 0)
+    | false, _, _, _, _, _ -> assert false
+  in
+  let expect_fail s err endptr =
+    match probe s with
+    | false, _, _, _, e, p ->
+        assert (Int.equal e err);
+        assert (Int.equal p endptr)
+    | true, _, _, _, _, _ -> assert false
+  in
+  (* General categories, particular categories, L&. *)
+  expect_ok "{L}" false Opcodes.pt_gc Ucp.ucp_l;
+  expect_ok "N" false Opcodes.pt_gc Ucp.ucp_n;
+  expect_ok "{Nd}" false Opcodes.pt_pc Ucp.ucp_nd;
+  expect_ok "{Lu}" false Opcodes.pt_pc Ucp.ucp_lu;
+  expect_ok "{L&}" false Opcodes.pt_lamp 0;
+  expect_ok "{Lc}" false Opcodes.pt_lamp 0;
+  (* Scripts: bare names are PT_SCX for scripts with extensions, PT_SC
+     otherwise; loose matching folds case and strips _ - and space. *)
+  expect_ok "{Greek}" false Opcodes.pt_scx Ucp.ucp_greek;
+  expect_ok "{greek}" false Opcodes.pt_scx Ucp.ucp_greek;
+  expect_ok "{GREEK}" false Opcodes.pt_scx Ucp.ucp_greek;
+  expect_ok "{ G-r_e e k }" false Opcodes.pt_scx Ucp.ucp_greek;
+  expect_ok "{Deseret}" false Opcodes.pt_sc Ucp.ucp_deseret;
+  (* sc= forces script-only; scx=/script_extensions= forces extensions. *)
+  expect_ok "{sc=Greek}" false Opcodes.pt_sc Ucp.ucp_greek;
+  expect_ok "{script:Greek}" false Opcodes.pt_sc Ucp.ucp_greek;
+  expect_ok "{scx:Greek}" false Opcodes.pt_scx Ucp.ucp_greek;
+  expect_ok "{Script_Extensions=Han}" false Opcodes.pt_scx Ucp.ucp_han;
+  (* Bidi classes ("bidi" + value) and boolean properties. *)
+  expect_ok "{bc=AN}" false Opcodes.pt_bidicl Ucp.ucp_bidi_an;
+  expect_ok "{Bidi_Class:AL}" false Opcodes.pt_bidicl Ucp.ucp_bidi_al;
+  expect_ok "{Cased}" false Opcodes.pt_bool Ucp.ucp_cased;
+  expect_ok "{White_Space}" false Opcodes.pt_bool Ucp.ucp_white_space;
+  (* The Perl-extension pseudo-properties and Any. *)
+  expect_ok "{Xan}" false Opcodes.pt_alnum 0;
+  expect_ok "{Xwd}" false Opcodes.pt_word 0;
+  expect_ok "{Xsp}" false Opcodes.pt_space 0;
+  expect_ok "{Xps}" false Opcodes.pt_pxspace 0;
+  expect_ok "{Xuc}" false Opcodes.pt_ucnc 0;
+  expect_ok "{Any}" false Opcodes.pt_any 0;
+  (* ^ negation inside the braces. *)
+  expect_ok "{^L}" true Opcodes.pt_gc Ucp.ucp_l;
+  expect_ok "{^Greek}" true Opcodes.pt_scx Ucp.ucp_greek;
+  (* ERR46 (malformed): end of pattern, non-letter, unterminated name, NUL
+     in the name; ptr points past the consumed characters. *)
+  expect_fail "" Errors.err46 0;
+  expect_fail "1" Errors.err46 1;
+  expect_fail "{L" Errors.err46 2;
+  expect_fail "{L\000}" Errors.err46 3;
+  expect_fail ("{" ^ String.make 60 'a' ^ "}") Errors.err46 50;
+  (* ERR47 (unknown property): after the binary chop, or an unknown
+     xx in \p{xx:yy}; ptr is already past the closing brace. *)
+  expect_fail "{Zz}" Errors.err47 4;
+  expect_fail "{}" Errors.err47 2;
+  expect_fail "{sc=Zz}" Errors.err47 7;
+  expect_fail "{foo=bar}" Errors.err47 9;
+  (* A script name that is a non-script property is diagnosed under sc=
+     (the switch's break at pcre2_compile.c:2313). *)
+  expect_fail "{sc=Cased}" Errors.err47 10
 
 (* is_newline_at over the non-fixed newline types (PRIV(is_newline),
    pcre2_newline.c:78-145, non-UTF 8-bit arm): NLTYPE_ANY matches LF, VT,

@@ -273,6 +273,11 @@ let pt_pxprint = 15 (* [:print:] - [:graph:] plus non-control spaces *)
 let pt_pxpunct = 16 (* [:punct:] - punctuation characters *)
 let pt_pxxdigit = 17 (* [:xdigit:] - hex digits *)
 
+(* pcre2_internal.h:1320-1323 — used when parsing \p and \P escapes to
+   indicate that neither \p{script:...} nor \p{scx:...} has been
+   encountered. *)
+let pt_notscript = 255
+
 (* pcre2_internal.h:1325-1336 — flag bits and data types for the extended
    class (OP_XCLASS) for classes that contain characters with values
    greater than 255. *)

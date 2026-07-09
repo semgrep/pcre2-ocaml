@@ -91,6 +91,8 @@ let err43 =
   compile_error_base + 43 (* two named subpatterns have the same name *)
 
 let err44 = compile_error_base + 44 (* name must start with a non-digit *)
+let err46 = compile_error_base + 46 (* malformed \P or \p sequence *)
+let err47 = compile_error_base + 47 (* unknown property after \P or \p *)
 let err48 = compile_error_base + 48 (* subpattern name is too long *)
 let err49 = compile_error_base + 49 (* too many named subpatterns *)
 let err50 = compile_error_base + 50 (* invalid range in character class *)

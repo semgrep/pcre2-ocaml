@@ -12,7 +12,7 @@ clusters (extuni + grapheme-break properties), `(*script_run:)`/`(*sr:)` and
 - [ ] ucd.ml: GET_UCD stage-table lookup, script/chartype/gbprop/othercase/caseset
   accessors over generated ucd_tables.ml (pcre2_internal.h GET_UCD macros +
   pcre2_ucd.c:1-90 header layout)
-- [ ] parse: \p/\P — get_ucp name lookup incl. script extensions, Bidi_Class, bool props
+- [x] parse: \p/\P — get_ucp name lookup incl. script extensions, Bidi_Class, bool props
   (pcre2_compile.c:2167-2340 + ucptables.ml binary search); compile OP_PROP/OP_NOTPROP +
   property XCLASS slots (compile_branch prop arms)
 - [ ] match: OP_PROP/OP_NOTPROP + property repeat arms — PT_ANY/PT_LAMP/PT_GC/PT_PC/

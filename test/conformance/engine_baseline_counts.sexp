@@ -2,8 +2,8 @@
 ; Regenerate with: dune exec test/conformance/runner.exe -- --driver=engine --update-baseline
 ((testinput1 1290 1290)
  (testinput2 722 746)
- (testinput4 282 617)
- (testinput5 215 419)
+ (testinput4 289 617)
+ (testinput5 239 419)
  (testinput8 0 0)
  (testinput9 10 10)
  (testinput10 44 44))
