@@ -2410,11 +2410,12 @@ let parse_tracked_extra_options =
   lor Options.extra_ascii_digit lor Options.extra_ascii_posix
 
 (* DEVIATION: distinctive placeholder error code for parse_regex arms that
-   are deferred to later chunks (conditionals, recursion, subroutine calls,
-   verbs and callouts -> M5; script runs -> M8). PCRE2 compile errors
-   occupy 100..201, so 299 can never collide with a real result; deferred
-   constructs fail loudly instead of misparsing. Every use site below
-   carries a comment naming its chunk. *)
+   were deferred to later chunks (conditionals, recursion, subroutine
+   calls, verbs -> M5; script runs -> M8; callouts were the last, M8).
+   PCRE2 compile errors occupy 100..201, so 299 can never collide with a
+   real result; deferred constructs failed loudly instead of misparsing.
+   No use site remains — kept for the invariant assert below and as the
+   marker to reuse if a future chunk needs to defer again. *)
 let err_deferred = 299
 
 (* Local control-flow exceptions for parse_regex (port-conventions §2:
@@ -2440,9 +2441,10 @@ exception Goto_failed
    named-group list, (?P=name) named references, alternation, group close,
    and the end-of-pattern epilogue), character classes (parse_regex B:
    POSIX class items with their UCP substitutions, literals, ranges and
-   in-class escapes) and the ( *VERB)/( *VERB:NAME) arm with its
-   inverbname accumulator block (pcre2_compile.c:2941-3039). Arms marked
-   "deferred" fail loudly with err_deferred until their chunks land.
+   in-class escapes), the ( *VERB)/( *VERB:NAME) arm with its
+   inverbname accumulator block (pcre2_compile.c:2941-3039), and the
+   (?C callout arm (numerical and string forms) — every arm of the C
+   function is now live (nothing fails with err_deferred).
 
    Arguments:
      cx              compile block; parsing starts at cx.ptr and the parsed
@@ -4255,11 +4257,151 @@ let parse_regex (cx : parse_context) ~(options : int)
                           pcre2_compile.c:4437-4446 *)
                        recurse_by_name ()
                    | 'C' ->
-                       (* pcre2_compile.c:4448-4563 — callouts with numerical
-                          or string argument: deferred (M5; the callout API
-                          itself stays type-only per the architecture doc). *)
-                       cx.errorcode <- err_deferred;
-                       raise_notrace Goto_failed
+                       (* ---- Callout with numerical or string argument ----
+                          pcre2_compile.c:4449-4563 *)
+                       incr ptr;
+                       if !ptr >= cx.ptrend then unclosed_parenthesis ();
+
+                       (* pcre2_compile.c:4454-4463 — if the previous item
+                          was a condition starting (?(? an assertion,
+                          optionally preceded by a callout, is expected. This
+                          is checked later on, during actual compilation.
+                          However we need to identify this kind of assertion
+                          in this pass because it must not be qualified. The
+                          value of expect_cond_assert is set to 2 after (?(?
+                          is processed. We decrement it for a callout - still
+                          leaving a positive value that identifies the
+                          assertion. Multiple callouts or any other items
+                          will make it zero or less, which doesn't matter
+                          because they will cause an error later. *)
+                       expect_cond_assert := prev_expect_cond_assert - 1;
+
+                       (* pcre2_compile.c:4465-4473 — if previous_callout is
+                          not NULL, it means this follows a previous callout.
+                          If it was a manual callout, do nothing; this means
+                          its "length of next pattern item" field will remain
+                          zero. If it was an automatic callout, abolish it. *)
+                       if
+                         !previous_callout >= 0
+                         && (not
+                               (Int.equal
+                                  (!options land Options.auto_callout)
+                                  0))
+                         && Int.equal !previous_callout (!pp - 4)
+                         && Int.equal buf.(!pp - 1) 255
+                       then pp := !previous_callout;
+
+                       (* pcre2_compile.c:4475-4479 — save for updating next
+                          pattern item length, and skip one item before
+                          completing. *)
+                       previous_callout := !pp;
+                       after_manual_callout := 1;
+
+                       (* pcre2_compile.c:4481-4527 — handle a string
+                          argument; specific delimiter is required. *)
+                       (if
+                          (not (Char.equal pat.[!ptr] ')'))
+                          && not (is_digit pat.[!ptr])
+                        then (
+                          let startptr = !ptr in
+                          (* pcre2_compile.c:4488-4501 — look up the ending
+                             delimiter paired with *ptr
+                             (pcre2_tables.c:73-81). *)
+                          let delimiter = ref 0 in
+                          let i = ref 0 in
+                          while
+                            Int.equal !delimiter 0
+                            && not
+                                 (Int.equal Tables.callout_start_delims.(!i) 0)
+                          do
+                            if
+                              Int.equal (Char.code pat.[!ptr])
+                                Tables.callout_start_delims.(!i)
+                            then delimiter := Tables.callout_end_delims.(!i)
+                            else incr i
+                          done;
+                          if Int.equal !delimiter 0 then (
+                            cx.errorcode <- Errors.err82;
+                            raise_notrace Goto_failed);
+
+                          buf.(!pp) <- meta_callout_string;
+                          pp := !pp + 3 (* Skip pattern info *);
+
+                          (* pcre2_compile.c:4506-4516 — scan to the ending
+                             delimiter; a doubled delimiter is a literal
+                             occurrence and does not end the string. *)
+                          let broke = ref false in
+                          while not !broke do
+                            incr ptr;
+                            if !ptr >= cx.ptrend then (
+                              cx.errorcode <- Errors.err81;
+                              ptr := startptr
+                              (* To give a more useful message *);
+                              raise_notrace Goto_failed);
+                            if
+                              Int.equal (Char.code pat.[!ptr]) !delimiter
+                            then (
+                              incr ptr;
+                              if
+                                !ptr >= cx.ptrend
+                                || not
+                                     (Int.equal (Char.code pat.[!ptr])
+                                        !delimiter)
+                              then broke := true)
+                          done;
+
+                          (* pcre2_compile.c:4518-4526 — store the length
+                             (including both delimiters) and the pattern
+                             offset of the string. The C's
+                             calloutlength > UINT32_MAX test (ERR72) is kept
+                             even though a pattern (an OCaml string) can
+                             never be that long here. *)
+                          let calloutlength = !ptr - startptr in
+                          if calloutlength > 0xFFFF_FFFF then (
+                            cx.errorcode <- Errors.err72;
+                            raise_notrace Goto_failed);
+                          buf.(!pp) <- calloutlength;
+                          incr pp;
+                          let offset = startptr in
+                          (* offset = startptr - cb->start_pattern *)
+                          putoffset buf pp offset)
+                        else (
+                          (* pcre2_compile.c:4529-4547 — handle a callout
+                             with an optional numerical argument, which must
+                             be less than or equal to 255. A missing argument
+                             gives 0. *)
+                          let n = ref 0 in
+                          buf.(!pp) <- meta_callout_number
+                          (* Numerical callout *);
+                          pp := !pp + 3 (* Skip pattern info *);
+                          while !ptr < cx.ptrend && is_digit pat.[!ptr] do
+                            (* n = n * 10 + *ptr++ - CHAR_0 *)
+                            n := (!n * 10) + Char.code pat.[!ptr] - 0x30;
+                            incr ptr;
+                            if !n > 255 then (
+                              cx.errorcode <- Errors.err38;
+                              raise_notrace Goto_failed)
+                          done;
+                          buf.(!pp) <- !n;
+                          incr pp));
+
+                       (* pcre2_compile.c:4549-4556 — both formats must have
+                          a closing parenthesis. *)
+                       if
+                         !ptr >= cx.ptrend
+                         || not (Char.equal pat.[!ptr] ')')
+                       then (
+                         cx.errorcode <- Errors.err39;
+                         raise_notrace Goto_failed);
+                       incr ptr;
+
+                       (* pcre2_compile.c:4558-4562 — remember the offset to
+                          the next item in the pattern, and set a default
+                          length. This should get updated after the next item
+                          is read. *)
+                       buf.(!previous_callout + 1) <- !ptr;
+                       buf.(!previous_callout + 2) <- 0
+                       (* End callout *)
                    | '(' ->
                        (* ---- Conditional group ----
                           pcre2_compile.c:4566-4738 — a condition can be an
@@ -5366,6 +5508,58 @@ let () =
       255;
       meta_end;
     |];
+
+  (* Explicit callouts (pcre2_compile.c:4449-4563): numerical (?Cn) and
+     string (?C"text") forms. Element [1] is the pattern offset just past
+     the callout's closing parenthesis, [2] the length of the next item
+     (filled in by a later manage_callouts cycle — for a manual callout
+     the item immediately after it is skipped via after_manual_callout).
+     Error numbers and offsets pinned against pcre2test 10.44 (and
+     conformance testinput2:1299-1302). *)
+  expect "(?C1)abc"
+    [| meta_callout_number; 5; 1; 1; 0x61; 0x62; 0x63; meta_end |];
+  (* A missing numerical argument gives 0 (pcre2_compile.c:4529-4530). *)
+  expect "(?C)a" [| meta_callout_number; 4; 1; 0; 0x61; meta_end |];
+  (* String form: [3] = length including both delimiters, [4] = pattern
+     offset of the starting delimiter. *)
+  expect "(?C\"text\")x"
+    [| meta_callout_string; 10; 1; 6; 3; 0x78; meta_end |];
+  (* Bracket-like {..} delimiters; a doubled ending delimiter is a literal
+     occurrence and does not end the string (pcre2_compile.c:4506-4516). *)
+  expect "(?C{ab}}c})z"
+    [| meta_callout_string; 11; 1; 7; 3; 0x7a; meta_end |];
+  (* An automatic callout immediately preceding a manual one is abolished
+     (pcre2_compile.c:4465-4473). *)
+  expect ~options:Options.auto_callout "a(?C1)b"
+    [|
+      meta_callout_number;
+      0;
+      1;
+      255;
+      0x61;
+      meta_callout_number;
+      6;
+      1;
+      1;
+      0x62;
+      meta_callout_number;
+      7;
+      0;
+      255;
+      meta_end;
+    |];
+  (* ERR81 missing terminating delimiter (ptr reset to the starting
+     delimiter for the message, pcre2_compile.c:4508-4513); ERR39 closing
+     parenthesis expected (4549-4555); ERR82 unrecognized delimiter
+     (4497-4501); ERR38 number > 255 (4540-4544); ERR14 for (?C at end of
+     pattern (4452). *)
+  expect_err "a(?C\"" Errors.err81 4;
+  expect_err "a(?C\"a" Errors.err81 4;
+  expect_err "a(?C\"a\"" Errors.err39 7;
+  expect_err "a(?C\"a\"bcde(?C\"b\")xyz" Errors.err39 7;
+  expect_err "a(?Cx)" Errors.err82 4;
+  expect_err "(?C256)" Errors.err38 6;
+  expect_err "(?C" Errors.err14 3;
 
   (* Character classes (parse_regex B). Each expected stream / error
      offset below was traced against pcre2_compile.c:3493-3915. *)

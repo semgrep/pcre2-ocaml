@@ -303,8 +303,9 @@ type match_data = {
      always reads the default tables through Chartables (same DEVIATION
      as Compile.compile_block);
    - pcre2_callout_block *cb (903), void *callout_data (904),
-     int ( *callout)(...) (905) — callout support chunk (M8); no callout
-     block exists until then, see the RETURN_SWITCH note in [backtrack]. *)
+     int ( *callout)(...) (905) — dropped: this library's API has no
+     callout surface, so mb->callout is always NULL and no callout block
+     is ever consulted (see [do_callout_length]). *)
 type match_block = {
   match_limit : int; (* uint32_t match_limit (867) *)
   match_limit_depth : int; (* uint32_t match_limit_depth (868) *)
@@ -938,6 +939,21 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            *lengthptr = eptr - eptr_start. *)
         lengthptr := length;
         0)
+  in
+
+  (* pcre2_match.c:254-334 — do_callout: process a callout, whether
+     "standalone" or at the start of a conditional group. [ecode] (Fecode)
+     points to either OP_CALLOUT or OP_CALLOUT_STR. Returns the length of
+     the callout item (the C's *lengthptr, pcre2_match.c:280-281). The C
+     then returns the return from the callout function, or 0 if no callout
+     function exists (pcre2_match.c:283); this library's API has no callout
+     surface, so mb->callout is always NULL and the callout return is
+     always 0 — the rest of the C body (callout block setup and invocation,
+     pcre2_match.c:285-333) is unreachable and not ported. *)
+  let do_callout_length (ecode : int) : int =
+    if Int.equal (Char.code (Bytes.get mb.start_code ecode)) Opcodes.op_callout
+    then Opcodes.op_lengths.(Opcodes.op_callout)
+    else Compile.get mb.start_code (ecode + 1 + (2 * Limits.link_size))
   in
 
   (* pcre2_match.c:550-556 + 662-773 + 790-798 + 6462-6501 — the goto
@@ -2150,9 +2166,17 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         (* Lframe_type *);
         (assert_not_loop [@tailcall]) f
     | 118 | 119 ->
-        (* OP_CALLOUT, OP_CALLOUT_STR (pcre2_match.c:5594-5606) — STUB:
-           callout support chunk (M8). *)
-        error_unported
+        (* OP_CALLOUT, OP_CALLOUT_STR (pcre2_match.c:5590-5600) — the
+           callout item calls an external function, if one is provided,
+           passing details of the match so far. This is mainly for
+           debugging, though the function is able to force a failure. No
+           callout function can be installed in this port, so rrc =
+           do_callout(F, mb, &length) is always 0 (pcre2_match.c:283): the
+           rrc > 0 RRETURN(MATCH_NOMATCH) and rrc < 0 RRETURN(rrc) exits
+           (5597-5598) are unreachable. *)
+        fr.(fb + Frames.slot_ecode) <- ecode + do_callout_length ecode
+        (* Fecode += length (5599) *);
+        (dispatch [@tailcall]) f
     | 139 | 144 ->
         (* OP_COND, OP_SCOND (pcre2_match.c:5603-5778) — conditional
            group: compilation checked that there are no more than two
@@ -2181,10 +2205,28 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         let ecode = ecode + 1 + Limits.link_size in
         fr.(fb + Frames.slot_ecode) <- ecode;
         (* pcre2_match.c:5623-5638 — because of the way auto-callout works
-           during compile, a callout item can be inserted between OP_COND
-           and an assertion condition. Callout support is M8: no callout
-           opcode compiles until then, so *Fecode is always the condition
-           here; site kept for evaluation order. *)
+           during compile, a callout item is inserted between OP_COND and
+           an assertion condition. Such a callout can also be inserted
+           manually. rrc = do_callout(F, mb, &length) is always 0 here (no
+           callout function can be installed, pcre2_match.c:283), so the
+           rrc > 0 / rrc < 0 RRETURNs (5630-5631) are unreachable. Advance
+           Fecode past the callout, so it now points to the condition; we
+           must adjust Flength so that the value of Fecode+Flength is
+           unchanged. *)
+        let ecode =
+          let op0 = Char.code (Bytes.get mb.start_code ecode) in
+          if
+            Int.equal op0 Opcodes.op_callout
+            || Int.equal op0 Opcodes.op_callout_str
+          then (
+            let length = do_callout_length ecode in
+            fr.(fb + Frames.slot_ecode) <- ecode + length (* Fecode (5636) *);
+            fr.(fb + Frames.slot_length) <-
+              fr.(fb + Frames.slot_length) - length
+            (* Flength (5637) *);
+            ecode + length)
+          else ecode
+        in
         (* pcre2_match.c:5640-5643 — test the various possible
            conditions: condition = FALSE; switch ( *Fecode ). *)
         let cond_op = Char.code (Bytes.get mb.start_code ecode) in
@@ -5965,7 +6007,8 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
       let f = f - fr.(fb + Frames.slot_back_frame) in
       (* pcre2_match.c:6473 — mb->cb->callout_flags |=
          PCRE2_CALLOUT_BACKTRACK: no callout block exists in this port
-         until the callout chunk (M8); site kept for evaluation order. *)
+         (callout_flags is only ever read by an installed callout function,
+         and mb->callout is always NULL); site kept for evaluation order. *)
       (* pcre2_match.c:6479-6500 — switch (Freturn_id), reading the NEW
          current frame. Each label resumes the C code after the RMATCH
          site listed below; the owning chunk replaces its stub together
@@ -7684,8 +7727,9 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
            (the offset-limit knob is M8+). *)
         let bumpalong_limit = true_end_subject in
         (* pcre2_match.c:6947-6960 — the callout block and the mb callout
-           fields: callout support is M8; no callout block exists (see the
-           RETURN_SWITCH note in [backtrack]). *)
+           fields: no callout block exists in this port (mb->callout is
+           always NULL — the C fields it feeds are only read by an
+           installed callout function, see [do_callout_length]). *)
         (* pcre2_match.c:6981-7017 — process the \R and newline settings
            (bsr goes straight into the mb literal below). The C switch's
            default returns PCRE2_ERROR_INTERNAL. *)
@@ -8229,7 +8273,9 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                   (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
                 else (
                   (* pcre2_match.c:7493-7497 — cb.start_match and
-                     PCRE2_CALLOUT_STARTMATCH: callouts are M8. *)
+                     PCRE2_CALLOUT_STARTMATCH: no callout block exists in
+                     this port (only an installed callout function would
+                     read them, and mb->callout is always NULL). *)
                   (* pcre2_match.c:7499-7508 — per-attempt mb resets;
                      mb->moptions = options | fragment_options (7502). *)
                   mb.start_used_ptr <- start_match;

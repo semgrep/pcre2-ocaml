@@ -1050,12 +1050,12 @@ let opcode_possessify =
 
    Chunk boundary (M1 chunks "compile_branch A".."D" + the M2 backref
    chunk + the M4 conditionals/lookarounds/recursion chunks + the M5
-   verbs chunk): chars/escapes, classes, repeats, capture/non-capture
-   groups (with bracket repeats), back references (numeric and by name),
-   conditionals, lookarounds, recursion and verbs are live. The arms for
-   string callouts and \P/\p are deferred — they fail loudly with
-   Parse.err_deferred (identically in both phases, before any
-   phase-dependent work). The C local `offset` (pcre2_compile.c:5658)
+   verbs chunk + the M7 UCP chunks + the M8 callout chunk): chars/escapes,
+   classes, repeats, capture/non-capture groups (with bracket repeats),
+   back references (numeric and by name), conditionals, lookarounds,
+   recursion, verbs, \P/\p and callouts (numerical and string) are live —
+   no arm fails with Parse.err_deferred any more. The C local `offset`
+   (pcre2_compile.c:5658)
    becomes a per-arm let binding in the backref arms. The class locals
    (negate_class, should_flip_negation,
    match_all_or_no_wide_chars, class_has_8bitchar, xclass, xclass_has_prop,
@@ -2808,11 +2808,90 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
         pptr := !pptr + 3;
         code := !code + Opcodes.op_lengths.(Opcodes.op_callout))
       else if Int.equal meta Parse.meta_callout_string then (
-        (* pcre2_compile.c:7114-7175 — callout with a string argument.
-           Deferred loudly (string callouts land with the verbs/callout
-           chunk, docs/ocaml-engine/06-verbs-k-start-opt.md). *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+        (* pcre2_compile.c:7114-7175 — handle a callout with a string
+           argument. In the pre-pass we just compute the length without
+           generating anything. The length in pptr[3] includes both
+           delimiters; in the actual compile only the first one is copied,
+           but a terminating zero is added. Any doubled delimiters within
+           the string make this an overestimate, but it is not worth
+           bothering about. *)
+        match lengthptr with
+        | Some length ->
+            (* pcre2_compile.c:7122-7127 *)
+            length :=
+              !length
+              + cb.parsed_pattern.(!pptr + 3)
+              + (1 + (4 * Limits.link_size));
+            pptr := !pptr + 3;
+            (* SKIPOFFSET(pptr) *)
+            pptr := !pptr + Parse.sizeoffset
+        | None ->
+            (* pcre2_compile.c:7129-7150 — in the real compile we can copy
+               the string. The starting delimiter is included so that the
+               client can discover it if they want. We also pass the start
+               offset to help a script language give better error
+               messages. *)
+            let length = ref cb.parsed_pattern.(!pptr + 3) in
+            let callout_string = ref (!code + 1 + (4 * Limits.link_size)) in
+            Bytes.set cb.start_code !code (Char.chr Opcodes.op_callout_str);
+            put cb.start_code (!code + 1) cb.parsed_pattern.(!pptr + 1)
+            (* Offset to next pattern item *);
+            put cb.start_code
+              (!code + 1 + Limits.link_size)
+              cb.parsed_pattern.(!pptr + 2)
+            (* Length of next pattern item *);
+            pptr := !pptr + 3;
+            (* GETPLUSOFFSET(offset, pptr) — offset to string in pattern;
+               [offset] is the branch-level ref (its value is read as a
+               stale value by the OP_COND post-processing, as in C). *)
+            pptr := !pptr + 1;
+            offset := cb.parsed_pattern.(!pptr);
+            let pp = ref !offset in
+            (* pp = cb->start_pattern + offset *)
+            let delimiter0 = cb.pattern.[!pp] in
+            (* delimiter = *callout_string++ = *pp++ *)
+            Bytes.set cb.start_code !callout_string delimiter0;
+            incr callout_string;
+            incr pp;
+            let delimiter =
+              if Char.equal delimiter0 '{' then '}' else delimiter0
+            in
+            put cb.start_code
+              (!code + 1 + (3 * Limits.link_size))
+              (!offset + 1)
+            (* One after delimiter *);
+
+            (* pcre2_compile.c:7152-7167 — the syntax of the pattern was
+               checked in the parsing scan. The length includes both
+               delimiters, but we have passed the opening one just above,
+               so we reduce length before testing it. The test is for > 1
+               because we do not want to copy the final delimiter. This
+               also ensures that pp[1] is accessible. *)
+            length := !length - 1;
+            while !length > 1 do
+              (if
+                 Char.equal cb.pattern.[!pp] delimiter
+                 && Char.equal cb.pattern.[!pp + 1] delimiter
+               then (
+                 Bytes.set cb.start_code !callout_string delimiter;
+                 incr callout_string;
+                 pp := !pp + 2;
+                 length := !length - 1)
+               else (
+                 Bytes.set cb.start_code !callout_string cb.pattern.[!pp];
+                 incr callout_string;
+                 incr pp));
+              length := !length - 1
+            done;
+            Bytes.set cb.start_code !callout_string '\000';
+            incr callout_string;
+
+            (* pcre2_compile.c:7170-7173 — set the length of the entire
+               item, then advance to its end. *)
+            put cb.start_code
+              (!code + 1 + (2 * Limits.link_size))
+              (!callout_string - !code);
+            code := !callout_string)
       else if
         meta >= Parse.meta_first_quantifier
         && meta <= Parse.meta_last_quantifier
@@ -6935,6 +7014,52 @@ let () =
       255;
     ];
 
+  (* Explicit callouts: OP_CALLOUT for (?Cn) (pcre2_compile.c:7101-7111)
+     and OP_CALLOUT_STR for (?C"text") (pcre2_compile.c:7114-7175) — the
+     item carries the offset to the next pattern item, its length, the
+     total item length, the offset one past the starting delimiter, then
+     the copied string (starting delimiter included) and a terminating
+     zero. String pinned with pcre2test 10.44 (Callout (4): "text"). *)
+  let cb, rc, _, _, _, _, _, _ = compile2 "(?C1)abc" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_callout;
+      0;
+      5;
+      0;
+      1;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_char;
+      0x63;
+    ];
+  let cb, rc, _, _, _, _, _, _ = compile2 "(?C\"text\")x" in
+  assert (Int.equal rc 1);
+  assert_code cb
+    [
+      Opcodes.op_callout_str;
+      0;
+      10;
+      0;
+      1;
+      0;
+      15;
+      0;
+      4;
+      0x22;
+      0x74;
+      0x65;
+      0x78;
+      0x74;
+      0;
+      Opcodes.op_char;
+      0x78;
+    ];
+
   (* \K inside an assertion: ERR99 unless PCRE2_EXTRA_ALLOW_LOOKAROUND_BSK
      (pcre2_compile.c:8159-8167). assert_depth is maintained by the
      lookaround arms (M4); simulate it directly. *)
@@ -8705,6 +8830,43 @@ let () =
       0;
       9;
       Opcodes.op_end;
+    ];
+
+  (* /(?C{ab}}c})z/ — string callout, full compile (pcre2_compile.c:
+     7114-7175): a doubled ending delimiter is copied once, so the
+     pre-pass length (which includes both source delimiters,
+     pcre2_compile.c:7122-7124) over-estimates by one and re.code keeps a
+     zeroed slack unit after OP_END (usedlength < length,
+     pcre2_compile.c:10712-10725). String pinned with pcre2test 10.44
+     (Callout (4): {ab}c}). *)
+  let re = ok "(?C{ab}}c})z" in
+  assert_code re
+    [
+      bra;
+      0;
+      20;
+      Opcodes.op_callout_str;
+      0;
+      11;
+      0;
+      1;
+      0;
+      15;
+      0;
+      4;
+      0x7b;
+      0x61;
+      0x62;
+      0x7d;
+      0x63;
+      0;
+      Opcodes.op_char;
+      0x7a;
+      ket;
+      0;
+      20;
+      Opcodes.op_end;
+      0;
     ]
 
 (* Backreference compilation (M2 compile chunk, pcre2_compile.c:7018-7098

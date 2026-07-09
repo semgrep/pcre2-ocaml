@@ -81,6 +81,9 @@ let err36 =
 let err37 =
   compile_error_base + 37 (* \F, \L, \l, \N{name}, \U, \u unsupported *)
 
+let err38 = compile_error_base + 38 (* number after (?C is greater than 255 *)
+let err39 = compile_error_base + 39 (* closing parenthesis for (?C expected *)
+
 let err40 =
   compile_error_base + 40 (* invalid escape sequence in ( *VERB) name *)
 
@@ -143,6 +146,7 @@ let err70 =
   compile_error_base + 70 (* internal: unknown meta in check_lookbehinds() *)
 
 let err71 = compile_error_base + 71 (* \N is not supported in a class *)
+let err72 = compile_error_base + 72 (* callout string is too long *)
 
 let err73 =
   compile_error_base + 73 (* disallowed Unicode code point (surrogate) *)
@@ -166,6 +170,13 @@ let err78 =
 let err79 = compile_error_base + 79
 (* syntax error or number too big in
    (?(VERSION condition *)
+
+let err81 =
+  compile_error_base
+  + 81 (* missing terminating delimiter for callout with string argument *)
+
+let err82 =
+  compile_error_base + 82 (* unrecognized string delimiter follows (?C *)
 
 let err83 =
   compile_error_base + 83 (* using \C is disabled by the application *)

@@ -9,6 +9,15 @@ surface with a large fuzz run.
 
 ## Chunks
 
+- [x] callouts (compile + no-op execution; the M8 chunk the G7 census pointed at): (?Cn)
+  and (?C"text") parse arm (pcre2_compile.c:4449-4563, delimiter tables, ERR38/39/81/82
+  sites), OP_CALLOUT_STR emission (7114-7175, doubled-delimiter copy + usedlength slack),
+  do_callout shell + OP_CALLOUT/OP_CALLOUT_STR dispatch + OP_COND callout skip
+  (pcre2_match.c:254-334, 5590-5600, 5623-5638) — always-continue because no callout
+  function can be installed (mb->callout == NULL, C:283; the API stays type-only). The
+  pcre2test default-callout trace stays out of scope: units demanding it are either the 7
+  skiplisted units or harness modifier-skips (callout_capture/error/extra/no_where),
+  identical to the oracle's skip set. t2 733/733, t5 418/418 — engine == oracle everywhere.
 - [ ] options long tail: ALT_BSUX (+EXTRA_ALT_BSUX \u{}), ALT_CIRCUMFLEX, ALT_VERBNAMES,
   EXTENDED_MORE (xx) — parse/compile behavior switches
   (pcre2_compile.c: option-conditioned arms across check_escape/parse_regex)
