@@ -17,6 +17,20 @@
         pkgs = nixpkgs.legacyPackages.${system};
         on = opam-nix.lib.${system};
         opamRepos = [ "${opam-repository}" ];
+        # The pure-OCaml engine is ported from PCRE2 10.44; the dev-only C
+        # oracle must be the same version so conformance/differential tests
+        # compare against identical upstream behavior.
+        pcre2c1044 = pkgs.pcre2.overrideAttrs (old: {
+          version = "10.44";
+          src = pkgs.fetchurl {
+            url =
+              "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.44/pcre2-10.44.tar.bz2";
+            hash = "sha256-008C4RPPcZOh6/J3DTrFJwiNSF1OBH7RDl0hfG713pY=";
+          };
+          # The 10.42 derivation's sljit path fixups don't apply to 10.44.
+          patches = [ ];
+          postPatch = "";
+        });
       in let
         devOpamPackagesQuery = {
           # You can add "development" ocaml packages here. They will get added
@@ -73,7 +87,13 @@
           # This doesnt work there because idk
           shellHook = with pkgs; ''
             export NIX_CXXFLAGS_COMPILE="$NIX_CXXFLAGS_COMPILE -I${pkgs.libcxx.dev}/include/c++/v1"
+            # Force the 10.44 C oracle ahead of the 10.42 depext.
+            export PKG_CONFIG_PATH="${pcre2c1044.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
           '';
+          # NOTE: pcre2c1044 is deliberately NOT in buildInputs: that would add
+          # its include dir as -isystem, and GCC ignores a -I that duplicates
+          # an -isystem dir, which lets the 10.42 depext headers win. The
+          # PKG_CONFIG_PATH export above + discover.ml's -I/-L are sufficient.
           inputsFrom = [ pcre2 ];
           buildInputs = devOpamPackages;
         };

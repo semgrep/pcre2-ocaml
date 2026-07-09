@@ -1,15 +1,15 @@
-; engine/ holds the pure-OCaml PCRE2 port; its modules are internal to the
-; wrapped library (only Pcre2 is exposed).
-(include_subdirs unqualified)
-
+; Dev-only C oracle: the original libpcre2-8 bindings, kept for differential
+; testing and as the perf baseline. Never part of the published pcre2 package.
+; C symbols are oracle_-prefixed so this can link alongside the pure engine.
 (library
- (public_name pcre2)
+ (name pcre2_c)
+ (public_name pcre2-dev.oracle)
  (preprocess
   (pps ppx_inline_test ppx_deriving.show ppx_deriving.eq))
  (inline_tests)
  (foreign_stubs
   (language c)
-  (names pcre2_stubs)
+  (names pcre2_c_stubs)
   (flags
    (:standard)
    (:include c_flags.sexp)
