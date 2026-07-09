@@ -7893,8 +7893,8 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
               (* pcre2_match.c:7091-7112 — set up the first code unit to
                  match, if available. If there's no first code unit there may
                  be a bitmap of possible first characters (filled in by
-                 PRIV(study) — M5; PCRE2_FIRSTMAPSET is never set until
-                 then). first_cu/first_cu2 are PCRE2_UCHAR: the C assignments
+                 Study.set_start_bits when it flags PCRE2_FIRSTMAPSET).
+                 first_cu/first_cu2 are PCRE2_UCHAR: the C assignments
                  truncate to the code-unit width (land 0xff). *)
               let has_first_cu =
                 not (Int.equal (re.Compile.flags land Compile.firstset) 0)
@@ -10533,7 +10533,44 @@ let () =
   expect_ov
     (compile "(A(A|B(*ACCEPT)|C)D)(E)")
     "AB"
-    [| 0; 2; 0; 2; 1; 2; -1; -1 |]
+    [| 0; 2; 0; 2; 1; 2; -1; -1 |];
+  (* Study's minlength feeds the driver's no-attempt break
+     (pcre2_match.c:7382-7397): a subject shorter than the studied
+     minimum NOMATCHes with no attempt at all, observable as MARK
+     absence. /( *MARK:m)abcd/ has lower bound 4 (find_minlength), so on
+     "ab" no attempt runs — oracle: No match (no mark) — while a real
+     attempt sets the mark — oracle: 0: abcd with MK: m on "xabcd". *)
+  (let re = compile "(*MARK:m)abcd" in
+   (match run re "ab" with
+   | rc, m ->
+       assert (Int.equal rc Errors.error_nomatch);
+       assert (String.equal (mark_name re m) ""));
+   match run re "xabcd" with
+   | rc, m ->
+       assert (Int.equal rc 1);
+       assert (String.equal (mark_name re m) "m"));
+  (* Backreference minlength (pcre2_study.c:548-596 expansion): lower
+     bound of /( *MARK:r)(ab)\1/ is 4, so "aba" (3) gets no attempt —
+     oracle: No match (no mark) / 0: abab with MK: r. *)
+  (let re = compile "(*MARK:r)(ab)\\1" in
+   (match run re "aba" with
+   | rc, m ->
+       assert (Int.equal rc Errors.error_nomatch);
+       assert (String.equal (mark_name re m) ""));
+   match run re "abab" with
+   | rc, m ->
+       assert (Int.equal rc 2 (* 0: abab, 1: ab *));
+       assert (String.equal (mark_name re m) "r"));
+  (* OP_MARK is in set_start_bits' SSB_FAIL list (pcre2_study.c:1023):
+     /( *MARK:z)[ab]c/ gets NO start bitmap, so attempts DO run on "xc"
+     and the nomatch mark is passed back — oracle: No match, mark = z.
+     (Without the verb the [ab] bitmap would suppress the attempts; see
+     the compile.ml study asserts.) *)
+  (let re = compile "(*MARK:z)[ab]c" in
+   match run re "xc" with
+   | rc, m ->
+       assert (Int.equal rc Errors.error_nomatch);
+       assert (String.equal (mark_name re m) "z"))
 
 (* UTF-8 match arms (this chunk): whole compiled UTF patterns through the
    [pcre2_match] driver — literal/CHARI/NOT decodes, wide char repeats

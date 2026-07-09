@@ -5949,7 +5949,7 @@ and check_lookbehinds (cb : compile_block) (pptr : int)
 type re = {
   code : Bytes.t; (* the compiled bytecode; offset 0 = C's codestart *)
   name_table : Bytes.t; (* name_count entries of name_entry_size units *)
-  start_bitmap : Bytes.t; (* 32 bytes; filled by PRIV(study) (M5) *)
+  start_bitmap : Bytes.t; (* 32 bytes; filled by PRIV(study) (Study) *)
   compile_options : int; (* options passed to pcre2_compile() *)
   mutable overall_options : int; (* options after processing the pattern *)
   extra_options : int; (* taken from compile_context *)
@@ -6565,17 +6565,40 @@ let pcre2_compile ?(ccontext : compile_context = default_compile_context)
               ucp && (not utf) && not (Int.equal (Ucd.othercase !reqcu) !reqcu)
             then re.flags <- re.flags lor lastcaseless));
 
-      (* pcre2_compile.c:10937-10950 — study the compiled pattern:
-         PRIV(study) fills re.start_bitmap (PCRE2_FIRSTMAPSET) and
-         re.minlength, and its FIRSTMAPSET minminlength bump rides with
-         it. DEFERRED (M5 owns the observable parts, M9 the rest;
-         docs/ocaml-engine/06-verbs-k-start-opt.md) WITHOUT an error
-         marker: both are start-of-match optimizations whose absence is
-         the documented PCRE2_NO_START_OPTIMIZE behavior, and study's
-         only error (ERR31) is "internal error: should not occur", so
-         skipping cannot change compile error behavior. Until it lands,
-         re.minlength is minminlength alone (lower than the C's studied
-         value; unobservable through the engine boundary). *)
+      (* pcre2_compile.c:10937-10942 — study the compiled pattern to set
+         up information such as a bitmap of starting code units and a
+         minimum matching length. PRIV(study) lives in the Study module,
+         which Compile calls: build its field view of [re] (same
+         underlying code/name_table/start_bitmap buffers), run, and copy
+         the scalar results back (see the DEVIATION note atop
+         study.ml). *)
+      let sre : Study.re =
+        {
+          Study.code = re.code;
+          name_table = re.name_table;
+          name_entry_size = re.name_entry_size;
+          overall_options = re.overall_options;
+          flags = re.flags;
+          first_codeunit = re.first_codeunit;
+          last_codeunit = re.last_codeunit;
+          minlength = re.minlength;
+          top_backref = re.top_backref;
+          start_bitmap = re.start_bitmap;
+        }
+      in
+      if not (Int.equal (Study.study sre ~find_bracket) 0) then
+        raise_notrace (Had_error (Errors.err31, cb.erroroffset));
+      re.flags <- sre.Study.flags;
+      re.first_codeunit <- sre.Study.first_codeunit;
+      re.minlength <- sre.Study.minlength;
+
+      (* pcre2_compile.c:10944-10948 — if study() set a bitmap of
+         starting code units, it implies a minimum length of at least
+         one. *)
+      if
+        (not (Int.equal (re.flags land firstmapset) 0))
+        && Int.equal !minminlength 0
+      then minminlength := 1;
 
       (* pcre2_compile.c:10952-10955 — if the minimum length set (or not
          set) by study() is less than the minimum implied by required
@@ -8381,7 +8404,9 @@ let () =
   assert (Int.equal re.first_codeunit 0x61);
   assert (Int.equal re.last_codeunit 0x63);
   assert (Int.equal (re.flags land match_empty) 0);
-  assert (Int.equal re.minlength 2 (* first + required code units *));
+  assert (
+    Int.equal re.minlength
+      3 (* find_minlength's studied value (oracle: lower bound = 3) *));
   assert (Int.equal re.top_bracket 0);
   assert (Int.equal re.name_count 0);
   assert (Int.equal re.newline_convention Options.newline_lf);
@@ -9550,3 +9575,88 @@ let () =
   expect_err "(?R" 0 Errors.err58 3;
   expect_err "(?+)" 0 Errors.err29 2;
   expect_err "(?(?z)a)" 0 Errors.err28 2
+
+(* Study integration (pcre2_compile.c:10937-10955 + pcre2_study.c): the
+   start-of-match data PRIV(study) records in the compiled pattern.
+   EVERY expected value below is pinned against the C oracle (pcre2test
+   'info' on the real 10.44 library: "Starting code units", "First code
+   unit" and "Subject length lower bound" lines). *)
+let () =
+  let ok pat =
+    match pcre2_compile pat ~options:0 with
+    | Ok re -> re
+    | Error (e, o) ->
+        failwith
+          (Printf.sprintf "pcre2_compile %S: error %d at offset %d" pat e o)
+  in
+  let bit_set (re : re) c =
+    not
+      (Int.equal
+         (Char.code (Bytes.get re.start_bitmap (c lsr 3))
+         land (1 lsl (c land 7)))
+         0)
+  in
+  let bitmap_is (re : re) (expected : int list) =
+    assert (not (Int.equal (re.flags land firstmapset) 0));
+    for c = 0 to 255 do
+      assert (
+        Bool.equal (bit_set re c)
+          (List.exists (fun x -> Int.equal x c) expected))
+    done
+  in
+  (* /[ab]c/: Starting code units: a b; lower bound 2. Two starting units
+     that are not a caseless pair, so no FIRSTSET. *)
+  let re = ok "[ab]c" in
+  bitmap_is re [ 0x61; 0x62 ];
+  assert (Int.equal (re.flags land firstset) 0);
+  assert (Int.equal re.minlength 2);
+  (* /(a|b)x/: the bitmap is built across the group's branches
+     (set_start_bits recursion, pcre2_study.c:1204-1225). *)
+  let re = ok "(a|b)x" in
+  bitmap_is re [ 0x61; 0x62 ];
+  assert (Int.equal re.minlength 2);
+  (* /\d+/: OP_TYPEPOSPLUS fudges the pointer onto OP_DIGIT
+     (pcre2_study.c:1456-1460, 1428-1431): the ten digits. *)
+  let re = ok "\\d+" in
+  bitmap_is re (List.init 10 (fun i -> 0x30 + i));
+  assert (Int.equal re.minlength 1);
+  (* /^x/: anchored with a first code unit — study skips set_start_bits
+     entirely (pcre2_study.c:1778); no bitmap. *)
+  let re = ok "^x" in
+  assert (not (Int.equal (re.overall_options land Options.anchored) 0));
+  assert (not (Int.equal (re.flags land firstset) 0));
+  assert (Int.equal (re.flags land firstmapset) 0);
+  assert (Int.equal re.minlength 1);
+  (* /( *COMMIT)[ab]c/: OP_COMMIT is in set_start_bits' SSB_FAIL list
+     (pcre2_study.c:1006), so no bitmap — but find_minlength skips the
+     verb (742-752) and still yields 2. Oracle: no "Starting code units"
+     line, lower bound 2. *)
+  let re = ok "(*COMMIT)[ab]c" in
+  assert (Int.equal (re.flags land (firstset lor firstmapset)) 0);
+  assert (Int.equal re.minlength 2);
+  (* /[Ww]ord/: exactly two starting units that ARE a caseless pair — the
+     bitmap is replaced by a caseless first code unit
+     (pcre2_study.c:1784-1877). Oracle: First code unit = 'W' (caseless);
+     lower bound 4. *)
+  let re = ok "[Ww]ord" in
+  assert (
+    Int.equal
+      (re.flags land (firstset lor firstcaseless))
+      (firstset lor firstcaseless));
+  assert (Int.equal (re.flags land firstmapset) 0);
+  assert (Int.equal re.first_codeunit (Char.code 'W'));
+  assert (Int.equal re.minlength 4);
+  (* /a*a/: the single-unit bitmap must NOT be promoted to a first code
+     unit equal to the required code unit (pcre2_study.c:1855-1873).
+     Oracle: Starting code units: a; Last code unit = 'a'; bound 1. *)
+  let re = ok "a*a" in
+  bitmap_is re [ 0x61 ];
+  assert (Int.equal (re.flags land firstset) 0);
+  assert (Int.equal re.minlength 1);
+  (* find_minlength hand-pins (oracle "Subject length lower bound"):
+     exact+upto repeats, alternation minimum, backreference expansion and
+     group recursion. *)
+  assert (Int.equal (ok "abc{2,4}").minlength 4);
+  assert (Int.equal (ok "(a|bc)d").minlength 2);
+  assert (Int.equal (ok "(ab)\\1").minlength 4);
+  assert (Int.equal (ok "(a(?1)?b)").minlength 2)

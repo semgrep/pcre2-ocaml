@@ -72,6 +72,10 @@ let err27 =
 let err28 = compile_error_base + 28 (* assertion expected after (?( or (?(?C) *)
 let err29 = compile_error_base + 29 (* digit expected after (?+ or (?- *)
 let err30 = compile_error_base + 30 (* unknown POSIX class name *)
+
+let err31 =
+  compile_error_base + 31 (* internal error in pcre2_study(): should not occur *)
+
 let err34 = compile_error_base + 34 (* code point in \x{} or \o{} too large *)
 let err35 = compile_error_base + 35 (* lookbehind is too complicated *)
 
