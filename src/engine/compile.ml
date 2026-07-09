@@ -2372,8 +2372,7 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
              let brazeroptr = ref (-1) in
 
              if
-               Int.equal !repeat_max 1
-               && Int.equal !repeat_min 1
+               Int.equal !repeat_max 1 && Int.equal !repeat_min 1
                && not !possessive_quantifier
              then raise_notrace End_repeat;
 
@@ -2553,14 +2552,12 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                      if not (Int.equal i 1) then (
                        emit_cu Opcodes.op_bra;
                        let linkoffset =
-                         if Int.equal !bralink (-1) then 0
-                         else !code - !bralink
+                         if Int.equal !bralink (-1) then 0 else !code - !bralink
                        in
                        bralink := !code;
                        putinc cb.start_code code linkoffset);
 
-                     Bytes.blit cb.start_code !previous cb.start_code !code
-                       len;
+                     Bytes.blit cb.start_code !previous cb.start_code !code len;
                      code := !code + len
                    done);
 
@@ -2578,7 +2575,7 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                  putinc cb.start_code code linkoffset;
                  put cb.start_code (bra + 1) linkoffset
                done)
-             else (
+             else
                (* pcre2_compile.c:7652-7749 — if the maximum is unlimited,
                   set a repeater in the final copy. For SCRIPT_RUN and ONCE
                   brackets, that's all we need to do. However, possessively
@@ -2672,43 +2669,43 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                       wrap the whole thing in a possessively repeated
                       non-capturing bracket, because we have not invented
                       POS versions of the COND opcodes. *)
-                   (if
-                      Int.equal
-                        (Char.code (Bytes.get cb.start_code bracode))
-                        Opcodes.op_cond
-                      || Int.equal
-                           (Char.code (Bytes.get cb.start_code bracode))
-                           Opcodes.op_scond
-                    then (
-                      let nlen = !code - bracode in
-                      (* Bytes.blit = memmove; the cell at bracode is below
-                         the destination range, so it still holds the
-                         original opcode afterwards, as in the C. *)
-                      Bytes.blit cb.start_code bracode cb.start_code
-                        (bracode + 1 + Limits.link_size)
-                        nlen;
-                      code := !code + 1 + Limits.link_size;
-                      let nlen = nlen + 1 + Limits.link_size in
-                      Bytes.set cb.start_code bracode
-                        (Char.chr
-                           (if
-                              Int.equal
-                                (Char.code (Bytes.get cb.start_code bracode))
-                                Opcodes.op_cond
-                            then Opcodes.op_brapos
-                            else Opcodes.op_sbrapos));
-                      emit_cu Opcodes.op_ketrpos;
-                      putinc cb.start_code code nlen;
-                      put cb.start_code (bracode + 1) nlen)
-                    else (
-                      (* pcre2_compile.c:7730-7736 — for non-COND brackets,
-                         we modify the BRA code and use KETRPOS. *)
-                      Bytes.set cb.start_code bracode
-                        (Char.chr
-                           (Char.code (Bytes.get cb.start_code bracode) + 1))
-                      (* Switch to xxxPOS opcodes *);
-                      Bytes.set cb.start_code ketcode
-                        (Char.chr Opcodes.op_ketrpos)));
+                   if
+                     Int.equal
+                       (Char.code (Bytes.get cb.start_code bracode))
+                       Opcodes.op_cond
+                     || Int.equal
+                          (Char.code (Bytes.get cb.start_code bracode))
+                          Opcodes.op_scond
+                   then (
+                     let nlen = !code - bracode in
+                     (* Bytes.blit = memmove; the cell at bracode is below
+                        the destination range, so it still holds the
+                        original opcode afterwards, as in the C. *)
+                     Bytes.blit cb.start_code bracode cb.start_code
+                       (bracode + 1 + Limits.link_size)
+                       nlen;
+                     code := !code + 1 + Limits.link_size;
+                     let nlen = nlen + 1 + Limits.link_size in
+                     Bytes.set cb.start_code bracode
+                       (Char.chr
+                          (if
+                             Int.equal
+                               (Char.code (Bytes.get cb.start_code bracode))
+                               Opcodes.op_cond
+                           then Opcodes.op_brapos
+                           else Opcodes.op_sbrapos));
+                     emit_cu Opcodes.op_ketrpos;
+                     putinc cb.start_code code nlen;
+                     put cb.start_code (bracode + 1) nlen)
+                   else (
+                     (* pcre2_compile.c:7730-7736 — for non-COND brackets,
+                        we modify the BRA code and use KETRPOS. *)
+                     Bytes.set cb.start_code bracode
+                       (Char.chr
+                          (Char.code (Bytes.get cb.start_code bracode) + 1))
+                     (* Switch to xxxPOS opcodes *);
+                     Bytes.set cb.start_code ketcode
+                       (Char.chr Opcodes.op_ketrpos));
 
                    (* pcre2_compile.c:7738-7742 — if the minimum is zero,
                       mark it as possessive, then unset the possessive flag
@@ -2721,7 +2718,7 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                    (* pcre2_compile.c:7745-7747 — non-possessive
                       quantifier. *)
                    Bytes.set cb.start_code ketcode
-                     (Char.chr (Opcodes.op_ketrmax + !repeat_type)))))
+                     (Char.chr (Opcodes.op_ketrmax + !repeat_type))))
            else if op_previous >= Opcodes.op_eodn then (
              (* pcre2_compile.c:7760-7765 — default case: not a character
                 type - internal error. *)
@@ -3091,7 +3088,7 @@ and compile_regex (options : int) (xoptions : int) (codeptr : int ref)
   if lookbehind then (
     errorcodeptr := Parse.err_deferred;
     0)
-  else (
+  else
     (* pcre2_compile.c:8442-8454 — if this is a capturing subpattern, add
        to the chain of open capturing items so that we can detect them if
        ( *ACCEPT) is encountered. Note that only OP_CBRA need be tested
@@ -3280,7 +3277,7 @@ and compile_regex (options : int) (xoptions : int) (codeptr : int ref)
       done;
       (* Control never reaches here (pcre2_compile.c:8645). *)
       assert false
-    with Return_regex rc -> rc)
+    with Return_regex rc -> rc
 
 (* ---------- Check for anchored pattern ---------- *)
 
@@ -3331,10 +3328,10 @@ let rec is_anchored (code : Bytes.t) (pos : int) (bracket_map : int)
         || Int.equal op Opcodes.op_cbrapos
         || Int.equal op Opcodes.op_scbra
         || Int.equal op Opcodes.op_scbrapos
-      then (
+      then
         let n = get2 code (scode + 1 + Limits.link_size) in
-        let new_map = bracket_map lor (if n < 32 then 1 lsl n else 1) in
-        is_anchored code scode new_map cb atomcount ~inassert)
+        let new_map = bracket_map lor if n < 32 then 1 lsl n else 1 in
+        is_anchored code scode new_map cb atomcount ~inassert
       else if
         (* pcre2_compile.c:8720-8725 — positive forward assertion *)
         Int.equal op Opcodes.op_assert || Int.equal op Opcodes.op_assert_na
@@ -3369,8 +3366,9 @@ let rec is_anchored (code : Bytes.t) (pos : int) (bracket_map : int)
           || (not (Int.equal (bracket_map land cb.backref_map) 0))
           || atomcount > 0 || cb.had_pruneorskip || inassert
           || not
-               (Int.equal (cb.external_options land Options.no_dotstar_anchor) 0)
-          )
+               (Int.equal
+                  (cb.external_options land Options.no_dotstar_anchor)
+                  0))
       else
         (* pcre2_compile.c:8760-8762 — check for explicit anchoring *)
         Int.equal op Opcodes.op_sod
@@ -3423,11 +3421,11 @@ let rec is_startline (code : Bytes.t) (pos : int) (bracket_map : int)
          auto-callout at the start of a condition. *)
       if Int.equal !op Opcodes.op_cond then (
         scode := !scode + 1 + Limits.link_size;
-        (if Int.equal (Char.code (Bytes.get code !scode)) Opcodes.op_callout
-         then scode := !scode + Opcodes.op_lengths.(Opcodes.op_callout)
-         else if
-           Int.equal (Char.code (Bytes.get code !scode)) Opcodes.op_callout_str
-         then scode := !scode + get code (!scode + 1 + (2 * Limits.link_size)));
+        if Int.equal (Char.code (Bytes.get code !scode)) Opcodes.op_callout then
+          scode := !scode + Opcodes.op_lengths.(Opcodes.op_callout)
+        else if
+          Int.equal (Char.code (Bytes.get code !scode)) Opcodes.op_callout_str
+        then scode := !scode + get code (!scode + 1 + (2 * Limits.link_size));
         let c = Char.code (Bytes.get code !scode) in
         if
           Int.equal c Opcodes.op_cref
@@ -3440,7 +3438,9 @@ let rec is_startline (code : Bytes.t) (pos : int) (bracket_map : int)
         then raise_notrace Return_false
         else (
           (* default: assertion *)
-          if not (is_startline code !scode bracket_map cb atomcount ~inassert:true)
+          if
+            not
+              (is_startline code !scode bracket_map cb atomcount ~inassert:true)
           then raise_notrace Return_false;
           (* do scode += GET(scode, 1); while ( *scode == OP_ALT); *)
           let rec skip_alts () =
@@ -3469,10 +3469,10 @@ let rec is_startline (code : Bytes.t) (pos : int) (bracket_map : int)
           || Int.equal op Opcodes.op_cbrapos
           || Int.equal op Opcodes.op_scbra
           || Int.equal op Opcodes.op_scbrapos
-        then (
+        then
           let n = get2 code (scode + 1 + Limits.link_size) in
-          let new_map = bracket_map lor (if n < 32 then 1 lsl n else 1) in
-          is_startline code scode new_map cb atomcount ~inassert)
+          let new_map = bracket_map lor if n < 32 then 1 lsl n else 1 in
+          is_startline code scode new_map cb atomcount ~inassert
         else if
           (* pcre2_compile.c:8858-8864 — positive forward assertions *)
           Int.equal op Opcodes.op_assert || Int.equal op Opcodes.op_assert_na
@@ -3492,7 +3492,9 @@ let rec is_startline (code : Bytes.t) (pos : int) (bracket_map : int)
         then
           not
             ((not
-                (Int.equal (Char.code (Bytes.get code (scode + 1))) Opcodes.op_any))
+                (Int.equal
+                   (Char.code (Bytes.get code (scode + 1)))
+                   Opcodes.op_any))
             || (not (Int.equal (bracket_map land cb.backref_map) 0))
             || atomcount > 0 || cb.had_pruneorskip || inassert
             || not
@@ -3592,7 +3594,9 @@ let rec find_firstassertedcu (code : Bytes.t) (pos : int) (flagsptr : int ref)
           find_firstassertedcu code !scode dflags
             (inassert
             +
-            if Int.equal op Opcodes.op_assert || Int.equal op Opcodes.op_assert_na
+            if
+              Int.equal op Opcodes.op_assert
+              || Int.equal op Opcodes.op_assert_na
             then 1
             else 0)
         in
@@ -3612,7 +3616,7 @@ let rec find_firstassertedcu (code : Bytes.t) (pos : int) (flagsptr : int ref)
         || Int.equal op Opcodes.op_posplus
       then (
         if Int.equal op Opcodes.op_exact then scode := !scode + Limits.imm2_size
-        (* fallthrough from OP_EXACT in C *);
+          (* fallthrough from OP_EXACT in C *);
         if Int.equal inassert 0 then raise_notrace Return0;
         let ch = Char.code (Bytes.get code (!scode + 1)) in
         if !cflags >= req_none then (
@@ -3641,8 +3645,7 @@ let rec find_firstassertedcu (code : Bytes.t) (pos : int) (flagsptr : int ref)
           c := ch;
           cflags := req_caseless)
         else if not (Int.equal !c ch) then raise_notrace Return0)
-      else
-        (* pcre2_compile.c:9092-9093 — default *)
+      else (* pcre2_compile.c:9092-9093 — default *)
         raise_notrace Return0;
       (* pcre2_compile.c:9152-9154 *)
       let pos = pos + get code (pos + 1) in
@@ -3694,7 +3697,8 @@ let add_name_to_table (cb : compile_block) ~(name : int) ~(length : int)
         Int.equal crc 0
         && not
              (Int.equal
-                (Char.code (Bytes.get table (!slot + Limits.imm2_size + length)))
+                (Char.code
+                   (Bytes.get table (!slot + Limits.imm2_size + length)))
                 0)
       then -1 (* Current name is a substring *)
       else crc
@@ -3993,8 +3997,7 @@ let pcre2_compile ?(ccontext : compile_context = default_compile_context)
 
     (* pcre2_compile.c:10419-10426 — check UCP lockout. *)
     let ucp = not (Int.equal (cb.external_options land Options.ucp) 0) in
-    if
-      ucp && not (Int.equal (cb.external_options land Options.never_ucp) 0)
+    if ucp && not (Int.equal (cb.external_options land Options.never_ucp) 0)
     then raise_notrace (Had_error (Errors.err75, skipatstart));
 
     (* pcre2_compile.c:10428-10430 — process the BSR setting. *)
@@ -4063,8 +4066,7 @@ let pcre2_compile ?(ccontext : compile_context = default_compile_context)
        check_lookbehinds). DEFERRED (M3): unreachable — parse_regex defers
        every lookbehind arm with err_deferred — but fail loudly rather
        than silently mis-compiling if that changes. *)
-    if !has_lookbehind then
-      raise_notrace (Had_error (Parse.err_deferred, 0));
+    if !has_lookbehind then raise_notrace (Had_error (Parse.err_deferred, 0));
 
     (* pcre2_compile.c:10575-10596 — pretend to compile the pattern while
        actually just accumulating the amount of memory required. On error,
@@ -4080,8 +4082,8 @@ let pcre2_compile ?(ccontext : compile_context = default_compile_context)
     let reqcu = ref 0 and reqcuflags = ref 0 in
     ignore
       (compile_regex cb.external_options ccontext.extra_options code pptr
-         errorcode ~skipunits:0 firstcu firstcuflags reqcu reqcuflags None
-         None cb (Some length));
+         errorcode ~skipunits:0 firstcu firstcuflags reqcu reqcuflags None None
+         cb (Some length));
     if not (Int.equal !errorcode 0) then
       raise_notrace (Had_error (!errorcode, cb.erroroffset));
 
@@ -4159,8 +4161,8 @@ let pcre2_compile ?(ccontext : compile_context = default_compile_context)
     Bytes.set cb.start_code 0 (Char.chr Opcodes.op_bra);
     let regexrc =
       compile_regex re.overall_options ccontext.extra_options code pptr
-        errorcode ~skipunits:0 firstcu firstcuflags reqcu reqcuflags None
-        None cb None
+        errorcode ~skipunits:0 firstcu firstcuflags reqcu reqcuflags None None
+        cb None
     in
     if regexrc < 0 then re.flags <- re.flags lor match_empty;
     re.top_bracket <- cb.bracount;
@@ -4220,96 +4222,93 @@ let pcre2_compile ?(ccontext : compile_context = default_compile_context)
        startline flag, the required code unit, and then study the pattern.
        This code need not be obeyed if PCRE2_NO_START_OPTIMIZE is set, as
        the data it would create will not be used. *)
-    (if Int.equal (re.overall_options land Options.no_start_optimize) 0 then (
-       let minminlength = ref 0 in
+    if Int.equal (re.overall_options land Options.no_start_optimize) 0 then (
+      let minminlength = ref 0 in
 
-       (* pcre2_compile.c:10832-10837 — if we do not have a first code
-          unit, see if there is one that is asserted. *)
-       if !firstcuflags >= req_none then
-         firstcu := find_firstassertedcu re.code 0 firstcuflags 0;
+      (* pcre2_compile.c:10832-10837 — if we do not have a first code
+         unit, see if there is one that is asserted. *)
+      if !firstcuflags >= req_none then
+        firstcu := find_firstassertedcu re.code 0 firstcuflags 0;
 
-       (* pcre2_compile.c:10839-10872 — save the data for a first code
-          unit. The existence of one means the minimum length must be at
-          least 1. *)
-       if !firstcuflags < req_none then (
-         re.first_codeunit <- !firstcu;
-         re.flags <- re.flags lor firstset;
-         incr minminlength;
+      (* pcre2_compile.c:10839-10872 — save the data for a first code
+         unit. The existence of one means the minimum length must be at
+         least 1. *)
+      if !firstcuflags < req_none then (
+        re.first_codeunit <- !firstcu;
+        re.flags <- re.flags lor firstset;
+        incr minminlength;
 
-         (* Handle caseless first code units. *)
-         if not (Int.equal (!firstcuflags land req_caseless) 0) then
-           if !firstcu < 128 || ((not utf) && (not ucp) && !firstcu < 255)
-           then (
-             if not (Int.equal (Chartables.fcc !firstcu) !firstcu) then
-               re.flags <- re.flags lor firstcaseless)
-           else if
-             (* pcre2_compile.c:10861-10864 — SUPPORT_UNICODE, 8-bit
-                width arm. *)
-             ucp && (not utf)
-             && not (Int.equal (Ucd.othercase !firstcu) !firstcu)
-           then re.flags <- re.flags lor firstcaseless)
-       else if
-         (* pcre2_compile.c:10874-10882 — when there is no first code
-            unit, for non-anchored patterns, see if we can set the
-            PCRE2_STARTLINE flag. *)
-         Int.equal (re.overall_options land Options.anchored) 0
-         && is_startline re.code 0 0 cb 0 ~inassert:false
-       then re.flags <- re.flags lor startline;
+        (* Handle caseless first code units. *)
+        if not (Int.equal (!firstcuflags land req_caseless) 0) then
+          if !firstcu < 128 || ((not utf) && (not ucp) && !firstcu < 255) then (
+            if not (Int.equal (Chartables.fcc !firstcu) !firstcu) then
+              re.flags <- re.flags lor firstcaseless)
+          else if
+            (* pcre2_compile.c:10861-10864 — SUPPORT_UNICODE, 8-bit
+               width arm. *)
+            ucp && (not utf)
+            && not (Int.equal (Ucd.othercase !firstcu) !firstcu)
+          then re.flags <- re.flags lor firstcaseless)
+      else if
+        (* pcre2_compile.c:10874-10882 — when there is no first code
+           unit, for non-anchored patterns, see if we can set the
+           PCRE2_STARTLINE flag. *)
+        Int.equal (re.overall_options land Options.anchored) 0
+        && is_startline re.code 0 0 cb 0 ~inassert:false
+      then re.flags <- re.flags lor startline;
 
-       (* pcre2_compile.c:10884-10935 — handle the "required code unit",
-          if one is set. *)
-       if !reqcuflags < req_none then (
-         (* pcre2_compile.c:10896-10904 — 8-bit arm: in the UTF case we
-            can increment the minimum length only if we are sure this
-            really is a different character and not a non-starting code
-            unit of the first character. *)
-         if
-           Int.equal (re.overall_options land Options.utf) 0 (* Not UTF *)
-           || !firstcuflags >= req_none (* First not set *)
-           || Int.equal (!firstcu land 0x80) 0 (* First is ASCII *)
-           || Int.equal (!reqcu land 0x80) 0 (* Req is ASCII *)
-         then incr minminlength;
+      (* pcre2_compile.c:10884-10935 — handle the "required code unit",
+         if one is set. *)
+      if !reqcuflags < req_none then (
+        (* pcre2_compile.c:10896-10904 — 8-bit arm: in the UTF case we
+           can increment the minimum length only if we are sure this
+           really is a different character and not a non-starting code
+           unit of the first character. *)
+        if
+          Int.equal (re.overall_options land Options.utf) 0 (* Not UTF *)
+          || !firstcuflags >= req_none (* First not set *)
+          || Int.equal (!firstcu land 0x80) 0 (* First is ASCII *)
+          || Int.equal (!reqcu land 0x80) 0 (* Req is ASCII *)
+        then incr minminlength;
 
-         (* pcre2_compile.c:10906-10934 — in the case of an anchored
-            pattern, set up the value only if it follows a variable length
-            item in the pattern. *)
-         if
-           Int.equal (re.overall_options land Options.anchored) 0
-           || not (Int.equal (!reqcuflags land req_vary) 0)
-         then (
-           re.last_codeunit <- !reqcu;
-           re.flags <- re.flags lor lastset;
+        (* pcre2_compile.c:10906-10934 — in the case of an anchored
+           pattern, set up the value only if it follows a variable length
+           item in the pattern. *)
+        if
+          Int.equal (re.overall_options land Options.anchored) 0
+          || not (Int.equal (!reqcuflags land req_vary) 0)
+        then (
+          re.last_codeunit <- !reqcu;
+          re.flags <- re.flags lor lastset;
 
-           (* Handle caseless required code units as for first code units
-              (above). *)
-           if not (Int.equal (!reqcuflags land req_caseless) 0) then
-             if !reqcu < 128 || ((not utf) && (not ucp) && !reqcu < 255)
-             then (
-               if not (Int.equal (Chartables.fcc !reqcu) !reqcu) then
-                 re.flags <- re.flags lor lastcaseless)
-             else if
-               (* pcre2_compile.c:10924-10926 — SUPPORT_UNICODE, 8-bit
-                  width arm. *)
-               ucp && (not utf)
-               && not (Int.equal (Ucd.othercase !reqcu) !reqcu)
-             then re.flags <- re.flags lor lastcaseless));
+          (* Handle caseless required code units as for first code units
+             (above). *)
+          if not (Int.equal (!reqcuflags land req_caseless) 0) then
+            if !reqcu < 128 || ((not utf) && (not ucp) && !reqcu < 255) then (
+              if not (Int.equal (Chartables.fcc !reqcu) !reqcu) then
+                re.flags <- re.flags lor lastcaseless)
+            else if
+              (* pcre2_compile.c:10924-10926 — SUPPORT_UNICODE, 8-bit
+                 width arm. *)
+              ucp && (not utf) && not (Int.equal (Ucd.othercase !reqcu) !reqcu)
+            then re.flags <- re.flags lor lastcaseless));
 
-       (* pcre2_compile.c:10937-10950 — study the compiled pattern:
-          PRIV(study) fills re.start_bitmap (PCRE2_FIRSTMAPSET) and
-          re.minlength, and its FIRSTMAPSET minminlength bump rides with
-          it. DEFERRED (M5 owns the observable parts, M9 the rest;
-          docs/ocaml-engine/06-verbs-k-start-opt.md) WITHOUT an error
-          marker: both are start-of-match optimizations whose absence is
-          the documented PCRE2_NO_START_OPTIMIZE behavior, and study's
-          only error (ERR31) is "internal error: should not occur", so
-          skipping cannot change compile error behavior. Until it lands,
-          re.minlength is minminlength alone (lower than the C's studied
-          value; unobservable through the engine boundary). *)
+      (* pcre2_compile.c:10937-10950 — study the compiled pattern:
+         PRIV(study) fills re.start_bitmap (PCRE2_FIRSTMAPSET) and
+         re.minlength, and its FIRSTMAPSET minminlength bump rides with
+         it. DEFERRED (M5 owns the observable parts, M9 the rest;
+         docs/ocaml-engine/06-verbs-k-start-opt.md) WITHOUT an error
+         marker: both are start-of-match optimizations whose absence is
+         the documented PCRE2_NO_START_OPTIMIZE behavior, and study's
+         only error (ERR31) is "internal error: should not occur", so
+         skipping cannot change compile error behavior. Until it lands,
+         re.minlength is minminlength alone (lower than the C's studied
+         value; unobservable through the engine boundary). *)
 
-       (* pcre2_compile.c:10952-10955 — if the minimum length set (or not
-          set) by study() is less than the minimum implied by required
-          code units, override it. *)
-       if re.minlength < !minminlength then re.minlength <- !minminlength));
+      (* pcre2_compile.c:10952-10955 — if the minimum length set (or not
+         set) by study() is less than the minimum implied by required
+         code units, override it. *)
+      if re.minlength < !minminlength then re.minlength <- !minminlength);
 
     Ok re
   with Had_error (errorcode, erroroffset) -> Error (errorcode, erroroffset)
@@ -5717,16 +5716,7 @@ let () =
   let cb, rc, _, _, _, _, _, _ = compile2 "(?:a)++" in
   assert (Int.equal rc 1);
   assert_code cb
-    [
-      Opcodes.op_brapos;
-      0;
-      5;
-      Opcodes.op_char;
-      0x61;
-      Opcodes.op_ketrpos;
-      0;
-      5;
-    ];
+    [ Opcodes.op_brapos; 0; 5; Opcodes.op_char; 0x61; Opcodes.op_ketrpos; 0; 5 ];
 
   (* "(a|)*": the group may match empty (group_return -1), so the real
      phase converts OP_CBRA to OP_SCBRA ( *bracode += OP_SBRA - OP_BRA,

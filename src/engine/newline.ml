@@ -111,9 +111,9 @@ let is_newline (subject : string) (type_ : int) (pos : int) (endptr : int)
     else if Int.equal c char_cr then (
       (* pcre2_newline.c:98 — ptr < endptr - 1 && ptr[1] == CHAR_LF *)
       lenptr :=
-        (if pos < endptr - 1 && Int.equal (Char.code subject.[pos + 1]) char_lf
-         then 2
-         else 1);
+        if pos < endptr - 1 && Int.equal (Char.code subject.[pos + 1]) char_lf
+        then 2
+        else 1;
       true)
     else false (* pcre2_newline.c:101-102 *)
   else if
@@ -125,14 +125,14 @@ let is_newline (subject : string) (type_ : int) (pos : int) (endptr : int)
   else if Int.equal c char_cr then (
     (* pcre2_newline.c:118-120 *)
     lenptr :=
-      (if pos < endptr - 1 && Int.equal (Char.code subject.[pos + 1]) char_lf
-       then 2
-       else 1);
+      if pos < endptr - 1 && Int.equal (Char.code subject.[pos + 1]) char_lf
+      then 2
+      else 1;
     true)
   else if Int.equal c char_nel then (
     (* pcre2_newline.c:124-126 — 8-bit: NEL is the two code units 0xC2 0x85
        in UTF-8 mode, the single code unit 0x85 otherwise *)
-    lenptr := (if utf then 2 else 1);
+    lenptr := if utf then 2 else 1;
     true)
   else if Int.equal c 0x2028 || Int.equal c 0x2029 then (
     (* pcre2_newline.c:128-131 — LS / PS: three UTF-8 code units. Reachable
@@ -162,10 +162,9 @@ let was_newline (subject : string) (type_ : int) (pos : int) (startptr : int)
     if Int.equal c char_lf then (
       (* pcre2_newline.c:190 — ptr > startptr && ptr[-1] == CHAR_CR *)
       lenptr :=
-        (if
-           ptr > startptr && Int.equal (Char.code subject.[ptr - 1]) char_cr
-         then 2
-         else 1);
+        if ptr > startptr && Int.equal (Char.code subject.[ptr - 1]) char_cr
+        then 2
+        else 1;
       true)
     else if Int.equal c char_cr then (
       lenptr := 1;
@@ -174,18 +173,17 @@ let was_newline (subject : string) (type_ : int) (pos : int) (startptr : int)
   else if Int.equal c char_lf then (
     (* pcre2_newline.c:205-207 — NLTYPE_ANY: LF, CRLF when preceded by CR *)
     lenptr :=
-      (if ptr > startptr && Int.equal (Char.code subject.[ptr - 1]) char_cr
-       then 2
-       else 1);
+      if ptr > startptr && Int.equal (Char.code subject.[ptr - 1]) char_cr then
+        2
+      else 1;
     true)
-  else if Int.equal c char_vt || Int.equal c char_ff || Int.equal c char_cr
-  then (
+  else if Int.equal c char_vt || Int.equal c char_ff || Int.equal c char_cr then (
     (* pcre2_newline.c:212-216 *)
     lenptr := 1;
     true)
   else if Int.equal c char_nel then (
     (* pcre2_newline.c:220-222 — 8-bit: utf? 2 : 1 *)
-    lenptr := (if utf then 2 else 1);
+    lenptr := if utf then 2 else 1;
     true)
   else if Int.equal c 0x2028 || Int.equal c 0x2029 then (
     (* pcre2_newline.c:224-227 — LS / PS: three UTF-8 code units *)
@@ -206,7 +204,9 @@ let () =
     (hit, !len)
   in
   (* ANY, non-UTF: LF / VT / FF are newlines of length 1. *)
-  (match probe_is nltype_any "\n" 0 false with true, 1 -> () | _ -> assert false);
+  (match probe_is nltype_any "\n" 0 false with
+  | true, 1 -> ()
+  | _ -> assert false);
   (match probe_is nltype_any "\x0b" 0 false with
   | true, 1 -> ()
   | _ -> assert false);

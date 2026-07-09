@@ -141,7 +141,6 @@ let err89 =
   compile_error_base + 89 (* internal error: unknown code in parsed pattern *)
 
 let err92 = compile_error_base + 92 (* invalid option bits with PCRE2_LITERAL *)
-
 let err93 = compile_error_base + 93 (* \N{U+dddd} only in Unicode (UTF) mode *)
 let err94 = compile_error_base + 94 (* invalid hyphen in option setting *)
 let err97 = compile_error_base + 97 (* too many capturing groups (max 65535) *)

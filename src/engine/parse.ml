@@ -892,13 +892,13 @@ let make_context (pattern : string) : parse_context =
    FIXED arm is compared inline by the macro itself — PRIV(is_newline)
    never sees NLTYPE_FIXED — so it stays here, below. *)
 let is_newline_at (cx : parse_context) (p : int) : bool =
-  if not (Int.equal cx.nltype nltype_fixed) then
+  if not (Int.equal cx.nltype nltype_fixed) then (
     p < cx.ptrend
     &&
     let len = ref 0 in
     let hit = Newline.is_newline cx.pattern cx.nltype p cx.ptrend len false in
     if hit then cx.nllen <- !len;
-    hit
+    hit)
   else
     p <= cx.ptrend - cx.nllen
     && Int.equal (Char.code cx.pattern.[p]) cx.nl0
@@ -2335,20 +2335,19 @@ let parse_regex (cx : parse_context) ~(options : int)
     let i = ref 0 in
     while (not !broke) && !i < cx.names_found do
       let ng = cx.named_groups.(!i) in
-      (if
-         Int.equal !namelen ng.length && strncmp_eq pat !name ng.name !namelen
-       then (
-         if Int.equal ng.number cx.bracount then broke := true
-         else if Int.equal (!options land Options.dupnames) 0 then (
-           cx.errorcode <- Errors.err43;
-           raise_notrace Goto_failed)
-         else (
-           ng.isdup <- true;
-           isdupname := true (* Mark as a duplicate *);
-           cx.dupnames <- true (* Duplicate names exist *)))
-       else if Int.equal ng.number cx.bracount then (
-         cx.errorcode <- Errors.err65;
-         raise_notrace Goto_failed));
+      if Int.equal !namelen ng.length && strncmp_eq pat !name ng.name !namelen
+      then
+        if Int.equal ng.number cx.bracount then broke := true
+        else if Int.equal (!options land Options.dupnames) 0 then (
+          cx.errorcode <- Errors.err43;
+          raise_notrace Goto_failed)
+        else (
+          ng.isdup <- true;
+          isdupname := true (* Mark as a duplicate *);
+          cx.dupnames <- true (* Duplicate names exist *))
+      else if Int.equal ng.number cx.bracount then (
+        cx.errorcode <- Errors.err65;
+        raise_notrace Goto_failed);
       if not !broke then incr i
     done;
 
@@ -3498,7 +3497,7 @@ let parse_regex (cx : parse_context) ~(options : int)
                           error (pcre2_compile.c:4373-4380). *)
                        cx.errorcode <- Errors.err41;
                        raise_notrace Goto_failed)
-                     else (
+                     else
                        (* pcre2_compile.c:4381-4387 *)
                        let offset = ref 0 in
                        let name = ref 0 in
@@ -3513,8 +3512,7 @@ let parse_regex (cx : parse_context) ~(options : int)
                        buf.(!pp) <- !namelen;
                        incr pp;
                        putoffset buf pp !offset;
-                       okquantifier := true)
-                     (* End of (?P processing *)
+                       okquantifier := true (* End of (?P processing *)
                  | 'R' | '+' | '0' .. '9' ->
                      (* pcre2_compile.c:4390-4436 — recursion/subroutine
                         calls by number (RECURSION_BYNUMBER): deferred
@@ -4614,9 +4612,7 @@ let () =
     (hit, cx.nllen)
   in
   (* ANY: NEL (0x85) is a newline of length 1. *)
-  (match probe nltype_any "a\x85b" 1 with
-  | true, 1 -> ()
-  | _ -> assert false);
+  (match probe nltype_any "a\x85b" 1 with true, 1 -> () | _ -> assert false);
   (* ANYCRLF: NEL is NOT a newline. *)
   (match probe nltype_anycrlf "a\x85b" 1 with
   | false, _ -> ()

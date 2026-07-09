@@ -272,20 +272,18 @@ let create ~(top_bracket : int) ~(heap_limit : int) : (t, int) result =
   (* pcre2_match.c:7053-7054 *)
   let heapframes_size = frame_size_bytes * 10 in
   let heapframes_size =
-    if heapframes_size < Limits.start_frames_size then
-      Limits.start_frames_size
+    if heapframes_size < Limits.start_frames_size then Limits.start_frames_size
     else heapframes_size
   in
   (* pcre2_match.c:7055-7060 *)
   let heapframes_size =
     if heapframes_size / 1024 > heap_limit then
       let max_size = 1024 * heap_limit in
-      if max_size < frame_size_bytes then Errors.error_heaplimit
-      else max_size
+      if max_size < frame_size_bytes then Errors.error_heaplimit else max_size
     else heapframes_size
   in
   if heapframes_size < 0 then Error heapframes_size (* error_heaplimit *)
-  else begin
+  else
     (* Simulated capacity in whole frames: frame f is usable iff its end
        lies strictly below frames_top (see [push]'s >= test), so
        floor(heapframes_size / frame_size_bytes) frames always suffice. *)
@@ -296,14 +294,7 @@ let create ~(top_bracket : int) ~(heap_limit : int) : (t, int) result =
       frames.(i) <- unset
     done;
     Ok
-      {
-        frames;
-        heapframes_size;
-        frame_size_ints;
-        frame_size_bytes;
-        heap_limit;
-      }
-  end
+      { frames; heapframes_size; frame_size_ints; frame_size_bytes; heap_limit }
 
 (* pcre2_match.c:668-712 — the frames vector is full: get a new one,
    doubling the size, but constrained by the heap limit (which is in KiB).
@@ -330,16 +321,14 @@ let grow (a : t) ~(n : int) : int =
       if newsize / 1024 >= a.heap_limit then
         let old_size = a.heapframes_size / 1024 in
         if a.heap_limit <= old_size then Errors.error_heaplimit
-        else begin
+        else
           let max_delta = 1024 * (a.heap_limit - old_size) in
           let over_bytes = a.heapframes_size mod 1024 in
           let max_delta =
-            if not (Int.equal over_bytes 0) then
-              max_delta - (1024 - over_bytes)
+            if not (Int.equal over_bytes 0) then max_delta - (1024 - over_bytes)
             else max_delta
           in
           a.heapframes_size + max_delta
-        end
       else newsize
     in
     if newsize < 0 then newsize
@@ -347,7 +336,7 @@ let grow (a : t) ~(n : int) : int =
       (* pcre2_match.c:697-700 — with a heap limit set, the permitted
          additional size may not be enough for another frame. *)
       Errors.error_heaplimit
-    else begin
+    else
       (* pcre2_match.c:701-711 — allocate the doubled vector, copy the
          used prefix, install it. DEVIATION: the C returns
          PCRE2_ERROR_NOMEMORY on malloc failure; Array.make has no NULL
@@ -361,7 +350,6 @@ let grow (a : t) ~(n : int) : int =
       a.frames <- new_frames;
       a.heapframes_size <- newsize;
       0
-    end
 
 (* pcre2_match.c:662-712 + 745-754 — MATCH_RECURSE: set up a new
    backtracking frame N just above the current frame [f], growing the
@@ -383,11 +371,10 @@ let push (a : t) (f : int) : int =
   let n = f + 1 in
   (* pcre2_match.c:667-668 *)
   let rc =
-    if (n + 1) * a.frame_size_bytes >= a.heapframes_size then grow a ~n
-    else 0
+    if (n + 1) * a.frame_size_bytes >= a.heapframes_size then grow a ~n else 0
   in
   if rc < 0 then rc
-  else begin
+  else (
     (* pcre2_match.c:749-751 — memcpy of frame_copy_size bytes from F's
        eptr field to N's eptr field, where frame_copy_size = frame_size -
        offsetof(heapframe, eptr) (:642). *)
@@ -399,8 +386,7 @@ let push (a : t) (f : int) : int =
     (* pcre2_match.c:753 — N->rdepth = Frdepth + 1 *)
     a.frames.((n * a.frame_size_ints) + slot_rdepth) <-
       a.frames.((f * a.frame_size_ints) + slot_rdepth) + 1;
-    n
-  end
+    n)
 
 (* ---------- Inline sanity checks (module-initialization asserts) ---------- *)
 
