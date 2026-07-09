@@ -32,7 +32,7 @@ Parse phase (`parse.ml` ← pcre2_compile.c front half):
   arms parse-error or defer to M3–M5)
 
 Compile phase (`compile.ml` ← pcre2_compile.c back half):
-- [ ] compile utilities: PUT/GET/PUT2/GET2, code-size first pass plumbing, find_dupname
+- [x] compile utilities: (this commit) PUT/GET/PUT2/GET2, code-size first pass plumbing, find_dupname
   scaffold (pcre2_compile.c:5538-5630 + macros pcre2_internal.h)
 - [ ] compile_branch A — single chars, escapes, OP_CHAR/CHARI/NOT/NOTI emission
   (pcre2_compile.c:5636-6500)

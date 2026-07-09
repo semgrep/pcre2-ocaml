@@ -3,6 +3,7 @@
    engine module gains init asserts. *)
 let () =
   ignore (Sys.opaque_identity Pcre2_engine.Parse.meta_end);
+  ignore (Sys.opaque_identity Pcre2_engine.Compile.compile_work_size);
   ignore (Sys.opaque_identity Pcre2_engine.Opcodes.op_table_length);
   ignore (Sys.opaque_identity (Pcre2_engine.Errors.message 114));
   ignore (Sys.opaque_identity (Pcre2_engine.Chartables.lcc (Char.code 'A')));

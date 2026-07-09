@@ -36,6 +36,10 @@ let repeat_unlimited = max_repeat_count + 1
 (* config.h.generic:263 — default maximum depth of nested parentheses. *)
 let parens_nest_limit = 250
 
+(* config.h.generic:224 — default maximum length, in characters, of the
+   branches of a variable-length lookbehind assertion. *)
+let max_varlookbehind = 255
+
 (* config.h.generic:190 — default match limit (backtracking ticks). *)
 let match_limit = 10_000_000
 

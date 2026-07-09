@@ -86,6 +86,20 @@ let substitute_matched = 0x00010000 (* pcre2_substitute() only *)
 let substitute_replacement_only = 0x00020000 (* pcre2_substitute() only *)
 let disable_recurseloop_check = 0x00040000 (* not for dfa or jit match *)
 
+(* pcre2.h.generic:206-215 — newline conventions, for use in compile
+   contexts and by the ( *CR)-style in-pattern settings. The values must
+   all be greater than zero (0 = "unset, use the context's"). *)
+let newline_cr = 1
+let newline_lf = 2
+let newline_crlf = 3
+let newline_any = 4
+let newline_anycrlf = 5
+let newline_nul = 6
+
+(* pcre2.h.generic:217-218 — \R conventions, for use in compile contexts. *)
+let bsr_unicode = 1
+let bsr_anycrlf = 2
+
 (* pcre2_compile.c:769-772 — public options permitted with PCRE2_LITERAL. *)
 let public_literal_compile_options =
   anchored lor auto_callout lor caseless lor endanchored lor firstline

@@ -71,6 +71,13 @@ let err50 = compile_error_base + 50 (* invalid range in character class *)
 let err51 =
   compile_error_base + 51 (* octal value > \377 in 8-bit non-UTF mode *)
 
+let err52 =
+  compile_error_base + 52 (* internal error: overran compiling workspace *)
+
+let err53 =
+  compile_error_base
+  + 53 (* internal error: previously-checked referenced subpattern not found *)
+
 let err55 = compile_error_base + 55 (* missing opening brace after \o *)
 let err57 = compile_error_base + 57 (* \g not followed by name/number *)
 let err60 = compile_error_base + 60 (* ( *VERB) not recognized or malformed *)
@@ -107,6 +114,7 @@ let err83 =
 let err84 =
   compile_error_base + 84 (* (?| / (?J: / (?x: parens too deeply nested *)
 
+let err86 = compile_error_base + 86 (* regular expression is too complicated *)
 let err93 = compile_error_base + 93 (* \N{U+dddd} only in Unicode (UTF) mode *)
 let err94 = compile_error_base + 94 (* invalid hyphen in option setting *)
 let err97 = compile_error_base + 97 (* too many capturing groups (max 65535) *)
