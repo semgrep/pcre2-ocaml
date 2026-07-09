@@ -14,7 +14,7 @@ report.
 
 ### Chunks
 
-- [ ] auto_possess.ml: compare_opcodes + possessification pass over compiled code, opcode
+- [x] auto_possess.ml: compare_opcodes + possessification pass over compiled code, opcode
   compatibility tables (pcre2_auto_possess.c:1-1371); PCRE2_NO_AUTO_POSSESS respected
 - [ ] study.ml full: start-code-unit bitmap (set_start_bits), req code unit + memchr-style
   skipping, minlength completion (pcre2_study.c:1-1915 remainder beyond the M5 subset)

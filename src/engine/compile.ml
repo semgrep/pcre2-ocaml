@@ -2856,9 +2856,7 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
             let delimiter =
               if Char.equal delimiter0 '{' then '}' else delimiter0
             in
-            put cb.start_code
-              (!code + 1 + (3 * Limits.link_size))
-              (!offset + 1)
+            put cb.start_code (!code + 1 + (3 * Limits.link_size)) (!offset + 1)
             (* One after delimiter *);
 
             (* pcre2_compile.c:7152-7167 — the syntax of the pattern was
@@ -2869,18 +2867,18 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                also ensures that pp[1] is accessible. *)
             length := !length - 1;
             while !length > 1 do
-              (if
-                 Char.equal cb.pattern.[!pp] delimiter
-                 && Char.equal cb.pattern.[!pp + 1] delimiter
-               then (
-                 Bytes.set cb.start_code !callout_string delimiter;
-                 incr callout_string;
-                 pp := !pp + 2;
-                 length := !length - 1)
-               else (
-                 Bytes.set cb.start_code !callout_string cb.pattern.[!pp];
-                 incr callout_string;
-                 incr pp));
+              if
+                Char.equal cb.pattern.[!pp] delimiter
+                && Char.equal cb.pattern.[!pp + 1] delimiter
+              then (
+                Bytes.set cb.start_code !callout_string delimiter;
+                incr callout_string;
+                pp := !pp + 2;
+                length := !length - 1)
+              else (
+                Bytes.set cb.start_code !callout_string cb.pattern.[!pp];
+                incr callout_string;
+                incr pp);
               length := !length - 1
             done;
             Bytes.set cb.start_code !callout_string '\000';
@@ -6458,15 +6456,25 @@ let pcre2_compile ?(ccontext : compile_context = default_compile_context)
            rcode := find_recurse re.code (!rcode + 1 + Limits.link_size) ~utf)
        done);
 
-    (* pcre2_compile.c:10794-10805 — unless PCRE2_NO_AUTO_POSSESS, check
-       whether any single character iterators can be auto-possessified
-       (PRIV(auto_possessify), ERR80). DEFERRED (M9,
-       docs/ocaml-engine/10-performance.md) WITHOUT an error marker:
-       auto-possession only rewrites quantifier opcodes into possessive
-       variants when the following item cannot match the same character —
-       it never changes what a pattern matches, only how fast failures are
-       detected — and its only error, ERR80, means malformed bytecode
-       (internal error). Compilation must succeed without it. *)
+    (* pcre2_compile.c:10794-10805 — unless disabled, check whether any
+       single character iterators can be auto-possessified. The function
+       overwrites the appropriate opcode values in re.code (offset 0 is
+       the C's codestart; the "temp" cast is a C const workaround with no
+       OCaml counterpart). Auto_possess reads cb->external_options,
+       cb->had_recurse and the character tables from cb (see its module
+       DEVIATION note). *)
+    if
+      Int.equal !errorcode 0
+      && Int.equal (re.overall_options land Options.no_auto_possess) 0
+    then
+      if
+        not
+          (Int.equal
+             (Auto_possess.auto_possessify re.code
+                ~external_options:cb.external_options
+                ~had_recurse:cb.had_recurse)
+             0)
+      then errorcode := Errors.err80;
 
     (* pcre2_compile.c:10807-10809 — failed to compile, or error while
        post-processing. *)
@@ -8183,8 +8191,9 @@ let () =
   (* Freestanding \p/\P (pcre2_compile.c:8136-8156): OP_PROP/OP_NOTPROP
      with type and value; \p{Any} = OP_ALLANY (auto-anchoring benefit);
      repeats go through the property branch of OUTPUT_SINGLE_REPEAT
-     (7776-7780: /\p{Nd}{2,}/ = TYPEEXACT{2} PROP Nd + TYPESTAR PROP Nd,
-     oracle dump `prop Nd {2}` / `prop Nd *+` before auto-possess). *)
+     (7776-7780: /\p{Nd}{2,}/ = TYPEEXACT{2} PROP Nd + TYPESTAR PROP Nd —
+     compile_branch output; the driver's auto_possessify pass then turns
+     the TYPESTAR into TYPEPOSSTAR, the oracle dump's `prop Nd *+`). *)
   let cb, rc, _, _, _, fcuf, _, _ = compile2 "\\p{Greek}" in
   assert (Int.equal rc 1);
   assert (Int.equal fcuf req_none);
@@ -8307,8 +8316,9 @@ let () =
        ]);
   (* Repeated multi-byte character (pcre2_compile.c:7280-7289 BACKCHAR +
      mcbuffer, OUTPUT_SINGLE_REPEAT): /é{2,4}/utf = [EXACT 2 c3 a9]
-     [UPTO 2 c3 a9] (auto-possessify is M9, so the oracle's {0,2}+ shows
-     here as plain UPTO). *)
+     [UPTO 2 c3 a9] from compile_branch; the driver's auto_possessify
+     pass then rewrites the UPTO to POSUPTO — the oracle's {0,2}+
+     (pinned in the debug_printer dumps). *)
   let cb, _, _, _, _, _, _, _ = compile2 ~options:Options.utf "\xc3\xa9{2,4}" in
   assert_code cb
     [ Opcodes.op_exact; 0; 2; 0xc3; 0xa9; Opcodes.op_upto; 0; 2; 0xc3; 0xa9 ];
@@ -9168,11 +9178,10 @@ let () =
       Opcodes.op_end;
     ];
   assert (Int.equal re.max_lookbehind 2);
-  (* /(?>a+)b/: [BRA 13][ONCE 5][PLUS a][KET 5][CHAR b][KET 13][END].
-     pcre2test shows "a++" because auto_possessify rewrites OP_PLUS to
-     OP_POSPLUS — that pass is M9 (deferred without an error marker, see
-     the driver note at its call site); opcode positions and lengths are
-     identical. *)
+  (* /(?>a+)b/: [BRA 13][ONCE 5][POSPLUS a][KET 5][CHAR b][KET 13][END].
+     pcre2test shows "a++": the driver's auto_possessify pass (M9)
+     rewrites OP_PLUS to OP_POSPLUS at the end of the atomic group
+     (pcre2_auto_possess.c:646-649, 1174-1175). *)
   let re = ok "(?>a+)b" in
   assert_code re
     [
@@ -9182,7 +9191,7 @@ let () =
       Opcodes.op_once;
       0;
       5;
-      Opcodes.op_plus;
+      Opcodes.op_posplus;
       0x61;
       Opcodes.op_ket;
       0;
@@ -9196,8 +9205,9 @@ let () =
     ];
   (* /(?<=a?bc|ab)d/: variable-length first branch (min 2, max 3) gets
      OP_VREVERSE; the fixed second branch (min = max = 2) keeps
-     OP_REVERSE; Max lookbehind = 3. (pcre2test shows "a?+" — OP_POSQUERY
-     — after the M9 auto_possessify pass; OP_QUERY here, same length.) *)
+     OP_REVERSE; Max lookbehind = 3. (pcre2test shows "a?+" — the M9
+     auto_possessify pass rewrites OP_QUERY to OP_POSQUERY before the
+     disjoint 'b', pcre2_auto_possess.c:1182-1183; same length.) *)
   let re = ok "(?<=a?bc|ab)d" in
   assert (Int.equal (Bytes.length re.code) 36);
   assert (Int.equal (byte re 3) Opcodes.op_assertback);
@@ -9205,7 +9215,7 @@ let () =
   assert (Int.equal (byte re 6) Opcodes.op_vreverse);
   assert (Int.equal (get2 re.code 7) 2 (* min *));
   assert (Int.equal (get2 re.code 9) 3 (* max *));
-  assert (Int.equal (byte re 11) Opcodes.op_query);
+  assert (Int.equal (byte re 11) Opcodes.op_posquery);
   assert (Int.equal (byte re 17) Opcodes.op_alt);
   assert (Int.equal (get re.code 18) 10);
   assert (Int.equal (byte re 20) Opcodes.op_reverse);

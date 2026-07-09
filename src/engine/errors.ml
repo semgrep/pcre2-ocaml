@@ -171,6 +171,10 @@ let err79 = compile_error_base + 79
 (* syntax error or number too big in
    (?(VERSION condition *)
 
+let err80 = compile_error_base + 80
+(* internal error: unknown opcode in
+   auto_possessify() *)
+
 let err81 =
   compile_error_base
   + 81 (* missing terminating delimiter for callout with string argument *)

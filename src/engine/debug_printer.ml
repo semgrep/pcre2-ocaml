@@ -921,8 +921,8 @@ let () =
        \  7   7 Ket\n\
        \ 10     End\n" ^ rule));
   (* /a*ab+?bc??cd{4}e{2,7}?e/ — single-char repeat names (each repeat is
-     followed by its own character so the C library's auto-possessify
-     pass leaves them alone), EXACT, and MINUPTO's {0,n}? form. *)
+     followed by its own character so the auto-possessify pass leaves
+     them alone), EXACT, and MINUPTO's {0,n}? form. *)
   assert (
     String.equal
       (dump "a*ab+?bc??cd{4}e{2,7}?e")
@@ -940,7 +940,7 @@ let () =
        \ 29  29 Ket\n\
        \ 32     End\n" ^ rule));
   (* /\d{2,}8\s*?\sx/ — TYPEEXACT, TYPESTAR, TYPEMINSTAR (again arranged
-     so the C's auto-possessify pass does not fire). *)
+     so the auto-possessify pass does not fire). *)
   assert (
     String.equal (dump "\\d{2,}8\\s*?\\sx")
       ("  0  16 Bra\n\
@@ -992,4 +992,61 @@ let () =
   (* /[]a-]/ — '-' and ']' are backslash-escaped in class output. *)
   assert (
     String.equal (dump "[]a-]")
-      ("  0  36 Bra\n  3     [\\-\\]a]\n 36  36 Ket\n 39     End\n" ^ rule))
+      ("  0  36 Bra\n  3     [\\-\\]a]\n 36  36 Ket\n 39     End\n" ^ rule));
+  (* Auto-possessified forms (M9): with the auto_possessify pass live,
+     these dumps show the possessive rewrites byte-identically to
+     `pcre2test -d` on the real 10.44 library (previously the engine
+     dumps showed the pre-possess forms, e.g. a* vs the C's a*+). *)
+  (* /a*b/ — STAR → POSSTAR before a disjoint character. *)
+  assert (
+    String.equal (dump "a*b")
+      ("  0   7 Bra\n  3     a*+\n  5     b\n  7   7 Ket\n 10     End\n" ^ rule));
+  (* /\d+x/ — TYPEPLUS → TYPEPOSPLUS. *)
+  assert (
+    String.equal (dump "\\d+x")
+      ("  0   7 Bra\n  3     \\d++\n  5     x\n  7   7 Ket\n 10     End\n"
+     ^ rule));
+  (* /[a-z]*z/ — 'z' is inside the class, so CRSTAR must NOT be
+     possessified. *)
+  assert (
+    String.equal (dump "[a-z]*z")
+      ("  0  39 Bra\n  3     [a-z]*\n 37     z\n 39  39 Ket\n 42     End\n"
+     ^ rule));
+  (* /é{2,4}/utf — the UPTO tail becomes POSUPTO ({0,2}+). *)
+  assert (
+    String.equal
+      (dump ~options:Options.utf "\xc3\xa9{2,4}")
+      ("  0  13 Bra\n\
+       \  3     \\x{e9}{2}\n\
+       \  8     \\x{e9}{0,2}+\n\
+       \ 13  13 Ket\n\
+       \ 16     End\n" ^ rule));
+  (* /\p{Nd}{2,}/utf — the TYPESTAR PROP tail becomes TYPEPOSSTAR. *)
+  assert (
+    String.equal
+      (dump ~options:Options.utf "\\p{Nd}{2,}")
+      ("  0  13 Bra\n\
+       \  3     prop Nd {2}\n\
+       \  9     prop Nd *+\n\
+       \ 13  13 Ket\n\
+       \ 16     End\n" ^ rule));
+  (* /(a|b)*c/ — group repeats (KETRMAX) are never rewritten by the
+     pass. *)
+  assert (
+    String.equal (dump "(a|b)*c")
+      ("  0  21 Bra\n\
+       \  3     Brazero\n\
+       \  4   7 CBra 1\n\
+       \  9     a\n\
+       \ 11   5 Alt\n\
+       \ 14     b\n\
+       \ 16  12 KetRmax\n\
+       \ 19     c\n\
+       \ 21  21 Ket\n\
+       \ 24     End\n" ^ rule));
+  (* /( *NO_AUTO_POSSESS)a*b/ — PCRE2_NO_AUTO_POSSESS suppresses the pass
+     (pcre2_compile.c:10801): a* stays. *)
+  assert (
+    String.equal
+      (dump "(*NO_AUTO_POSSESS)a*b")
+      ("  0   7 Bra\n  3     a*\n  5     b\n  7   7 Ket\n 10     End\n" ^ rule))
