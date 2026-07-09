@@ -387,11 +387,19 @@ let release (a : t) : unit =
   if a.holds_scratch then (
     if Array.length a.frames <= scratch_max_retained_ints then
       scratch_arena := a.frames
-    else
-      (* DEVIATION (retention cap): see [scratch_max_retained_ints]. *)
-      scratch_arena := [||];
-    (* The plain write above is published by this release store: the next
-       acquire's compare_and_set synchronizes with it. *)
+    else (
+      (* DEVIATION (retention cap): see [scratch_max_retained_ints].
+         Also un-pin the dead arena record's own reference: [a] stays
+         reachable until the next exec's reset (the interpreter's
+         scratch trio holds st.arena = a), which would otherwise keep
+         the dropped oversized array alive for one inter-exec window,
+         bypassing the cap. No a.frames read can follow: release is the
+         last act before pcre2_match returns, and the results live in
+         the caller's match data. *)
+      a.frames <- [||];
+      scratch_arena := [||]);
+    (* The plain writes above are published by this release store: the
+       next acquire's compare_and_set synchronizes with them. *)
     Atomic.set scratch_busy false)
 
 (* pcre2_match.c:668-712 — the frames vector is full: get a new one,

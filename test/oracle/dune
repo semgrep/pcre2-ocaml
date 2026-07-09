@@ -11,6 +11,6 @@
  (name pcre2_c_tests)
  (package pcre2-dev)
  (modules pcre2_c_tests pcre2)
- (libraries pcre2-dev.oracle ounit2)
+ (libraries pcre2-dev.oracle pcre2.engine ounit2)
  (preprocess
   (pps ppx_deriving.show)))

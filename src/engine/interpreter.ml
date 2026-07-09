@@ -308,36 +308,45 @@ type match_data = {
    - pcre2_callout_block *cb (903), void *callout_data (904),
      int ( *callout)(...) (905) — dropped: this library's API has no
      callout surface, so mb->callout is always NULL and no callout block
-     is ever consulted (see [do_callout_length]). *)
+     is ever consulted (see [do_callout_length]).
+
+   Every field is mutable (DEVIATION (perf), the scratch-trio reuse —
+   see [fresh_trio]): like the C, which fills a stack-allocated
+   actual_match_block imperatively per call (pcre2_match.c:6588-6589,
+   6956-6979), one cached mb is re-filled per exec at the single reset
+   site in [pcre2_match]. The three heap-pointing fields (subject /
+   name_table / start_code) cost one caml_modify each per exec —
+   plan-sanctioned. *)
 type match_block = {
-  match_limit : int; (* uint32_t match_limit (867) *)
-  match_limit_depth : int; (* uint32_t match_limit_depth (868) *)
+  mutable match_limit : int; (* uint32_t match_limit (867) *)
+  mutable match_limit_depth : int; (* uint32_t match_limit_depth (868) *)
   mutable match_call_count : int;
       (* uint32_t match_call_count (869): number of times a new frame is
          created *)
   mutable hitend : bool;
       (* BOOL hitend (870): hit the end of the subject at some point *)
-  hasthen : bool;
+  mutable hasthen : bool;
       (* BOOL hasthen (871): pattern contains ( *THEN) — consumed by the
          bracket/verb arms (M5); the driver sets it from re->flags *)
-  allowemptypartial : bool;
+  mutable allowemptypartial : bool;
       (* BOOL allowemptypartial (872): allow empty hard partial *)
-  subject : string;
+  mutable subject : string;
       (* DEVIATION: the subject string itself; C pointer fields below are
          int offsets into it *)
-  start_offset : int; (* PCRE2_SIZE start_offset (876) *)
+  mutable start_offset : int; (* PCRE2_SIZE start_offset (876) *)
   mutable end_offset_top : int;
       (* PCRE2_SIZE end_offset_top (877): highwater mark at end of match *)
-  partial : int; (* uint16_t partial (878): PARTIAL options as 0/1/2 *)
-  bsr_convention : int; (* uint16_t bsr_convention (879): \R interpretation *)
-  name_count : int; (* uint16_t name_count (880) *)
-  name_entry_size : int; (* uint16_t name_entry_size (881) *)
-  name_table : Bytes.t; (* PCRE2_SPTR name_table (882) *)
-  start_code : Bytes.t;
+  mutable partial : int; (* uint16_t partial (878): PARTIAL options as 0/1/2 *)
+  mutable bsr_convention : int;
+      (* uint16_t bsr_convention (879): \R interpretation *)
+  mutable name_count : int; (* uint16_t name_count (880) *)
+  mutable name_entry_size : int; (* uint16_t name_entry_size (881) *)
+  mutable name_table : Bytes.t; (* PCRE2_SPTR name_table (882) *)
+  mutable start_code : Bytes.t;
       (* PCRE2_SPTR start_code (883): the compiled program; ecode values
          are offsets into it, offset 0 = the C's mb->start_code
          (pcre2_match.c:6979 = Compile.re.code offset 0) *)
-  start_subject : int; (* PCRE2_SPTR start_subject (884) *)
+  mutable start_subject : int; (* PCRE2_SPTR start_subject (884) *)
   mutable check_subject : int;
       (* PCRE2_SPTR check_subject (885): where UTF-checked from — equal to
          start_subject except in UTF mode with a nonzero start offset,
@@ -350,7 +359,8 @@ type match_block = {
       (* PCRE2_SPTR end_subject (886): usable end; mutable because the
          MATCH_INVALID_UTF fragment carry-on shortens/restores it per
          fragment (pcre2_match.c:7682, 7692) *)
-  true_end_subject : int; (* PCRE2_SPTR true_end_subject (887): actual end *)
+  mutable true_end_subject : int;
+      (* PCRE2_SPTR true_end_subject (887): actual end *)
   mutable end_match_ptr : int;
       (* PCRE2_SPTR end_match_ptr (888): subject position at end match *)
   mutable start_used_ptr : int;
@@ -385,7 +395,7 @@ type match_block = {
       (* uint32_t moptions (896): match options; mutable because the
          driver's bump-along loop resets it per attempt
          (pcre2_match.c:7502-7504) *)
-  poptions : int; (* uint32_t poptions (897): pattern options *)
+  mutable poptions : int; (* uint32_t poptions (897): pattern options *)
   mutable skip_arg_count : int;
       (* uint32_t skip_arg_count (898): for counting SKIP_ARGs — reset
          per attempt by the driver (pcre2_match.c:7508), bumped by the
@@ -395,15 +405,15 @@ type match_block = {
          was not found — 0 at driver entry (pcre2_match.c:6970), set to
          skip_arg_count when a MATCH_SKIP_ARG reaches the top (7538),
          reset to 0 on a normal bump-along (7558) *)
-  nltype : int; (* uint32_t nltype (900): newline type *)
+  mutable nltype : int; (* uint32_t nltype (900): newline type *)
   mutable nllen : int;
       (* uint32_t nllen (901): newline string length; mutable because
          IS_NEWLINE/WAS_NEWLINE pass &mb->nllen to PRIV(is_newline)/
          PRIV(was_newline), which store the length of the newline actually
          found for the ANY/ANYCRLF conventions
          (pcre2_internal.h:496-521) *)
-  nl0 : int;
-  nl1 : int;
+  mutable nl0 : int;
+  mutable nl1 : int;
       (* PCRE2_UCHAR nl[4] (902) — newline string when fixed; only
          elements 0..1 are ever used (nllen is 1 or 2), as in
          Compile.compile_block *)
@@ -414,19 +424,21 @@ type match_block = {
    function nest per attempt. This record is that environment, allocated
    once per pcre2_match/match_internal call and threaded explicitly.
    Field order: the hottest pointers (mb, arena) come first for the
-   smallest load offsets. The mutable fields are ints only — stores are
-   setfield_imm, no caml_modify write barrier after construction — and
-   every heap-pointing field is immutable. The frames int array is
+   smallest load offsets. Exec-variant fields are mutable for the
+   scratch-trio reuse (see [fresh_trio]; re-filled per exec at the single
+   reset site in [pcre2_match]); [mb] is immutable — it points WITHIN the
+   trio — and the two ref fields are preallocated out-parameter cells
+   whose contents are write-before-read. The frames int array is
    deliberately NOT cached here: Frames growth re-points arena.frames
    (frames.ml:350), so it must be re-read through [arena] at function
    heads. *)
 type match_state = {
   mb : match_block;
-  arena : Frames.t;
-  match_data : match_data;
-  top_bracket : int;
-  utf : bool; (* pcre2_match.c:630-637 *)
-  ucp : bool;
+  mutable arena : Frames.t;
+  mutable match_data : match_data;
+  mutable top_bracket : int;
+  mutable utf : bool; (* pcre2_match.c:630-637 *)
+  mutable ucp : bool;
   nl_scratch : int ref;
       (* out-parameter scratch for IS_NEWLINE/WAS_NEWLINE
          (pcre2_internal.h:496-521); write-before-read, never reset *)
@@ -8275,18 +8287,19 @@ let req_cu_max = 5000
    contract: 0 <= p and p + n <= String.length subject (every driver call
    site passes n = e - p for some e <= end_subject <= String.length
    subject and p >= 0). *)
+let rec memchr_scan (subject : string) (c : int) (e : int) (i : int) : int =
+  if i >= e then -1
+  else if
+    (* safe: p <= i < e <= String.length subject and p >= 0 (the
+       [memchr_subject] caller contract above) *)
+    Int.equal (Char.code (String.unsafe_get subject i)) c
+  then i
+  else (memchr_scan [@tailcall]) subject c e (i + 1)
+
 let memchr_subject (subject : string) (p : int) (c : int) (n : int) : int =
-  let e = p + n in
-  let rec scan (i : int) : int =
-    if i >= e then -1
-    else if
-      (* safe: p <= i < e <= String.length subject and p >= 0 (caller
-         contract above) *)
-      Int.equal (Char.code (String.unsafe_get subject i)) c
-    then i
-    else (scan [@tailcall]) (i + 1)
-  in
-  scan p
+  (* the scan loop is module-level ([memchr_scan]) so each memchr call is
+     closure-free (§8) *)
+  memchr_scan subject c (p + n) p
 
 (* ---------- The bump-along driver ---------- *)
 
@@ -8294,8 +8307,9 @@ let memchr_subject (subject : string) (p : int) (c : int) (n : int) : int =
    precedent): the pcre2_match() locals (pcre2_match.c:6534-6589 and the
    start-of-match precomputation, 7091-7131) that the bump-along loop
    reads, made explicit so the loop functions below live at module level
-   instead of being rebuilt as a closure group on every exec. Allocated
-   once per exec, next to [match_state]; kept SEPARATE from it — the
+   instead of being rebuilt as a closure group on every exec. One
+   instance is cached across execs in the scratch trio (see
+   [fresh_trio]); kept SEPARATE from [match_state] — the
    dispatch nest never reads driver state, and merging would widen the
    nest's record for no benefit. Immutable fields are exec-constant
    configuration and precomputation; mutable fields are the C driver
@@ -8303,31 +8317,34 @@ let memchr_subject (subject : string) (p : int) (c : int) (n : int) : int =
    FRAGMENT_RESTART (pcre2_match.c:7136-7149: start_partial /
    match_partial and the 8-bit memchr caches; 6575: fragment_options). *)
 type driver_state = {
-  st : match_state; (* the per-exec match state ([attempt] runs match_) *)
-  mb : match_block; (* = st.mb *)
-  re : Compile.re;
+  st : match_state;
+      (* the per-exec match state ([attempt] runs match_) — immutable:
+         points WITHIN the scratch trio (see [fresh_trio]) *)
+  mb : match_block; (* = st.mb — immutable: points within the trio *)
+  mutable re : Compile.re;
       (* the compiled pattern: overall_options / start_bitmap / minlength
          / flags reads inside the loop *)
-  subject : string; (* = mb.subject *)
-  match_data : match_data; (* = st.match_data *)
-  length : int; (* String.length subject (pcre2_match.c:6603-6607) *)
-  true_end_subject : int; (* pcre2_match.c:6608 *)
-  options : int; (* match options after the NOTEMPTY transfer (6621-6637) *)
-  start_offset : int;
-  utf : bool; (* = st.utf (pcre2_match.c:6648-6654) *)
-  anchored : bool; (* pcre2_match.c:6941 *)
-  firstline : bool; (* pcre2_match.c:6942 *)
-  startline : bool; (* pcre2_match.c:6943 *)
-  bumpalong_limit : int;
+  mutable subject : string; (* = mb.subject *)
+  mutable match_data : match_data; (* = st.match_data *)
+  mutable length : int; (* String.length subject (pcre2_match.c:6603-6607) *)
+  mutable true_end_subject : int; (* pcre2_match.c:6608 *)
+  mutable options : int;
+      (* match options after the NOTEMPTY transfer (6621-6637) *)
+  mutable start_offset : int;
+  mutable utf : bool; (* = st.utf (pcre2_match.c:6648-6654) *)
+  mutable anchored : bool; (* pcre2_match.c:6941 *)
+  mutable firstline : bool; (* pcre2_match.c:6942 *)
+  mutable startline : bool; (* pcre2_match.c:6943 *)
+  mutable bumpalong_limit : int;
       (* pcre2_match.c:6944-6945; 6931-6939 — mcontext->offset_limit is
          PCRE2_UNSET in the default match context: true_end_subject *)
-  has_first_cu : bool; (* pcre2_match.c:7091-7112 *)
-  first_cu : int;
-  first_cu2 : int;
-  use_start_bits : bool;
-  has_req_cu : bool; (* pcre2_match.c:7114-7131 *)
-  req_cu : int;
-  req_cu2 : int;
+  mutable has_first_cu : bool; (* pcre2_match.c:7091-7112 *)
+  mutable first_cu : int;
+  mutable first_cu2 : int;
+  mutable use_start_bits : bool;
+  mutable has_req_cu : bool; (* pcre2_match.c:7114-7131 *)
+  mutable req_cu : int;
+  mutable req_cu2 : int;
   nl_scratch : int ref;
       (* the driver's own IS_NEWLINE/WAS_NEWLINE out-parameter
          (pcre2_internal.h:496-521), distinct from st.nl_scratch exactly
@@ -8341,6 +8358,129 @@ type driver_state = {
   mutable memchr_found_first_cu : int; (* 8-bit memchr cache; -1 = NULL *)
   mutable memchr_found_first_cu2 : int;
 }
+
+(* DEVIATION (perf, scratch-trio reuse): one ds -> st -> mb record trio
+   is cached across execs in [scratch_trio] and re-filled per exec,
+   extending the C's match_data-lifetime reuse idea (the P1 arena
+   scratch) to the OCaml-only per-exec records the C keeps on the stack
+   (actual_match_block, pcre2_match.c:6588-6589) or has no counterpart
+   for (match_state/driver_state, this port's closure-environment
+   DEVIATIONS). The trio is guarded by THE SAME busy flag as the frames
+   arena: Frames.create ~use_scratch:true performs the one atomic
+   acquire, [pcre2_match] takes the trio iff a.holds_scratch (busy or
+   fresh-flag paths build a fresh trio and do NOT write it back), and
+   the write-back happens before Frames.release clears the flag. EVERY
+   exec-variant field of all three records is re-assigned at the single
+   reset site in [pcre2_match] — both the fresh and the reuse paths run
+   that same site, so the dummy values below are never read and the two
+   paths cannot drift. The trio-internal links (st.mb, ds.st, ds.mb) and
+   the three preallocated out-parameter refs (st.nl_scratch,
+   st.ref_length, ds.nl_scratch) are exec-constant; the ref CONTENTS are
+   write-before-read scratch, never reset (their existing field
+   comments). The heap-typed fields need real placeholders, passed in by
+   the caller. *)
+let fresh_trio ~(re : Compile.re) ~(arena : Frames.t) ~(match_data : match_data)
+    ~(subject : string) : driver_state =
+  let mb =
+    {
+      match_limit = 0;
+      match_limit_depth = 0;
+      match_call_count = 0;
+      hitend = false;
+      hasthen = false;
+      allowemptypartial = false;
+      subject;
+      start_offset = 0;
+      end_offset_top = 0;
+      partial = 0;
+      bsr_convention = 0;
+      name_count = 0;
+      name_entry_size = 0;
+      name_table = Bytes.empty;
+      start_code = re.Compile.code;
+      start_subject = 0;
+      check_subject = 0;
+      end_subject = 0;
+      true_end_subject = 0;
+      end_match_ptr = 0;
+      start_used_ptr = 0;
+      last_used_ptr = 0;
+      mark = Frames.unset;
+      nomatch_mark = Frames.unset;
+      verb_ecode_ptr = Frames.unset;
+      verb_skip_ptr = Frames.unset;
+      verb_current_recurse = Frames.recurse_unset;
+      moptions = 0;
+      poptions = 0;
+      skip_arg_count = 0;
+      ignore_skip_arg = 0;
+      nltype = 0;
+      nllen = 0;
+      nl0 = 0;
+      nl1 = 0;
+    }
+  in
+  let st =
+    {
+      mb;
+      arena;
+      match_data;
+      top_bracket = 0;
+      utf = false;
+      ucp = false;
+      nl_scratch = ref 0;
+      ref_length = ref 0;
+      branch_end = -1;
+      assert_accept_frame = -1;
+    }
+  in
+  {
+    st;
+    mb;
+    re;
+    subject;
+    match_data;
+    length = 0;
+    true_end_subject = 0;
+    options = 0;
+    start_offset = 0;
+    utf = false;
+    anchored = false;
+    firstline = false;
+    startline = false;
+    bumpalong_limit = 0;
+    has_first_cu = false;
+    first_cu = 0;
+    first_cu2 = 0;
+    use_start_bits = false;
+    has_req_cu = false;
+    req_cu = 0;
+    req_cu2 = 0;
+    nl_scratch = ref 0;
+    fragment_options = 0;
+    start_partial = -1;
+    match_partial = -1;
+    memchr_found_first_cu = -1;
+    memchr_found_first_cu2 = -1;
+  }
+
+(* The trio slot. Only touched while holding the Frames scratch flag:
+   the holder either finds its previous trio here or installs the fresh
+   one it built (a one-time Some allocation; steady state re-reads the
+   same trio, allocation-free). Never dropped: the trio's OWN size is
+   pattern-independent (~90 words), so no retention cap is needed
+   (unlike the arena's, frames.ml scratch_max_retained_ints).
+   Cross-exec reachability: the one unbounded pin — the subject string —
+   is blanked at exec exit (mb.subject / ds.subject <- "", the release
+   site in [pcre2_match]), and a capped-out frames array is un-pinned by
+   Frames.release itself (a.frames <- [||] on the drop path). What
+   legitimately stays reachable until the next exec's reset is bounded
+   by the last-used pattern: ds.re (the compiled pattern, including the
+   code/name_table bytes mb also points into) and st.match_data /
+   ds.match_data (the last match data, its ovector sized by the
+   pattern's group count), plus the small dead arena record in
+   st.arena. *)
+let scratch_trio : driver_state option ref = ref None
 
 (* pcre2_internal.h:496-521 — IS_NEWLINE(p) / WAS_NEWLINE(p)
    for the driver's own scan sites (7176/7184, 7328/7336,
@@ -8386,6 +8526,123 @@ let driver_was_newline_at (ds : driver_state) (p : int) : bool =
     && Int.equal (Char.code subject.[p - mb.nllen]) mb.nl0
     && (Int.equal mb.nllen 1
        || Int.equal (Char.code subject.[p - mb.nllen + 1]) mb.nl1)
+
+(* ---------- Localized driver scan loops ---------- *)
+
+(* DEVIATION (perf): like the P3 scan-loop localization, the driver's
+   per-position pre-match scans run in module-level tail-recursive
+   helpers over immediates, their loop invariants read once at the
+   [bump_top] seams. For the firstline/startline scans the
+   IS_NEWLINE/WAS_NEWLINE fixed/variable fork (pcre2_internal.h:497/511)
+   is hoisted OUT of the loop — mb.nltype is loop-invariant — so the
+   NLTYPE_FIXED family runs over immediates below while the ANY/ANYCRLF
+   family keeps the per-position PRIV(is_newline)/PRIV(was_newline) call
+   structure (and its mb.nllen out-writes) at the original [bump_top]
+   sites, exactly the call shape the C has; per-iteration evaluation
+   order within each family is unchanged. *)
+
+(* pcre2_match.c:7358-7366 — the start-bits scan: while (start_match <
+   end_subject) { c = *start_match; if ((start_bits[c/8] &
+   (1u << (c&7))) != 0) break; start_match++; }. The bitmap contains
+   only 256 bits; 8-bit code units index it directly (7351-7355).
+   Bytes.unsafe_get bound: c <= 255 so c lsr 3 <= 31 < 32 =
+   Bytes.length start_bitmap (Compile.re.start_bitmap is always the
+   32-byte block made at compile.ml's re construction). *)
+let rec scan_start_bits (subject : string) (start_bitmap : Bytes.t)
+    (end_subject : int) (sm : int) : int =
+  if sm >= end_subject then sm
+  else
+    (* safe: sm < end_subject <= String.length subject (mb invariant;
+       [bump_top] passes its possibly firstline-shortened end_subject <=
+       mb.end_subject) *)
+    let c = Char.code (String.unsafe_get subject sm) in
+    if
+      not
+        (Int.equal
+           (Char.code (Bytes.unsafe_get start_bitmap (c lsr 3))
+           land (1 lsl (c land 7)))
+           0)
+    then sm
+    else (scan_start_bits [@tailcall]) subject start_bitmap end_subject (sm + 1)
+
+(* pcre2_match.c:7184 — the firstline scan, fixed newline convention,
+   not UTF: while (t < end_subject && !IS_NEWLINE(t)) t++, with
+   IS_NEWLINE's NLTYPE_FIXED arm inlined (pcre2_internal.h:502-505).
+   [limit] is mb.end_subject — both the loop bound and the arm's PSEND.
+   Safe indexing: cold pre-match scan, no §8 pressure. *)
+let rec scan_firstline_fixed (subject : string) (limit : int) (nllen : int)
+    (nl0 : int) (nl1 : int) (t : int) : int =
+  if
+    t < limit
+    && not
+         (t <= limit - nllen
+         && Int.equal (Char.code subject.[t]) nl0
+         && (Int.equal nllen 1 || Int.equal (Char.code subject.[t + 1]) nl1))
+  then (scan_firstline_fixed [@tailcall]) subject limit nllen nl0 nl1 (t + 1)
+  else t
+
+(* pcre2_match.c:7176-7180 — the firstline scan, fixed newline
+   convention, UTF: as above plus ACROSSCHAR(t < end_subject, t, t++)
+   (7179) after each advance. *)
+let rec scan_firstline_fixed_utf (subject : string) (limit : int) (nllen : int)
+    (nl0 : int) (nl1 : int) (t : int) : int =
+  if
+    t < limit
+    && not
+         (t <= limit - nllen
+         && Int.equal (Char.code subject.[t]) nl0
+         && (Int.equal nllen 1 || Int.equal (Char.code subject.[t + 1]) nl1))
+  then (
+    let t = ref (t + 1) in
+    while !t < limit && Int.equal (Char.code subject.[!t] land 0xc0) 0x80 do
+      incr t
+    done;
+    (scan_firstline_fixed_utf [@tailcall]) subject limit nllen nl0 nl1 !t)
+  else t
+
+(* pcre2_match.c:7336-7337 — the startline scan, fixed newline
+   convention, not UTF: while (start_match < end_subject &&
+   !WAS_NEWLINE(start_match)) start_match++, with WAS_NEWLINE's
+   NLTYPE_FIXED arm inlined (pcre2_internal.h:516-519). [end_subject] is
+   [bump_top]'s local, possibly firstline-shortened bound;
+   [start_subject] is the arm's PSSTART. *)
+let rec scan_startline_fixed (subject : string) (end_subject : int)
+    (start_subject : int) (nllen : int) (nl0 : int) (nl1 : int) (sm : int) : int
+    =
+  if
+    sm < end_subject
+    && not
+         (sm >= start_subject + nllen
+         && Int.equal (Char.code subject.[sm - nllen]) nl0
+         && (Int.equal nllen 1
+            || Int.equal (Char.code subject.[sm - nllen + 1]) nl1))
+  then
+    (scan_startline_fixed [@tailcall]) subject end_subject start_subject nllen
+      nl0 nl1 (sm + 1)
+  else sm
+
+(* pcre2_match.c:7328-7332 — the startline scan, fixed newline
+   convention, UTF: as above plus ACROSSCHAR (7331). *)
+let rec scan_startline_fixed_utf (subject : string) (end_subject : int)
+    (start_subject : int) (nllen : int) (nl0 : int) (nl1 : int) (sm : int) : int
+    =
+  if
+    sm < end_subject
+    && not
+         (sm >= start_subject + nllen
+         && Int.equal (Char.code subject.[sm - nllen]) nl0
+         && (Int.equal nllen 1
+            || Int.equal (Char.code subject.[sm - nllen + 1]) nl1))
+  then (
+    let sm = ref (sm + 1) in
+    while
+      !sm < end_subject && Int.equal (Char.code subject.[!sm] land 0xc0) 0x80
+    do
+      incr sm
+    done;
+    (scan_startline_fixed_utf [@tailcall]) subject end_subject start_subject
+      nllen nl0 nl1 !sm)
+  else sm
 
 (* pcre2_match.c:7151-7617 + 7637-7768 — the bump-along for(;;)
    loop and its ENDLOOP epilogue, as mutually tail-recursive
@@ -8442,26 +8699,37 @@ and bump_top (ds : driver_state) (start_match : int) (req_cu_ptr : int) : int =
     (* pcre2_match.c:7164-7186 — if firstline is TRUE, the
        start of the match is constrained to the first line of a
        multiline string: temporarily adjust end_subject so that
-       the first-code-unit scans stop at a newline. *)
+       the first-code-unit scans stop at a newline. The
+       fixed-convention scans run in the [scan_firstline_fixed*]
+       helpers (fork hoisted out of the loop — see the
+       scan-helpers DEVIATION note). *)
     let end_subject =
       if firstline then (
-        let t = ref start_match in
-        if utf then
-          while !t < mb.end_subject && not (driver_is_newline_at ds !t) do
-            incr t;
-            (* ACROSSCHAR(t < end_subject, t, t++) (7179) *)
-            while
-              !t < mb.end_subject
-              && Int.equal (Char.code subject.[!t] land 0xc0) 0x80
-            do
-              incr t
-            done
-          done
+        if Int.equal mb.nltype Newline.nltype_fixed then
+          if utf then
+            scan_firstline_fixed_utf subject mb.end_subject mb.nllen mb.nl0
+              mb.nl1 start_match
+          else
+            scan_firstline_fixed subject mb.end_subject mb.nllen mb.nl0 mb.nl1
+              start_match
         else
-          while !t < mb.end_subject && not (driver_is_newline_at ds !t) do
-            incr t
-          done;
-        !t)
+          let t = ref start_match in
+          if utf then
+            while !t < mb.end_subject && not (driver_is_newline_at ds !t) do
+              incr t;
+              (* ACROSSCHAR(t < end_subject, t, t++) (7179) *)
+              while
+                !t < mb.end_subject
+                && Int.equal (Char.code subject.[!t] land 0xc0) 0x80
+              do
+                incr t
+              done
+            done
+          else
+            while !t < mb.end_subject && not (driver_is_newline_at ds !t) do
+              incr t
+            done;
+          !t)
       else mb.end_subject
     in
     if anchored then
@@ -8553,10 +8821,21 @@ and bump_top (ds : driver_state) (start_match : int) (req_cu_ptr : int) : int =
     else if startline then (
       (* pcre2_match.c:7318-7349 — if there's no first code
          unit, advance to just after a linebreak for a
-         multiline match if required. *)
+         multiline match if required. The fixed-convention scans
+         run in the [scan_startline_fixed*] helpers (fork
+         hoisted out of the loop — see the scan-helpers
+         DEVIATION note). *)
       let sm = ref start_match in
       if !sm > mb.start_subject + start_offset then (
-        if utf then
+        if Int.equal mb.nltype Newline.nltype_fixed then
+          sm :=
+            if utf then
+              scan_startline_fixed_utf subject end_subject mb.start_subject
+                mb.nllen mb.nl0 mb.nl1 !sm
+            else
+              scan_startline_fixed subject end_subject mb.start_subject mb.nllen
+                mb.nl0 mb.nl1 !sm
+        else if utf then
           while !sm < end_subject && not (driver_was_newline_at ds !sm) do
             incr sm;
             (* ACROSSCHAR (7331) *)
@@ -8583,28 +8862,19 @@ and bump_top (ds : driver_state) (start_match : int) (req_cu_ptr : int) : int =
           && Int.equal (Char.code subject.[!sm]) Newline.char_lf
         then incr sm);
       (tail_opts [@tailcall]) ds !sm req_cu_ptr)
-    else if use_start_bits then (
+    else if use_start_bits then
       (* pcre2_match.c:7351-7375 — if there's no first code
          unit or a requirement for a multiline line start,
          advance to a non-unique first code unit if any have
-         been identified (the bitmap contains only 256 bits;
-         8-bit code units index it directly). *)
-      let sm = ref start_match in
-      let hit = ref false in
-      while (not !hit) && !sm < end_subject do
-        let c = Char.code subject.[!sm] in
-        if
-          not
-            (Int.equal
-               (Char.code (Bytes.get re.Compile.start_bitmap (c lsr 3))
-               land (1 lsl (c land 7)))
-               0)
-        then hit := true
-        else incr sm
-      done;
+         been identified, via [scan_start_bits] (loop invariants
+         — subject, the 32-byte bitmap, the possibly
+         firstline-shortened end_subject — read once). *)
+      let sm =
+        scan_start_bits subject re.Compile.start_bitmap end_subject start_match
+      in
       (* pcre2_match.c:7368-7374 — see the comment in
          [first_cu_tail]. *)
-      (first_cu_tail [@tailcall]) ds !sm req_cu_ptr)
+      (first_cu_tail [@tailcall]) ds sm req_cu_ptr
     else (tail_opts [@tailcall]) ds start_match req_cu_ptr
 
 and first_cu_tail (ds : driver_state) (start_match : int) (req_cu_ptr : int) :
@@ -9205,147 +9475,170 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
            fields: no callout block exists in this port (mb->callout is
            always NULL — the C fields it feeds are only read by an
            installed callout function, see [do_callout_length]). *)
-        (* pcre2_match.c:6981-7017 — process the \R and newline settings
-           (bsr goes straight into the mb literal below). The C switch's
-           default returns PCRE2_ERROR_INTERNAL. *)
-        let nltype = ref Newline.nltype_fixed in
-        let nllen = ref 0 in
-        let nl0 = ref 0 in
-        let nl1 = ref 0 in
-        let nl_valid = ref true in
-        let nlc = re.Compile.newline_convention in
-        if Int.equal nlc Options.newline_cr then (
-          nllen := 1;
-          nl0 := Newline.char_cr)
-        else if Int.equal nlc Options.newline_lf then (
-          nllen := 1;
-          nl0 := Newline.char_lf)
-        else if Int.equal nlc Options.newline_nul then (
-          nllen := 1;
-          nl0 := 0 (* CHAR_NUL *))
-        else if Int.equal nlc Options.newline_crlf then (
-          nllen := 2;
-          nl0 := Newline.char_cr;
-          nl1 := Newline.char_lf)
-        else if Int.equal nlc Options.newline_any then
-          nltype := Newline.nltype_any
-        else if Int.equal nlc Options.newline_anycrlf then
-          nltype := Newline.nltype_anycrlf
-        else nl_valid := false;
-        if not !nl_valid then Errors.error_internal
-        else
-          (* pcre2_match.c:7036-7046 — limits set in the pattern override the
+        (* The \R and newline settings (pcre2_match.c:6981-7017) are
+           processed at the mb fill site below, writing the mb fields
+           directly like the C switch. *)
+        (* pcre2_match.c:7036-7046 — limits set in the pattern override the
              match context only if they are smaller. The default match
              context carries the build defaults (module Limits); the
              re->limit_xxx fields are 0xffff_ffff unless ( *LIMIT_...=) set
              them, so the unsigned < holds on plain ints. *)
-          let heap_limit =
-            if Limits.heap_limit < re.Compile.limit_heap then Limits.heap_limit
-            else re.Compile.limit_heap
-          in
-          let match_limit =
-            if Limits.match_limit < re.Compile.limit_match then
-              Limits.match_limit
-            else re.Compile.limit_match
-          in
-          let match_limit_depth =
-            if Limits.match_limit_depth < re.Compile.limit_depth then
-              Limits.match_limit_depth
-            else re.Compile.limit_depth
-          in
-          (* pcre2_match.c:7019-7034 + 7048-7083 — frame_size, the initial
-             frames-vector sizing under the heap limit, the
-             keep-if-big-enough frames-vector reuse (7062-7077, the
-             Frames scratch slot standing in for the C's caller-owned
-             match_data cache) and the frame-0 ovector unset fill all
-             live in Frames.create; Frames.release at the bottom of this
-             function hands the arena back when the match returns. *)
-          match
-            Frames.create ~use_scratch:true ~top_bracket:re.Compile.top_bracket
-              ~heap_limit
-          with
-          | Error e -> e
-          | Ok a ->
-              let rc =
-                (* pcre2_match.c:6956-6979 + 6658 + 6983 + 7039-7046 — fill in
-                   the fields of the match block, except for moptions,
-                   start_used_ptr, last_used_ptr, match_call_count and
-                   end_offset_top, which are set per attempt (7499-7508).
-                   mb->ignore_skip_arg (6970) and mb->skip_arg_count are M5
-                   fields (see the match_block comment). *)
-                let mb =
-                  {
-                    match_limit;
-                    match_limit_depth;
-                    match_call_count = 0;
-                    hitend = false;
-                    hasthen =
-                      not (Int.equal (re.Compile.flags land Compile.hasthen) 0)
-                      (* 6966 *);
-                    allowemptypartial =
-                      re.Compile.max_lookbehind > 0
-                      || not
-                           (Int.equal
-                              (re.Compile.flags land Compile.match_empty)
-                              0)
-                      (* 6967-6968 *);
-                    subject;
-                    start_offset (* 6963 *);
-                    end_offset_top = 0;
-                    partial (* 6658-6659 *);
-                    bsr_convention = re.Compile.bsr_convention (* 6983 *);
-                    name_count = re.Compile.name_count (* 6977 *);
-                    name_entry_size = re.Compile.name_entry_size (* 6978 *);
-                    name_table = re.Compile.name_table (* 6976 *);
-                    start_code =
-                      re.Compile.code (* 6979: codestart = offset 0 *);
-                    start_subject = 0 (* 6962 *);
-                    check_subject (* 6795 / 6851: computed above *);
-                    end_subject =
-                      !end_subject
-                      (* 6964; shortened to the first fragment's end above
-                         when handling invalid UTF *);
-                    true_end_subject (* 6965 *);
-                    end_match_ptr = 0;
-                    start_used_ptr = 0;
-                    last_used_ptr = 0;
-                    mark = Frames.unset;
-                    nomatch_mark = Frames.unset (* 6971: in case never set *);
-                    verb_ecode_ptr = Frames.unset;
-                    verb_skip_ptr = Frames.unset;
-                    verb_current_recurse =
-                      Frames.recurse_unset
-                      (* the C leaves these three uninitialized: they are only
-                         read after a verb return has set them *);
-                    moptions = 0 (* 6956-6957: gets set later, per attempt *);
-                    poptions = re.Compile.overall_options (* 6969 *);
-                    skip_arg_count = 0 (* reset per attempt, 7508 *);
-                    ignore_skip_arg = 0 (* 6970 *);
-                    nltype = !nltype;
-                    nllen = !nllen;
-                    nl0 = !nl0;
-                    nl1 = !nl1;
-                  }
-                in
+        let heap_limit =
+          if Limits.heap_limit < re.Compile.limit_heap then Limits.heap_limit
+          else re.Compile.limit_heap
+        in
+        let match_limit =
+          if Limits.match_limit < re.Compile.limit_match then Limits.match_limit
+          else re.Compile.limit_match
+        in
+        let match_limit_depth =
+          if Limits.match_limit_depth < re.Compile.limit_depth then
+            Limits.match_limit_depth
+          else re.Compile.limit_depth
+        in
+        (* pcre2_match.c:7019-7034 + 7048-7083 — frame_size, the initial
+           frames-vector sizing under the heap limit, the
+           keep-if-big-enough frames-vector reuse (7062-7077, the
+           Frames scratch slot standing in for the C's caller-owned
+           match_data cache) and the frame-0 ovector unset fill all
+           live in Frames.create; Frames.release at the bottom of this
+           function hands the arena back when the match returns. *)
+        match
+          Frames.create ~use_scratch:true ~top_bracket:re.Compile.top_bracket
+            ~heap_limit
+        with
+        | Error e -> e
+        | Ok a ->
+            let rc =
+              (* Scratch-trio acquire (DEVIATION (perf) — see
+                 [fresh_trio]): Frames.create above performed the ONE
+                 atomic acquire; a.holds_scratch says whether this exec
+                 holds the flag and may use/install the cached trio.
+                 Busy (or first-use) paths build a fresh trio; both
+                 paths then run the same field fills below, so reuse
+                 and fresh cannot drift. *)
+              let ds =
+                if a.Frames.holds_scratch then
+                  match !scratch_trio with
+                  | Some ds -> ds
+                  | None -> fresh_trio ~re ~arena:a ~match_data ~subject
+                else fresh_trio ~re ~arena:a ~match_data ~subject
+              in
+              let st = ds.st in
+              let mb = ds.mb in
+              (* pcre2_match.c:6956-6979 + 6658 + 6983 + 7039-7046 — fill in
+                 the fields of the match block, except for moptions,
+                 start_used_ptr, last_used_ptr, match_call_count and
+                 end_offset_top, which are set per attempt (7499-7508).
+                 mb->ignore_skip_arg (6970) and mb->skip_arg_count are M5
+                 fields (see the match_block comment). Imperative fills,
+                 exactly the C's mb->x = ... assignments into its
+                 stack-allocated match block; EVERY match_block field is
+                 (re)assigned here, in declaration order — the single
+                 reset site of the scratch-trio design. *)
+              mb.match_limit <- match_limit;
+              mb.match_limit_depth <- match_limit_depth;
+              mb.match_call_count <- 0;
+              mb.hitend <- false;
+              mb.hasthen <-
+                not (Int.equal (re.Compile.flags land Compile.hasthen) 0)
+              (* 6966 *);
+              mb.allowemptypartial <-
+                re.Compile.max_lookbehind > 0
+                || not (Int.equal (re.Compile.flags land Compile.match_empty) 0)
+              (* 6967-6968 *);
+              mb.subject <- subject;
+              mb.start_offset <- start_offset (* 6963 *);
+              mb.end_offset_top <- 0;
+              mb.partial <- partial (* 6658-6659 *);
+              mb.bsr_convention <- re.Compile.bsr_convention (* 6983 *);
+              mb.name_count <- re.Compile.name_count (* 6977 *);
+              mb.name_entry_size <- re.Compile.name_entry_size (* 6978 *);
+              mb.name_table <- re.Compile.name_table (* 6976 *);
+              mb.start_code <- re.Compile.code (* 6979: codestart = offset 0 *);
+              mb.start_subject <- 0 (* 6962 *);
+              mb.check_subject <- check_subject
+              (* 6795 / 6851: computed
+                 above *);
+              mb.end_subject <- !end_subject
+              (* 6964; shortened to the first fragment's end above
+                 when handling invalid UTF *);
+              mb.true_end_subject <- true_end_subject (* 6965 *);
+              mb.end_match_ptr <- 0;
+              mb.start_used_ptr <- 0;
+              mb.last_used_ptr <- 0;
+              mb.mark <- Frames.unset;
+              mb.nomatch_mark <- Frames.unset (* 6971: in case never set *);
+              mb.verb_ecode_ptr <- Frames.unset;
+              mb.verb_skip_ptr <- Frames.unset;
+              mb.verb_current_recurse <- Frames.recurse_unset
+              (* the C leaves these three uninitialized: they are only
+                 read after a verb return has set them *);
+              mb.moptions <- 0 (* 6956-6957: gets set later, per attempt *);
+              mb.poptions <- re.Compile.overall_options (* 6969 *);
+              mb.skip_arg_count <- 0 (* reset per attempt, 7508 *);
+              mb.ignore_skip_arg <- 0 (* 6970 *);
+              (* pcre2_match.c:6981-7017 — process the \R and newline
+                 settings: the C switch writes mb->nltype / nllen /
+                 nl[0..1] directly, default: return PCRE2_ERROR_INTERNAL.
+                 The ANY/ANYCRLF arms leave nllen/nl[0..1] untouched in
+                 the C (uninitialized stack there, previous-exec scratch
+                 here; nllen is a write-before-read out-cell for the
+                 non-fixed conventions) — pre-zeroed so this reset site
+                 assigns every mb field. DEVIATION (order): the C's
+                 default arm returns before the frames vector is sized
+                 (7017 < 7048); here the arena/trio acquire already
+                 happened, so the error path — unreachable for a
+                 compiled pattern, Compile validates the convention —
+                 flows through the normal Frames.release exit. *)
+              mb.nltype <- Newline.nltype_fixed;
+              mb.nllen <- 0;
+              mb.nl0 <- 0;
+              mb.nl1 <- 0;
+              let nl_valid =
+                let nlc = re.Compile.newline_convention in
+                if Int.equal nlc Options.newline_cr then (
+                  mb.nllen <- 1;
+                  mb.nl0 <- Newline.char_cr;
+                  true)
+                else if Int.equal nlc Options.newline_lf then (
+                  mb.nllen <- 1;
+                  mb.nl0 <- Newline.char_lf;
+                  true)
+                else if Int.equal nlc Options.newline_nul then (
+                  mb.nllen <- 1;
+                  mb.nl0 <- 0 (* CHAR_NUL *);
+                  true)
+                else if Int.equal nlc Options.newline_crlf then (
+                  mb.nllen <- 2;
+                  mb.nl0 <- Newline.char_cr;
+                  mb.nl1 <- Newline.char_lf;
+                  true)
+                else if Int.equal nlc Options.newline_any then (
+                  mb.nltype <- Newline.nltype_any;
+                  true)
+                else if Int.equal nlc Options.newline_anycrlf then (
+                  mb.nltype <- Newline.nltype_anycrlf;
+                  true)
+                else false
+              in
+              if not nl_valid then Errors.error_internal
+              else (
                 (* The per-exec [match_state] threaded through [match_]
                    (DEVIATION (perf) — see the type). utf/ucp: mb.poptions =
                    re->overall_options (pcre2_match.c:6969), so the values
                    computed above (6648-6654) equal match()'s own derivation
-                   from mb->poptions (630-637). *)
-                let st =
-                  {
-                    mb;
-                    arena = a;
-                    match_data;
-                    top_bracket = re.Compile.top_bracket;
-                    utf;
-                    ucp;
-                    nl_scratch = ref 0;
-                    ref_length = ref 0;
-                    branch_end = -1;
-                    assert_accept_frame = -1;
-                  }
-                in
+                   from mb->poptions (630-637). EVERY exec-variant
+                   match_state field is (re)assigned here (mb is the
+                   trio-internal link; the two refs are preallocated
+                   write-before-read cells — see the type). *)
+                st.arena <- a;
+                st.match_data <- match_data;
+                st.top_bracket <- re.Compile.top_bracket;
+                st.utf <- utf;
+                st.ucp <- ucp;
+                st.branch_end <- -1;
+                st.assert_accept_frame <- -1;
                 (* pcre2_match.c:7085-7089 — pointers to the individual
                    character tables: dropped, this port always reads the
                    default tables through Chartables (as in Compile). *)
@@ -9415,43 +9708,46 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                     else (rc_, rc_)
                   else (0, 0)
                 in
-                (* The per-exec [driver_state] (DEVIATION (perf) — see the
-                   type): the loop-state fields' initial values are dead —
+                (* The per-exec [driver_state] fills (DEVIATION (perf) — see
+                   the type): EVERY exec-variant driver_state field is
+                   (re)assigned here (st/mb are the trio-internal links,
+                   nl_scratch the preallocated write-before-read cell).
+                   The loop-state fields' initial values are dead —
                    [fragment_restart] (re)sets them on entry
                    (pcre2_match.c:7139-7148) — except fragment_options, which
                    the invalid-UTF validation above may already have set
                    (6920-6926). *)
-                let ds : driver_state =
-                  {
-                    st;
-                    mb;
-                    re;
-                    subject;
-                    match_data;
-                    length;
-                    true_end_subject;
-                    options;
-                    start_offset;
-                    utf;
-                    anchored;
-                    firstline;
-                    startline;
-                    bumpalong_limit;
-                    has_first_cu;
-                    first_cu;
-                    first_cu2;
-                    use_start_bits;
-                    has_req_cu;
-                    req_cu;
-                    req_cu2;
-                    nl_scratch = ref 0;
-                    fragment_options = !fragment_options;
-                    start_partial = -1;
-                    match_partial = -1;
-                    memchr_found_first_cu = -1;
-                    memchr_found_first_cu2 = -1;
-                  }
-                in
+                ds.re <- re;
+                ds.subject <- subject;
+                ds.match_data <- match_data;
+                ds.length <- length;
+                ds.true_end_subject <- true_end_subject;
+                ds.options <- options;
+                ds.start_offset <- start_offset;
+                ds.utf <- utf;
+                ds.anchored <- anchored;
+                ds.firstline <- firstline;
+                ds.startline <- startline;
+                ds.bumpalong_limit <- bumpalong_limit;
+                ds.has_first_cu <- has_first_cu;
+                ds.first_cu <- first_cu;
+                ds.first_cu2 <- first_cu2;
+                ds.use_start_bits <- use_start_bits;
+                ds.has_req_cu <- has_req_cu;
+                ds.req_cu <- req_cu;
+                ds.req_cu2 <- req_cu2;
+                ds.fragment_options <- !fragment_options;
+                ds.start_partial <- -1;
+                ds.match_partial <- -1;
+                ds.memchr_found_first_cu <- -1;
+                ds.memchr_found_first_cu2 <- -1;
+                (* Install the trio while still holding the flag (one-time;
+                   steady state finds it already installed). Frames.release
+                   below clears the flag after this exec is done with it. *)
+                (if a.Frames.holds_scratch then
+                   match !scratch_trio with
+                   | Some _ -> ()
+                   | None -> scratch_trio := Some ds);
                 (* pcre2_match.c:6601-6602 + 7139-7151 — enter the bumpalong
                    loop through the FRAGMENT_RESTART fall-through resets:
                    start_match is subject + start_offset possibly advanced
@@ -9459,16 +9755,28 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                    one before the ORIGINAL start_match (6602, set before
                    the UTF checks). This entry call is deliberately NOT in
                    tail position (one constant extra stack frame per exec):
-                   the arena release below must run on return. All
-                   recursion inside the driver nest stays tail-annotated. *)
-                fragment_restart ds !start_match (start_offset - 1)
-              in
-              (* pcre2_match.c:7062-7077 — the C leaves the frames vector
-                 in match_data for the next match to reuse; hand it back
-                 to the Frames scratch slot. a.frames — re-pointed by any
-                 growth during the match — is what gets retained. *)
-              Frames.release a;
-              rc)
+                   the pin-blanking below and the arena release must run
+                   on return. All recursion inside the driver nest stays
+                   tail-annotated. *)
+                let rc = fragment_restart ds !start_match (start_offset - 1) in
+                (* Blank the trio's unbounded cross-exec pin — the subject
+                   string — before the trio goes back to the slot (the
+                   scratch_trio comment): nothing reads mb.subject or
+                   ds.subject after the driver returns (the caller's
+                   results live in the match data, and the next exec's
+                   reset site re-assigns both). Two allocation-free stores
+                   of the static empty string; run on the fresh-trio
+                   paths too, harmlessly. *)
+                mb.subject <- "";
+                ds.subject <- "";
+                rc)
+            in
+            (* pcre2_match.c:7062-7077 — the C leaves the frames vector
+               in match_data for the next match to reuse; hand it back
+               to the Frames scratch slot. a.frames — re-pointed by any
+               growth during the match — is what gets retained. *)
+            Frames.release a;
+            rc)
 
 (* ---------- Test-only single-attempt entry ---------- *)
 

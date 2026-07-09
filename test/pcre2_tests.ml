@@ -413,12 +413,55 @@ end
 let check_version ctxt =
   assert_bool "Version is older than newest tested" (Pcre2.version >= (10, 43))
 
+let alloc_per_exec_minor ctxt =
+  (* Perf chunk 2 P4b pin at the ENGINE seam (plan target < ~40 minor
+     words/exec): the per-exec mb/match_state/driver_state records are
+     cached and re-filled (interpreter.ml fresh_trio, one scratch bundle
+     under the frames-arena busy flag), the newline-config refs became
+     direct mb writes, and the bool/pair seam skips exec_full's Match
+     record + Array.sub — leaving only the per-exec leftovers (three
+     driver setup refs, the arena record + Ok, the match data + its
+     ovector, the result option), ~30 words for a 1-capture pattern.
+     Measured at Engine.exec, not through Pcre2.Interp: the frozen
+     pcre2.ml layer adds ~29 words/exec of its own wrappers that this
+     project must not change (its find/is_match semantics are FROZEN).
+     Pre-P4b the engine seam measured ~123 words/exec. This test is
+     engine-seam-single (Interp and Jit share Engine.exec — bindings.ml
+     aliases them), so it lives outside the Interp/Jit functor. *)
+  let re =
+    match Pcre2_engine.Engine.compile "(q)z" 0l with
+    | Ok r -> r
+    | Error code ->
+        assert_failure ("failed to compile: error " ^ string_of_int code)
+  in
+  let subject = "qqqq" in
+  (* warm-up exec: lazy initialization + scratch seeding *)
+  (match Pcre2_engine.Engine.exec re subject 0 0l with
+  | Ok None -> ()
+  | _ -> assert_failure "expected no match");
+  let wrong = ref 0 in
+  let before = Gc.minor_words () in
+  for _ = 1 to 1_000 do
+    match Pcre2_engine.Engine.exec re subject 0 0l with
+    | Ok None -> ()
+    | Ok (Some _) | Error _ -> incr wrong
+  done;
+  let delta = (Gc.minor_words () -. before) /. 1000. in
+  assert_equal ~printer:string_of_int ~msg:"unexpected exec results" 0 !wrong;
+  assert_bool
+    (Printf.sprintf
+       "expected < 40 minor words per exec at the engine seam (scratch-trio \
+        reuse + exec fast path), measured %.1f words/exec"
+       delta)
+    (delta < 40.)
+
 let suite =
   let module Interp_Tests = MakeTests (Interp) in
   let module Jit_Tests = MakeTests (Jit) in
   "Test pcre"
   >::: [
          "version" >:: check_version;
+         "alloc_per_exec_minor" >:: alloc_per_exec_minor;
          "Interp" >::: Interp_Tests.tests;
          "JIT" >::: Jit_Tests.tests;
        ]

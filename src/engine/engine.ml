@@ -161,12 +161,39 @@ let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
       }
   else Error { code = rc; start_char = md.Interpreter.startchar }
 
+(* Internal fast path for the (start, end)-only seam (the public type is
+   unchanged — engine.mli): run the match exactly like [exec_full] (same
+   md shape, same Interpreter.pcre2_match call) but read the match-data
+   ovector directly, skipping the [Match] record, the Array.sub rc-clip
+   and the mark decode that [exec_full] builds for captures/marks
+   consumers. Result mapping identical to going through [exec_full]
+   (port-conventions §5): rc > 0 -> the pair (the clip kept >= 2 slots
+   when rc >= 1, so ovector.(0)/(1) are the same values); NOMATCH /
+   PARTIAL -> Ok None (pcre2_stubs.c: PARTIAL -> Ok None); any other rc
+   (including the unreachable 0, see [exec_full]) -> Error rc. *)
 let exec (re : t) (subject : string) (offset : int) (options : int32) :
     ((int * int) option, int) result =
-  match exec_full re subject offset options with
-  | Match { ovector; _ } -> Ok (Some (ovector.(0), ovector.(1)))
-  | No_match _ | Partial _ -> Ok None (* pcre2_stubs.c: PARTIAL -> Ok None *)
-  | Error { code; _ } -> Result.Error code
+  let oveccount = re.Compile.top_bracket + 1 in
+  let md =
+    {
+      Interpreter.ovector = Array.make (2 * oveccount) (-1);
+      oveccount;
+      rc = 0;
+      startchar = 0;
+      leftchar = 0;
+      rightchar = 0;
+      mark = -1;
+    }
+  in
+  let rc =
+    Interpreter.pcre2_match re ~subject ~start_offset:offset
+      ~options:(Options.of_int32 options) md
+  in
+  if rc > 0 then
+    Ok (Some (md.Interpreter.ovector.(0), md.Interpreter.ovector.(1)))
+  else if Int.equal rc Errors.error_nomatch || Int.equal rc Errors.error_partial
+  then Ok None
+  else Result.Error rc
 
 let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
     (((int * int) array * (string * int) array) option, int) result =
@@ -402,8 +429,8 @@ let () =
 let () =
   let copts = Int32.of_int (Options.match_invalid_utf lor Options.multiline) in
   match
-    compile_ctx ~newline:Options.newline_anycrlf
-      ~extra:Options.extra_match_line "(*LIMIT_MATCH=80000)()()((()()))" copts
+    compile_ctx ~newline:Options.newline_anycrlf ~extra:Options.extra_match_line
+      "(*LIMIT_MATCH=80000)()()((()()))" copts
   with
   | Result.Error _ -> assert false
   | Ok re -> (
@@ -449,8 +476,26 @@ let () =
           {
             ovector =
               [|
-                1; 1; -1; -1; -1; -1; -1; -1; -1; -1; -1; -1; 1; 1; 1; 1; 1; 1;
-                1; 1;
+                1;
+                1;
+                -1;
+                -1;
+                -1;
+                -1;
+                -1;
+                -1;
+                -1;
+                -1;
+                -1;
+                -1;
+                1;
+                1;
+                1;
+                1;
+                1;
+                1;
+                1;
+                1;
               |];
             mark = None;
             start_char = 1;
@@ -476,9 +521,7 @@ let () =
   | Result.Error _ -> assert false
   | Ok re -> (
       match exec_full re "aaaaaa" 5 0l with
-      | Match
-          { ovector = [| 5; 5; 0; 4 |]; mark = None; start_char = 5 } ->
-          ()
+      | Match { ovector = [| 5; 5; 0; 4 |]; mark = None; start_char = 5 } -> ()
       | _ -> assert false)
 
 (* The option-independent (plain-UTF) route through the same OP_VREVERSE
@@ -501,9 +544,7 @@ let () =
   | Result.Error _ -> assert false
   | Ok re -> (
       match exec_full re "\x80\x80aaaaaa" 7 0l with
-      | Match
-          { ovector = [| 7; 7; 2; 6 |]; mark = None; start_char = 7 } ->
-          ()
+      | Match { ovector = [| 7; 7; 2; 6 |]; mark = None; start_char = 7 } -> ()
       | _ -> assert false)
 
 (* The word-boundary previous-character probe below check_subject (the
@@ -523,9 +564,7 @@ let () =
   | Result.Error _ -> assert false
   | Ok re -> (
       match exec_full re "aaaaaa" 5 0l with
-      | Match
-          { ovector = [| 5; 5; 0; 4 |]; mark = None; start_char = 5 } ->
-          ()
+      | Match { ovector = [| 5; 5; 0; 4 |]; mark = None; start_char = 5 } -> ()
       | _ -> assert false)
 
 (* 2. The pre-fix OBSERVABLE divergence (UCP): subject \xb5\xf8a under
@@ -549,7 +588,5 @@ let () =
   | Result.Error _ -> assert false
   | Ok re -> (
       match exec_full re "\xb5\xf8a" 0 0l with
-      | Match
-          { ovector = [| 3; 3; 2; 2 |]; mark = None; start_char = 3 } ->
-          ()
+      | Match { ovector = [| 3; 3; 2; 2 |]; mark = None; start_char = 3 } -> ()
       | _ -> assert false)

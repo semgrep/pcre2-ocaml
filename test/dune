@@ -4,7 +4,7 @@
 
 (executable
  (name pcre2_tests)
- (libraries pcre2 ounit2)
+ (libraries pcre2 pcre2.engine ounit2)
  (preprocess
   (pps ppx_deriving.show)))
 
