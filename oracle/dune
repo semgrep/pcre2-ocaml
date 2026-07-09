@@ -4,12 +4,30 @@
 (library
  (name pcre2_c)
  (public_name pcre2-dev.oracle)
+ (modules pcre2_c bindings intf)
  (preprocess
   (pps ppx_inline_test ppx_deriving.show ppx_deriving.eq))
  (inline_tests)
  (foreign_stubs
   (language c)
   (names pcre2_c_stubs)
+  (flags
+   (:standard)
+   (:include c_flags.sexp)
+   -g))
+ (c_library_flags
+  (:include c_library_flags.sexp)
+  (-g)))
+
+; Richer oracle access for the pcre2test harness: compile error offsets,
+; compile contexts, full ovector, MARK, pattern info.
+(library
+ (name pcre2_test_driver)
+ (public_name pcre2-dev.test-driver)
+ (modules test_driver)
+ (foreign_stubs
+  (language c)
+  (names pcre2test_stubs)
   (flags
    (:standard)
    (:include c_flags.sexp)
