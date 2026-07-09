@@ -314,6 +314,35 @@ end = struct
           [ Ok { start = 0; end_ = 2 }; Ok { start = 2; end_ = 4 } ]
           (List.map (Result.map range_of_match) results)
 
+  let alloc_per_attempt_test ctxt =
+    (* Perf chunk 1 (interpreter.ml DEVIATION (perf), match_state): the
+       dispatch nest is module-level, so a match attempt allocates no
+       minor words. Pattern "qz": the first code unit 'q' hits at every
+       position of a 100k-'q' subject (defeating the driver's memchr
+       fast-forward), so this single exec runs ~100k failing attempts.
+       Before the hoist each attempt rebuilt the interpreter closure
+       nest (~66 minor words per attempt, ~6.6M for this exec); now the
+       whole exec is O(1). The 1_000-word slack covers the per-exec
+       setup (mb/match_state/driver closures) and the float boxing of
+       Gc.minor_words itself. *)
+    match compile "qz" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let subject = String.make 100_000 'q' in
+        let bool_printer = [%show: (bool, match_error) result] in
+        (* warm-up exec: one-time lazy initialization out of the way *)
+        assert_equal ~printer:bool_printer (Ok false) (is_match re subject);
+        let before = Gc.minor_words () in
+        let result = is_match re subject in
+        let delta = Gc.minor_words () -. before in
+        assert_equal ~printer:bool_printer (Ok false) result;
+        assert_bool
+          (Printf.sprintf
+             "expected O(1) minor allocation for ~100k attempts in one exec, \
+              measured %.0f words"
+             delta)
+          (delta < 1000.)
+
   let tests =
     [
       "simple_test" >:: simple_test;
@@ -336,6 +365,7 @@ end = struct
       "empty_pattern" >:: empty_pattern_test;
       "unicode" >:: unicode_test;
       "overlapping_matches" >:: overlapping_matches_test;
+      "alloc_per_attempt" >:: alloc_per_attempt_test;
     ]
 end
 
