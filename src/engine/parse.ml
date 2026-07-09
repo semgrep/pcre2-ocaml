@@ -4046,12 +4046,34 @@ let parse_regex (cx : parse_context) ~(options : int)
                        Int.equal meta meta_script_run
                        || Int.equal meta meta_atomic_script_run
                      then (
-                       (* pcre2_compile.c:4030-4059 — ( *sr: ( *asr:
-                          ( *script_run: ( *atomic_script_run: — the script
-                          run facilities: deferred (M8,
-                          docs/ocaml-engine/08-ucp.md). *)
-                       cx.errorcode <- err_deferred;
-                       raise_notrace Goto_failed)
+                       (* pcre2_compile.c:4030-4055 — the script run
+                          facilities are handled here. Unicode support is
+                          required (the C's no-Unicode ERR96 arm at
+                          4056-4059 is unreachable: this port always has
+                          Unicode support). Always record a
+                          META_SCRIPT_RUN item. Then, for the atomic
+                          version, insert META_ATOMIC and remember
+                          (NSF_ATOMICSR) that we need two META_KETs at
+                          the end. *)
+                       buf.(!pp) <- meta_script_run;
+                       incr pp;
+                       nest_depth := !nest_depth + 1;
+                       incr ptr;
+                       if Int.equal meta meta_atomic_script_run then (
+                         buf.(!pp) <- meta_atomic;
+                         incr pp;
+                         if Int.equal !top_nest (-1) then top_nest := 0
+                         else (
+                           incr top_nest;
+                           if !top_nest >= nest_slots then (
+                             cx.errorcode <- Errors.err84;
+                             raise_notrace Goto_failed));
+                         let tn = nests.(!top_nest) in
+                         tn.nest_depth <- !nest_depth;
+                         tn.flags <- nsf_atomicsr;
+                         tn.options <- !options land parse_tracked_options;
+                         tn.xoptions <-
+                           !xoptions land parse_tracked_extra_options))
                      else (
                        (* pcre2_compile.c:4007-4009 *)
                        cx.errorcode <- Errors.err89;
@@ -5798,7 +5820,26 @@ let () =
   (* Deferred arms fail loudly with the placeholder code (never a real
      PCRE2 error number). *)
   assert (err_deferred > 201);
-  expect_err "(*script_run:a)" err_deferred 12 (* script runs: M8 *);
+
+  (* Script runs (pcre2_compile.c:4030-4055 + 4960-4963): META_SCRIPT_RUN
+     ... META_KET; the atomic form inserts META_ATOMIC and closes with two
+     META_KETs (NSF_ATOMICSR). *)
+  expect "(*script_run:a)" [| meta_script_run; 0x61; meta_ket; meta_end |];
+  expect "(*sr:a)" [| meta_script_run; 0x61; meta_ket; meta_end |];
+  expect "(*atomic_script_run:a)"
+    [| meta_script_run; meta_atomic; 0x61; meta_ket; meta_ket; meta_end |];
+  expect "(*asr:a|b)"
+    [|
+      meta_script_run;
+      meta_atomic;
+      0x61;
+      meta_alt;
+      0x62;
+      meta_ket;
+      meta_ket;
+      meta_end;
+    |];
+  expect_err "(*sr:a" Errors.err14 6 (* missing closing parenthesis *);
 
   (* Freestanding \p and \P (pcre2_compile.c:3327-3346): META_ESCAPE +
      ESC_p/ESC_P followed by (ptype << 16) | pdata; {^...} flips the

@@ -8,7 +8,7 @@
    (790-798, 6445-6457), OP_END (876-940), the char family OP_CHAR/
    OP_CHARI/OP_NOT/OP_NOTI and the single-character repeat machinery
    REPEATCHAR/REPEATNOTCHAR with resume labels RM25-RM32 and (UTF)
-   RM202-RM207 (992-1916; UCP-without-UTF arms -> M7), the bit-mapped
+   RM202-RM207 (992-1916, incl. the UCP-without-UTF arms), the bit-mapped
    class family OP_CLASS/OP_NCLASS with resume labels RM23/RM24 and (UTF)
    RM200/RM201 (1919-2172), OP_XCLASS with RM100/RM101 (2175-2302; the
    XCL item matcher is xclass.ml),
@@ -16,7 +16,9 @@
    OP_PROP/OP_NOTPROP (2479-2614) and
    the TYPE repeat machinery REPEATTYPE with resume labels RM33/RM34,
    (UTF) RM219/RM221 and (properties) RM208-RM217/RM222-RM225
-   (2651-5005; EXTUNI arms -> the \X chunk), the
+   (2651-5005), OP_EXTUNI and its repeat loops with resume labels
+   RM218/RM220 (2617-2635, 2976-2996, 3804-3827, 4401-4467; the cluster
+   stepper is extuni.ml), the
    backreference family
    match_ref and OP_REF/OP_REFI/OP_DNREF/OP_DNREFI with the repeat
    machinery and resume labels RM20-RM22 (338-481, 4980-5194, including
@@ -25,8 +27,9 @@
    OP_EODN/word boundaries incl. the UCP variants (6132-6338), the
    bracket/alternation/ket family OP_BRAZERO/OP_BRAMINZERO/OP_SKIPZERO
    (5224-5246), OP_BRA/OP_CBRA/OP_SCBRA and the shared GROUPLOOP
-   (5349-5411; the OP_ONCE/OP_SCRIPT_RUN/OP_SBRA head at 5391-5394 is
-   live; the OP_SCRIPT_RUN ket action defers to M7), OP_ALT and OP_KET/
+   (5349-5411, incl. the OP_ONCE/OP_SCRIPT_RUN/OP_SBRA head at 5391-5394;
+   the OP_SCRIPT_RUN ket action at 6045-6051 calls script_run.ml), OP_ALT
+   and OP_KET/
    OP_KETRMIN/OP_KETRMAX with resume labels RM1/RM2/RM6/RM7/RM9/RM10
    (5893-6127), the conditional/recursion family — OP_COND/OP_SCOND with
    the condition opcodes and the assertion-condition protocol
@@ -614,10 +617,7 @@ let scheck_partial (mb : match_block) (feptr : int) : int =
    error condition. *)
 let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
     (a : Frames.t) (match_data : match_data) (mb : match_block) : int =
-  (* pcre2_match.c:630-637 — UTF and UCP flags. The UTF and property
-     arms are live; the ucp-without-utf caseless-singles arms and the
-     EXTUNI/SCRIPT_RUN opcodes defer to later 08-ucp.md chunks with
-     [error_unported]. *)
+  (* pcre2_match.c:630-637 — UTF and UCP flags. *)
   let utf = not (Int.equal (mb.poptions land Options.utf) 0) in
   let ucp = not (Int.equal (mb.poptions land Options.ucp) 0) in
 
@@ -710,6 +710,23 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
     Char.code
       (Bytes.get mb.start_code (fr.(fb + Frames.slot_temp_sptr_1) + (fc lsr 3)))
     land (1 lsl (fc land 7))
+  in
+  (* GETCHARINCTEST(fc, Feptr); Feptr = PRIV(extuni)(fc, Feptr,
+     mb->start_subject, mb->end_subject, utf, NULL) — the shared body of
+     the four OP_EXTUNI stepping sites (pcre2_match.c:2629-2631 =
+     2990-2992 = 3821-3823 = 4415-4417): one grapheme cluster from [eptr],
+     returning the position after it. Defined once per match (the
+     [is_newline_at] precedent), so the dispatch loop stays
+     allocation-free. Caller contract: eptr < mb.end_subject. *)
+  let extuni_step (eptr : int) : int =
+    (* safe: eptr < mb.end_subject <= String.length mb.subject (caller
+       contract); 0 <= start_eptr <= eptr (mb invariant) *)
+    let c0 = Char.code (String.unsafe_get mb.subject eptr) in
+    let fc = if utf && c0 >= 0xc0 then Utf.getutf8 c0 mb.subject eptr else c0 in
+    let eptr' =
+      if utf && c0 >= 0xc0 then eptr + 1 + Utf.get_extralen c0 else eptr + 1
+    in
+    Extuni.extuni fc mb.subject eptr' mb.start_subject mb.end_subject utf
   in
   (* pcre2_string_utils.c:101-112 — PRIV(strcmp) over two zero-terminated
      verb names stored in the compiled code, consulted only for equality
@@ -1221,8 +1238,29 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
               fr.(fb + Frames.slot_ecode) <- ecode + 1 + flength;
               (dispatch [@tailcall]) f))
         else if ucp then
-          (* pcre2_match.c:1075-1092 — UCP without UTF: M7. *)
-          error_unported
+          (* pcre2_match.c:1075-1092 — if UCP is set without UTF we must
+             do the same as above, but with one character per code unit.
+             Feptr++/Fecode += 2 happen after the tests: nothing advances
+             on NOMATCH (unlike the UTF arm's GETCHARINC). *)
+          (* safe: eptr < mb.end_subject <= String.length mb.subject
+             (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
+          let cc = Char.code (String.unsafe_get mb.subject eptr) in
+          let fc = Char.code (Bytes.get mb.start_code (ecode + 1)) in
+          if
+            if fc < 128 then
+              (* pcre2_match.c:1082-1085 — mb->lcc[fc] !=
+                 TABLE_GET(cc, mb->lcc, cc). *)
+              not (Int.equal (Chartables.lcc fc) (Chartables.lcc cc))
+            else
+              (* pcre2_match.c:1086-1089 — cc != fc && cc !=
+                 UCD_OTHERCASE(fc). *)
+              (not (Int.equal cc fc)) && not (Int.equal cc (Ucd.othercase fc))
+          then (backtrack [@tailcall]) f match_nomatch
+          else (
+            (* pcre2_match.c:1090-1091 *)
+            fr.(fb + Frames.slot_eptr) <- eptr + 1;
+            fr.(fb + Frames.slot_ecode) <- ecode + 2;
+            (dispatch [@tailcall]) f)
         else
           (* pcre2_match.c:1097-1103 — not UTF or UCP mode; use the table
              for characters < 256: if (TABLE_GET(Fecode[1], mb->lcc,
@@ -1279,9 +1317,32 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
           else (
             fr.(fb + Frames.slot_ecode) <- ecode';
             (dispatch [@tailcall]) f))
-        else if ucp then
-          (* pcre2_match.c:1139-1160 — UCP without UTF: M7. *)
-          error_unported
+        else if ucp then (
+          (* pcre2_match.c:1139-1160 — UCP without UTF is as above, but
+             with one character per code unit. *)
+          (* fc = UCHAR21INC(Feptr) (1144) — the post-increment advances
+             Feptr even when the test fails: the character was consulted,
+             and RETURN_SWITCH's last_used_ptr update (6470) must see
+             it. *)
+          (* safe: eptr < mb.end_subject <= String.length mb.subject
+             (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
+          let fc = Char.code (String.unsafe_get mb.subject eptr) in
+          fr.(fb + Frames.slot_eptr) <- eptr + 1;
+          let ch = Char.code (Bytes.get mb.start_code (ecode + 1)) in
+          if Int.equal ch fc then
+            (* pcre2_match.c:1148-1151 — caseful match. *)
+            (backtrack [@tailcall]) f match_nomatch
+          else if Int.equal op Opcodes.op_noti then
+            (* pcre2_match.c:1152-1159 — caseless: fold ch through
+               UCD_OTHERCASE (> 127) or the fcc table. *)
+            let ch = if ch > 127 then Ucd.othercase ch else Chartables.fcc ch in
+            if Int.equal ch fc then (backtrack [@tailcall]) f match_nomatch
+            else (
+              fr.(fb + Frames.slot_ecode) <- ecode + 2;
+              (dispatch [@tailcall]) f)
+          else (
+            fr.(fb + Frames.slot_ecode) <- ecode + 2;
+            (dispatch [@tailcall]) f))
         else
           (* pcre2_match.c:1165-1173 — neither UTF nor UCP is set. *)
           let ch = Char.code (Bytes.get mb.start_code (ecode + 1)) in
@@ -1842,9 +1903,28 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
             fr.(fb + Frames.slot_ecode) <- ecode + 3;
             (dispatch [@tailcall]) f)
     | 22 ->
-        (* OP_EXTUNI (pcre2_match.c:2621-2648) — STUB: the \X grapheme
-           chunk (08-ucp.md). *)
-        error_unported
+        (* OP_EXTUNI (pcre2_match.c:2617-2635) — match an extended
+           Unicode sequence. We will get here only if the support is in
+           the binary (always, in this port). *)
+        let eptr = fr.(fb + Frames.slot_eptr) in
+        if eptr >= mb.end_subject then
+          (* pcre2_match.c:2622-2626 — SCHECK_PARTIAL(), then no match. *)
+          let rc = scheck_partial mb eptr in
+          if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch
+        else
+          (* pcre2_match.c:2627-2632 — GETCHARINCTEST(fc, Feptr); Feptr =
+             PRIV(extuni)(...). *)
+          let eptr' = extuni_step eptr in
+          fr.(fb + Frames.slot_eptr) <- eptr';
+          (* CHECK_PARTIAL() (2633). *)
+          let rc =
+            if eptr' >= mb.end_subject then scheck_partial mb eptr' else 0
+          in
+          if rc < 0 then rc
+          else (
+            (* Fecode++ (2634). *)
+            fr.(fb + Frames.slot_ecode) <- ecode + 1;
+            (dispatch [@tailcall]) f)
     | 93 ->
         (* OP_TYPEEXACT (pcre2_match.c:2651-2654). reptype is never read
            when Lmin = Lmax (the post-min-phase Lmin == Lmax continue
@@ -2005,9 +2085,8 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         (* OP_ONCE, OP_SCRIPT_RUN, OP_SBRA (pcre2_match.c:5391-5394) —
            atomic groups and non-capturing brackets that can match an
            empty string must record a backtracking point and set up a
-           chained frame: Lframe_type = GF_NOCAPTURE | Fop. The shared
-           GROUPLOOP is fully live; OP_ONCE and OP_SCRIPT_RUN differ only
-           in their ket actions (OP_SCRIPT_RUN's is an M7 stub there). *)
+           chained frame: Lframe_type = GF_NOCAPTURE | Fop. OP_ONCE and
+           OP_SCRIPT_RUN differ only in their ket actions. *)
         fr.(fb + Frames.slot_temp_32_0) <- Frames.gf_nocapture lor op;
         (grouploop [@tailcall]) f
     | 117 ->
@@ -2446,10 +2525,21 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                  RRETURN(MATCH_MATCH). *)
               (backtrack [@tailcall]) f match_match
           | 134 ->
-              (* OP_SCRIPT_RUN (pcre2_match.c:6049-6051) — STUB: M7
-                 (PRIV(script_run) needs the UCD script data; script runs
-                 cause a compile-time error until then). *)
-              error_unported
+              (* OP_SCRIPT_RUN (pcre2_match.c:6045-6051) — at the end of
+                 a script run, apply the script-checking rules to the
+                 group's matched substring, P->eptr .. Feptr. This code
+                 will never be exercised if Unicode support is not
+                 compiled (always compiled in this port). In bounds:
+                 p >= 0 — OP_SCRIPT_RUN is not OP_BRA/OP_COND, so the
+                 unchain above found the recorded group frame. *)
+              if
+                not
+                  (Script_run.script_run mb.subject
+                     fr.(Frames.base a p + Frames.slot_eptr)
+                     fr.(fb + Frames.slot_eptr)
+                     utf)
+              then (backtrack [@tailcall]) f match_nomatch
+              else (op_ket_tail [@tailcall]) f p bracode
           | 137 | 138 | 142 | 143 ->
               (* OP_CBRA, OP_CBRAPOS, OP_SCBRA, OP_SCBRAPOS
                  (pcre2_match.c:6056-6084). *)
@@ -3073,9 +3163,10 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
     if fr.(fb + Frames.slot_op) >= Opcodes.op_stari then
       (* pcre2_match.c:1383-1400 — caseless comparison: Loc is the other
          case. *)
-      if ucp && (not utf) && lc > 127 then
-        (* pcre2_match.c:1388-1389 — Loc = UCD_OTHERCASE(Lc): M7. *)
-        error_unported
+      if ucp && (not utf) && lc > 127 then (
+        (* pcre2_match.c:1388-1389 — Loc = UCD_OTHERCASE(Lc). *)
+        fr.(fb + Frames.slot_temp_32_3) <- Ucd.othercase lc (* Loc *);
+        (repeatchar_ci_min [@tailcall]) f 1 reptype)
       else (
         (* pcre2_match.c:1393 — Loc = mb->fcc[Lc] (Lc < 128 in UTF-8
            mode, and characters < 256 otherwise). *)
@@ -3859,10 +3950,16 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
           (backtrack [@tailcall]) f match_nomatch
         else (propmin [@tailcall]) f 1 proptype reptype
       else (repeattype_prop_post_min [@tailcall]) f proptype reptype)
-    else if Int.equal lctype Opcodes.op_extuni then
-      (* pcre2_match.c:2976-2996 (+ 3804-3827, 4401-4467) — the OP_EXTUNI
-         repeat loops: STUB, the \X grapheme chunk (08-ucp.md). *)
-      error_unported
+    else if Int.equal lctype Opcodes.op_extuni then (
+      (* pcre2_match.c:2976-2996 — match extended Unicode sequences: the
+         min loop; the strategy dispatch and the RM218/RM220 loops are
+         [extuni_post_min] and the resume arms in [backtrack]. *)
+      fr.(fb + Frames.slot_temp_32_0) <- lmin (* Lmin *);
+      fr.(fb + Frames.slot_temp_32_1) <- lmax (* Lmax *);
+      fr.(fb + Frames.slot_temp_32_2) <- lctype (* Lctype *);
+      fr.(fb + Frames.slot_ecode) <- ecode;
+      if lmin > 0 then (typemin_extuni [@tailcall]) f 1 reptype
+      else (extuni_post_min [@tailcall]) f reptype)
     else (
       fr.(fb + Frames.slot_temp_32_0) <- lmin (* Lmin *);
       fr.(fb + Frames.slot_temp_32_1) <- lmax (* Lmax *);
@@ -4276,6 +4373,117 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
               (Int.equal fr.(fb + Frames.slot_temp_32_2) Opcodes.op_notprop)
           then (backtrack [@tailcall]) f match_nomatch
           else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rmlabel 0
+  and typemin_extuni (f : int) (i : int) (reptype : int) : int =
+    (* pcre2_match.c:2979-2996 — OP_EXTUNI: ensure the minimum number of
+       clusters are present: for (i = 1; i <= Lmin; i++). *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if i <= fr.(fb + Frames.slot_temp_32_0) then (
+      let eptr = fr.(fb + Frames.slot_eptr) in
+      if eptr >= mb.end_subject then
+        (* pcre2_match.c:2983-2987 — SCHECK_PARTIAL(), then no match. *)
+        let rc = scheck_partial mb eptr in
+        if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch
+      else
+        (* pcre2_match.c:2988-2993 — GETCHARINCTEST(fc, Feptr); Feptr =
+           PRIV(extuni)(...). *)
+        let eptr' = extuni_step eptr in
+        fr.(fb + Frames.slot_eptr) <- eptr';
+        (* CHECK_PARTIAL() (2994). *)
+        let rc =
+          if eptr' >= mb.end_subject then scheck_partial mb eptr' else 0
+        in
+        if rc < 0 then rc else (typemin_extuni [@tailcall]) f (i + 1) reptype)
+    else (extuni_post_min [@tailcall]) f reptype
+  and extuni_post_min (f : int) (reptype : int) : int =
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    (* pcre2_match.c:3503-3505 — if (Lmin = Lmax) we are done: continue
+       with the main loop. *)
+    if Int.equal fr.(fb + Frames.slot_temp_32_0) fr.(fb + Frames.slot_temp_32_1)
+    then (dispatch [@tailcall]) f
+    else if Int.equal reptype reptype_min then
+      (* pcre2_match.c:3804-3811 — minimize: the for(;;) starts with
+         RMATCH(Fecode, RM218); the rest of the loop body is the RM218
+         resume arm in [backtrack]. *)
+      (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm218 0
+    else (
+      (* pcre2_match.c:4110-4112 — maximize: Lstart_eptr = Feptr. *)
+      fr.(fb + Frames.slot_temp_sptr_0) <- fr.(fb + Frames.slot_eptr);
+      (extuni_maxscan [@tailcall]) f fr.(fb + Frames.slot_temp_32_0) reptype)
+  and extuni_maxscan (f : int) (i : int) (reptype : int) : int =
+    (* pcre2_match.c:4401-4420 — match extended Unicode grapheme
+       clusters, maximize: for (i = Lmin; i < Lmax; i++). *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if i < fr.(fb + Frames.slot_temp_32_1) then (
+      let eptr = fr.(fb + Frames.slot_eptr) in
+      if eptr >= mb.end_subject then
+        (* pcre2_match.c:4408-4412 — SCHECK_PARTIAL(); break. *)
+        let rc = scheck_partial mb eptr in
+        if rc < 0 then rc else (extuni_maxend [@tailcall]) f reptype
+      else
+        (* pcre2_match.c:4413-4418 — GETCHARINCTEST(fc, Feptr); Feptr =
+           PRIV(extuni)(...). *)
+        let eptr' = extuni_step eptr in
+        fr.(fb + Frames.slot_eptr) <- eptr';
+        (* CHECK_PARTIAL() (4419). *)
+        let rc =
+          if eptr' >= mb.end_subject then scheck_partial mb eptr' else 0
+        in
+        if rc < 0 then rc else (extuni_maxscan [@tailcall]) f (i + 1) reptype)
+    else (extuni_maxend [@tailcall]) f reptype
+  and extuni_maxend (f : int) (reptype : int) : int =
+    (* pcre2_match.c:4422-4424 — Feptr is now past the end of the maximum
+       run; if possessive, no backtracking: continue the main loop at the
+       advanced Fecode. *)
+    if Int.equal reptype reptype_pos then (dispatch [@tailcall]) f
+    else (extuni_maxbt [@tailcall]) f
+  and extuni_maxbt (f : int) : int =
+    (* pcre2_match.c:4426-4437 — the cluster maximize backtracking
+       for(;;) head: we use <= Lstart_eptr rather than == to detect the
+       start of the run while backtracking, because the use of \C in UTF
+       mode can cause BACKCHAR to move back past Lstart_eptr. The minimum
+       position is tried in place (break -> main loop); every position
+       above it via RMATCH(Fecode, RM220), whose resume steps back one
+       cluster (the RM220 arm + [extuni_bt_inner]). *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if fr.(fb + Frames.slot_eptr) <= fr.(fb + Frames.slot_temp_sptr_0) then
+      (dispatch [@tailcall]) f
+    else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm220 0
+  and extuni_bt_inner (f : int) (rgb : int) : int =
+    (* pcre2_match.c:4452-4465 — the inner for(;;) of the RM220 resume:
+       walk further back while the pair table forbids a break between the
+       character before Feptr and the one at Feptr ([rgb], a plain local
+       in the C too — it never survives an RMATCH). NOTE: this re-walk
+       uses only the pair table, not the ZWJ/RI special rules — the C's
+       approach, transcribed as-is. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    let eptr = fr.(fb + Frames.slot_eptr) in
+    if eptr <= fr.(fb + Frames.slot_temp_sptr_0) then
+      (* At start of char run: break to the outer loop head. *)
+      (extuni_maxbt [@tailcall]) f
+    else
+      (* pcre2_match.c:4455-4460 — fptr = Feptr - 1; if (!utf) fc = *fptr;
+         else { BACKCHAR(fptr); GETCHAR(fc, fptr); }. eptr - 1 >=
+         Lstart_eptr >= 0 (guard above); backchar_subject/getchar_subject
+         clamp their reads (non-UTF read: fptr < eptr <= a former
+         in-bounds position < String.length mb.subject). *)
+      let fptr = eptr - 1 in
+      let fptr = if utf then backchar_subject mb.subject fptr else fptr in
+      let fc =
+        if utf then getchar_subject mb.subject fptr
+        else Char.code (String.unsafe_get mb.subject fptr)
+      in
+      let lgb = Ucd.gbprop fc in
+      (* pcre2_match.c:4461-4464 *)
+      if Int.equal (Tables.ucp_gbtable.(lgb) land (1 lsl rgb)) 0 then
+        (extuni_maxbt [@tailcall]) f
+      else (
+        fr.(fb + Frames.slot_eptr) <- fptr;
+        (extuni_bt_inner [@tailcall]) f lgb)
   and repeattype_post_min (f : int) (reptype : int) : int =
     let fr = a.Frames.frames in
     let fb = Frames.base a f in
@@ -7133,11 +7341,60 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                  backchar_subject mb.subject (fr.(fb + Frames.slot_eptr) - 1)
                else fr.(fb + Frames.slot_eptr) - 1);
             (propmax_bt [@tailcall]) f)
-      | 218 | 220 ->
-          (* RM218 (extuni minimize resume, pcre2_match.c:3807-3827) and
-             RM220 (extuni maximize resume, 4431-4466) — STUB: the \X
-             grapheme chunk (08-ucp.md). *)
-          error_unported
+      | 218 ->
+          (* RM218 (pcre2_match.c:3807-3827) — OP_EXTUNI minimize resume:
+             if (rrc != MATCH_NOMATCH) RRETURN(rrc); if (Lmin++ >= Lmax)
+             RRETURN(MATCH_NOMATCH); bound check + SCHECK_PARTIAL; one
+             cluster step; CHECK_PARTIAL; back to the RMATCH. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else
+            let lmin = fr.(fb + Frames.slot_temp_32_0) in
+            fr.(fb + Frames.slot_temp_32_0) <- lmin + 1 (* Lmin++ *);
+            if lmin >= fr.(fb + Frames.slot_temp_32_1) then
+              (backtrack [@tailcall]) f match_nomatch
+            else
+              let eptr = fr.(fb + Frames.slot_eptr) in
+              if eptr >= mb.end_subject then
+                (* pcre2_match.c:3814-3818 — SCHECK_PARTIAL(), then no
+                   match. *)
+                let rc = scheck_partial mb eptr in
+                if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch
+              else
+                (* pcre2_match.c:3819-3824 — GETCHARINCTEST(fc, Feptr);
+                   Feptr = PRIV(extuni)(...). *)
+                let eptr' = extuni_step eptr in
+                fr.(fb + Frames.slot_eptr) <- eptr';
+                (* CHECK_PARTIAL() (3825). *)
+                let rc =
+                  if eptr' >= mb.end_subject then scheck_partial mb eptr' else 0
+                in
+                if rc < 0 then rc
+                else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm218 0
+      | 220 ->
+          (* RM220 (pcre2_match.c:4437-4466) — OP_EXTUNI maximize resume:
+             backtracking over an extended grapheme cluster involves
+             inspecting the previous two characters (if present) to see
+             if a break is permitted between them. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else
+            (* pcre2_match.c:4444-4450 — Feptr--; if (!utf) fc = *Feptr;
+               else { BACKCHAR(Feptr); GETCHAR(fc, Feptr); }; rgb =
+               UCD_GRAPHBREAK(fc). eptr - 1 >= Lstart_eptr >= 0 (the loop
+               head only RMATCHes when Feptr > Lstart_eptr);
+               backchar_subject/getchar_subject clamp their reads (the
+               non-UTF read: eptr - 1 < eptr <= mb.end_subject <=
+               String.length mb.subject — non-UTF steps are single code
+               units). *)
+            let eptr = fr.(fb + Frames.slot_eptr) - 1 in
+            let eptr = if utf then backchar_subject mb.subject eptr else eptr in
+            let fc =
+              if utf then getchar_subject mb.subject eptr
+              else Char.code (String.unsafe_get mb.subject eptr)
+            in
+            fr.(fb + Frames.slot_eptr) <- eptr;
+            (extuni_bt_inner [@tailcall]) f (Ucd.gbprop fc)
       | _ ->
           (* pcre2_match.c:6498-6499 — default: PCRE2_ERROR_INTERNAL. *)
           Errors.error_internal

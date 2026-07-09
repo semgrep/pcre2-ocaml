@@ -19,9 +19,12 @@
    stage1 (pcre2_internal.h:1869-1873 guards only in the 32-bit library,
    where GET_UCD returns PRIV(dummy_ucd_record) — script Unknown, type
    Cn, no case set, no other case, pcre2_ucd.c:95-108). Clamping yields
-   U+10FFFF's record, whose fields agree with the dummy record for every
-   accessor defined here (chartype Cn, caseset 0, other_case 0 — asserted
-   below), without needing a dummy row in the generated tables. *)
+   U+10FFFF's record, whose fields agree with the dummy record for
+   chartype/caseset/other_case/script/gbprop/scriptx (asserted below);
+   bidiclass (bidiBN vs the dummy's bidiL) and bprops (non-empty set vs
+   the dummy's empty) DIVERGE — reachable only under NO_UTF_CHECK garbage
+   where the 8-bit C is undefined, so no defined-behavior divergence
+   exists. No dummy row needed in the generated tables. *)
 let record_index (ch : int) : int =
   let ch = if ch > 0x10ffff then 0x10ffff else ch in
   Ucd_tables.stage2
@@ -131,8 +134,9 @@ let () =
   assert (Int.equal Ucd_tables.ucd_caseless_sets.(ks + 3) Tables.notachar);
   (* The out-of-range clamp (DEVIATION above): U+10FFFF's record carries
      the same field values as the 32-bit library's dummy record
-     (pcre2_ucd.c:99-108) for every accessor defined here, and values
-     above the maximum read that record instead of overrunning stage1. *)
+     (pcre2_ucd.c:99-108) for the accessors asserted here (bidiclass and
+     bprops diverge; see the record_index comment), and values above the
+     maximum read that record instead of overrunning stage1. *)
   assert (Int.equal (chartype 0x10ffff) Ucp.ucp_cn);
   assert (Int.equal (caseset 0x10ffff) 0);
   assert (Int.equal (othercase 0x10ffff) 0x10ffff);

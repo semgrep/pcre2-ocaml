@@ -2682,13 +2682,14 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
         (* pcre2_compile.c:6798-6800 *)
         group_process ~note_group_empty:true ~bravalue:Opcodes.op_once
           ~skipunits:0
-      else if Int.equal meta Parse.meta_script_run then (
-        (* pcre2_compile.c:6802-6804 — ( *script_run:): OP_SCRIPT_RUN needs
-           the UCP machinery (docs/ocaml-engine/08-ucp.md). Deferred loudly
-           (parse_regex defers the ( *sr: forms with the same marker, so
-           this is unreachable until M8). *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+      else if Int.equal meta Parse.meta_script_run then
+        (* pcre2_compile.c:6802-6804 — bravalue = OP_SCRIPT_RUN; fall
+           through to GROUP_PROCESS_NOTE_EMPTY. (The atomic form arrives
+           as META_SCRIPT_RUN followed by META_ATOMIC — parse_regex,
+           pcre2_compile.c:4038-4043 — so it compiles to OP_ONCE nested
+           inside OP_SCRIPT_RUN.) *)
+        group_process ~note_group_empty:true ~bravalue:Opcodes.op_script_run
+          ~skipunits:0
       else if Int.equal meta Parse.meta_nocapture then
         (* pcre2_compile.c:6806-6808 — bravalue = OP_BRA; fall through to
            GROUP_PROCESS_NOTE_EMPTY. *)
