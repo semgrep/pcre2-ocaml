@@ -52,10 +52,11 @@ let req_none = 0xffff_fffe (* Found not fixed character *)
 let req_caseless = 0x0000_0001 (* Code unit in xxcu is caseless *)
 let req_vary = 0x0000_0002 (* Code unit is followed by non-literal *)
 
-(* pcre2_internal.h:536,547 — compiled-pattern flag bits recorded in
+(* pcre2_internal.h:536-537,547 — compiled-pattern flag bits recorded in
    cb->external_flags by compile_branch (the parse-phase bits it sets live
    in Parse: hasbkporx, jchanged, dupcapused). *)
 let hascrorlf = 0x0000_0800 (* PCRE2_HASCRORLF: explicit \r or \n in pattern *)
+let hasthen = 0x0000_1000 (* PCRE2_HASTHEN: pattern contains ( *THEN) *)
 let hasbkc = 0x0040_0000 (* PCRE2_HASBKC: contains \C *)
 
 (* pcre2_internal.h:526-548 — the remaining re->flags bits the
@@ -75,7 +76,24 @@ let nl_set = 0x0000_8000 (* PCRE2_NL_SET: newline was set in the pattern *)
 let notempty_set = 0x0001_0000 (* PCRE2_NOTEMPTY_SET: ( *NOTEMPTY) used *)
 let ne_atst_set = 0x0002_0000 (* PCRE2_NE_ATST_SET: ( *NOTEMPTY_ATSTART) *)
 let nojit = 0x0008_0000 (* PCRE2_NOJIT: ( *NOJIT) used *)
-let hasaccept = 0x0080_0000 (* PCRE2_HASACCEPT: contains ( *ACCEPT) (M5) *)
+let hasaccept = 0x0080_0000 (* PCRE2_HASACCEPT: contains ( *ACCEPT) *)
+
+(* pcre2_compile.c:633-637 — verb opcodes, indexed by their META code
+   offset from META_MARK. *)
+let verbops : int array =
+  [|
+    Opcodes.op_mark;
+    Opcodes.op_accept;
+    Opcodes.op_fail;
+    Opcodes.op_commit;
+    Opcodes.op_commit_arg;
+    Opcodes.op_prune;
+    Opcodes.op_prune_arg;
+    Opcodes.op_skip;
+    Opcodes.op_skip_arg;
+    Opcodes.op_then;
+    Opcodes.op_then_arg;
+  |]
 
 (* ---------- LINK_SIZE / IMM2_SIZE store-load primitives ---------- *)
 
@@ -895,14 +913,14 @@ let opcode_possessify =
                       -1 Success, this branch may match an empty string
 
    Chunk boundary (M1 chunks "compile_branch A".."D" + the M2 backref
-   chunk): chars/escapes, classes, repeats, plain capture/non-capture
-   groups (with bracket repeats) and back references (numeric and by
-   name) are live. The arms for conditionals/lookarounds (M4/M5), verbs,
-   recursion and string callouts are deferred — they fail loudly with
+   chunk + the M4 conditionals/lookarounds/recursion chunks + the M5
+   verbs chunk): chars/escapes, classes, repeats, capture/non-capture
+   groups (with bracket repeats), back references (numeric and by name),
+   conditionals, lookarounds, recursion and verbs are live. The arms for
+   string callouts and \P/\p are deferred — they fail loudly with
    Parse.err_deferred (identically in both phases, before any
    phase-dependent work). The C local `offset` (pcre2_compile.c:5658)
-   becomes a per-arm let binding in the backref arms; the still-deferred
-   conditional arms bring their own uses with them. The class locals
+   becomes a per-arm let binding in the backref arms. The class locals
    (negate_class, should_flip_negation,
    match_all_or_no_wide_chars, class_has_8bitchar, xclass, xclass_has_prop,
    class_uchardata, classbits; pcre2_compile.c:5672,5690-5693,5725-5733)
@@ -2041,23 +2059,114 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                 Bytes.blit classbits 0 cb.start_code !code 32
             | Some _ -> ());
             code := !code + 32 (* End of class processing *)))
+      else if Int.equal meta Parse.meta_accept then (
+        (* pcre2_compile.c:6487-6514 — deal with ( *VERB)s. Check for open
+           captures before ACCEPT and close those that are within the same
+           assertion level, also converting ACCEPT to ASSERT_ACCEPT in an
+           assertion. In the first pass, just accumulate the length
+           required; otherwise hitting ( *ACCEPT) inside many nested
+           parentheses can cause workspace overflow. Do not set firstcu
+           after *ACCEPT. *)
+        cb.had_accept <- true;
+        had_accept := true;
+        let oc = ref open_caps in
+        let walking = ref true in
+        while !walking do
+          match !oc with
+          | Some item when item.assert_depth >= cb.assert_depth ->
+              (match lengthptr with
+              | Some length ->
+                  (* *lengthptr += CU2BYTES(1) + IMM2_SIZE
+                     (pcre2_compile.c:6502-6505); CU2BYTES(1) = 1 code
+                     unit in the 8-bit library. *)
+                  length := !length + 1 + Limits.imm2_size
+              | None ->
+                  emit_cu Opcodes.op_close;
+                  put2inc cb.start_code code item.number);
+              oc := item.next
+          | _ -> walking := false
+        done;
+        emit_cu
+          (if cb.assert_depth > 0 then Opcodes.op_assert_accept
+           else Opcodes.op_accept);
+        if Int.equal !firstcuflags req_unset then firstcuflags := req_none)
       else if
-        Int.equal meta Parse.meta_accept
-        || Int.equal meta Parse.meta_prune
+        Int.equal meta Parse.meta_prune
         || Int.equal meta Parse.meta_skip
         || Int.equal meta Parse.meta_commit
         || Int.equal meta Parse.meta_fail
-        || Int.equal meta Parse.meta_then
-        || Int.equal meta Parse.meta_then_arg
+      then (
+        (* pcre2_compile.c:6516-6523 — META_PRUNE and META_SKIP record
+           had_pruneorskip, then fall through to the shared verb-opcode
+           emission (with META_COMMIT and META_FAIL). *)
+        if Int.equal meta Parse.meta_prune || Int.equal meta Parse.meta_skip
+        then cb.had_pruneorskip <- true;
+        (* fallthrough from META_PRUNE/META_SKIP in C *)
+        emit_cu verbops.((meta - Parse.meta_mark) lsr 16))
+      else if Int.equal meta Parse.meta_then then (
+        (* pcre2_compile.c:6525-6528 *)
+        cb.external_flags <- cb.external_flags lor hasthen;
+        emit_cu Opcodes.op_then)
+      else if
+        Int.equal meta Parse.meta_then_arg
         || Int.equal meta Parse.meta_prune_arg
         || Int.equal meta Parse.meta_skip_arg
         || Int.equal meta Parse.meta_mark
         || Int.equal meta Parse.meta_commit_arg
       then (
-        (* pcre2_compile.c:6487-6573 — ( *VERB)s:
-           docs/ocaml-engine/06-verbs-k-start-opt.md. Deferred loudly. *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+        (* pcre2_compile.c:6530-6546 — handle verbs with arguments.
+           Arguments can be very long, especially in 16- and 32-bit modes,
+           and can overflow the workspace in the first pass. However, the
+           argument length is constrained to be small enough to fit in one
+           code unit. This check happens in parse_regex(). In the first
+           pass, instead of putting the argument into memory, we just
+           update the length counter and set up an empty argument.
+           META_THEN_ARG records PCRE2_HASTHEN (6537-6539), and
+           META_PRUNE_ARG/META_SKIP_ARG record had_pruneorskip
+           (6541-6543), before falling through (with META_MARK and
+           META_COMMIT_ARG) to the shared VERB_ARG code. *)
+        if Int.equal meta Parse.meta_then_arg then
+          cb.external_flags <- cb.external_flags lor hasthen;
+        if
+          Int.equal meta Parse.meta_prune_arg
+          || Int.equal meta Parse.meta_skip_arg
+        then cb.had_pruneorskip <- true;
+
+        (* VERB_ARG (pcre2_compile.c:6547-6572) *)
+        emit_cu verbops.((meta - Parse.meta_mark) lsr 16);
+        (* The length is in characters: verbarglen = *(++pptr). *)
+        pptr := !pptr + 1;
+        let verbarglen = cb.parsed_pattern.(!pptr) in
+        let verbculen = ref 0 in
+        (* tempcode = code++ — reserve the length code unit. *)
+        let tempcode = !code in
+        incr code;
+        for _i = 0 to verbarglen - 1 do
+          pptr := !pptr + 1;
+          let vchar = cb.parsed_pattern.(!pptr) in
+          (* pcre2_compile.c:6556-6562 — mclength/mcbuffer: the utf arm
+             (mclength = PRIV(ord2utf)(meta, mcbuffer)) is M6 (utf.ml);
+             UTF compilation is rejected before compile_branch in the
+             current engine, so fail loudly rather than emit a truncated
+             character. *)
+          if utf then (
+            errorcodeptr := Parse.err_deferred;
+            return_from_branch 0);
+          let mclength = 1 in
+          match lengthptr with
+          | Some length -> length := !length + mclength
+          | None ->
+              (* memcpy(code, mcbuffer, CU2BYTES(mclength)); with
+                 mclength = 1 this is one code-unit store. *)
+              Bytes.set cb.start_code !code (Char.chr (vchar land 0xff));
+              code := !code + mclength;
+              verbculen := !verbculen + mclength
+        done;
+
+        (* *tempcode = verbculen — fill in the code unit length
+           (pcre2_compile.c:6571). *)
+        Bytes.set cb.start_code tempcode (Char.chr (!verbculen land 0xff));
+        emit_cu 0 (* Terminating zero *))
       else if Int.equal meta Parse.meta_options then (
         (* pcre2_compile.c:6576-6587 — handle options change. The new
            setting must be passed back for use in subsequent branches.
@@ -7736,10 +7845,8 @@ let () =
   expect_err "(*LIMIT_MATCH=x)a" 0 Errors.err60 14;
   expect_err "(*LIMIT_MATCH=12" 0 Errors.err60 17;
   (* Unknown ( *WORD) is not a pso: falls through to parse_regex's verb
-     handling (deferred, M5) — just check it is an error, not a crash. *)
-  (match pcre2_compile "(*XYZZY)a" ~options:0 with
-  | Ok _ -> assert false
-  | Error _ -> ());
+     handling — ERR60 with ptr at the closing parenthesis. *)
+  expect_err "(*XYZZY)a" 0 Errors.err60 7;
   (* Error propagation with parse offsets: "(" = ERR14 at 1; "a{2,1}" =
      ERR4 at 5 (testoutput2:128-129 shape). *)
   expect_err "(" 0 Errors.err14 1;
@@ -7775,6 +7882,312 @@ let () =
   assert_entry 0 "ww" 3;
   assert_entry 1 "xx" 1;
   assert_entry 2 "yy" 2
+
+(* Backtracking-verb compilation (M5 verbs chunk, pcre2_compile.c:596-637,
+   2941-3039, 4064-4152 and 6487-6573,
+   docs/ocaml-engine/06-verbs-k-start-opt.md): bytecode and flags pinned
+   with `pcre2test` + fullbincode on the real 10.44 library. *)
+let () =
+  let ok ?(options = 0) pat =
+    match pcre2_compile pat ~options with
+    | Ok re -> re
+    | Error (e, o) ->
+        failwith
+          (Printf.sprintf "pcre2_compile %S: error %d at offset %d" pat e o)
+  in
+  let assert_code (re : re) (expected : int list) =
+    assert (Int.equal (Bytes.length re.code) (List.length expected));
+    List.iteri
+      (fun i v -> assert (Int.equal (Char.code (Bytes.get re.code i)) v))
+      expected
+  in
+  let bra = Opcodes.op_bra and ket = Opcodes.op_ket in
+
+  (* /( *FAIL)/ *)
+  let re = ok "(*FAIL)" in
+  assert_code re [ bra; 0; 4; Opcodes.op_fail; ket; 0; 4; Opcodes.op_end ];
+
+  (* /a( *COMMIT)b/ *)
+  let re = ok "a(*COMMIT)b" in
+  assert_code re
+    [
+      bra;
+      0;
+      8;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_commit;
+      Opcodes.op_char;
+      0x62;
+      ket;
+      0;
+      8;
+      Opcodes.op_end;
+    ];
+
+  (* /( *MARK:x)a/ — OP_MARK carries a length code unit, the name and a
+     terminating zero (pcre2_compile.c:6547-6572). *)
+  let re = ok "(*MARK:x)a" in
+  assert_code re
+    [
+      bra;
+      0;
+      9;
+      Opcodes.op_mark;
+      1;
+      0x78;
+      0;
+      Opcodes.op_char;
+      0x61;
+      ket;
+      0;
+      9;
+      Opcodes.op_end;
+    ];
+
+  (* /( *PRUNE:n)a/ *)
+  let re = ok "(*PRUNE:n)a" in
+  assert_code re
+    [
+      bra;
+      0;
+      9;
+      Opcodes.op_prune_arg;
+      1;
+      0x6e;
+      0;
+      Opcodes.op_char;
+      0x61;
+      ket;
+      0;
+      9;
+      Opcodes.op_end;
+    ];
+
+  (* /( *SKIP)a/ *)
+  let re = ok "(*SKIP)a" in
+  assert_code re
+    [
+      bra;
+      0;
+      6;
+      Opcodes.op_skip;
+      Opcodes.op_char;
+      0x61;
+      ket;
+      0;
+      6;
+      Opcodes.op_end;
+    ];
+
+  (* /( *THEN)a|b/ — sets PCRE2_HASTHEN (pcre2_compile.c:6525-6528). *)
+  let re = ok "(*THEN)a|b" in
+  assert_code re
+    [
+      bra;
+      0;
+      6;
+      Opcodes.op_then;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_alt;
+      0;
+      5;
+      Opcodes.op_char;
+      0x62;
+      ket;
+      0;
+      11;
+      Opcodes.op_end;
+    ];
+  assert (Int.equal (re.flags land hasthen) hasthen);
+  let re = ok "(*THEN:x)a" in
+  assert (Int.equal (re.flags land hasthen) hasthen);
+
+  (* /a( *ACCEPT)b/ — sets PCRE2_HASACCEPT and disables reqcu
+     (pcre2_compile.c:6496-6513, 10705-10710). *)
+  let re = ok "a(*ACCEPT)b" in
+  assert_code re
+    [
+      bra;
+      0;
+      8;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_accept;
+      Opcodes.op_char;
+      0x62;
+      ket;
+      0;
+      8;
+      Opcodes.op_end;
+    ];
+  assert (Int.equal (re.flags land hasaccept) hasaccept);
+  assert (Int.equal (re.flags land lastset) 0);
+
+  (* /(?:a( *ACCEPT))+/ *)
+  let re = ok "(?:a(*ACCEPT))+" in
+  assert_code re
+    [
+      bra;
+      0;
+      12;
+      bra;
+      0;
+      6;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_accept;
+      Opcodes.op_ketrmax;
+      0;
+      6;
+      ket;
+      0;
+      12;
+      Opcodes.op_end;
+    ];
+
+  (* /a( *ACCEPT)?/ — parse_regex wraps the quantified ( *ACCEPT) in
+     non-capturing brackets (pcre2_compile.c:3464-3477). *)
+  let re = ok "a(*ACCEPT)?" in
+  assert_code re
+    [
+      bra;
+      0;
+      13;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_brazero;
+      bra;
+      0;
+      4;
+      Opcodes.op_accept;
+      ket;
+      0;
+      4;
+      ket;
+      0;
+      13;
+      Opcodes.op_end;
+    ];
+
+  (* /( *ACCEPT:x)+/ — the argument becomes a preceding ( *MARK) inside the
+     wrapping brackets. *)
+  let re = ok "(*ACCEPT:x)+" in
+  assert_code re
+    [
+      bra;
+      0;
+      14;
+      Opcodes.op_sbra;
+      0;
+      8;
+      Opcodes.op_mark;
+      1;
+      0x78;
+      0;
+      Opcodes.op_accept;
+      Opcodes.op_ketrmax;
+      0;
+      8;
+      ket;
+      0;
+      14;
+      Opcodes.op_end;
+    ];
+
+  (* /((a)(b)( *ACCEPT)c)/ — open captures at the same assertion level are
+     closed with OP_CLOSE before OP_ACCEPT (pcre2_compile.c:6498-6511):
+     only group 1 is still open at the ( *ACCEPT). *)
+  let re = ok "((a)(b)(*ACCEPT)c)" in
+  assert_code re
+    [
+      bra;
+      0;
+      37;
+      Opcodes.op_cbra;
+      0;
+      31;
+      0;
+      1;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      2;
+      Opcodes.op_char;
+      0x61;
+      ket;
+      0;
+      7;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      3;
+      Opcodes.op_char;
+      0x62;
+      ket;
+      0;
+      7;
+      Opcodes.op_close;
+      0;
+      1;
+      Opcodes.op_accept;
+      Opcodes.op_char;
+      0x63;
+      ket;
+      0;
+      31;
+      ket;
+      0;
+      37;
+      Opcodes.op_end;
+    ];
+
+  (* /(?=a( *ACCEPT))b/ — ACCEPT inside an assertion becomes
+     OP_ASSERT_ACCEPT (pcre2_compile.c:6512). *)
+  let re = ok "(?=a(*ACCEPT))b" in
+  assert_code re
+    [
+      bra;
+      0;
+      14;
+      Opcodes.op_assert;
+      0;
+      6;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_assert_accept;
+      ket;
+      0;
+      6;
+      Opcodes.op_char;
+      0x62;
+      ket;
+      0;
+      14;
+      Opcodes.op_end;
+    ];
+
+  (* /( *COMMIT:abc)/ *)
+  let re = ok "(*COMMIT:abc)" in
+  assert_code re
+    [
+      bra;
+      0;
+      9;
+      Opcodes.op_commit_arg;
+      3;
+      0x61;
+      0x62;
+      0x63;
+      0;
+      ket;
+      0;
+      9;
+      Opcodes.op_end;
+    ]
 
 (* Backreference compilation (M2 compile chunk, pcre2_compile.c:7018-7098
    and 8022-8058, docs/ocaml-engine/03-backreferences.md): bytecode,

@@ -11,10 +11,10 @@ testinput2 (non-UTF).
 
 ## Chunks
 
-- [ ] parse: verb recognition incl. verb args and name-quoting rules, `(*LIMIT_MATCH=)/
+- [x] parse: verb recognition incl. verb args and name-quoting rules, `(*LIMIT_MATCH=)/
   (*LIMIT_DEPTH=)/(*LIMIT_HEAP=)` pattern limits (pcre2_compile.c: parse_regex verb table +
   arms, ~2900-3100 within the main loop range)
-- [ ] compile: OP_MARK/OP_PRUNE(_ARG)/OP_SKIP(_ARG)/OP_THEN(_ARG)/OP_COMMIT(_ARG)/
+- [x] compile: OP_MARK/OP_PRUNE(_ARG)/OP_SKIP(_ARG)/OP_THEN(_ARG)/OP_COMMIT(_ARG)/
   OP_ACCEPT/OP_FAIL emission; \K → OP_SET_SOM + error 199 check
   (pcre2_compile.c: verb arms in compile_branch 6812-8370)
 - [ ] match: verb opcodes + backtrack-verb semantics threaded through the frame unwind

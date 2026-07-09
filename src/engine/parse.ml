@@ -2151,6 +2151,29 @@ let nsf_reset = 0x0001
 let nsf_condassert = 0x0002
 let nsf_atomicsr = 0x0004
 
+(* pcre2_compile.c:596-631 — table of special "verbs" like ( *PRUNE). This
+   is a short table, so it is searched linearly. The C keeps the names in
+   one \0-separated string (verbnames) with per-entry lengths in verbs;
+   OCaml string literals carry their own lengths, so each entry is
+   (name, base META code, has_arg). Order preserved. The empty name is a
+   shorthand for MARK. has_arg: > 0 => must have an argument; < 0 =>
+   optional argument, convert to pre-MARK; 0 => optional argument; bump
+   the META code if found. *)
+let verbs : (string * int * int) array =
+  [|
+    ("", meta_mark, 1);
+    ("MARK", meta_mark, 1);
+    ("ACCEPT", meta_accept, -1);
+    ("F", meta_fail, -1);
+    ("FAIL", meta_fail, -1);
+    ("COMMIT", meta_commit, 0);
+    ("PRUNE", meta_prune, 0);
+    ("SKIP", meta_skip, 0);
+    ("THEN", meta_then, 0);
+  |]
+
+let verbcount = Array.length verbs
+
 (* pcre2_compile.c:639-685 — table of "alpha assertions" like ( *pla:...),
    similar to the ( *VERB) table. The C keeps the names in one \0-separated
    string (alasnames) with per-entry lengths in alasmeta; OCaml string
@@ -2230,13 +2253,11 @@ exception Goto_failed
    parentheses, quantifiers * + ? {n,m} with their lazy/possessive
    modifiers, named-group definitions (?<name> (?'name' (?P<name> with the
    named-group list, (?P=name) named references, alternation, group close,
-   and the end-of-pattern epilogue) and character classes (parse_regex B:
+   and the end-of-pattern epilogue), character classes (parse_regex B:
    POSIX class items with their UCP substitutions, literals, ranges and
-   in-class escapes). Arms marked "deferred" fail loudly with
-   err_deferred until their chunks land; the verb-name locals
-   (verblengthptr/verbnamestart, add_after_mark) and the inverbname
-   accumulator block (pcre2_compile.c:2941-3039) are deferred with those
-   arms.
+   in-class escapes) and the ( *VERB)/( *VERB:NAME) arm with its
+   inverbname accumulator block (pcre2_compile.c:2941-3039). Arms marked
+   "deferred" fail loudly with err_deferred until their chunks land.
 
    Arguments:
      cx              compile block; parsing starts at cx.ptr and the parsed
@@ -2257,12 +2278,18 @@ let parse_regex (cx : parse_context) ~(options : int)
      locals belong to deferred arms). *)
   let previous_callout = ref (-1) in
   (* uint32_t *previous_callout = NULL *)
-  (* pcre2_compile.c:2780 — uint32_t *verbstartptr = NULL, as an index into
-     the parsed pattern with -1 for NULL. It is set only by the ( *VERB) arm
-     (M5); until that chunk lands its one reader (the META_ACCEPT block in
-     CHECK_QUANTIFIER) is unreachable, because META_ACCEPT is never
-     emitted. *)
+  (* pcre2_compile.c:2780-2781 — uint32_t *verblengthptr / *verbstartptr =
+     NULL, as indices into the parsed pattern with -1 for NULL. Set by the
+     ( *VERB) arm; verblengthptr is filled in by the inverbname block when
+     the closing parenthesis is reached, verbstartptr is read by the
+     META_ACCEPT block in CHECK_QUANTIFIER. *)
+  let verblengthptr = ref (-1) in
   let verbstartptr = ref (-1) in
+  (* pcre2_compile.c:2806 — PCRE2_SPTR verbnamestart = NULL, as a pattern
+     index with -1 for NULL. *)
+  let verbnamestart = ref (-1) in
+  (* pcre2_compile.c:2788 — uint32_t add_after_mark = 0. *)
+  let add_after_mark = ref 0 in
   let pp = ref 0 in
   (* parsed_pattern = cb->parsed_pattern, as an index *)
   let this_parsed_item = ref (-1) in
@@ -2684,10 +2711,98 @@ let parse_regex (cx : parse_context) ~(options : int)
                meta_quantifier := 0);
              raise_notrace Loop_continue (* Next character *));
 
-           (* pcre2_compile.c:2941-3039 — the ( *VERB:NAME) name accumulator
-              block. inverbname is set only by the deferred ( *VERB) arm
-              (M5), so this block is deferred with it and is unreachable
-              here. *)
+           (* pcre2_compile.c:2941-3039 — if we are processing the "name"
+              part of a ( *VERB:NAME) item, all characters up to the closing
+              parenthesis are literals except when PCRE2_ALT_VERBNAMES is
+              set. That causes backslash interpretation, but only \Q and \E
+              and escaped characters are allowed (no character types such as
+              \d). If PCRE2_EXTENDED is also set, we must ignore white space
+              and # comments. Do this by not entering the special
+              ( *VERB:NAME) processing - they are then picked up below. Note
+              that c is a character, not a code unit. *)
+           if
+             !inverbname
+             && ((* EITHER: not both options set
+                    (pcre2_compile.c:2953-2955) *)
+                 (not
+                    (Int.equal
+                       (!options
+                       land (Options.extended lor Options.alt_verbnames))
+                       (Options.extended lor Options.alt_verbnames)))
+                (* OR: character > 255 AND not Unicode Pattern White Space
+                   (pcre2_compile.c:2957-2958); c > 255 is unreachable until
+                   UTF decode lands (M6). *)
+                || !c > 255
+                   && (not (Int.equal (!c lor 1) 0x200f))
+                   && not (Int.equal (!c lor 1) 0x2029)
+                (* OR: not a # comment or isspace() white space, and not
+                   CHAR_NEL when Unicode is supported
+                   (pcre2_compile.c:2960-2966) *)
+                || !c < 256
+                   && (not (Int.equal !c (Char.code '#')))
+                   && Int.equal
+                        (Chartables.ctypes !c land Chartables.ctype_space)
+                        0
+                   && not (Int.equal !c 0x85 (* CHAR_NEL *)))
+           then (
+             (* switch(c) (pcre2_compile.c:2970-3037) *)
+             if Int.equal !c (Char.code ')') then (
+               (* pcre2_compile.c:2979-3001 *)
+               inverbname := false;
+               (* This is the length in characters *)
+               let verbnamelength = !pp - !verblengthptr - 1 in
+               (* But the limit on the length is in code units *)
+               if !ptr - !verbnamestart - 1 > Limits.max_mark then (
+                 decr ptr;
+                 cx.errorcode <- Errors.err76;
+                 raise_notrace Goto_failed);
+               buf.(!verblengthptr) <- verbnamelength;
+
+               (* If this name was on a verb such as ( *ACCEPT) which does
+                  not continue, a ( *MARK) was generated for the name. We
+                  now add the original verb as the next item
+                  (pcre2_compile.c:2992-3000). *)
+               if not (Int.equal !add_after_mark 0) then (
+                 buf.(!pp) <- !add_after_mark;
+                 incr pp;
+                 add_after_mark := 0))
+             else if Int.equal !c 0x5c (* CHAR_BACKSLASH *) then
+               (* pcre2_compile.c:3003-3010 *)
+               let escape =
+                 if not (Int.equal (!options land Options.alt_verbnames) 0) then (
+                   let e =
+                     check_escape cx ptr c ~options:!options ~xoptions:!xoptions
+                       ~isclass:false (Some cx)
+                   in
+                   if not (Int.equal cx.errorcode 0) then
+                     raise_notrace Goto_failed;
+                   e)
+                 else 0 (* Treat all as literal *)
+               in
+
+               (* switch(escape) (pcre2_compile.c:3012-3036) *)
+               if Int.equal escape 0 then (
+                 (* Don't use parsed_literal (PARSED_LITERAL) because it
+                    sets okquantifier (pcre2_compile.c:3014-3019). *)
+                 buf.(!pp) <- !c;
+                 incr pp)
+               else if Int.equal escape esc_ub then (
+                 (* pcre2_compile.c:3021-3024 *)
+                 buf.(!pp) <- Char.code 'u';
+                 incr pp;
+                 parsed_literal (Char.code '{'))
+               else if Int.equal escape esc_big_q then inescq := true
+               else if Int.equal escape esc_big_e then () (* Ignore *)
+               else (
+                 cx.errorcode <- Errors.err40 (* Invalid in verb name *);
+                 raise_notrace Goto_failed)
+             else (
+               (* The C switch's default case, first in the source
+                  (pcre2_compile.c:2972-2977) — don't use parsed_literal
+                  (PARSED_LITERAL) because it sets okquantifier. *)
+               buf.(!pp) <- !c;
+               incr pp);
+             raise_notrace Loop_continue (* Next character in pattern *));
 
            (* pcre2_compile.c:3041-3054 — not a verb name character. Process
               \Q and \E here, so that an item such as A\Q\E+ is treated as
@@ -2860,9 +2975,7 @@ let parse_regex (cx : parse_context) ~(options : int)
                 negated ( *COMMIT). We therefore allow ( *ACCEPT) to be
                 quantified by wrapping it in non-capturing brackets, but we
                 have to allow for a preceding ( *MARK) for when ( *ACCEPT)
-                has an argument. META_ACCEPT is emitted (and verbstartptr
-                set) only by the ( *VERB) arm, so this block is unreachable
-                until that chunk lands (M5). *)
+                has an argument. *)
              (* safe: prev_okquantifier guarantees a previous item
                 (pcre2_compile.c:3454-3455), so prev_parsed_item >= 0. *)
              if Int.equal buf.(!prev_parsed_item) meta_accept then (
@@ -3601,7 +3714,7 @@ let parse_regex (cx : parse_context) ~(options : int)
                (* If ( is not followed by ? it is either a capture or a
                   special verb or an alpha assertion or a positive
                   non-atomic lookahead (pcre2_compile.c:3923-3926). *)
-               if not (Char.equal pat.[!ptr] '?') then
+               if not (Char.equal pat.[!ptr] '?') then (
                  if not (Char.equal pat.[!ptr] '*') then (
                    (* pcre2_compile.c:3930-3947 — handle capturing brackets
                       (or non-capturing if auto-capture is turned off). *)
@@ -3722,11 +3835,104 @@ let parse_regex (cx : parse_context) ~(options : int)
                      (* pcre2_compile.c:4007-4009 *)
                      cx.errorcode <- Errors.err89;
                      raise_notrace Goto_failed))
-                 else (
-                   (* pcre2_compile.c:4063-4152 — ( *VERB) and ( *VERB:NAME):
-                      deferred (M5). *)
-                   cx.errorcode <- err_deferred;
-                   raise_notrace Goto_failed)
+                 else
+                   (* ---- Handle ( *VERB) and ( *VERB:NAME) ----
+                      pcre2_compile.c:4064-4076 *)
+                   let offset = ref 0 in
+                   let name = ref 0 in
+                   let namelen = ref 0 in
+                   if
+                     not
+                       (read_name cx ptr ~utf ~terminator:0 offset name namelen)
+                   then raise_notrace Goto_failed;
+                   if
+                     !ptr >= cx.ptrend
+                     || (not (Char.equal pat.[!ptr] ':'))
+                        && not (Char.equal pat.[!ptr] ')')
+                   then (
+                     cx.errorcode <- Errors.err60 (* Malformed *);
+                     raise_notrace Goto_failed);
+
+                   (* pcre2_compile.c:4078-4092 — scan the table of verb
+                      names. *)
+                   let i = ref 0 in
+                   while
+                     !i < verbcount
+                     && not
+                          (let vname, _, _ = verbs.(!i) in
+                           Int.equal !namelen (String.length vname)
+                           && strncmp_c8_eq pat !name vname !namelen)
+                   do
+                     incr i
+                   done;
+                   if !i >= verbcount then (
+                     cx.errorcode <- Errors.err60 (* Verb not recognized *);
+                     raise_notrace Goto_failed);
+                   let _, verb_meta, verb_has_arg = verbs.(!i) in
+
+                   (* pcre2_compile.c:4094-4098 — an empty argument is
+                      treated as no argument. *)
+                   if
+                     Char.equal pat.[!ptr] ':'
+                     && !ptr + 1 < cx.ptrend
+                     && Char.equal pat.[!ptr + 1] ')'
+                   then incr ptr (* Advance to the closing parens *);
+
+                   (* pcre2_compile.c:4100-4106 — check for mandatory
+                      non-empty argument; this is ( *MARK). *)
+                   if verb_has_arg > 0 && not (Char.equal pat.[!ptr] ':') then (
+                     cx.errorcode <- Errors.err66;
+                     raise_notrace Goto_failed);
+
+                   (* pcre2_compile.c:4108-4112 — remember where this verb,
+                      possibly with a preceding ( *MARK), starts, for
+                      handling quantified ( *ACCEPT). *)
+                   verbstartptr := !pp;
+                   okquantifier := Int.equal verb_meta meta_accept;
+
+                   (* pcre2_compile.c:4114-4151 — it appears that Perl
+                      allows any characters whatsoever, other than a closing
+                      parenthesis, to appear in arguments ("names"), so we
+                      no longer insist on letters, digits, and underscores.
+                      Perl does not, however, do any interpretation within
+                      arguments, and has no means of including a closing
+                      parenthesis. PCRE supports escape processing but only
+                      when it is requested by an option. We set inverbname
+                      true here, and let the main loop take care of this so
+                      that escape and \x processing is done by the main code
+                      above. The C's `if ( *ptr++ == CHAR_COLON)` reads the
+                      delimiter, then skips past it. *)
+                   let was_colon = Char.equal pat.[!ptr] ':' in
+                   incr ptr (* Skip past : or ) *);
+                   if was_colon then (
+                     (* Some optional arguments can be treated as a
+                        preceding ( *MARK) (pcre2_compile.c:4125-4131) *)
+                     if verb_has_arg < 0 then (
+                       add_after_mark := verb_meta;
+                       buf.(!pp) <- meta_mark;
+                       incr pp)
+                     else (
+                       (* The remaining verbs with arguments (except *MARK)
+                          need a different opcode
+                          (pcre2_compile.c:4133-4140). *)
+                       buf.(!pp) <-
+                         (verb_meta
+                         +
+                         if not (Int.equal verb_meta meta_mark) then 0x0001_0000
+                         else 0);
+                       incr pp);
+
+                     (* Set up for reading the name in the main loop
+                        (pcre2_compile.c:4142-4147). *)
+                     verblengthptr := !pp;
+                     incr pp;
+                     verbnamestart := !ptr;
+                     inverbname := true)
+                   else (
+                     (* No verb "name" argument
+                        (pcre2_compile.c:4148-4151) *)
+                     buf.(!pp) <- verb_meta;
+                     incr pp) (* End of ( *VERB) handling *))
                else (
                  (* ---- Items starting (? ---- pcre2_compile.c:4157-4167.
                     The type of item is determined by what follows (?.
@@ -5281,11 +5487,65 @@ let () =
   (* Recursions are quantifiable (okquantifier = TRUE). *)
   expect "(?R)?" [| meta_recurse; 3; meta_query; meta_end |];
 
+  (* ( *VERB) and ( *VERB:NAME) (pcre2_compile.c:596-631, 2941-3039,
+     4064-4152). *)
+  expect "(*FAIL)" [| meta_fail; meta_end |];
+  expect "(*F)" [| meta_fail; meta_end |];
+  expect "a(*COMMIT)b" [| 0x61; meta_commit; 0x62; meta_end |];
+  expect "(*SKIP)a" [| meta_skip; 0x61; meta_end |];
+  expect "(*THEN)a|b" [| meta_then; 0x61; meta_alt; 0x62; meta_end |];
+  expect "a(*ACCEPT)b" [| 0x61; meta_accept; 0x62; meta_end |];
+  (* MARK and the arg-taking forms: META word, length word, name chars. *)
+  expect "(*MARK:x)a" [| meta_mark; 1; 0x78; 0x61; meta_end |];
+  expect "(*:ab)" [| meta_mark; 2; 0x61; 0x62; meta_end |];
+  expect "(*PRUNE:n)a" [| meta_prune_arg; 1; 0x6e; 0x61; meta_end |];
+  expect "(*SKIP:n)a" [| meta_skip_arg; 1; 0x6e; 0x61; meta_end |];
+  expect "(*THEN:n)a" [| meta_then_arg; 1; 0x6e; 0x61; meta_end |];
+  expect "(*COMMIT:n)a" [| meta_commit_arg; 1; 0x6e; 0x61; meta_end |];
+  (* An empty argument is treated as no argument
+     (pcre2_compile.c:4094-4098). *)
+  expect "(*COMMIT:)a" [| meta_commit; 0x61; meta_end |];
+  (* ( *ACCEPT:x) converts the argument to a preceding ( *MARK)
+     (pcre2_compile.c:4125-4131, 2992-3000). *)
+  expect "(*ACCEPT:x)y" [| meta_mark; 1; 0x78; meta_accept; 0x79; meta_end |];
+  (* Quantified ( *ACCEPT) is wrapped in non-capturing brackets, allowing
+     for a preceding ( *MARK) (pcre2_compile.c:3464-3477). *)
+  expect "a(*ACCEPT)?"
+    [| 0x61; meta_nocapture; meta_accept; meta_ket; meta_query; meta_end |];
+  expect "(*ACCEPT:x)+"
+    [|
+      meta_nocapture;
+      meta_mark;
+      1;
+      0x78;
+      meta_accept;
+      meta_ket;
+      meta_plus;
+      meta_end;
+    |];
+  (* Verb-name escape rules: backslash is literal unless
+     PCRE2_ALT_VERBNAMES is set; then only \Q\E and escaped data
+     characters are allowed (pcre2_compile.c:3003-3036). *)
+  (* Without ALT_VERBNAMES the backslash is a literal name character: the
+     name is "a\d", three characters. *)
+  expect "(*MARK:a\\d)b" [| meta_mark; 3; 0x61; 0x5c; 0x64; 0x62; meta_end |];
+  expect ~options:Options.alt_verbnames "(*MARK:a\\n)b"
+    [| meta_mark; 2; 0x61; 0x0a; 0x62; meta_end |];
+  expect ~options:Options.alt_verbnames "(*MARK:a\\Qb)c\\Ed)e"
+    [| meta_mark; 5; 0x61; 0x62; 0x29; 0x63; 0x64; 0x65; meta_end |];
+  expect_err ~options:Options.alt_verbnames "(*MARK:a\\d)" Errors.err40 10;
+  (* Error sites: ERR66 (mandatory argument), ERR60 (malformed /
+     unrecognized), ERR76 (name too long, > MAX_MARK code units). *)
+  expect_err "(*MARK)" Errors.err66 6;
+  expect_err "(*MARK:)" Errors.err66 7;
+  expect_err "(*JUNK)" Errors.err60 6;
+  expect_err "(*MARK:ab" Errors.err60 9;
+  expect_err ("(*MARK:" ^ String.make 256 'a' ^ ")") Errors.err76 263;
+
   (* Deferred arms fail loudly with the placeholder code (never a real
      PCRE2 error number). *)
   assert (err_deferred > 201);
   expect_err "(*script_run:a)" err_deferred 12 (* script runs: M8 *);
-  expect_err "(*FAIL)" err_deferred 1 (* verbs: M5 *);
   expect_err "\\p{L}" err_deferred 2 (* properties: M7 *)
 
 (* is_newline_at over the non-fixed newline types (PRIV(is_newline),

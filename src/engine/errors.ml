@@ -81,6 +81,9 @@ let err36 =
 let err37 =
   compile_error_base + 37 (* \F, \L, \l, \N{name}, \U, \u unsupported *)
 
+let err40 =
+  compile_error_base + 40 (* invalid escape sequence in ( *VERB) name *)
+
 let err41 = compile_error_base + 41 (* unrecognized character after (?P *)
 let err42 = compile_error_base + 42 (* syntax error in subpattern name *)
 
@@ -127,6 +130,7 @@ let err64 = compile_error_base + 64 (* non-octal character in \o{} *)
 let err65 =
   compile_error_base + 65 (* different names for subpatterns of same number *)
 
+let err66 = compile_error_base + 66 (* ( *MARK) must have an argument *)
 let err67 = compile_error_base + 67 (* non-hex character in \x{} *)
 let err68 = compile_error_base + 68 (* \c must be followed by printable ASCII *)
 
@@ -146,6 +150,10 @@ let err74 =
 
 let err75 =
   compile_error_base + 75 (* using UCP is disabled by the application *)
+
+let err76 =
+  compile_error_base
+  + 76 (* name too long in ( *MARK)/( *PRUNE)/( *SKIP)/( *THEN) *)
 
 let err77 =
   compile_error_base + 77 (* code point in \u.... sequence too large *)
