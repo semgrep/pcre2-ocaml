@@ -883,12 +883,57 @@ let make_context (pattern : string) : parse_context =
 
 (* pcre2_internal.h:494-506 — IS_NEWLINE(p), with NLBLOCK = cb and
    PSEND = end_pattern as pcre2_compile.c sets them up. The non-FIXED arm
-   calls PRIV(is_newline) (pcre2_newline.c), which is the newline.ml chunk;
-   nothing can set a non-fixed nltype until the compile-context plumbing
-   lands, so that arm fails loudly instead of guessing. *)
+   is the macro's `(p) < PSEND && PRIV(is_newline)(p, nltype, PSEND,
+   &nllen, utf)` with PRIV(is_newline) (pcre2_newline.c:78-145) inlined
+   for this parse-time check; like the C, it writes the matched newline's
+   length into cx.nllen (the caller advances by it). This is the 8-bit
+   NON-UTF instantiation: parse cannot run in UTF mode until M6 (the
+   pcre2_compile driver defers UTF before parse_regex), so c is always a
+   single code unit — the GETCHAR decode (pcre2_newline.c:85) and the
+   utf-dependent arms (NEL length 2, U+2028/U+2029 length 3,
+   pcre2_newline.c:123-131) are unreachable until utf.ml lands. The
+   match-phase newline.ml chunk (pcre2_newline.c over subjects) should
+   consolidate is_newline/was_newline; this stays the compile-side view. *)
 let is_newline_at (cx : parse_context) (p : int) : bool =
   if not (Int.equal cx.nltype nltype_fixed) then
-    failwith "Parse.is_newline_at: NLTYPE_ANY/ANYCRLF pending newline.ml"
+    p < cx.ptrend
+    &&
+    let c = Char.code cx.pattern.[p] in
+    if Int.equal cx.nltype nltype_anycrlf then
+      (* pcre2_newline.c:91-103 — NLTYPE_ANYCRLF *)
+      if Int.equal c 0x0a (* CHAR_LF *) then (
+        cx.nllen <- 1;
+        true)
+      else if Int.equal c 0x0d (* CHAR_CR *) then (
+        (* pcre2_newline.c:98 — ptr < endptr - 1 && ptr[1] == CHAR_LF *)
+        cx.nllen <-
+          (if
+             p < cx.ptrend - 1 && Int.equal (Char.code cx.pattern.[p + 1]) 0x0a
+           then 2
+           else 1);
+        true)
+      else false
+    else if
+      (* pcre2_newline.c:107-144 — NLTYPE_ANY. Non-UTF 8-bit: LF, VT, FF,
+         CR(LF) and NEL (0x85, length 1); 0x2028/0x2029 cannot match a
+         single code unit. *)
+      Int.equal c 0x0a (* CHAR_LF *)
+      || Int.equal c 0x0b (* CHAR_VT *)
+      || Int.equal c 0x0c (* CHAR_FF *)
+    then (
+      cx.nllen <- 1;
+      true)
+    else if Int.equal c 0x0d (* CHAR_CR *) then (
+      (* pcre2_newline.c:119 *)
+      cx.nllen <-
+        (if p < cx.ptrend - 1 && Int.equal (Char.code cx.pattern.[p + 1]) 0x0a
+         then 2
+         else 1);
+      true)
+    else if Int.equal c 0x85 (* CHAR_NEL *) then (
+      cx.nllen <- 1 (* pcre2_newline.c:125 — utf? 2 : 1, and utf is false *);
+      true)
+    else false
   else
     p <= cx.ptrend - cx.nllen
     && Int.equal (Char.code cx.pattern.[p]) cx.nl0
@@ -4591,3 +4636,36 @@ let () =
   expect_err "\\p{L}" err_deferred 2 (* properties: M7 *);
   expect_err "\\g<1>" err_deferred 4 (* subroutine calls: M5 *);
   expect_err "\\g'n'" err_deferred 5 (* subroutine calls: M5 *)
+
+(* is_newline_at over the non-fixed newline types (PRIV(is_newline),
+   pcre2_newline.c:78-145, non-UTF 8-bit arm): NLTYPE_ANY matches LF, VT,
+   FF, CR (length 2 before LF, else 1) and NEL 0x85; NLTYPE_ANYCRLF
+   matches only CR, LF, CRLF — in particular NOT NEL. *)
+let () =
+  let probe nltype pat p =
+    let cx = make_context pat in
+    cx.nltype <- nltype;
+    let hit = is_newline_at cx p in
+    (hit, cx.nllen)
+  in
+  (* ANY: NEL (0x85) is a newline of length 1. *)
+  (match probe nltype_any "a\x85b" 1 with
+  | true, 1 -> ()
+  | _ -> assert false);
+  (* ANYCRLF: NEL is NOT a newline. *)
+  (match probe nltype_anycrlf "a\x85b" 1 with
+  | false, _ -> ()
+  | _ -> assert false);
+  (* ANY: VT / FF length 1; CRLF length 2; lone CR at end length 1. *)
+  (match probe nltype_any "\x0b" 0 with true, 1 -> () | _ -> assert false);
+  (match probe nltype_any "\x0c" 0 with true, 1 -> () | _ -> assert false);
+  (match probe nltype_any "\r\na" 0 with true, 2 -> () | _ -> assert false);
+  (match probe nltype_any "a\r" 1 with true, 1 -> () | _ -> assert false);
+  (* ANYCRLF: LF 1, CRLF 2; VT is not a newline. *)
+  (match probe nltype_anycrlf "\n" 0 with true, 1 -> () | _ -> assert false);
+  (match probe nltype_anycrlf "\r\n" 0 with true, 2 -> () | _ -> assert false);
+  (match probe nltype_anycrlf "\x0b" 0 with
+  | false, _ -> ()
+  | _ -> assert false);
+  (* p at/after ptrend: the IS_NEWLINE macro's (p) < PSEND guard. *)
+  match probe nltype_any "a" 1 with false, _ -> () | _ -> assert false

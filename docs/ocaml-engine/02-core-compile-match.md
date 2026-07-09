@@ -57,8 +57,14 @@ Compile phase (`compile.ml` ← pcre2_compile.c back half):
   (pcre2_compile.c:8050-8370, minus backref/recursion arms → M2/M4)
 - [x] compile_regex + branch linking (core 8345-8646 absorbed by chunk D; tail 8650-9390 rides with the driver chunk), OP_ALT/OP_KET chains, first/req cu seed
   (pcre2_compile.c:8378-9390)
-- [ ] pcre2_compile top-level: two-pass driver, workspace, error offset tracking,
-  anchoring flags, name-table finalization (pcre2_compile.c:10126-11001)
+- [x] pcre2_compile top-level: (this commit) two-pass driver, workspace, error offset
+  tracking, anchoring flags, name-table finalization
+  (pcre2_compile.c:10096-10993 + pso table 819-859 + option masks 766-792;
+  tail utilities is_anchored/is_startline 8650-8901, find_firstassertedcu
+  9053-9158, add_name_to_table 9162-9219; find_recurse fixup loop → M5,
+  check_lookbehinds → M3, auto_possessify → M9, study → M5/M9, valid_utf →
+  M6 — all with loud in-driver notes; engine.ml compile/compile_ctx/info/
+  capture_groups wired to the real pipeline, exec still Error -44)
 
 Match phase (`interpreter.ml`, `frames.ml`, `newline.ml`):
 - [ ] newline.ml (pcre2_newline.c:1-243)

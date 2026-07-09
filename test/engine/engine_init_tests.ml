@@ -6,6 +6,7 @@ let () =
   ignore (Sys.opaque_identity Pcre2_engine.Compile.compile_work_size);
   ignore (Sys.opaque_identity Pcre2_engine.Opcodes.op_table_length);
   ignore (Sys.opaque_identity (Pcre2_engine.Errors.message 114));
+  ignore (Sys.opaque_identity Pcre2_engine.Engine.version);
   ignore (Sys.opaque_identity (Pcre2_engine.Chartables.lcc (Char.code 'A')));
   ignore (Sys.opaque_identity Pcre2_engine.Ucd_tables.ucd_block_size);
   print_endline "engine module-init asserts: OK"

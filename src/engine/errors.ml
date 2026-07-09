@@ -47,10 +47,15 @@ let err13 =
 
 let err14 = compile_error_base + 14 (* missing closing parenthesis *)
 let err15 = compile_error_base + 15 (* reference to non-existent subpattern *)
+
+let err17 =
+  compile_error_base + 17 (* unrecognised compile-time option bit(s) *)
+
 let err18 = compile_error_base + 18 (* missing ) after (?# comment *)
 let err19 = compile_error_base + 19 (* parentheses are too deeply nested *)
 let err20 = compile_error_base + 20 (* regular expression is too large *)
 let err22 = compile_error_base + 22 (* unmatched closing parenthesis *)
+let err23 = compile_error_base + 23 (* internal error: code overflow *)
 let err26 = compile_error_base + 26 (* a relative value of zero not allowed *)
 let err28 = compile_error_base + 28 (* assertion expected after (?( or (?(?C) *)
 let err30 = compile_error_base + 30 (* unknown POSIX class name *)
@@ -81,6 +86,10 @@ let err53 =
   + 53 (* internal error: previously-checked referenced subpattern not found *)
 
 let err55 = compile_error_base + 55 (* missing opening brace after \o *)
+
+let err56 =
+  compile_error_base + 56 (* internal error: unknown newline setting *)
+
 let err57 = compile_error_base + 57 (* \g not followed by name/number *)
 let err60 = compile_error_base + 60 (* ( *VERB) not recognized or malformed *)
 let err61 = compile_error_base + 61 (* subpattern number is too big *)
@@ -105,6 +114,12 @@ let err71 = compile_error_base + 71 (* \N is not supported in a class *)
 let err73 =
   compile_error_base + 73 (* disallowed Unicode code point (surrogate) *)
 
+let err74 =
+  compile_error_base + 74 (* using UTF is disabled by the application *)
+
+let err75 =
+  compile_error_base + 75 (* using UCP is disabled by the application *)
+
 let err77 =
   compile_error_base + 77 (* code point in \u.... sequence too large *)
 
@@ -119,13 +134,21 @@ let err84 =
 
 let err86 = compile_error_base + 86 (* regular expression is too complicated *)
 
+let err88 =
+  compile_error_base + 88 (* pattern string longer than application limit *)
+
 let err89 =
   compile_error_base + 89 (* internal error: unknown code in parsed pattern *)
+
+let err92 = compile_error_base + 92 (* invalid option bits with PCRE2_LITERAL *)
 
 let err93 = compile_error_base + 93 (* \N{U+dddd} only in Unicode (UTF) mode *)
 let err94 = compile_error_base + 94 (* invalid hyphen in option setting *)
 let err97 = compile_error_base + 97 (* too many capturing groups (max 65535) *)
 let err99 = compile_error_base + 99 (* \K is not allowed in lookarounds *)
+
+let err101 =
+  compile_error_base + 101 (* compiled pattern longer than application limit *)
 
 (* "Expected" matching error codes: pcre2.h.generic:327-328. *)
 let error_nomatch = -1
