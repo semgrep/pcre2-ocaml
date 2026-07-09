@@ -5,7 +5,7 @@
    meta_extra_lengths), the parse-phase helpers (read_number,
    read_repeat_counts, check_posix_syntax, check_posix_name, read_name,
    check_escape, handle_escdsw, manage_callouts), parse_context, and
-   parse_regex itself (assertion/conditional/recursion/verb/callout and
+   parse_regex itself (conditional/recursion/verb/callout, script-run and
    \p arms still deferred per docs/ocaml-engine/02-core-compile-match.md).
 
    The pattern is a `string` of 8-bit code units (this port is the 8-bit
@@ -2151,6 +2151,34 @@ let nsf_reset = 0x0001
 let nsf_condassert = 0x0002
 let nsf_atomicsr = 0x0004
 
+(* pcre2_compile.c:639-685 — table of "alpha assertions" like ( *pla:...),
+   similar to the ( *VERB) table. The C keeps the names in one \0-separated
+   string (alasnames) with per-entry lengths in alasmeta; OCaml string
+   literals carry their own lengths, so each entry is (name, base META
+   code). Order preserved. *)
+let alasmeta : (string * int) array =
+  [|
+    ("pla", meta_lookahead);
+    ("plb", meta_lookbehind);
+    ("napla", meta_lookahead_na);
+    ("naplb", meta_lookbehind_na);
+    ("nla", meta_lookaheadnot);
+    ("nlb", meta_lookbehindnot);
+    ("positive_lookahead", meta_lookahead);
+    ("positive_lookbehind", meta_lookbehind);
+    ("non_atomic_positive_lookahead", meta_lookahead_na);
+    ("non_atomic_positive_lookbehind", meta_lookbehind_na);
+    ("negative_lookahead", meta_lookaheadnot);
+    ("negative_lookbehind", meta_lookbehindnot);
+    ("atomic", meta_atomic);
+    ("sr", meta_script_run);
+    ("asr", meta_atomic_script_run);
+    ("script_run", meta_script_run);
+    ("atomic_script_run", meta_atomic_script_run);
+  |]
+
+let alascount = Array.length alasmeta
+
 (* pcre2_compile.c:2751-2754 — states used for analyzing ranges in character
    classes. The two OK values must be last. *)
 let range_no = 0
@@ -2174,12 +2202,11 @@ let parse_tracked_extra_options =
   lor Options.extra_ascii_digit lor Options.extra_ascii_posix
 
 (* DEVIATION: distinctive placeholder error code for parse_regex arms that
-   are deferred to later chunks (lookarounds/atomic groups -> M4;
-   conditionals, recursion, subroutine calls, verbs and callouts -> M5;
-   \p and \P -> M7). PCRE2 compile
-   errors occupy 100..201, so 299 can never collide with a real result;
-   deferred constructs fail loudly instead of misparsing. Every use site
-   below carries a comment naming its chunk. *)
+   are deferred to later chunks (conditionals, recursion, subroutine calls,
+   verbs and callouts -> M5; \p and \P -> M7; script runs -> M8). PCRE2
+   compile errors occupy 100..201, so 299 can never collide with a real
+   result; deferred constructs fail loudly instead of misparsing. Every use
+   site below carries a comment naming its chunk. *)
 let err_deferred = 299
 
 (* Local control-flow exceptions for parse_regex (port-conventions §2:
@@ -2441,6 +2468,96 @@ let parse_regex (cx : parse_context) ~(options : int)
        if not (Int.equal (!options land Options.extended_more) 0) then
          options := !options lor Options.extended;
 
+       (* Shared goto targets of the lookaround/atomic-group arms below.
+          Each is reached both from its traditional symbolic form and from
+          the alpha-assertion dispatch (pcre2_compile.c:4005-4028), so the
+          labels become functions. prev_expect_cond_assert is a
+          per-iteration value (pcre2_compile.c:3168), passed in by the call
+          sites. *)
+
+       (* pcre2_compile.c:4741-4748 — the ATOMIC_GROUP label: come here
+          from ( *atomic: with ptr at the colon, or fall in from (?> with
+          ptr at '>'. *)
+       let atomic_group () =
+         buf.(!pp) <- meta_atomic;
+         incr pp;
+         nest_depth := !nest_depth + 1;
+         incr ptr
+       in
+
+       (* pcre2_compile.c:4797-4821 — the POST_ASSERTION label. If the
+          previous item was a condition starting (?(? an assertion,
+          optionally preceded by a callout, is expected. This is checked
+          later on, during actual compilation. However we need to identify
+          this kind of assertion in this pass because it must not be
+          qualified. The value of expect_cond_assert is set to 2 after (?(?
+          is processed. We decrement it for a callout - still leaving a
+          positive value that identifies the assertion. Multiple callouts
+          or any other items will make it zero or less, which doesn't
+          matter because they will cause an error later. *)
+       let post_assertion ~prev_expect_cond_assert =
+         nest_depth := !nest_depth + 1;
+         if prev_expect_cond_assert > 0 then (
+           if Int.equal !top_nest (-1) then top_nest := 0
+           else (
+             incr top_nest;
+             if !top_nest >= nest_slots then (
+               cx.errorcode <- Errors.err84;
+               raise_notrace Goto_failed));
+           let tn = nests.(!top_nest) in
+           tn.nest_depth <- !nest_depth;
+           tn.flags <- nsf_condassert;
+           tn.options <- !options land parse_tracked_options;
+           tn.xoptions <- !xoptions land parse_tracked_extra_options)
+       in
+
+       (* pcre2_compile.c:4753-4757 — the POSITIVE_LOOK_AHEAD label: come
+          here from ( *pla: with ptr at the colon, or fall in from (?= with
+          ptr at '='. *)
+       let positive_look_ahead ~prev_expect_cond_assert =
+         buf.(!pp) <- meta_lookahead;
+         incr pp;
+         incr ptr;
+         post_assertion ~prev_expect_cond_assert
+       in
+
+       (* pcre2_compile.c:4759-4763 — the POSITIVE_NONATOMIC_LOOK_AHEAD
+          label: come here from ( *napla: with ptr at the colon, or fall in
+          from (?* with ptr at '*'. *)
+       let positive_nonatomic_look_ahead ~prev_expect_cond_assert =
+         buf.(!pp) <- meta_lookahead_na;
+         incr pp;
+         incr ptr;
+         post_assertion ~prev_expect_cond_assert
+       in
+
+       (* pcre2_compile.c:4765-4769 — the NEGATIVE_LOOK_AHEAD label: come
+          here from ( *nla: with ptr at the colon, or fall in from (?! with
+          ptr at '!'. *)
+       let negative_look_ahead ~prev_expect_cond_assert =
+         buf.(!pp) <- meta_lookaheadnot;
+         incr pp;
+         incr ptr;
+         post_assertion ~prev_expect_cond_assert
+       in
+
+       (* pcre2_compile.c:4790-4795 — the POST_LOOKBEHIND label: come here
+          from ( *plb: ( *naplb: and ( *nlb: (with ptr backed up onto the
+          last name character) or fall in from (?< with ptr at '<'. The
+          lookbehind META has already been stored; record the pattern
+          offset of the assertion (for lookbehind-length error messages)
+          and fall through to POST_ASSERTION. *)
+       let post_lookbehind ~prev_expect_cond_assert =
+         has_lookbehind := true;
+         (* offset = ptr - cb->start_pattern - 2 (indices here are already
+            pattern offsets). *)
+         let offset = !ptr - 2 in
+         putoffset buf pp offset;
+         ptr := !ptr + 2;
+         (* Fall through *)
+         post_assertion ~prev_expect_cond_assert
+       in
+
        (* pcre2_compile.c:2862-2864 — now scan the pattern. *)
        while !ptr < cx.ptrend do
          try
@@ -2634,10 +2751,8 @@ let parse_regex (cx : parse_context) ~(options : int)
            (* pcre2_compile.c:3165-3177 — remember whether we are expecting
               a conditional assertion and the quantification status of the
               previous significant item, then set the defaults for this
-              item. prev_expect_cond_assert is consumed by the deferred
-              alpha-assertion and lookaround code (its underscore goes away
-              with those chunks, M4). *)
-           let _prev_expect_cond_assert = !expect_cond_assert in
+              item. *)
+           let prev_expect_cond_assert = !expect_cond_assert in
            expect_cond_assert := 0;
            let prev_okquantifier = !okquantifier in
            let prev_meta_quantifier = !meta_quantifier in
@@ -3451,12 +3566,96 @@ let parse_regex (cx : parse_context) ~(options : int)
                         land Chartables.ctype_lcletter)
                         0)
                  then (
-                   (* pcre2_compile.c:3955-4061 — "alpha assertions" such as
-                      ( *pla:...), ( *atomic:...) and ( *script_run:...):
-                      deferred (M4 lookarounds/atomic groups, M8 script
-                      runs). *)
-                   cx.errorcode <- err_deferred;
-                   raise_notrace Goto_failed)
+                   (* pcre2_compile.c:3955-3972 — handle "alpha assertions"
+                      such as ( *pla:...). Most of these are synonyms for
+                      the historical symbolic assertions, but the script
+                      run and non-atomic lookaround ones are new. They are
+                      distinguished by starting with a lower case letter.
+                      Checking both ends of the alphabet makes this work in
+                      all character codes. *)
+                   let offset = ref 0 in
+                   let name = ref 0 in
+                   let namelen = ref 0 in
+                   if
+                     not
+                       (read_name cx ptr ~utf ~terminator:0 offset name namelen)
+                   then raise_notrace Goto_failed;
+                   if !ptr >= cx.ptrend || not (Char.equal pat.[!ptr] ':') then (
+                     cx.errorcode <- Errors.err95 (* Malformed *);
+                     raise_notrace Goto_failed);
+
+                   (* pcre2_compile.c:3974-3988 — scan the table of alpha
+                      assertion names. *)
+                   let i = ref 0 in
+                   while
+                     !i < alascount
+                     && not
+                          (Int.equal !namelen
+                             (String.length (fst alasmeta.(!i)))
+                          && strncmp_c8_eq pat !name
+                               (fst alasmeta.(!i))
+                               !namelen)
+                   do
+                     incr i
+                   done;
+                   if !i >= alascount then (
+                     cx.errorcode <-
+                       Errors.err95 (* Alpha assertion not recognized *);
+                     raise_notrace Goto_failed);
+
+                   (* pcre2_compile.c:3990-4000 — check for expecting an
+                      assertion condition. If so, only atomic lookaround
+                      assertions are valid. *)
+                   let meta = snd alasmeta.(!i) in
+                   if
+                     prev_expect_cond_assert > 0
+                     && (meta < meta_lookahead || meta > meta_lookbehindnot)
+                   then (
+                     cx.errorcode <-
+                       (if
+                          Int.equal meta meta_lookahead_na
+                          || Int.equal meta meta_lookbehind_na
+                        then Errors.err98
+                        else Errors.err28)
+                     (* (Atomic) assertion expected *);
+                     raise_notrace Goto_failed);
+
+                   (* pcre2_compile.c:4002-4060 — the lookaround alphabetic
+                      synonyms can mostly be handled by jumping to the code
+                      that handles the traditional symbolic forms (the
+                      switch's default case — ERR89, "should never occur
+                      because the meta values come from a table above" — is
+                      the final else here). *)
+                   if Int.equal meta meta_atomic then atomic_group ()
+                   else if Int.equal meta meta_lookahead then
+                     positive_look_ahead ~prev_expect_cond_assert
+                   else if Int.equal meta meta_lookahead_na then
+                     positive_nonatomic_look_ahead ~prev_expect_cond_assert
+                   else if Int.equal meta meta_lookaheadnot then
+                     negative_look_ahead ~prev_expect_cond_assert
+                   else if
+                     Int.equal meta meta_lookbehind
+                     || Int.equal meta meta_lookbehindnot
+                     || Int.equal meta meta_lookbehind_na
+                   then (
+                     buf.(!pp) <- meta;
+                     incr pp;
+                     decr ptr;
+                     post_lookbehind ~prev_expect_cond_assert)
+                   else if
+                     Int.equal meta meta_script_run
+                     || Int.equal meta meta_atomic_script_run
+                   then (
+                     (* pcre2_compile.c:4030-4059 — ( *sr: ( *asr:
+                        ( *script_run: ( *atomic_script_run: — the script
+                        run facilities: deferred (M8,
+                        docs/ocaml-engine/08-ucp.md). *)
+                     cx.errorcode <- err_deferred;
+                     raise_notrace Goto_failed)
+                   else (
+                     (* pcre2_compile.c:4007-4009 *)
+                     cx.errorcode <- Errors.err89;
+                     raise_notrace Goto_failed))
                  else (
                    (* pcre2_compile.c:4063-4152 — ( *VERB) and ( *VERB:NAME):
                       deferred (M5). *)
@@ -3536,16 +3735,19 @@ let parse_regex (cx : parse_context) ~(options : int)
                      cx.errorcode <- err_deferred;
                      raise_notrace Goto_failed
                  | '>' ->
-                     (* pcre2_compile.c:4741-4747 — atomic groups: deferred
-                        (M4). *)
-                     cx.errorcode <- err_deferred;
-                     raise_notrace Goto_failed
-                 | '=' | '!' | '*' ->
-                     (* pcre2_compile.c:4750-4770 — lookahead assertions
-                        (including the (?* non-atomic form): deferred
-                        (M4). *)
-                     cx.errorcode <- err_deferred;
-                     raise_notrace Goto_failed
+                     (* ---- Atomic group ---- pcre2_compile.c:4741-4748 *)
+                     atomic_group ()
+                 | '=' ->
+                     (* ---- Lookahead assertions ----
+                        pcre2_compile.c:4753-4757 *)
+                     positive_look_ahead ~prev_expect_cond_assert
+                 | '*' ->
+                     (* pcre2_compile.c:4759-4763 — the (?* non-atomic
+                        form. *)
+                     positive_nonatomic_look_ahead ~prev_expect_cond_assert
+                 | '!' ->
+                     (* pcre2_compile.c:4765-4769 *)
+                     negative_look_ahead ~prev_expect_cond_assert
                  | '<' ->
                      (* ---- Lookbehind assertions ----
                         pcre2_compile.c:4774-4785 — (?< followed by = or !
@@ -3559,10 +3761,14 @@ let parse_regex (cx : parse_context) ~(options : int)
                      then define_name ~terminator:(Char.code '>')
                        (* goto DEFINE_NAME *)
                      else (
-                       (* pcre2_compile.c:4786-4820 — lookbehind assertions:
-                          deferred (M4). *)
-                       cx.errorcode <- err_deferred;
-                       raise_notrace Goto_failed)
+                       (* pcre2_compile.c:4786-4795 *)
+                       buf.(!pp) <-
+                         (if Char.equal pat.[!ptr + 1] '=' then meta_lookbehind
+                          else if Char.equal pat.[!ptr + 1] '!' then
+                            meta_lookbehindnot
+                          else meta_lookbehind_na);
+                       incr pp;
+                       post_lookbehind ~prev_expect_cond_assert)
                  | '\'' ->
                      (* ---- Define a named group ----
                         pcre2_compile.c:4824-4831 — a named group may be
@@ -4586,12 +4792,51 @@ let () =
   (* Named references are quantifiable. *)
   expect "(?P=n)?" [| meta_backref_byname; 1; 4; meta_query; meta_end |];
 
+  (* Lookaround assertions and atomic groups (pcre2_compile.c:3955-4061,
+     4741-4821): symbolic and alpha-assertion forms. The lookbehind forms
+     store the offset of the assertion start (for length-error messages)
+     and set has_lookbehind. *)
+  expect "(?=a)" [| meta_lookahead; 0x61; meta_ket; meta_end |];
+  expect "(?!a)" [| meta_lookaheadnot; 0x61; meta_ket; meta_end |];
+  expect "(?*a)" [| meta_lookahead_na; 0x61; meta_ket; meta_end |];
+  expect "(?>a)" [| meta_atomic; 0x61; meta_ket; meta_end |];
+  expect "(?<=a)" [| meta_lookbehind; 0; 0x61; meta_ket; meta_end |];
+  expect "(?<!a)" [| meta_lookbehindnot; 0; 0x61; meta_ket; meta_end |];
+  expect "(?<*a)" [| meta_lookbehind_na; 0; 0x61; meta_ket; meta_end |];
+  expect "x(?<=a)" [| 0x78; meta_lookbehind; 1; 0x61; meta_ket; meta_end |];
+  expect "(*pla:a)" [| meta_lookahead; 0x61; meta_ket; meta_end |];
+  expect "(*napla:a)" [| meta_lookahead_na; 0x61; meta_ket; meta_end |];
+  expect "(*negative_lookahead:a)"
+    [| meta_lookaheadnot; 0x61; meta_ket; meta_end |];
+  expect "(*atomic:a)" [| meta_atomic; 0x61; meta_ket; meta_end |];
+  (* Alpha lookbehinds: ptr is backed onto the last name character before
+     POST_LOOKBEHIND, so the stored offset is (colon index - 3). *)
+  expect "(*plb:a)" [| meta_lookbehind; 2; 0x61; meta_ket; meta_end |];
+  expect "(*nlb:a)" [| meta_lookbehindnot; 2; 0x61; meta_ket; meta_end |];
+  expect "(*naplb:a)" [| meta_lookbehind_na; 4; 0x61; meta_ket; meta_end |];
+  (let cx = make_context "(?<=a)" in
+   allocate_parsed_pattern cx ~options:0;
+   let hlb = ref false in
+   assert (Int.equal (parse_regex cx ~options:0 hlb) 0);
+   assert !hlb);
+  (let cx = make_context "(?=a)" in
+   allocate_parsed_pattern cx ~options:0;
+   let hlb = ref false in
+   assert (Int.equal (parse_regex cx ~options:0 hlb) 0);
+   assert (not !hlb));
+  (* Alpha-assertion error paths: ERR95 for a malformed or unrecognized
+     name (offsets verified against pcre2test 10.44: error 195 at offset
+     5 for both). *)
+  expect_err "(*plx:ab)" Errors.err95 5;
+  expect_err "(*pla|ab)" Errors.err95 5;
+  (* Unclosed assertion openers still fall out of the main loop as ERR14
+     via the nest_depth check. *)
+  expect_err "(?=a" Errors.err14 4;
+
   (* Deferred arms fail loudly with the placeholder code (never a real
      PCRE2 error number). *)
   assert (err_deferred > 201);
-  expect_err "(?=a)" err_deferred 2 (* lookaheads: M4 *);
-  expect_err "(?<=a)" err_deferred 2 (* lookbehinds: M4 *);
-  expect_err "(?>a)" err_deferred 2 (* atomic groups: M4 *);
+  expect_err "(*script_run:a)" err_deferred 12 (* script runs: M8 *);
   expect_err "(?(1)a)" err_deferred 2 (* conditionals: M5 *);
   expect_err "(?R)" err_deferred 2 (* recursion: M5 *);
   expect_err "(?P>n)" err_deferred 3 (* subroutine calls: M5 *);

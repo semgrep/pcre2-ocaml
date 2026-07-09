@@ -56,10 +56,18 @@ let err19 = compile_error_base + 19 (* parentheses are too deeply nested *)
 let err20 = compile_error_base + 20 (* regular expression is too large *)
 let err22 = compile_error_base + 22 (* unmatched closing parenthesis *)
 let err23 = compile_error_base + 23 (* internal error: code overflow *)
+
+let err25 =
+  compile_error_base + 25 (* length of lookbehind assertion is not limited *)
+
 let err26 = compile_error_base + 26 (* a relative value of zero not allowed *)
 let err28 = compile_error_base + 28 (* assertion expected after (?( or (?(?C) *)
 let err30 = compile_error_base + 30 (* unknown POSIX class name *)
 let err34 = compile_error_base + 34 (* code point in \x{} or \o{} too large *)
+let err35 = compile_error_base + 35 (* lookbehind is too complicated *)
+
+let err36 =
+  compile_error_base + 36 (* \C not allowed in lookbehind in UTF-8 mode *)
 
 let err37 =
   compile_error_base + 37 (* \F, \L, \l, \N{name}, \U, \u unsupported *)
@@ -109,6 +117,9 @@ let err68 = compile_error_base + 68 (* \c must be followed by printable ASCII *)
 let err69 =
   compile_error_base + 69 (* \k not followed by braced/bracketed name *)
 
+let err70 =
+  compile_error_base + 70 (* internal: unknown meta in check_lookbehinds() *)
+
 let err71 = compile_error_base + 71 (* \N is not supported in a class *)
 
 let err73 =
@@ -133,6 +144,7 @@ let err84 =
   compile_error_base + 84 (* (?| / (?J: / (?x: parens too deeply nested *)
 
 let err86 = compile_error_base + 86 (* regular expression is too complicated *)
+let err87 = compile_error_base + 87 (* lookbehind assertion is too long *)
 
 let err88 =
   compile_error_base + 88 (* pattern string longer than application limit *)
@@ -140,11 +152,23 @@ let err88 =
 let err89 =
   compile_error_base + 89 (* internal error: unknown code in parsed pattern *)
 
+let err90 =
+  compile_error_base + 90 (* internal error: bad code value in parsed_skip() *)
+
 let err92 = compile_error_base + 92 (* invalid option bits with PCRE2_LITERAL *)
 let err93 = compile_error_base + 93 (* \N{U+dddd} only in Unicode (UTF) mode *)
 let err94 = compile_error_base + 94 (* invalid hyphen in option setting *)
+let err95 = compile_error_base + 95 (* ( *alpha_assertion) not recognized *)
 let err97 = compile_error_base + 97 (* too many capturing groups (max 65535) *)
+
+let err98 =
+  compile_error_base + 98 (* atomic assertion expected after (?( or (?(?C) *)
+
 let err99 = compile_error_base + 99 (* \K is not allowed in lookarounds *)
+
+let err100 =
+  compile_error_base
+  + 100 (* branch too long in variable-length lookbehind assertion *)
 
 let err101 =
   compile_error_base + 101 (* compiled pattern longer than application limit *)

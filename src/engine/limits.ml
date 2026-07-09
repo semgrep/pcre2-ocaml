@@ -33,6 +33,11 @@ let max_repeat_count = 65535
    internal marker for an unbounded repeat. *)
 let repeat_unlimited = max_repeat_count + 1
 
+(* pcre2_intmodedep.h:609-618 — maximum lookbehind branch length
+   (characters): UINT16_MAX in 8-bit mode, because the length fits in the
+   16 data bits of a parsed-pattern META word and in an IMM2 operand. *)
+let lookbehind_max = 65535
+
 (* config.h.generic:263 — default maximum depth of nested parentheses. *)
 let parens_nest_limit = 250
 

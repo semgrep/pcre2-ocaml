@@ -2019,20 +2019,60 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
            loudly. *)
         errorcodeptr := Parse.err_deferred;
         return_from_branch 0)
-      else if
-        Int.equal meta Parse.meta_lookahead
-        || Int.equal meta Parse.meta_lookahead_na
-        || Int.equal meta Parse.meta_lookaheadnot
-        || Int.equal meta Parse.meta_lookbehind
-        || Int.equal meta Parse.meta_lookbehindnot
-        || Int.equal meta Parse.meta_lookbehind_na
-        || Int.equal meta Parse.meta_atomic
-        || Int.equal meta Parse.meta_script_run
-      then (
-        (* pcre2_compile.c:6747-6804 — lookarounds, atomic groups
-           (docs/ocaml-engine/04-lookaround-atomic-possessive.md) and
-           ( *script_run:) (docs/ocaml-engine/08-ucp.md). Deferred
-           loudly. *)
+      else if Int.equal meta Parse.meta_lookahead then (
+        (* pcre2_compile.c:6748-6755 — handle all kinds of nested bracketed
+           groups. The non-capturing, non-conditional cases are here;
+           others come to GROUP_PROCESS via goto. *)
+        cb.assert_depth <- cb.assert_depth + 1;
+        group_process ~note_group_empty:false ~bravalue:Opcodes.op_assert
+          ~skipunits:0)
+      else if Int.equal meta Parse.meta_lookahead_na then (
+        (* pcre2_compile.c:6757-6760 *)
+        cb.assert_depth <- cb.assert_depth + 1;
+        group_process ~note_group_empty:false ~bravalue:Opcodes.op_assert_na
+          ~skipunits:0)
+      else if Int.equal meta Parse.meta_lookaheadnot then
+        if
+          (* pcre2_compile.c:6762-6781 — optimize (?!) to ( *FAIL) unless it
+             is quantified - which is a weird thing to do, but Perl allows
+             all assertions to be quantified, and when they contain capturing
+             parentheses there may be a potential use for this feature. Not
+             that that applies to a quantified (?!) but we allow it for
+             uniformity. *)
+          Int.equal cb.parsed_pattern.(!pptr + 1) Parse.meta_ket
+          && (cb.parsed_pattern.(!pptr + 2) < Parse.meta_asterisk
+             || cb.parsed_pattern.(!pptr + 2) > Parse.meta_minmax_query)
+        then (
+          emit_cu Opcodes.op_fail;
+          pptr := !pptr + 1)
+        else (
+          cb.assert_depth <- cb.assert_depth + 1;
+          group_process ~note_group_empty:false ~bravalue:Opcodes.op_assert_not
+            ~skipunits:0)
+      else if Int.equal meta Parse.meta_lookbehind then (
+        (* pcre2_compile.c:6783-6786 *)
+        cb.assert_depth <- cb.assert_depth + 1;
+        group_process ~note_group_empty:false ~bravalue:Opcodes.op_assertback
+          ~skipunits:0)
+      else if Int.equal meta Parse.meta_lookbehindnot then (
+        (* pcre2_compile.c:6788-6791 *)
+        cb.assert_depth <- cb.assert_depth + 1;
+        group_process ~note_group_empty:false
+          ~bravalue:Opcodes.op_assertback_not ~skipunits:0)
+      else if Int.equal meta Parse.meta_lookbehind_na then (
+        (* pcre2_compile.c:6793-6796 *)
+        cb.assert_depth <- cb.assert_depth + 1;
+        group_process ~note_group_empty:false ~bravalue:Opcodes.op_assertback_na
+          ~skipunits:0)
+      else if Int.equal meta Parse.meta_atomic then
+        (* pcre2_compile.c:6798-6800 *)
+        group_process ~note_group_empty:true ~bravalue:Opcodes.op_once
+          ~skipunits:0
+      else if Int.equal meta Parse.meta_script_run then (
+        (* pcre2_compile.c:6802-6804 — ( *script_run:): OP_SCRIPT_RUN needs
+           the UCP machinery (docs/ocaml-engine/08-ucp.md). Deferred loudly
+           (parse_regex defers the ( *sr: forms with the same marker, so
+           this is unreachable until M8). *)
         errorcodeptr := Parse.err_deferred;
         return_from_branch 0)
       else if Int.equal meta Parse.meta_nocapture then
@@ -3197,214 +3237,233 @@ and compile_regex (options : int) (xoptions : int) (codeptr : int ref)
   let length = ref (2 + (2 * Limits.link_size) + skipunits) in
 
   (* pcre2_compile.c:8427-8440 — remember if this is a lookbehind
-     assertion, and if it is, save its length and skip over the pattern
-     offset. DEVIATION: the lookbehind machinery — the length/min-length
-     bookkeeping here (8434-8440), the OP_REVERSE/OP_VREVERSE insertion per
-     branch (8467-8491) and the per-alternative lookbehindlength update
-     (8639-8642) — lands with the lookaround chunks (M3/M4,
-     docs/ocaml-engine/04-lookaround-atomic-possessive.md). It is
-     unreachable until then, because compile_branch defers every lookbehind
-     META before an ASSERTBACK bravalue can reach this function; deferred
-     loudly, both phases, so those chunks cannot silently miss it. *)
+     assertion, and if it is, save its length (stored by
+     set_lookbehind_lengths in the data bits of the group META word,
+     pptr[-1]) and its minimum length (stored in the word that follows,
+     replacing the pattern offset), then skip over that word. *)
   let op0 = Char.code (Bytes.get cb.start_code !code) in
   let lookbehind =
     Int.equal op0 Opcodes.op_assertback
     || Int.equal op0 Opcodes.op_assertback_not
     || Int.equal op0 Opcodes.op_assertback_na
   in
+  let lookbehindlength = ref 0 in
+  let lookbehindminlength = ref 0 in
   if lookbehind then (
-    errorcodeptr := Parse.err_deferred;
-    0)
-  else
-    (* pcre2_compile.c:8442-8454 — if this is a capturing subpattern, add
-       to the chain of open capturing items so that we can detect them if
-       ( *ACCEPT) is encountered. Note that only OP_CBRA need be tested
-       here; changing this opcode to one of its variants, e.g.
-       OP_SCBRAPOS, happens later, after the group has been compiled. *)
-    let open_caps =
-      if Int.equal op0 Opcodes.op_cbra then
-        Some
-          {
-            next = open_caps;
-            number = get2 cb.start_code (!code + 1 + Limits.link_size);
-            assert_depth = cb.assert_depth;
-          }
-      else open_caps
-    in
+    lookbehindlength := Parse.meta_data cb.parsed_pattern.(!pptr - 1);
+    lookbehindminlength := cb.parsed_pattern.(!pptr);
+    pptr := !pptr + Parse.sizeoffset);
 
-    (* pcre2_compile.c:8456-8459 — offset is set zero to mark that this
-       bracket is still open. *)
-    put cb.start_code (!code + 1) 0;
-    code := !code + 1 + Limits.link_size + skipunits;
+  (* pcre2_compile.c:8442-8454 — if this is a capturing subpattern, add
+     to the chain of open capturing items so that we can detect them if
+     ( *ACCEPT) is encountered. Note that only OP_CBRA need be tested
+     here; changing this opcode to one of its variants, e.g.
+     OP_SCBRAPOS, happens later, after the group has been compiled. *)
+  let open_caps =
+    if Int.equal op0 Opcodes.op_cbra then
+      Some
+        {
+          next = open_caps;
+          number = get2 cb.start_code (!code + 1 + Limits.link_size);
+          assert_depth = cb.assert_depth;
+        }
+    else open_caps
+  in
 
-    (* The C's `return okreturn` / `return 0` exits from inside the branch
-       loop. Local exception, never escapes this function
-       (port-conventions §2; compile phase only). *)
-    let exception Return_regex of int in
-    (* pcre2_compile.c:8461-8644 — loop for each alternative branch. *)
-    try
-      while true do
-        (* pcre2_compile.c:8467-8491 — insert OP_REVERSE or OP_VREVERSE if
-           this is a lookbehind assertion: with the lookbehind machinery
-           above (M3/M4; lookbehind is always false here). *)
+  (* pcre2_compile.c:8456-8459 — offset is set zero to mark that this
+     bracket is still open. *)
+  put cb.start_code (!code + 1) 0;
+  code := !code + 1 + Limits.link_size + skipunits;
 
-        (* pcre2_compile.c:8493-8500 — now compile the branch; in the
-           pre-compile phase its length gets added into the length. *)
-        let branch_return =
-          compile_branch options xoptions code pptr errorcodeptr branchfirstcu
-            branchfirstcuflags branchreqcu branchreqcuflags (Some bc) open_caps
-            cb
-            (match lengthptr with None -> None | Some _ -> Some length)
-        in
-        if Int.equal branch_return 0 then raise_notrace (Return_regex 0);
+  (* The C's `return okreturn` / `return 0` exits from inside the branch
+     loop. Local exception, never escapes this function
+     (port-conventions §2; compile phase only). *)
+  let exception Return_regex of int in
+  (* pcre2_compile.c:8461-8644 — loop for each alternative branch. *)
+  try
+    while true do
+      (* pcre2_compile.c:8467-8491 — insert OP_REVERSE or OP_VREVERSE if
+         this is a lookbehind assertion. There is only a single minimum
+         length for the whole assertion. When the minimum length is
+         LOOKBEHIND_MAX it means that all branches are of fixed length,
+         though not necessarily the same length. In this case, the
+         original OP_REVERSE can be used. It can also be used if a branch
+         in a variable length lookbehind has the same maximum and
+         minimum. Otherwise, use OP_VREVERSE, which has both maximum and
+         minimum values. *)
+      if lookbehind && !lookbehindlength > 0 then
+        if
+          Int.equal !lookbehindminlength Limits.lookbehind_max
+          || Int.equal !lookbehindminlength !lookbehindlength
+        then (
+          Bytes.set cb.start_code !code (Char.chr Opcodes.op_reverse);
+          incr code;
+          put2inc cb.start_code code !lookbehindlength;
+          length := !length + 1 + Limits.imm2_size)
+        else (
+          Bytes.set cb.start_code !code (Char.chr Opcodes.op_vreverse);
+          incr code;
+          put2inc cb.start_code code !lookbehindminlength;
+          put2inc cb.start_code code !lookbehindlength;
+          length := !length + 1 + (2 * Limits.imm2_size));
 
-        (* pcre2_compile.c:8502-8504 — if a branch can match an empty
-           string, so can the whole group. *)
-        if branch_return < 0 then okreturn := -1;
+      (* pcre2_compile.c:8493-8500 — now compile the branch; in the
+         pre-compile phase its length gets added into the length. *)
+      let branch_return =
+        compile_branch options xoptions code pptr errorcodeptr branchfirstcu
+          branchfirstcuflags branchreqcu branchreqcuflags (Some bc) open_caps cb
+          (match lengthptr with None -> None | Some _ -> Some length)
+      in
+      if Int.equal branch_return 0 then raise_notrace (Return_regex 0);
 
-        (* pcre2_compile.c:8506-8566 — in the real compile phase, there is
-           some post-processing to be done. *)
+      (* pcre2_compile.c:8502-8504 — if a branch can match an empty
+         string, so can the whole group. *)
+      if branch_return < 0 then okreturn := -1;
+
+      (* pcre2_compile.c:8506-8566 — in the real compile phase, there is
+         some post-processing to be done. *)
+      (match lengthptr with
+      | None ->
+          if
+            not
+              (Int.equal
+                 (Char.code (Bytes.get cb.start_code !last_branch))
+                 Opcodes.op_alt)
+          then (
+            (* pcre2_compile.c:8510-8519 — if this is the first branch,
+               the firstcu and reqcu values for the branch become the
+               values for the regex. *)
+            firstcu := !branchfirstcu;
+            firstcuflags := !branchfirstcuflags;
+            reqcu := !branchreqcu;
+            reqcuflags := !branchreqcuflags)
+          else (
+            (* pcre2_compile.c:8521-8543 — if this is not the first
+               branch, the first char and reqcu have to match the values
+               from all the previous branches, except that if the
+               previous value for reqcu didn't have REQ_VARY set, it can
+               still match, and we set REQ_VARY for the group from this
+               branch's value.
+
+               If we previously had a firstcu, but it doesn't match the
+               new branch, we have to abandon the firstcu for the regex,
+               but if there was previously no reqcu, it takes on the
+               value of the old firstcu. *)
+            if
+              (not (Int.equal !firstcuflags !branchfirstcuflags))
+              || not (Int.equal !firstcu !branchfirstcu)
+            then (
+              if !firstcuflags < req_none && !reqcuflags >= req_none then (
+                reqcu := !firstcu;
+                reqcuflags := !firstcuflags);
+              firstcuflags := req_none);
+
+            (* pcre2_compile.c:8545-8553 — if we (now or from before)
+               have no firstcu, a firstcu from the branch becomes a reqcu
+               if there isn't a branch reqcu. *)
+            if
+              !firstcuflags >= req_none
+              && !branchfirstcuflags < req_none
+              && !branchreqcuflags >= req_none
+            then (
+              branchreqcu := !branchfirstcu;
+              branchreqcuflags := !branchfirstcuflags);
+
+            (* pcre2_compile.c:8555-8564 — now ensure that the reqcus
+               match. *)
+            if
+              (not
+                 (Int.equal
+                    (!reqcuflags land lnot req_vary)
+                    (!branchreqcuflags land lnot req_vary)))
+              || not (Int.equal !reqcu !branchreqcu)
+            then reqcuflags := req_none
+            else (
+              reqcu := !branchreqcu;
+              reqcuflags := !reqcuflags lor !branchreqcuflags
+              (* To "or" REQ_VARY if present *)))
+      | Some _ -> ());
+
+      (* pcre2_compile.c:8568-8615 — handle reaching the end of the
+         expression, either ')' or end of pattern. In the real compile
+         phase, go back through the alternative branches and reverse the
+         chain of offsets, with the field in the BRA item now becoming an
+         offset to the first alternative. If there are no alternatives,
+         it points to the end of the group. The length in the terminating
+         ket is always the length of the whole bracketed item. Return
+         leaving the pointer at the terminating char. *)
+      if
+        not
+          (Int.equal (Parse.meta_code cb.parsed_pattern.(!pptr)) Parse.meta_alt)
+      then (
         (match lengthptr with
         | None ->
-            if
-              not
-                (Int.equal
-                   (Char.code (Bytes.get cb.start_code !last_branch))
-                   Opcodes.op_alt)
-            then (
-              (* pcre2_compile.c:8510-8519 — if this is the first branch,
-                 the firstcu and reqcu values for the branch become the
-                 values for the regex. *)
-              firstcu := !branchfirstcu;
-              firstcuflags := !branchfirstcuflags;
-              reqcu := !branchreqcu;
-              reqcuflags := !branchreqcuflags)
-            else (
-              (* pcre2_compile.c:8521-8543 — if this is not the first
-                 branch, the first char and reqcu have to match the values
-                 from all the previous branches, except that if the
-                 previous value for reqcu didn't have REQ_VARY set, it can
-                 still match, and we set REQ_VARY for the group from this
-                 branch's value.
-
-                 If we previously had a firstcu, but it doesn't match the
-                 new branch, we have to abandon the firstcu for the regex,
-                 but if there was previously no reqcu, it takes on the
-                 value of the old firstcu. *)
-              if
-                (not (Int.equal !firstcuflags !branchfirstcuflags))
-                || not (Int.equal !firstcu !branchfirstcu)
-              then (
-                if !firstcuflags < req_none && !reqcuflags >= req_none then (
-                  reqcu := !firstcu;
-                  reqcuflags := !firstcuflags);
-                firstcuflags := req_none);
-
-              (* pcre2_compile.c:8545-8553 — if we (now or from before)
-                 have no firstcu, a firstcu from the branch becomes a reqcu
-                 if there isn't a branch reqcu. *)
-              if
-                !firstcuflags >= req_none
-                && !branchfirstcuflags < req_none
-                && !branchreqcuflags >= req_none
-              then (
-                branchreqcu := !branchfirstcu;
-                branchreqcuflags := !branchfirstcuflags);
-
-              (* pcre2_compile.c:8555-8564 — now ensure that the reqcus
-                 match. *)
-              if
-                (not
-                   (Int.equal
-                      (!reqcuflags land lnot req_vary)
-                      (!branchreqcuflags land lnot req_vary)))
-                || not (Int.equal !reqcu !branchreqcu)
-              then reqcuflags := req_none
-              else (
-                reqcu := !branchreqcu;
-                reqcuflags := !reqcuflags lor !branchreqcuflags
-                (* To "or" REQ_VARY if present *)))
+            (* pcre2_compile.c:8578-8589 — do { ... } while
+               (branch_length > 0). *)
+            let branch_length = ref (!code - !last_branch) in
+            let continue_ = ref true in
+            while !continue_ do
+              let prev_length = get cb.start_code (!last_branch + 1) in
+              put cb.start_code (!last_branch + 1) !branch_length;
+              branch_length := prev_length;
+              last_branch := !last_branch - !branch_length;
+              if not (!branch_length > 0) then continue_ := false
+            done
         | Some _ -> ());
 
-        (* pcre2_compile.c:8568-8615 — handle reaching the end of the
-           expression, either ')' or end of pattern. In the real compile
-           phase, go back through the alternative branches and reverse the
-           chain of offsets, with the field in the BRA item now becoming an
-           offset to the first alternative. If there are no alternatives,
-           it points to the end of the group. The length in the terminating
-           ket is always the length of the whole bracketed item. Return
-           leaving the pointer at the terminating char. *)
-        if
-          not
-            (Int.equal
-               (Parse.meta_code cb.parsed_pattern.(!pptr))
-               Parse.meta_alt)
-        then (
-          (match lengthptr with
-          | None ->
-              (* pcre2_compile.c:8578-8589 — do { ... } while
-                 (branch_length > 0). *)
-              let branch_length = ref (!code - !last_branch) in
-              let continue_ = ref true in
-              while !continue_ do
-                let prev_length = get cb.start_code (!last_branch + 1) in
-                put cb.start_code (!last_branch + 1) !branch_length;
-                branch_length := prev_length;
-                last_branch := !last_branch - !branch_length;
-                if not (!branch_length > 0) then continue_ := false
-              done
-          | Some _ -> ());
+        (* pcre2_compile.c:8591-8595 — fill in the ket. *)
+        Bytes.set cb.start_code !code (Char.chr Opcodes.op_ket);
+        put cb.start_code (!code + 1) (!code - start_bracket);
+        code := !code + 1 + Limits.link_size;
 
-          (* pcre2_compile.c:8591-8595 — fill in the ket. *)
-          Bytes.set cb.start_code !code (Char.chr Opcodes.op_ket);
-          put cb.start_code (!code + 1) (!code - start_bracket);
-          code := !code + 1 + Limits.link_size;
-
-          (* pcre2_compile.c:8597-8614 — set values to pass back. *)
-          codeptr := !code;
-          pptrptr := !pptr;
-          firstcuptr := !firstcu;
-          firstcuflagsptr := !firstcuflags;
-          reqcuptr := !reqcu;
-          reqcuflagsptr := !reqcuflags;
-          (match lengthptr with
-          | Some lp ->
-              if oflow_max - !lp < !length then (
-                errorcodeptr := Errors.err20;
-                raise_notrace (Return_regex 0));
-              lp := !lp + !length
-          | None -> ());
-          raise_notrace (Return_regex !okreturn));
-
-        (* pcre2_compile.c:8617-8637 — another branch follows. In the
-           pre-compile phase, we can move the code pointer back to where it
-           was for the start of the first branch. (That is, pretend that
-           each branch is the only one.)
-
-           In the real compile phase, insert an ALT node. Its length field
-           points back to the previous branch while the bracket remains
-           open. At the end the chain is reversed. It's done like this so
-           that the start of the bracket has a zero offset until it is
-           closed, making it possible to detect recursion. *)
+        (* pcre2_compile.c:8597-8614 — set values to pass back. *)
+        codeptr := !code;
+        pptrptr := !pptr;
+        firstcuptr := !firstcu;
+        firstcuflagsptr := !firstcuflags;
+        reqcuptr := !reqcu;
+        reqcuflagsptr := !reqcuflags;
         (match lengthptr with
-        | Some _ ->
-            code := !codeptr + 1 + Limits.link_size + skipunits;
-            length := !length + 1 + Limits.link_size
-        | None ->
-            Bytes.set cb.start_code !code (Char.chr Opcodes.op_alt);
-            put cb.start_code (!code + 1) (!code - !last_branch);
-            last_branch := !code;
-            bc.current_branch <- !code;
-            code := !code + 1 + Limits.link_size);
+        | Some lp ->
+            if oflow_max - !lp < !length then (
+              errorcodeptr := Errors.err20;
+              raise_notrace (Return_regex 0));
+            lp := !lp + !length
+        | None -> ());
+        raise_notrace (Return_regex !okreturn));
 
-        (* pcre2_compile.c:8639-8643 — set the maximum lookbehind length
-           for the next branch (deferred with the lookbehind machinery
-           above) and then advance past the vertical bar. *)
-        pptr := !pptr + 1
-      done;
-      (* Control never reaches here (pcre2_compile.c:8645). *)
-      assert false
-    with Return_regex rc -> rc
+      (* pcre2_compile.c:8617-8637 — another branch follows. In the
+         pre-compile phase, we can move the code pointer back to where it
+         was for the start of the first branch. (That is, pretend that
+         each branch is the only one.)
+
+         In the real compile phase, insert an ALT node. Its length field
+         points back to the previous branch while the bracket remains
+         open. At the end the chain is reversed. It's done like this so
+         that the start of the bracket has a zero offset until it is
+         closed, making it possible to detect recursion. *)
+      (match lengthptr with
+      | Some _ ->
+          code := !codeptr + 1 + Limits.link_size + skipunits;
+          length := !length + 1 + Limits.link_size
+      | None ->
+          Bytes.set cb.start_code !code (Char.chr Opcodes.op_alt);
+          put cb.start_code (!code + 1) (!code - !last_branch);
+          last_branch := !code;
+          bc.current_branch <- !code;
+          code := !code + 1 + Limits.link_size);
+
+      (* pcre2_compile.c:8639-8643 — set the maximum lookbehind length
+         for the next branch (if not in a lookbehind the value will be
+         zero: set_lookbehind_lengths ORs each branch length into the
+         preceding META_ALT word) and then advance past the vertical
+         bar. *)
+      lookbehindlength := Parse.meta_data cb.parsed_pattern.(!pptr);
+      pptr := !pptr + 1
+    done;
+    (* Control never reaches here (pcre2_compile.c:8645). *)
+    assert false
+  with Return_regex rc -> rc
 
 (* ---------- Check for anchored pattern ---------- *)
 
@@ -3856,12 +3915,998 @@ let add_name_to_table (cb : compile_block) ~(name : int) ~(length : int)
     (cb.name_entry_size - length - Limits.imm2_size)
     '\000'
 
-(* pcre2_compile.c:9223-10120 — parsed_skip, get_grouplength,
-   get_branchlength, set_lookbehind_lengths, check_lookbehinds: the parsed-
-   pattern lookbehind-length machinery. DEFERRED (M3,
-   docs/ocaml-engine/04-lookaround-atomic-possessive.md): unreachable until
-   parse_regex stops deferring lookbehinds; the driver defers loudly at its
-   has_lookbehind call site (pcre2_compile.c:10536-10553). *)
+(* ---------- Parsed-pattern lookbehind-length machinery ---------- *)
+
+(* pcre2_intmodedep.h:686-692 — structure for checking for mutual recursion
+   when scanning compiled or parsed code. The C's uint32_t *groupptr becomes
+   an index into cb.parsed_pattern; the chain pointer becomes an option. *)
+type parsed_recurse_check = {
+  prev : parsed_recurse_check option;
+  groupptr : int;
+}
+
+(* pcre2_compile.c:375 — values for parsed_skip's skiptype parameter. *)
+let pskip_alt = 0
+let pskip_class = 1
+let pskip_ket = 2
+
+(* pcre2_compile.c:396-402 — GI values stored in the groupinfo vector:
+   "when scanning the parsed pattern, information about groups with fixed
+   lengths is remembered in a dynamically created vector of the following
+   flags + length values, indexed by group number". *)
+let gi_set_fixed_length = 0x80000000
+let gi_not_fixed_length = 0x40000000
+let gi_fixed_length_mask = 0x0000ffff
+
+(* The C's INT_MAX (32-bit int build), used by the lookbehind-length
+   arithmetic overflow checks below. *)
+let int_max = 0x7fffffff
+
+(* The C's `return -1` sites inside get_branchlength and the labels it
+   reaches by goto (ISNOTFIXED, PARSED_SKIP_FAILED, RECURSE_OR_BACKREF_
+   LENGTH, CHECK_GROUP — the last two factored into functions below, so
+   the exception crosses back into get_branchlength's handler, which turns
+   it into the C's -1 return). *errcodeptr has been dealt with at every
+   raise site (some C paths deliberately leave it 0). Never escapes
+   get_branchlength (port-conventions §2; compile phase only). *)
+exception Bl_fail
+
+(* pcre2_compile.c:9223-9342 — parsed_skip. This function is called to skip
+   parts of the parsed pattern when finding the length of a lookbehind
+   branch. It is called after ( *ACCEPT) and ( *FAIL) to find the end of the
+   branch, it is called to skip over an internal lookaround or (DEFINE)
+   group, and it is also called to skip to the end of a class, during which
+   it will never encounter nested groups (but there's no need to have
+   special code for that).
+
+   When called to find the end of a branch or group, pptr must point to the
+   first meta code inside the branch, not the branch-starting code. In
+   other cases it can point to the item that causes the function to be
+   called.
+
+   Arguments:
+     cb        compile block (the C takes the raw pptr; the parsed pattern
+               is an array here, so its owner comes too)
+     pptr      current index to skip from
+     skiptype  pskip_class when skipping to end of class
+               pskip_alt when META_ALT ends the skip
+               pskip_ket when only META_KET ends the skip
+
+   Returns: new value of pptr, or -1 (the C's NULL) if META_END is reached
+            (should never occur) or for an unknown meta value - likewise. *)
+let parsed_skip (cb : compile_block) (pptr : int) ~(skiptype : int) : int =
+  let nestlevel = ref 0 in
+  let pptr = ref pptr in
+  let exception Skip_return of int in
+  try
+    (* for (;; pptr++) *)
+    while true do
+      let word = cb.parsed_pattern.(!pptr) in
+      let meta = Parse.meta_code word in
+      (* The C's switch: `default: if (meta < META_END) continue;` — a
+         literal skips the extra-length lookup below; every other case
+         falls out of the switch (after any manual pointer bumps) and picks
+         up its extra data length from the table. *)
+      if word < Parse.meta_end then () (* Literal: continue *)
+      else (
+        if Int.equal meta Parse.meta_end then
+          (* pcre2_compile.c:9264-9267 — this should never occur. *)
+          raise_notrace (Skip_return (-1))
+        else if Int.equal meta Parse.meta_backref then (
+          if
+            (* pcre2_compile.c:9269-9273 — the data for these items is
+               variable in length; offset is present only if group >= 10. *)
+            Parse.meta_data word >= 10
+          then pptr := !pptr + Parse.sizeoffset)
+        else if Int.equal meta Parse.meta_escape then (
+          (* pcre2_compile.c:9275-9288 — a few escapes are followed by
+             data items. *)
+          let d = Parse.meta_data word in
+          if Int.equal d Parse.esc_big_p || Int.equal d Parse.esc_p then
+            pptr := !pptr + 1
+          else if Int.equal d Parse.esc_g || Int.equal d Parse.esc_k then
+            pptr := !pptr + 1 + Parse.sizeoffset)
+        else if
+          Int.equal meta Parse.meta_mark
+          || Int.equal meta Parse.meta_commit_arg
+          || Int.equal meta Parse.meta_prune_arg
+          || Int.equal meta Parse.meta_skip_arg
+          || Int.equal meta Parse.meta_then_arg
+        then
+          (* pcre2_compile.c:9290-9296 — add the length of the name (the
+             table below adds the length word itself). *)
+          pptr := !pptr + cb.parsed_pattern.(!pptr + 1)
+        else if Int.equal meta Parse.meta_class_end then (
+          if
+            (* pcre2_compile.c:9300-9302 — these are the "active" items in
+               this loop. *)
+            Int.equal skiptype pskip_class
+          then raise_notrace (Skip_return !pptr))
+        else if
+          Int.equal meta Parse.meta_atomic
+          || Int.equal meta Parse.meta_capture
+          || Int.equal meta Parse.meta_cond_assert
+          || Int.equal meta Parse.meta_cond_define
+          || Int.equal meta Parse.meta_cond_name
+          || Int.equal meta Parse.meta_cond_number
+          || Int.equal meta Parse.meta_cond_rname
+          || Int.equal meta Parse.meta_cond_rnumber
+          || Int.equal meta Parse.meta_cond_version
+          || Int.equal meta Parse.meta_lookahead
+          || Int.equal meta Parse.meta_lookaheadnot
+          || Int.equal meta Parse.meta_lookahead_na
+          || Int.equal meta Parse.meta_lookbehind
+          || Int.equal meta Parse.meta_lookbehindnot
+          || Int.equal meta Parse.meta_lookbehind_na
+          || Int.equal meta Parse.meta_nocapture
+          || Int.equal meta Parse.meta_script_run
+        then (* pcre2_compile.c:9304-9322 *)
+          incr nestlevel
+        else if Int.equal meta Parse.meta_alt then (
+          if
+            (* pcre2_compile.c:9324-9326 *)
+            Int.equal !nestlevel 0 && Int.equal skiptype pskip_alt
+          then raise_notrace (Skip_return !pptr))
+        else if Int.equal meta Parse.meta_ket then (
+          (* pcre2_compile.c:9328-9331 *)
+          if Int.equal !nestlevel 0 then raise_notrace (Skip_return !pptr);
+          decr nestlevel);
+
+        (* pcre2_compile.c:9334-9338 — the extra data item length for each
+           meta is in a table. *)
+        let idx = (meta lsr 16) land 0x7fff in
+        if idx >= Array.length Parse.meta_extra_lengths then
+          raise_notrace (Skip_return (-1));
+        pptr := !pptr + Parse.meta_extra_lengths.(idx));
+      incr pptr
+    done;
+    (* Control never reaches here (pcre2_compile.c:9340-9341). *)
+    assert false
+  with Skip_return v -> v
+
+(* pcre2_compile.c:9346-9419 — get_grouplength. This is called for nested
+   groups within a branch of a lookbehind whose length is being computed.
+   On entry, the pointer must be at the first element after the group
+   initializing code. On exit it points to OP_KET. Caching is used to
+   improve processing speed when the same capturing group occurs many
+   times.
+
+   Arguments:
+     pptrptr     pointer (ref) to index in the parsed pattern
+     minptr      where to return the minimum length
+     isinline    false if a reference or recursion; true for inline group
+     errcodeptr  pointer to the errorcode
+     lcptr       pointer to the loop counter
+     group       number of captured group or -1 for a non-capturing group
+     recurses    chain of recurse_check to catch mutual recursion
+     cb          pointer to the compile data
+
+   Returns: the maximum group length or a negative number. *)
+let rec get_grouplength (pptrptr : int ref) (minptr : int ref)
+    ~(isinline : bool) (errcodeptr : int ref) (lcptr : int ref) ~(group : int)
+    (recurses : parsed_recurse_check option) (cb : compile_block) : int =
+  (* uint32_t *gi = cb->groupinfo + 2 * group *)
+  let gi = 2 * group in
+  let grouplength = ref (-1) in
+  let groupminlength = ref int_max in
+  let exception Gl_return of int in
+  try
+    (* pcre2_compile.c:9377-9392 — the cache can be used only if there is
+       no possibility of there being two groups with the same number. We do
+       not need to set the end pointer for a group that is being processed
+       as a back reference or recursion, but we must do so for an inline
+       group. *)
+    if group > 0 && Int.equal (cb.external_flags land Parse.dupcapused) 0 then (
+      let groupinfo = cb.groupinfo.(gi) in
+      if not (Int.equal (groupinfo land gi_not_fixed_length) 0) then
+        raise_notrace (Gl_return (-1));
+      if not (Int.equal (groupinfo land gi_set_fixed_length) 0) then (
+        if isinline then pptrptr := parsed_skip cb !pptrptr ~skiptype:pskip_ket;
+        minptr := cb.groupinfo.(gi + 1);
+        raise_notrace (Gl_return (groupinfo land gi_fixed_length_mask))));
+
+    (* pcre2_compile.c:9394-9405 — scan the group. In this case we find the
+       end pointer of necessity. The C's `goto ISNOTFIXED` is the
+       Gl_notfixed handler below. *)
+    let exception Gl_notfixed in
+    try
+      let continue_ = ref true in
+      while !continue_ do
+        let branchminlength = ref 0 in
+        let branchlength =
+          get_branchlength pptrptr branchminlength errcodeptr lcptr recurses cb
+        in
+        if branchlength < 0 then raise_notrace Gl_notfixed;
+        if branchlength > !grouplength then grouplength := branchlength;
+        if !branchminlength < !groupminlength then
+          groupminlength := !branchminlength;
+        if Int.equal cb.parsed_pattern.(!pptrptr) Parse.meta_ket then
+          continue_ := false
+        else pptrptr := !pptrptr + 1 (* Skip META_ALT *)
+      done;
+
+      (* pcre2_compile.c:9407-9414 *)
+      if group > 0 then (
+        cb.groupinfo.(gi) <-
+          cb.groupinfo.(gi) lor (gi_set_fixed_length lor !grouplength);
+        cb.groupinfo.(gi + 1) <- !groupminlength);
+      minptr := !groupminlength;
+      !grouplength
+    with Gl_notfixed ->
+      (* ISNOTFIXED: pcre2_compile.c:9416-9418 *)
+      if group > 0 then
+        cb.groupinfo.(gi) <- cb.groupinfo.(gi) lor gi_not_fixed_length;
+      -1
+  with Gl_return v -> v
+
+(* pcre2_compile.c:9423-9843 — get_branchlength. Return fixed maximum and
+   minimum lengths for a branch in a lookbehind, giving an error if the
+   length is not limited. On entry, *pptrptr points to the first element
+   inside the branch. On exit it is set to point to the ALT or KET.
+
+   Arguments:
+     pptrptr     pointer (ref) to index in the parsed pattern
+     minptr      where to return the minimum length
+     errcodeptr  pointer to error code
+     lcptr       pointer to loop counter
+     recurses    chain of recurse_check to catch mutual recursion
+     cb          pointer to compile block
+
+   Returns: the maximum length, or a negative value on error (some paths -
+   the C's bare `return -1`s such as \X - leave *errcodeptr at 0; the
+   callers patch in ERR25). *)
+and get_branchlength (pptrptr : int ref) (minptr : int ref)
+    (errcodeptr : int ref) (lcptr : int ref)
+    (recurses : parsed_recurse_check option) (cb : compile_block) : int =
+  let branchlength = ref 0 in
+  let branchminlength = ref 0 in
+  let lastitemlength = ref 0 in
+  let lastitemminlength = ref 0 in
+  let pptr = ref !pptrptr in
+
+  (* Local exception modelling the C's `goto EXIT` (port-conventions §2;
+     compile phase only); Bl_fail (module level, above) models the
+     `return -1` sites. *)
+  let exception Bl_exit in
+  (* The ISNOTFIXED label (pcre2_compile.c:9809-9812), reached by goto from
+     several cases and by switch fallthrough from the default case. *)
+  let isnotfixed () : 'a =
+    errcodeptr := Errors.err25 (* Not fixed length *);
+    raise_notrace Bl_fail
+  in
+  (* The PARSED_SKIP_FAILED label (pcre2_compile.c:9840-9842). *)
+  let parsed_skip_failed () : 'a =
+    errcodeptr := Errors.err90;
+    raise_notrace Bl_fail
+  in
+
+  (* pcre2_compile.c:9455-9463 — a large and/or complex regex can take too
+     long to process. This can happen more often when (?| groups are
+     present in the pattern because their length cannot be cached. The C's
+     ( *lcptr)++ compares the value before incrementing. *)
+  let lc = !lcptr in
+  lcptr := lc + 1;
+  if lc > 2000 then (
+    errcodeptr := Errors.err35 (* Lookbehind is too complicated *);
+    -1)
+  else
+    try
+      (* pcre2_compile.c:9465-9467 — scan the branch, accumulating the
+         length: for (;; pptr++). *)
+      while true do
+        let group = ref 0 in
+        let itemlength = ref 0 in
+        let itemminlength = ref 0 in
+        let word = cb.parsed_pattern.(!pptr) in
+
+        (* pcre2_compile.c:9477-9480 *)
+        (if word < Parse.meta_end then (
+           itemlength := 1;
+           itemminlength := 1)
+         else
+           let meta = Parse.meta_code word in
+           if Int.equal meta Parse.meta_ket || Int.equal meta Parse.meta_alt
+           then raise_notrace Bl_exit
+           else if
+             Int.equal meta Parse.meta_accept || Int.equal meta Parse.meta_fail
+           then (
+             (* pcre2_compile.c:9488-9495 — ( *ACCEPT) and ( *FAIL)
+                terminate the branch, but we must skip to the actual
+                termination. *)
+             let skipped = parsed_skip cb !pptr ~skiptype:pskip_alt in
+             if Int.equal skipped (-1) then parsed_skip_failed ();
+             pptr := skipped;
+             raise_notrace Bl_exit)
+           else if
+             Int.equal meta Parse.meta_mark
+             || Int.equal meta Parse.meta_commit_arg
+             || Int.equal meta Parse.meta_prune_arg
+             || Int.equal meta Parse.meta_skip_arg
+             || Int.equal meta Parse.meta_then_arg
+           then
+             (* pcre2_compile.c:9497-9503 *)
+             pptr := !pptr + cb.parsed_pattern.(!pptr + 1) + 1
+           else if
+             Int.equal meta Parse.meta_circumflex
+             || Int.equal meta Parse.meta_commit
+             || Int.equal meta Parse.meta_dollar
+             || Int.equal meta Parse.meta_prune
+             || Int.equal meta Parse.meta_skip
+             || Int.equal meta Parse.meta_then
+           then (* pcre2_compile.c:9505-9511 *)
+             ()
+           else if Int.equal meta Parse.meta_options then
+             (* pcre2_compile.c:9513-9515 *)
+             pptr := !pptr + 2
+           else if Int.equal meta Parse.meta_bigvalue then (
+             (* pcre2_compile.c:9517-9520 *)
+             itemlength := 1;
+             itemminlength := 1;
+             pptr := !pptr + 1)
+           else if
+             Int.equal meta Parse.meta_class
+             || Int.equal meta Parse.meta_class_not
+           then (
+             (* pcre2_compile.c:9522-9527 *)
+             itemlength := 1;
+             itemminlength := 1;
+             let skipped = parsed_skip cb !pptr ~skiptype:pskip_class in
+             if Int.equal skipped (-1) then parsed_skip_failed ();
+             pptr := skipped)
+           else if
+             Int.equal meta Parse.meta_class_empty_not
+             || Int.equal meta Parse.meta_dot
+           then (
+             (* pcre2_compile.c:9529-9532 *)
+             itemlength := 1;
+             itemminlength := 1)
+           else if Int.equal meta Parse.meta_callout_number then
+             (* pcre2_compile.c:9534-9536 *)
+             pptr := !pptr + 3
+           else if Int.equal meta Parse.meta_callout_string then
+             (* pcre2_compile.c:9538-9540 *)
+             pptr := !pptr + 3 + Parse.sizeoffset
+           else if Int.equal meta Parse.meta_escape then (
+             (* pcre2_compile.c:9542-9566 — only some escapes consume a
+                character. Of those, \R can match one or two characters,
+                but \X is never allowed because it matches an unknown
+                number of characters. \C is allowed only in 32-bit and
+                non-UTF 8/16-bit modes. *)
+             let escape = Parse.meta_data word in
+             if Int.equal escape Parse.esc_big_x then
+               (* return -1 with *errcodeptr unset (see the header note). *)
+               raise_notrace Bl_fail
+             else if Int.equal escape Parse.esc_big_r then (
+               itemminlength := 1;
+               itemlength := 2)
+             else if escape > Parse.esc_b && escape < Parse.esc_big_z then (
+               (* PCRE2_CODE_UNIT_WIDTH != 32 in this 8-bit port. *)
+               if
+                 (not (Int.equal (cb.external_options land Options.utf) 0))
+                 && Int.equal escape Parse.esc_big_c
+               then (
+                 errcodeptr := Errors.err36;
+                 raise_notrace Bl_fail);
+               itemlength := 1;
+               itemminlength := 1;
+               if
+                 Int.equal escape Parse.esc_p
+                 || Int.equal escape Parse.esc_big_p
+               then pptr := !pptr + 1 (* Skip prop data *)))
+           else if
+             Int.equal meta Parse.meta_lookahead
+             || Int.equal meta Parse.meta_lookaheadnot
+             || Int.equal meta Parse.meta_lookahead_na
+           then (
+             (* pcre2_compile.c:9568-9602 — lookaheads do not contribute to
+                the length of this branch, but they may contain lookbehinds
+                within them whose lengths need to be set. *)
+             let ret = ref !pptr in
+             errcodeptr :=
+               check_lookbehinds cb (!pptr + 1) (Some ret) recurses lcptr;
+             if not (Int.equal !errcodeptr 0) then raise_notrace Bl_fail;
+             pptr := !ret;
+
+             (* Ignore any qualifiers that follow a lookahead assertion. *)
+             let next = cb.parsed_pattern.(!pptr + 1) in
+             if
+               Int.equal next Parse.meta_asterisk
+               || Int.equal next Parse.meta_asterisk_plus
+               || Int.equal next Parse.meta_asterisk_query
+               || Int.equal next Parse.meta_plus
+               || Int.equal next Parse.meta_plus_plus
+               || Int.equal next Parse.meta_plus_query
+               || Int.equal next Parse.meta_query
+               || Int.equal next Parse.meta_query_plus
+               || Int.equal next Parse.meta_query_query
+             then pptr := !pptr + 1
+             else if
+               Int.equal next Parse.meta_minmax
+               || Int.equal next Parse.meta_minmax_plus
+               || Int.equal next Parse.meta_minmax_query
+             then pptr := !pptr + 3)
+           else if
+             Int.equal meta Parse.meta_lookbehind
+             || Int.equal meta Parse.meta_lookbehindnot
+             || Int.equal meta Parse.meta_lookbehind_na
+           then (
+             if
+               (* pcre2_compile.c:9604-9612 — a nested lookbehind does not
+                  contribute any length to this lookbehind, but must itself
+                  be checked and have its lengths set. *)
+               not (set_lookbehind_lengths cb pptr errcodeptr lcptr recurses)
+             then raise_notrace Bl_fail)
+           else if
+             Int.equal meta Parse.meta_backref_byname
+             || Int.equal meta Parse.meta_recurse_byname
+           then (
+             (* pcre2_compile.c:9614-9661 — back references and recursions
+                are handled by very similar code. At this stage, the names
+                generated in the parsing pass are available, but the main
+                name table has not yet been created. So for the named
+                varieties, scan the list of names in order to get the
+                number of the first one in the pattern, and whether or not
+                this name is duplicated. *)
+             if
+               Int.equal meta Parse.meta_backref_byname
+               && not
+                    (Int.equal
+                       (cb.external_options land Options.match_unset_backref)
+                       0)
+             then isnotfixed ();
+             (* Fall through (META_RECURSE_BYNAME) *)
+             let is_dupname = ref false in
+             pptr := !pptr + 1;
+             let length = cb.parsed_pattern.(!pptr) in
+             (* GETPLUSOFFSET(offset, pptr) *)
+             pptr := !pptr + 1;
+             let offset = cb.parsed_pattern.(!pptr) in
+             let name = offset in
+             (* PRIV(strncmp) (pcre2_string_utils.c:156-167) becomes a
+                code-unit loop over the pattern, as in compile_branch's
+                named-backref arm; the C breaks at the first match. *)
+             let i = ref 0 in
+             let broke = ref false in
+             while (not !broke) && !i < cb.names_found do
+               let ng = cb.named_groups.(!i) in
+               let name_eq =
+                 Int.equal length ng.Parse.length
+                 &&
+                 let rec cmp j =
+                   if j >= length then true
+                   else if
+                     Char.equal
+                       cb.pattern.[name + j]
+                       cb.pattern.[ng.Parse.name + j]
+                   then (cmp [@tailcall]) (j + 1)
+                   else false
+                 in
+                 cmp 0
+               in
+               if name_eq then (
+                 group := ng.Parse.number;
+                 is_dupname := ng.Parse.isdup;
+                 broke := true)
+               else incr i
+             done;
+
+             if Int.equal !group 0 then (
+               errcodeptr := Errors.err15 (* Non-existent subpattern *);
+               cb.erroroffset <- offset;
+               raise_notrace Bl_fail);
+
+             (* pcre2_compile.c:9653-9661 — a numerical back reference can
+                be fixed length if duplicate capturing groups are not being
+                used. A non-duplicate named back reference can also be
+                handled. Handle as a numbered version, or fail as a
+                duplicate name. *)
+             if
+               Int.equal meta Parse.meta_recurse_byname
+               || (not !is_dupname)
+                  && Int.equal (cb.external_flags land Parse.dupcapused) 0
+             then
+               recurse_or_backref_length ~group:!group ~offset pptr itemlength
+                 itemminlength errcodeptr lcptr recurses cb
+             else isnotfixed () (* Duplicate name or number *))
+           else if Int.equal meta Parse.meta_backref then (
+             (* pcre2_compile.c:9663-9676 — the offset values for back
+                references < 10 are in a separate vector because otherwise
+                they would use more than two parsed pattern elements on
+                64-bit systems. *)
+             if
+               (not
+                  (Int.equal
+                     (cb.external_options land Options.match_unset_backref)
+                     0))
+               || not (Int.equal (cb.external_flags land Parse.dupcapused) 0)
+             then isnotfixed ();
+             group := Parse.meta_data word;
+             if !group < 10 then
+               let offset = cb.small_ref_offset.(!group) in
+               recurse_or_backref_length ~group:!group ~offset pptr itemlength
+                 itemminlength errcodeptr lcptr recurses cb
+             else (
+               (* Fall through to the META_RECURSE case: for groups >= 10 -
+                  picking up group twice does no harm
+                  (pcre2_compile.c:9678-9686). *)
+               group := Parse.meta_data word;
+               pptr := !pptr + 1;
+               let offset = cb.parsed_pattern.(!pptr) in
+               recurse_or_backref_length ~group:!group ~offset pptr itemlength
+                 itemminlength errcodeptr lcptr recurses cb))
+           else if Int.equal meta Parse.meta_recurse then (
+             (* pcre2_compile.c:9681-9686 — a true recursion implies not
+                fixed length, but a subroutine call may be OK. Back
+                reference "recursions" are also failed. *)
+             group := Parse.meta_data word;
+             pptr := !pptr + 1;
+             let offset = cb.parsed_pattern.(!pptr) in
+             recurse_or_backref_length ~group:!group ~offset pptr itemlength
+               itemminlength errcodeptr lcptr recurses cb)
+           else if Int.equal meta Parse.meta_cond_define then (
+             (* pcre2_compile.c:9730-9736 — a (DEFINE) group is never
+                obeyed inline and so it does not contribute to the length
+                of this branch. Skip from the following item to the next
+                unpaired ket.
+                DEVIATION: the C stores parsed_skip's result without a NULL
+                check (it would dereference NULL, UB); fail with the
+                parsed_skip error instead. *)
+             let skipped = parsed_skip cb (!pptr + 1) ~skiptype:pskip_ket in
+             if Int.equal skipped (-1) then parsed_skip_failed ();
+             pptr := skipped)
+           else if
+             Int.equal meta Parse.meta_cond_name
+             || Int.equal meta Parse.meta_cond_number
+             || Int.equal meta Parse.meta_cond_rname
+             || Int.equal meta Parse.meta_cond_rnumber
+           then (
+             (* pcre2_compile.c:9738-9746 — check other nested groups -
+                advance past the initial data for each type and then seek a
+                fixed length with get_grouplength(). *)
+             pptr := !pptr + 2 + Parse.sizeoffset;
+             check_group ~group:!group pptr itemlength itemminlength errcodeptr
+               lcptr recurses cb)
+           else if Int.equal meta Parse.meta_cond_assert then (
+             (* pcre2_compile.c:9748-9750 *)
+             pptr := !pptr + 1;
+             check_group ~group:!group pptr itemlength itemminlength errcodeptr
+               lcptr recurses cb)
+           else if Int.equal meta Parse.meta_cond_version then (
+             (* pcre2_compile.c:9752-9754 *)
+             pptr := !pptr + 4;
+             check_group ~group:!group pptr itemlength itemminlength errcodeptr
+               lcptr recurses cb)
+           else if Int.equal meta Parse.meta_capture then (
+             (* pcre2_compile.c:9756-9758 + fall through *)
+             group := Parse.meta_data word;
+             pptr := !pptr + 1;
+             check_group ~group:!group pptr itemlength itemminlength errcodeptr
+               lcptr recurses cb)
+           else if
+             Int.equal meta Parse.meta_atomic
+             || Int.equal meta Parse.meta_nocapture
+             || Int.equal meta Parse.meta_script_run
+           then (
+             (* pcre2_compile.c:9760-9770 *)
+             pptr := !pptr + 1;
+             check_group ~group:!group pptr itemlength itemminlength errcodeptr
+               lcptr recurses cb)
+           else if
+             Int.equal meta Parse.meta_query
+             || Int.equal meta Parse.meta_query_plus
+             || Int.equal meta Parse.meta_query_query
+             || Int.equal meta Parse.meta_minmax
+             || Int.equal meta Parse.meta_minmax_plus
+             || Int.equal meta Parse.meta_minmax_query
+           then (
+             (* pcre2_compile.c:9772-9805 — the ? and {n,m} families share
+                the REPETITION code. Exact repetition is OK; variable
+                repetition is not. A repetition of zero must subtract the
+                length that has already been added. *)
+             let min = ref 0 in
+             let max = ref 1 in
+             if
+               Int.equal meta Parse.meta_minmax
+               || Int.equal meta Parse.meta_minmax_plus
+               || Int.equal meta Parse.meta_minmax_query
+             then (
+               min := cb.parsed_pattern.(!pptr + 1);
+               max := cb.parsed_pattern.(!pptr + 2);
+               pptr := !pptr + 2);
+
+             (* REPETITION *)
+             if not (Int.equal !max Limits.repeat_unlimited) then (
+               if
+                 (not (Int.equal !lastitemlength 0))
+                 (* Should not occur, but just in case *)
+                 && (not (Int.equal !max 0))
+                 && (int_max - !branchlength) / !lastitemlength < !max - 1
+               then (
+                 errcodeptr :=
+                   Errors.err87 (* Integer overflow; lookbehind too big *);
+                 raise_notrace Bl_fail);
+               if Int.equal !min 0 then
+                 branchminlength := !branchminlength - !lastitemminlength
+               else itemminlength := (!min - 1) * !lastitemminlength;
+               if Int.equal !max 0 then
+                 branchlength := !branchlength - !lastitemlength
+               else itemlength := (!max - 1) * !lastitemlength)
+             else (* Fall through to the default case. *)
+               isnotfixed ())
+           else
+             (* pcre2_compile.c:9807-9812 — any other item means this
+                branch does not have a fixed length. *)
+             isnotfixed ());
+
+        (* pcre2_compile.c:9815-9825 — add the item length to the
+           branchlength, checking for integer overflow and for the branch
+           length exceeding the overall limit. Later, if there is at least
+           one variable-length branch in the group, there is a test for
+           the (smaller) variable-length branch length limit. *)
+        if int_max - !branchlength < !itemlength then (
+          errcodeptr := Errors.err87;
+          raise_notrace Bl_fail)
+        else (
+          branchlength := !branchlength + !itemlength;
+          if !branchlength > Limits.lookbehind_max then (
+            errcodeptr := Errors.err87;
+            raise_notrace Bl_fail));
+
+        branchminlength := !branchminlength + !itemminlength;
+
+        (* pcre2_compile.c:9829-9832 — save this item length for use if
+           the next item is a quantifier. *)
+        lastitemlength := !itemlength;
+        lastitemminlength := !itemminlength;
+        pptr := !pptr + 1
+      done;
+      assert false
+    with
+    | Bl_exit ->
+        (* EXIT: pcre2_compile.c:9835-9838 *)
+        pptrptr := !pptr;
+        minptr := !branchminlength;
+        !branchlength
+    | Bl_fail -> -1
+
+(* pcre2_compile.c:9688-9728 — the RECURSE_OR_BACKREF_LENGTH label inside
+   get_branchlength, reached from the named/numbered backreference and
+   recursion cases. Finds the referenced group in the parsed pattern and
+   measures it with get_grouplength, guarding against local and mutual
+   recursion. Writes the item lengths through itemlength/itemminlength;
+   failure paths raise Bl_fail (caught by the enclosing get_branchlength),
+   which is the C's `return -1` / `goto ISNOTFIXED` / `goto
+   PARSED_SKIP_FAILED`. *)
+and recurse_or_backref_length ~(group : int) ~(offset : int) (pptr : int ref)
+    (itemlength : int ref) (itemminlength : int ref) (errcodeptr : int ref)
+    (lcptr : int ref) (recurses : parsed_recurse_check option)
+    (cb : compile_block) : unit =
+  let isnotfixed () : 'a =
+    errcodeptr := Errors.err25;
+    raise_notrace Bl_fail
+  in
+  (* pcre2_compile.c:9689-9695 *)
+  if group > cb.bracount then (
+    cb.erroroffset <- offset;
+    errcodeptr := Errors.err15 (* Non-existent subpattern *);
+    raise_notrace Bl_fail);
+  if Int.equal group 0 then isnotfixed () (* Local recursion *);
+  (* pcre2_compile.c:9696-9700 — find the referenced group. (The C's scan
+     cannot hit META_END because group <= cb->bracount guarantees the
+     capture exists; the loop condition mirrors `*gptr != META_END` all the
+     same.) *)
+  let gptr = ref 0 in
+  while
+    (not (Int.equal cb.parsed_pattern.(!gptr) (Parse.meta_capture lor group)))
+    && not (Int.equal cb.parsed_pattern.(!gptr) Parse.meta_end)
+  do
+    if Int.equal (Parse.meta_code cb.parsed_pattern.(!gptr)) Parse.meta_bigvalue
+    then gptr := !gptr + 1;
+    gptr := !gptr + 1
+  done;
+
+  (* pcre2_compile.c:9702-9711 — we must start the search for the end of
+     the group at the first meta code inside the group. Otherwise it will
+     be treated as an enclosed group. *)
+  let gptrend = parsed_skip cb (!gptr + 1) ~skiptype:pskip_ket in
+  if Int.equal gptrend (-1) then (
+    (* PARSED_SKIP_FAILED: pcre2_compile.c:9840-9842 *)
+    errcodeptr := Errors.err90;
+    raise_notrace Bl_fail);
+  if !pptr > !gptr && !pptr < gptrend then isnotfixed () (* Local recursion *);
+  let rec find_mutual (r : parsed_recurse_check option) : bool =
+    match r with
+    | None -> false
+    | Some rc ->
+        if Int.equal rc.groupptr !gptr then true else (find_mutual [@tailcall]) rc.prev
+  in
+  if find_mutual recurses then isnotfixed () (* Mutual recursion *);
+  let this_recurse = { prev = recurses; groupptr = !gptr } in
+
+  (* pcre2_compile.c:9713-9728 — we do not need to know the position of
+     the end of the group, that is, gptr is not used after the call to
+     get_grouplength(). Setting isinline false stops it scanning for the
+     end when the length can be found in the cache. *)
+  gptr := !gptr + 1;
+  let groupminlength = ref 0 in
+  let grouplength =
+    get_grouplength gptr groupminlength ~isinline:false errcodeptr lcptr ~group
+      (Some this_recurse) cb
+  in
+  if grouplength < 0 then (
+    if Int.equal !errcodeptr 0 then isnotfixed ();
+    raise_notrace Bl_fail (* Error already set *));
+  itemlength := grouplength;
+  itemminlength := !groupminlength
+
+(* pcre2_compile.c:9764-9770 — the CHECK_GROUP label inside
+   get_branchlength: seek a fixed length with get_grouplength(). A
+   negative result is the C's `return -1` (the errorcode may deliberately
+   still be 0; the callers patch in ERR25). *)
+and check_group ~(group : int) (pptr : int ref) (itemlength : int ref)
+    (itemminlength : int ref) (errcodeptr : int ref) (lcptr : int ref)
+    (recurses : parsed_recurse_check option) (cb : compile_block) : unit =
+  let groupminlength = ref 0 in
+  let grouplength =
+    get_grouplength pptr groupminlength ~isinline:true errcodeptr lcptr ~group
+      recurses cb
+  in
+  if grouplength < 0 then raise_notrace Bl_fail;
+  itemlength := grouplength;
+  itemminlength := !groupminlength
+
+(* pcre2_compile.c:9847-9937 — set_lookbehind_lengths. This function is
+   called for each lookbehind, to set the lengths in its branches. An error
+   occurs if any branch does not have a limited maximum length that is less
+   than the limit (65535). On exit, the pointer must be left on the final
+   ket.
+
+   The function also maintains the max_lookbehind value. Any lookbehind
+   branch that contains a nested lookbehind may actually look further back
+   than the length of the branch. The additional amount is passed back from
+   get_branchlength() as an "extra" value.
+
+   Arguments:
+     cb          pointer to compile block
+     pptrptr     pointer (ref) to index in the parsed pattern
+     errcodeptr  pointer to error code
+     lcptr       pointer to loop counter
+     recurses    chain of recurse_check to catch mutual recursion
+
+   Returns: true if all is well; false otherwise, with error code and
+   offset set. *)
+and set_lookbehind_lengths (cb : compile_block) (pptrptr : int ref)
+    (errcodeptr : int ref) (lcptr : int ref)
+    (recurses : parsed_recurse_check option) : bool =
+  let bptr = ref !pptrptr in
+  let gbptr = !pptrptr in
+  let maxlength = ref 0 in
+  let minlength = ref int_max in
+  let variable = ref false in
+
+  (* READPLUSOFFSET(offset, bptr) — offset for error messages. *)
+  let offset = cb.parsed_pattern.(!bptr + 1) in
+  pptrptr := !pptrptr + Parse.sizeoffset;
+
+  let exception Slb_false in
+  try
+    (* pcre2_compile.c:9886-9913 — each branch can have a different
+       maximum length, but we can keep only a single minimum for the whole
+       group, because there's nowhere to save individual values in the
+       META_ALT item: do { ... } while (META_CODE( *bptr) == META_ALT). *)
+    let continue_ = ref true in
+    while !continue_ do
+      pptrptr := !pptrptr + 1;
+      let branchminlength = ref 0 in
+      let branchlength =
+        get_branchlength pptrptr branchminlength errcodeptr lcptr recurses cb
+      in
+
+      if branchlength < 0 then (
+        (* The errorcode and offset may already be set from a nested
+           lookbehind. *)
+        if Int.equal !errcodeptr 0 then errcodeptr := Errors.err25;
+        if Int.equal cb.erroroffset Parse.pcre2_unset then
+          cb.erroroffset <- offset;
+        raise_notrace Slb_false);
+
+      if not (Int.equal branchlength !branchminlength) then variable := true;
+      if !branchminlength < !minlength then minlength := !branchminlength;
+      if branchlength > !maxlength then maxlength := branchlength;
+      if branchlength > cb.max_lookbehind then cb.max_lookbehind <- branchlength;
+      (* branchlength never more than 65535 *)
+      cb.parsed_pattern.(!bptr) <- cb.parsed_pattern.(!bptr) lor branchlength;
+      bptr := !pptrptr;
+      if
+        not
+          (Int.equal (Parse.meta_code cb.parsed_pattern.(!bptr)) Parse.meta_alt)
+      then continue_ := false
+    done;
+
+    (* pcre2_compile.c:9915-9936 — if any branch is of variable length,
+       the whole lookbehind is of variable length. If the maximum length
+       of any branch exceeds the maximum for variable lookbehinds, give an
+       error. Otherwise, the minimum length is set in the word that
+       follows the original group META value. For a fixed-length
+       lookbehind, this is set to LOOKBEHIND_MAX, to indicate that each
+       branch is of a fixed (but possibly different) length. (The C
+       assigns gbptr[1] in the if/else and then re-assigns the same value
+       at 9935; one assignment suffices, done after the error check to
+       match the observable order.) *)
+    if !variable then (
+      cb.parsed_pattern.(gbptr + 1) <- !minlength;
+      if !maxlength > cb.max_varlookbehind then (
+        errcodeptr := Errors.err100;
+        cb.erroroffset <- offset;
+        raise_notrace Slb_false))
+    else cb.parsed_pattern.(gbptr + 1) <- Limits.lookbehind_max;
+    true
+  with Slb_false -> false
+
+(* pcre2_compile.c:9941-10102 — check_lookbehinds. This function is called
+   at the end of parsing a pattern if any lookbehinds were encountered. It
+   scans the parsed pattern for them, calling set_lookbehind_lengths() for
+   each one. At the start, the errorcode is zero and the error offset is
+   marked unset. This enables the functions above not to override settings
+   from deeper nestings.
+
+   This function is called recursively from get_branchlength() for
+   lookaheads in order to process any lookbehinds that they may contain. It
+   stops when it hits a non-nested closing parenthesis in this case,
+   returning the index of it through retptr.
+
+   Arguments:
+     cb        points to the compile block
+     pptr      where to start (start of pattern or start of lookahead)
+     retptr    if not None, return the ket index here
+     recurses  chain of recurse_check to catch mutual recursion
+     lcptr     points to loop counter
+
+   Returns: 0 on success, or an errorcode (cb.erroroffset will be set). *)
+and check_lookbehinds (cb : compile_block) (pptr : int)
+    (retptr : int ref option) (recurses : parsed_recurse_check option)
+    (lcptr : int ref) : int =
+  let errorcode = ref 0 in
+  let nestlevel = ref 0 in
+  let pptr = ref pptr in
+
+  cb.erroroffset <- Parse.pcre2_unset;
+
+  let exception Cl_return of int in
+  try
+    (* for (; *pptr != META_END; pptr++) *)
+    while not (Int.equal cb.parsed_pattern.(!pptr) Parse.meta_end) do
+      let word = cb.parsed_pattern.(!pptr) in
+      (if word < Parse.meta_end then () (* Literal: continue *)
+       else
+         let meta = Parse.meta_code word in
+         if Int.equal meta Parse.meta_escape then (
+           if
+             (* pcre2_compile.c:9983-9986 *)
+             Int.equal (word - Parse.meta_escape) Parse.esc_big_p
+             || Int.equal (word - Parse.meta_escape) Parse.esc_p
+           then pptr := !pptr + 1)
+         else if Int.equal meta Parse.meta_ket then (
+           (* pcre2_compile.c:9988-9994 *)
+           decr nestlevel;
+           if !nestlevel < 0 then (
+             (match retptr with Some r -> r := !pptr | None -> ());
+             raise_notrace (Cl_return 0)))
+         else if
+           Int.equal meta Parse.meta_atomic
+           || Int.equal meta Parse.meta_capture
+           || Int.equal meta Parse.meta_cond_assert
+           || Int.equal meta Parse.meta_lookahead
+           || Int.equal meta Parse.meta_lookaheadnot
+           || Int.equal meta Parse.meta_lookahead_na
+           || Int.equal meta Parse.meta_nocapture
+           || Int.equal meta Parse.meta_script_run
+         then (* pcre2_compile.c:9996-10005 *)
+           incr nestlevel
+         else if
+           Int.equal meta Parse.meta_accept
+           || Int.equal meta Parse.meta_alt
+           || Int.equal meta Parse.meta_asterisk
+           || Int.equal meta Parse.meta_asterisk_plus
+           || Int.equal meta Parse.meta_asterisk_query
+           || Int.equal meta Parse.meta_backref
+           || Int.equal meta Parse.meta_circumflex
+           || Int.equal meta Parse.meta_class
+           || Int.equal meta Parse.meta_class_empty
+           || Int.equal meta Parse.meta_class_empty_not
+           || Int.equal meta Parse.meta_class_end
+           || Int.equal meta Parse.meta_class_not
+           || Int.equal meta Parse.meta_commit
+           || Int.equal meta Parse.meta_dollar
+           || Int.equal meta Parse.meta_dot
+           || Int.equal meta Parse.meta_fail
+           || Int.equal meta Parse.meta_plus
+           || Int.equal meta Parse.meta_plus_plus
+           || Int.equal meta Parse.meta_plus_query
+           || Int.equal meta Parse.meta_prune
+           || Int.equal meta Parse.meta_query
+           || Int.equal meta Parse.meta_query_plus
+           || Int.equal meta Parse.meta_query_query
+           || Int.equal meta Parse.meta_range_escaped
+           || Int.equal meta Parse.meta_range_literal
+           || Int.equal meta Parse.meta_skip
+           || Int.equal meta Parse.meta_then
+         then
+           (* pcre2_compile.c:10007-10034 — nothing to do (a META_BACKREF
+              offset word, present for groups >= 10, is skipped by the
+              literal test above, exactly as in the C). *)
+           ()
+         else if Int.equal meta Parse.meta_recurse then
+           (* pcre2_compile.c:10036-10038 *)
+           pptr := !pptr + Parse.sizeoffset
+         else if
+           Int.equal meta Parse.meta_backref_byname
+           || Int.equal meta Parse.meta_recurse_byname
+         then
+           (* pcre2_compile.c:10040-10043 *)
+           pptr := !pptr + 1 + Parse.sizeoffset
+         else if Int.equal meta Parse.meta_cond_define then (
+           (* pcre2_compile.c:10045-10048 *)
+           pptr := !pptr + Parse.sizeoffset;
+           incr nestlevel)
+         else if
+           Int.equal meta Parse.meta_cond_name
+           || Int.equal meta Parse.meta_cond_number
+           || Int.equal meta Parse.meta_cond_rname
+           || Int.equal meta Parse.meta_cond_rnumber
+         then (
+           (* pcre2_compile.c:10050-10056 *)
+           pptr := !pptr + 1 + Parse.sizeoffset;
+           incr nestlevel)
+         else if Int.equal meta Parse.meta_cond_version then (
+           (* pcre2_compile.c:10058-10061 *)
+           pptr := !pptr + 3;
+           incr nestlevel)
+         else if Int.equal meta Parse.meta_callout_string then
+           (* pcre2_compile.c:10063-10065 *)
+           pptr := !pptr + 3 + Parse.sizeoffset
+         else if
+           Int.equal meta Parse.meta_bigvalue
+           || Int.equal meta Parse.meta_posix
+           || Int.equal meta Parse.meta_posix_neg
+         then (* pcre2_compile.c:10067-10071 *)
+           pptr := !pptr + 1
+         else if
+           Int.equal meta Parse.meta_minmax
+           || Int.equal meta Parse.meta_minmax_query
+           || Int.equal meta Parse.meta_minmax_plus
+           || Int.equal meta Parse.meta_options
+         then (* pcre2_compile.c:10073-10078 *)
+           pptr := !pptr + 2
+         else if Int.equal meta Parse.meta_callout_number then
+           (* pcre2_compile.c:10080-10082 *)
+           pptr := !pptr + 3
+         else if
+           Int.equal meta Parse.meta_mark
+           || Int.equal meta Parse.meta_commit_arg
+           || Int.equal meta Parse.meta_prune_arg
+           || Int.equal meta Parse.meta_skip_arg
+           || Int.equal meta Parse.meta_then_arg
+         then
+           (* pcre2_compile.c:10084-10090 *)
+           pptr := !pptr + 1 + cb.parsed_pattern.(!pptr + 1)
+         else if
+           Int.equal meta Parse.meta_lookbehind
+           || Int.equal meta Parse.meta_lookbehindnot
+           || Int.equal meta Parse.meta_lookbehind_na
+         then (
+           if
+             (* pcre2_compile.c:10092-10097 *)
+             not (set_lookbehind_lengths cb pptr errorcode lcptr recurses)
+           then raise_notrace (Cl_return !errorcode))
+         else
+           (* pcre2_compile.c:9980-9981 — unrecognized meta code (the C
+              switch's default case, first in the source). *)
+           raise_notrace (Cl_return Errors.err70));
+      pptr := !pptr + 1
+    done;
+    0
+  with Cl_return rc -> rc
 
 (* ---------- The compiled pattern ---------- *)
 
@@ -4189,11 +5234,24 @@ let pcre2_compile ?(ccontext : compile_context = default_compile_context)
     Array.blit pcx.Parse.small_ref_offset 0 cb.small_ref_offset 0 10;
 
     (* pcre2_compile.c:10526-10553 — if there are any lookbehinds, scan
-       the parsed pattern to figure out their lengths (groupinfo vector +
-       check_lookbehinds). DEFERRED (M3): unreachable — parse_regex defers
-       every lookbehind arm with err_deferred — but fail loudly rather
-       than silently mis-compiling if that changes. *)
-    if !has_lookbehind then raise_notrace (Had_error (Parse.err_deferred, 0));
+       the parsed pattern to figure out their lengths. Workspace is needed
+       to remember whether numbered groups are or are not of limited
+       length, and if limited, what the minimum and maximum lengths are.
+       This caching saves re-computing the length of any group that is
+       referenced more than once, which is particularly relevant when
+       recursion is involved. Unnumbered groups do not have this exposure
+       because they cannot be referenced. The vector must be initialized
+       to zero.
+       DEVIATION: the C keeps a 256-element default vector on the stack
+       and only heap-allocates (with the ERR21 failure path) for larger
+       group counts (10539-10549); here the exactly-sized zeroed vector is
+       always allocated. *)
+    if !has_lookbehind then (
+      let loopcount = ref 0 in
+      cb.groupinfo <- Array.make (2 * (cb.bracount + 1)) 0;
+      let errorcode = check_lookbehinds cb 0 None None loopcount in
+      if not (Int.equal errorcode 0) then
+        raise_notrace (Had_error (errorcode, cb.erroroffset)));
 
     (* pcre2_compile.c:10575-10596 — pretend to compile the pattern while
        actually just accumulating the amount of memory required. On error,
@@ -6275,3 +7333,250 @@ let () =
   expect_err "abc\\1" 0 Errors.err15 4;
   expect_err "\\g{12}abc" 0 Errors.err15 5;
   expect_err "\\g{2}()" 0 Errors.err15 4
+
+(* Lookaround assertions and atomic groups (M3 compile chunk,
+   pcre2_compile.c:6748-6804, 8427-8491, 8639-8643 and the lookbehind-
+   length machinery 9223-10102, docs/ocaml-engine/04-lookaround-atomic-
+   possessive.md): bytecode, max_lookbehind and error numbers/offsets
+   pinned with `pcre2test -q` + fullbincode/-I on the real 10.44
+   library. *)
+let () =
+  let ok ?(options = 0) pat =
+    match pcre2_compile pat ~options with
+    | Ok re -> re
+    | Error (e, o) ->
+        failwith
+          (Printf.sprintf "pcre2_compile %S: error %d at offset %d" pat e o)
+  in
+  let expect_err pat options e o =
+    match pcre2_compile pat ~options with
+    | Ok _ -> assert false
+    | Error (e', o') ->
+        assert (Int.equal e e');
+        assert (Int.equal o o')
+  in
+  let assert_code (re : re) (expected : int list) =
+    assert (Int.equal (Bytes.length re.code) (List.length expected));
+    List.iteri
+      (fun i v -> assert (Int.equal (Char.code (Bytes.get re.code i)) v))
+      expected
+  in
+  let byte (re : re) i = Char.code (Bytes.get re.code i) in
+  (* /(?=ab)/: [BRA 13][ASSERT 7][CHAR a][CHAR b][KET 7][KET 13][END]. *)
+  let re = ok "(?=ab)" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      13;
+      Opcodes.op_assert;
+      0;
+      7;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_ket;
+      0;
+      13;
+      Opcodes.op_end;
+    ];
+  assert (Int.equal re.max_lookbehind 0);
+  (* /(?!x)/: [BRA 11][ASSERT_NOT 5][CHAR x][KET 5][KET 11][END]. *)
+  let re = ok "(?!x)" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      11;
+      Opcodes.op_assert_not;
+      0;
+      5;
+      Opcodes.op_char;
+      0x78;
+      Opcodes.op_ket;
+      0;
+      5;
+      Opcodes.op_ket;
+      0;
+      11;
+      Opcodes.op_end;
+    ];
+  (* /(?<=ab)c/: fixed-length lookbehind — [ASSERTBACK 10][REVERSE 2]
+     inserted at the head of the branch; Max lookbehind = 2. *)
+  let re = ok "(?<=ab)c" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      18;
+      Opcodes.op_assertback;
+      0;
+      10;
+      Opcodes.op_reverse;
+      0;
+      2;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_ket;
+      0;
+      10;
+      Opcodes.op_char;
+      0x63;
+      Opcodes.op_ket;
+      0;
+      18;
+      Opcodes.op_end;
+    ];
+  assert (Int.equal re.max_lookbehind 2);
+  (* /(?<!a|bc)d/: per-branch fixed lengths (1 and 2) each get their own
+     OP_REVERSE (the whole group's minlength word is LOOKBEHIND_MAX);
+     Max lookbehind = 2. *)
+  let re = ok "(?<!a|bc)d" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      26;
+      Opcodes.op_assertback_not;
+      0;
+      8;
+      Opcodes.op_reverse;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_alt;
+      0;
+      10;
+      Opcodes.op_reverse;
+      0;
+      2;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_char;
+      0x63;
+      Opcodes.op_ket;
+      0;
+      18;
+      Opcodes.op_char;
+      0x64;
+      Opcodes.op_ket;
+      0;
+      26;
+      Opcodes.op_end;
+    ];
+  assert (Int.equal re.max_lookbehind 2);
+  (* /(?>a+)b/: [BRA 13][ONCE 5][PLUS a][KET 5][CHAR b][KET 13][END].
+     pcre2test shows "a++" because auto_possessify rewrites OP_PLUS to
+     OP_POSPLUS — that pass is M9 (deferred without an error marker, see
+     the driver note at its call site); opcode positions and lengths are
+     identical. *)
+  let re = ok "(?>a+)b" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      13;
+      Opcodes.op_once;
+      0;
+      5;
+      Opcodes.op_plus;
+      0x61;
+      Opcodes.op_ket;
+      0;
+      5;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_ket;
+      0;
+      13;
+      Opcodes.op_end;
+    ];
+  (* /(?<=a?bc|ab)d/: variable-length first branch (min 2, max 3) gets
+     OP_VREVERSE; the fixed second branch (min = max = 2) keeps
+     OP_REVERSE; Max lookbehind = 3. (pcre2test shows "a?+" — OP_POSQUERY
+     — after the M9 auto_possessify pass; OP_QUERY here, same length.) *)
+  let re = ok "(?<=a?bc|ab)d" in
+  assert (Int.equal (Bytes.length re.code) 36);
+  assert (Int.equal (byte re 3) Opcodes.op_assertback);
+  assert (Int.equal (get re.code 4) 14);
+  assert (Int.equal (byte re 6) Opcodes.op_vreverse);
+  assert (Int.equal (get2 re.code 7) 2 (* min *));
+  assert (Int.equal (get2 re.code 9) 3 (* max *));
+  assert (Int.equal (byte re 11) Opcodes.op_query);
+  assert (Int.equal (byte re 17) Opcodes.op_alt);
+  assert (Int.equal (get re.code 18) 10);
+  assert (Int.equal (byte re 20) Opcodes.op_reverse);
+  assert (Int.equal (get2 re.code 21) 2);
+  assert (Int.equal (byte re 27) Opcodes.op_ket);
+  assert (Int.equal (get re.code 28) 24);
+  assert (Int.equal (byte re 30) Opcodes.op_char);
+  assert (Int.equal re.max_lookbehind 3);
+  assert (Int.equal re.first_codeunit 0x64 (* "First code unit = 'd'" *));
+  (* Max lookbehind is the longest branch, not the longest whole
+     assertion: /(?<=ab|defgh)x/ -> 5. *)
+  let re = ok "(?<=ab|defgh)x" in
+  assert (Int.equal re.max_lookbehind 5);
+  (* An unquantified (?!) is optimized to OP_FAIL
+     (pcre2_compile.c:6762-6774)... *)
+  let re = ok "(?!)" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      4;
+      Opcodes.op_fail;
+      Opcodes.op_ket;
+      0;
+      4;
+      Opcodes.op_end;
+    ];
+  (* ...but a quantified one is a real (repeated) assertion group. *)
+  let re = ok "(?!)+" in
+  assert (Int.equal (Bytes.length re.code) 20);
+  assert (Int.equal (byte re 3) Opcodes.op_assert_not);
+  assert (Int.equal (byte re 9) Opcodes.op_brazero);
+  assert (Int.equal (byte re 10) Opcodes.op_assert_not);
+  (* Non-atomic forms: (?* and (?<* (and their alpha synonyms) compile
+     OP_ASSERT_NA / OP_ASSERTBACK_NA. *)
+  let re = ok "(?*abc)d" in
+  assert (Int.equal (byte re 3) Opcodes.op_assert_na);
+  let re = ok "(?<*ab)c" in
+  assert (Int.equal (byte re 3) Opcodes.op_assertback_na);
+  assert (Int.equal (byte re 6) Opcodes.op_reverse);
+  assert (Int.equal re.max_lookbehind 2);
+  (* Alpha synonyms produce identical code to the symbolic forms. *)
+  let re = ok "(*plb:ab)c" in
+  assert (Int.equal (byte re 3) Opcodes.op_assertback);
+  assert (Int.equal (byte re 6) Opcodes.op_reverse);
+  assert (Int.equal (get2 re.code 7) 2);
+  (* A lookahead nested in a lookbehind contributes no length but
+     compiles inline (REVERSE 1 for the y). *)
+  let re = ok "(?<=(?=x)y)z" in
+  assert (Int.equal (byte re 3) Opcodes.op_assertback);
+  assert (Int.equal (byte re 6) Opcodes.op_reverse);
+  assert (Int.equal (get2 re.code 7) 1);
+  assert (Int.equal (byte re 9) Opcodes.op_assert);
+  assert (Int.equal re.max_lookbehind 1);
+  (* Lookbehind length errors, offsets per pcre2test: ERR25 (125) for
+     unlimited length (\X never allowed); ERR100 (200) for a variable
+     branch longer than max_varlookbehind (default 255); ERR87 (187) for
+     a branch over LOOKBEHIND_MAX (65535). *)
+  expect_err "(?<=a+)b" 0 Errors.err25 0;
+  expect_err "x(?<!a*)b" 0 Errors.err25 1;
+  expect_err "(?<=\\Xa)b" 0 Errors.err25 0;
+  expect_err "(?<=a{0,300})b" 0 Errors.err100 0;
+  expect_err "(?<=a{40000}a{40000})b" 0 Errors.err87 0;
+  (* A variable lookbehind within the default 255 limit compiles. *)
+  let re = ok "(?<=a{2,5})b" in
+  assert (Int.equal (byte re 3) Opcodes.op_assertback);
+  assert (Int.equal (byte re 6) Opcodes.op_vreverse);
+  assert (Int.equal (get2 re.code 7) 2);
+  assert (Int.equal (get2 re.code 9) 5);
+  assert (Int.equal re.max_lookbehind 5)
