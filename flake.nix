@@ -87,15 +87,18 @@
           # This doesnt work there because idk
           shellHook = with pkgs; ''
             export NIX_CXXFLAGS_COMPILE="$NIX_CXXFLAGS_COMPILE -I${pkgs.libcxx.dev}/include/c++/v1"
-            # Force the 10.44 C oracle ahead of the 10.42 depext.
-            export PKG_CONFIG_PATH="${pcre2c1044.dev}/lib/pkgconfig:$PKG_CONFIG_PATH"
           '';
-          # NOTE: pcre2c1044 is deliberately NOT in buildInputs: that would add
-          # its include dir as -isystem, and GCC ignores a -I that duplicates
-          # an -isystem dir, which lets the 10.42 depext headers win. The
-          # PKG_CONFIG_PATH export above + discover.ml's -I/-L are sufficient.
+          # Since the pure swap, package pcre2 has no C deps, so nothing pulls
+          # in pkg-config or a pcre2 C library for the dev-only oracle
+          # (pcre2-dev) — both must be explicit here. The nixpkgs pkg-config
+          # wrapper only honors .pc paths accumulated from buildInputs (it
+          # ignores ambient PKG_CONFIG_PATH), which is also what keeps the
+          # oracle pinned to pcre2c1044 (10.44): it is the only pcre2 in the
+          # shell. (History: while the 10.42 depext was still present, having
+          # pcre2c1044 in buildInputs made GCC drop its -I for the dir's
+          # -isystem entry behind 10.42's — moot now that the depext is gone.)
           inputsFrom = [ pcre2 ];
-          buildInputs = devOpamPackages;
+          buildInputs = devOpamPackages ++ [ pcre2c1044 pkgs.pkg-config ];
         };
       });
 }
