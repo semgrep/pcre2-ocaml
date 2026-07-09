@@ -98,8 +98,24 @@ spanning ~100k attempts at < 1000 minor words (measures 205; pre-hoist
 into per-call subject memcpy; bench now uses `oracle_test_exec_nopad`
 (timing-only, containment documented) so oracle ≈ raw-C again.
 
+**Chunk 2 diagnosis + plan (2026-07-09)**: measurement-grounded (perf(1)
+works via `sudo sysctl kernel.perf_event_paranoid=1`, revert after),
+prototype-validated plan at
+`/home/ubuntu/.claude/plans/pcre2-perf-chunk2-plan.md`. Headline: the gap
+was never the matching loop — it is (a) per-exec frames-arena allocation
+(Frames.create's 32KB major-heap array per exec = 81% of http_lines
+engine time; C reuses its buffer, pcre2_match.c:7062-7077) and (b) dev
+profile's `-opaque` (generic caml_apply at hot cross-module calls; the
+published package never has it). Measured prototype ladder: release
+8.57 → +arena-reuse 3.42 → +barrier-kill 2.60 → +scan-localization 2.39;
+-unsafe ceiling 2.17. Read the plan's do-not-bother list before
+proposing levers (jump table already fine; flambda no help; UTF decode a
+red herring). **P0 (release-profile gating) DONE** — see the
+"Measurement profile" note in `10-performance.md`.
+
 **Honest baseline after chunk 1** (full bench, reps=5, uncontended,
-2026-07-09): **geomean 10.30x** (was 46.9x). Per-benchmark
+2026-07-09, dev profile — pre-P0): **geomean 10.30x** (was 46.9x);
+release-profile equivalent 8.57x. Per-benchmark
 engine/oracle: repeat_negclass 5.45, uri 5.96, findall_email 6.08,
 email 6.13, pathological 6.85 (the floor; was 7.6), ipv4 7.57, backref
 7.80, keywords 10.56, repeat_bounded 14.94, findall_utf 23.92,

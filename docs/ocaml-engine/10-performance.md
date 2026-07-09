@@ -30,6 +30,15 @@ report.
 **Gate G10** (verbatim from plan): engine/oracle ratio ≤ 2.0 (geomean AND per-benchmark;
 any exception requires explicit user sign-off); `dune build -p pcre2` dependency-free.
 
+**Measurement profile (decided 2026-07-09, chunk-2 P0)**: the gate is measured under
+`--profile release`. Dune's dev profile passes `-opaque`, which strips cmx approximations
+and forces generic `caml_apply` calls at every cross-module call in the hot loop (241
+sites in interpreter.ml's cmm) — a build configuration the published package
+(`dune build -p pcre2`) never uses. Release differs from dev only by dropping `-opaque`
+(`-g` stays, asserts stay ON — verified via `dune printenv`). Conformance/fuzz batteries
+stay on dev. Measured effect at 9d62182: geomean 10.30 (dev) → 8.57 (release), identical
+match counts.
+
 ### Chunks
 
 - [x] bench corpus: mariomka regex-benchmark trio (email/URI/IPv4 over large text), keyword

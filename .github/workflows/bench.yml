@@ -26,15 +26,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v14
       - uses: DeterminateSystems/magic-nix-cache-action@v8
+      # --profile release: the gate measures the build users get. Dev profile's
+      # -opaque forces generic caml_apply at hot cross-module calls (see
+      # docs/ocaml-engine/10-performance.md "Measurement profile").
       - name: Build bench suite
-        run: nix develop -c dune build bench/bench.exe bench/compare.exe
+        run: nix develop -c dune build --profile release bench/bench.exe bench/compare.exe
       - name: Run benchmarks (interleaved reps, medians, count cross-check)
         run: |
-          nix develop -c dune exec bench/bench.exe -- \
+          nix develop -c dune exec --profile release bench/bench.exe -- \
             ${{ inputs.mode == 'quick' && '--quick' || '' }} \
             --out bench/results.json
       - name: Perf gate (engine/oracle <= 2.0 geomean AND per-benchmark)
-        run: nix develop -c dune exec bench/compare.exe -- bench/results.json
+        run: nix develop -c dune exec --profile release bench/compare.exe -- bench/results.json
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
