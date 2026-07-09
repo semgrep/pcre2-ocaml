@@ -12,15 +12,17 @@
    class family OP_CLASS/OP_NCLASS with resume labels RM23/RM24 and (UTF)
    RM200/RM201 (1919-2172), OP_XCLASS with RM100/RM101 (2175-2302; the
    XCL item matcher is xclass.ml),
-   the character-type singles OP_ANY..OP_VSPACE (943-989, 2305-2476) and
-   the TYPE repeat machinery REPEATTYPE with resume labels RM33/RM34 and
-   (UTF) RM219/RM221 (2651-5005; property/EXTUNI arms -> M7), the
+   the character-type singles OP_ANY..OP_VSPACE (943-989, 2305-2476),
+   OP_PROP/OP_NOTPROP (2479-2614) and
+   the TYPE repeat machinery REPEATTYPE with resume labels RM33/RM34,
+   (UTF) RM219/RM221 and (properties) RM208-RM217/RM222-RM225
+   (2651-5005; EXTUNI arms -> the \X chunk), the
    backreference family
    match_ref and OP_REF/OP_REFI/OP_DNREF/OP_DNREFI with the repeat
    machinery and resume labels RM20-RM22 (338-481, 4980-5194, including
    the Unicode caseless fold 388-434), the anchors and simple
    assertions OP_CIRC(M)/OP_DOLL(M)/OP_SOD/OP_SOM/OP_SET_SOM/OP_EOD/
-   OP_EODN/word boundaries (6132-6338; UCP boundaries -> M7), the
+   OP_EODN/word boundaries incl. the UCP variants (6132-6338), the
    bracket/alternation/ket family OP_BRAZERO/OP_BRAMINZERO/OP_SKIPZERO
    (5224-5246), OP_BRA/OP_CBRA/OP_SCBRA and the shared GROUPLOOP
    (5349-5411; the OP_ONCE/OP_SCRIPT_RUN/OP_SBRA head at 5391-5394 is
@@ -433,6 +435,96 @@ let vspace_char (c : int) : bool =
   | 0x0a | 0x0b | 0x0c | 0x0d | 0x85 | 0x2028 | 0x2029 -> true
   | _ -> false
 
+(* pcre2_match.c:2576-2583 (= 2903-2916, 3723-3736, 4311-4319) — the
+   PT_CLIST scan: cp = PRIV(ucd_caseless_sets) + <property value>;
+   for (;;) { if (fc < *cp) <no match>; if (fc == *cp++) <match>; }.
+   Terminates inside the table: the sets are ascending and end with
+   NOTACHAR = 0xffffffff (pcre2_ucd.c:114-143), which exceeds every
+   decoded character (getutf8 yields at most 0x7fffffff), so the fc < *cp
+   exit always fires by the set's end. *)
+let rec prop_clist_member (fc : int) (cp : int) : bool =
+  let v = Ucd_tables.ucd_caseless_sets.(cp) in
+  if fc < v then false
+  else if Int.equal fc v then true
+  else (prop_clist_member [@tailcall]) fc (cp + 1)
+
+(* pcre2_match.c:2493-2610 — the Unicode property test shared by the
+   OP_PROP/OP_NOTPROP single-character arm and the property repeat loops
+   (min 2726-2974, minimize 3515-3801, maximize 4115-4381): does
+   character [c] have property ([ptype], [pdata])?
+
+   DEVIATION(structure): the C repeats this switch inline at each of
+   those four sites with the notmatch / (Lctype == OP_NOTPROP)
+   comparison folded into every case; factored here once — each call
+   site keeps its own comparison, control flow and evaluation order.
+   Cases in the C's order, with the C's exact category groupings; the
+   PT_CLIST arms' fc < */== *cp exits reduce to set membership compared
+   against notmatch at the call site, exactly as the other cases.
+   Callers exclude property types above PT_BOOL (the C switches'
+   defaults: PCRE2_ERROR_INTERNAL). The C fetches the ucd_record once
+   per character (GET_UCD); cases probing several record fields do the
+   same through [Ucd.record_index]. *)
+let prop_test (c : int) (ptype : int) (pdata : int) : bool =
+  if Int.equal ptype Opcodes.pt_any then true (* 2495-2497 *)
+  else if Int.equal ptype Opcodes.pt_lamp then
+    (* pcre2_match.c:2499-2505 *)
+    let chartype = Ucd.chartype c in
+    Int.equal chartype Ucp.ucp_lu
+    || Int.equal chartype Ucp.ucp_ll
+    || Int.equal chartype Ucp.ucp_lt
+  else if Int.equal ptype Opcodes.pt_gc then
+    (* pcre2_match.c:2507-2510 — Fecode[2] ==
+       PRIV(ucp_gentype)[prop->chartype]. *)
+    Int.equal pdata Tables.ucp_gentype.(Ucd.chartype c)
+  else if Int.equal ptype Opcodes.pt_pc then
+    (* pcre2_match.c:2512-2515 *)
+    Int.equal pdata (Ucd.chartype c)
+  else if Int.equal ptype Opcodes.pt_sc then
+    (* pcre2_match.c:2517-2520 *)
+    Int.equal pdata (Ucd.script c)
+  else if Int.equal ptype Opcodes.pt_scx then
+    (* pcre2_match.c:2522-2528 — script match, or the Script Extensions
+       set bit (MAPBIT bound proof: Ucd.script_set_contains). *)
+    let ri = Ucd.record_index c in
+    Int.equal pdata (Ucd_tables.script ri) || Ucd.script_set_contains ri pdata
+  else if Int.equal ptype Opcodes.pt_alnum then
+    (* pcre2_match.c:2532-2537 — these are specials. *)
+    let gentype = Tables.ucp_gentype.(Ucd.chartype c) in
+    Int.equal gentype Ucp.ucp_l || Int.equal gentype Ucp.ucp_n
+  else if Int.equal ptype Opcodes.pt_space || Int.equal ptype Opcodes.pt_pxspace
+  then
+    (* pcre2_match.c:2539-2557 — Perl space and POSIX space are identical
+       since Perl 5.18 / PCRE 8.34: the HSPACE/VSPACE cases, else general
+       category Z. *)
+    hspace_char c || vspace_char c
+    || Int.equal Tables.ucp_gentype.(Ucd.chartype c) Ucp.ucp_z
+  else if Int.equal ptype Opcodes.pt_word then
+    (* pcre2_match.c:2559-2566 *)
+    let chartype = Ucd.chartype c in
+    let gentype = Tables.ucp_gentype.(chartype) in
+    Int.equal gentype Ucp.ucp_l
+    || Int.equal gentype Ucp.ucp_n
+    || Int.equal chartype Ucp.ucp_mn
+    || Int.equal chartype Ucp.ucp_pc
+  else if Int.equal ptype Opcodes.pt_clist then
+    (* pcre2_match.c:2568-2584 (the width-32 MAX_UTF guard is compiled
+       out in the 8-bit library) *)
+    prop_clist_member c pdata
+  else if Int.equal ptype Opcodes.pt_ucnc then
+    (* pcre2_match.c:2586-2591 — CHAR_DOLLAR_SIGN 0x24,
+       CHAR_COMMERCIAL_AT 0x40, CHAR_GRAVE_ACCENT 0x60. *)
+    Int.equal c 0x24 || Int.equal c 0x40 || Int.equal c 0x60
+    || (c >= 0xa0 && c <= 0xd7ff)
+    || c >= 0xe000
+  else if Int.equal ptype Opcodes.pt_bidicl then
+    (* pcre2_match.c:2593-2596 — UCD_BIDICLASS_PROP(prop) == Fecode[2]. *)
+    Int.equal (Ucd.bidiclass c) pdata
+  else
+    (* PT_BOOL (pcre2_match.c:2598-2604) — MAPBIT over the
+       Boolean-property set (bound proof: Ucd.boolprop_set_contains);
+       the callers' ptype <= PT_BOOL gate makes this the last case. *)
+    Ucd.boolprop_set_contains (Ucd.record_index c) pdata
+
 (* pcre2_intmodedep.h:341-345 — BACKCHAR(eptr) over the subject: if the
    position is not at the start of a character, move it back until it is.
    DEVIATION (defined behavior where the C is undefined, the Utf.peek
@@ -522,8 +614,9 @@ let scheck_partial (mb : match_block) (feptr : int) : int =
    error condition. *)
 let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
     (a : Frames.t) (match_data : match_data) (mb : match_block) : int =
-  (* pcre2_match.c:630-637 — UTF and UCP flags. The UTF arms are live;
-     arms testing ucp (and the property/EXTUNI opcodes) defer to M7 with
+  (* pcre2_match.c:630-637 — UTF and UCP flags. The UTF and property
+     arms are live; the ucp-without-utf caseless-singles arms and the
+     EXTUNI/SCRIPT_RUN opcodes defer to later 08-ucp.md chunks with
      [error_unported]. *)
   let utf = not (Int.equal (mb.poptions land Options.utf) 0) in
   let ucp = not (Int.equal (mb.poptions land Options.ucp) 0) in
@@ -1713,11 +1806,44 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
               (dispatch [@tailcall]) f
           | _ -> (backtrack [@tailcall]) f match_nomatch)
     | 16 | 15 ->
-        (* OP_PROP, OP_NOTPROP (pcre2_match.c:2479-2618) — STUB: M7
-           (UCP). *)
-        error_unported
+        (* OP_PROP, OP_NOTPROP (pcre2_match.c:2479-2614) — check the next
+           character by Unicode property. *)
+        let eptr = fr.(fb + Frames.slot_eptr) in
+        if eptr >= mb.end_subject then
+          (* pcre2_match.c:2481-2485 — SCHECK_PARTIAL(), then no match. *)
+          let rc = scheck_partial mb eptr in
+          if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch
+        else
+          (* GETCHARINCTEST(fc, Feptr) (2486). *)
+          (* safe: eptr < mb.end_subject <= String.length mb.subject
+             (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
+          let c0 = Char.code (String.unsafe_get mb.subject eptr) in
+          let fc =
+            if utf && c0 >= 0xc0 then Utf.getutf8 c0 mb.subject eptr else c0
+          in
+          fr.(fb + Frames.slot_eptr) <-
+            (if utf && c0 >= 0xc0 then eptr + 1 + Utf.get_extralen c0
+             else eptr + 1);
+          (* pcre2_match.c:2488-2610 — BOOL notmatch = Fop == OP_NOTPROP;
+             switch(Fecode[1]) with value Fecode[2], via [prop_test]; a
+             property type above PT_BOOL is the switch default:
+             PCRE2_ERROR_INTERNAL (2606-2609, direct return, NOT
+             RRETURN). *)
+          let ptype = Char.code (Bytes.get mb.start_code (ecode + 1)) in
+          if ptype > Opcodes.pt_bool then Errors.error_internal
+          else if
+            Bool.equal
+              (prop_test fc ptype
+                 (Char.code (Bytes.get mb.start_code (ecode + 2))))
+              (Int.equal op Opcodes.op_notprop)
+          then (backtrack [@tailcall]) f match_nomatch
+          else (
+            (* Fecode += 3 (2612). *)
+            fr.(fb + Frames.slot_ecode) <- ecode + 3;
+            (dispatch [@tailcall]) f)
     | 22 ->
-        (* OP_EXTUNI (pcre2_match.c:2621-2648) — STUB: M7 (UCP). *)
+        (* OP_EXTUNI (pcre2_match.c:2621-2648) — STUB: the \X grapheme
+           chunk (08-ucp.md). *)
         error_unported
     | 93 ->
         (* OP_TYPEEXACT (pcre2_match.c:2651-2654). reptype is never read
@@ -2486,77 +2612,116 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
     | 4 | 5 | 169 | 170 ->
         (* OP_NOT_WORD_BOUNDARY, OP_WORD_BOUNDARY,
            OP_NOT_UCP_WORD_BOUNDARY, OP_UCP_WORD_BOUNDARY
-           (pcre2_match.c:6265-6338) — find out if the previous and
+           (pcre2_match.c:6258-6333) — find out if the previous and
            current characters are "word" characters, remembering the
            earliest and latest consulted characters, then see if the
-           situation is what we want. *)
-        if
+           situation is what we want. Characters > 255 are assumed to be
+           "non-word" characters when PCRE2_UCP is not set; when it is
+           set (the *_UCP_* opcodes), Unicode properties are used, even
+           when not in UTF mode. *)
+        let ucp_op =
           Int.equal op Opcodes.op_ucp_word_boundary
           || Int.equal op Opcodes.op_not_ucp_word_boundary
-        then
-          (* pcre2_match.c:6284-6291, 6317-6324 — UCD property probes: M7
-             (these opcodes are only compiled under PCRE2_UCP). *)
-          error_unported
-        else
-          let eptr = fr.(fb + Frames.slot_eptr) in
-          (* pcre2_match.c:6269-6293 — status of the previous character:
-             none at mb->check_subject (= start_subject except in UTF mode
-             with a nonzero start offset). *)
-          let prev_is_word =
-            if Int.equal eptr mb.check_subject then false
-            else if utf then (
-              (* pcre2_match.c:6271-6277 — lastptr = Feptr - 1;
-                 BACKCHAR(lastptr); GETCHAR(fc, lastptr). eptr - 1 >=
-                 check_subject >= 0 (eptr <> check_subject above and
-                 lookbehinds stop at check_subject); backchar_subject and
-                 getchar_subject clamp their reads. *)
-              let lastptr = backchar_subject mb.subject (eptr - 1) in
-              let fc = getchar_subject mb.subject lastptr in
-              if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
-              (* pcre2_match.c:6293 — CHMAX_255(fc) && ctype_word. *)
+        in
+        let eptr = fr.(fb + Frames.slot_eptr) in
+        (* pcre2_match.c:6269-6293 — status of the previous character:
+           none at mb->check_subject (= start_subject except in UTF mode
+           with a nonzero start offset). *)
+        let prev_is_word =
+          if Int.equal eptr mb.check_subject then false
+          else if utf then (
+            (* pcre2_match.c:6271-6277 — lastptr = Feptr - 1;
+               BACKCHAR(lastptr); GETCHAR(fc, lastptr). eptr - 1 >=
+               check_subject >= 0 (eptr <> check_subject above and
+               lookbehinds stop at check_subject); backchar_subject and
+               getchar_subject clamp their reads. *)
+            let lastptr = backchar_subject mb.subject (eptr - 1) in
+            let fc = getchar_subject mb.subject lastptr in
+            if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
+            if ucp_op then
+              (* pcre2_match.c:6283-6289 — the UCD chartype/category
+                 probe. *)
+              let chartype = Ucd.chartype fc in
+              let category = Tables.ucp_gentype.(chartype) in
+              Int.equal category Ucp.ucp_l
+              || Int.equal category Ucp.ucp_n
+              || Int.equal chartype Ucp.ucp_mn
+              || Int.equal chartype Ucp.ucp_pc
+            else
+              (* pcre2_match.c:6292 — CHMAX_255(fc) && ctype_word. *)
               fc <= 255
               && not
                    (Int.equal
                       (Chartables.ctypes fc land Chartables.ctype_word)
                       0))
+          else
+            let lastptr = eptr - 1 in
+            (* safe: 0 <= check_subject = start_subject <= lastptr
+               (checked above) and lastptr < eptr <= end_subject <=
+               String.length mb.subject *)
+            let fc = Char.code (String.unsafe_get mb.subject lastptr) in
+            if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
+            if ucp_op then
+              (* pcre2_match.c:6283-6289 — the UCD probe, without UTF. *)
+              let chartype = Ucd.chartype fc in
+              let category = Tables.ucp_gentype.(chartype) in
+              Int.equal category Ucp.ucp_l
+              || Int.equal category Ucp.ucp_n
+              || Int.equal chartype Ucp.ucp_mn
+              || Int.equal chartype Ucp.ucp_pc
             else
-              let lastptr = eptr - 1 in
-              (* safe: 0 <= check_subject = start_subject <= lastptr
-                 (checked above) and lastptr < eptr <= end_subject <=
-                 String.length mb.subject *)
-              let fc = Char.code (String.unsafe_get mb.subject lastptr) in
-              if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
-              (* pcre2_match.c:6293 — CHMAX_255(fc) is TRUE for a non-UTF
+              (* pcre2_match.c:6292 — CHMAX_255(fc) is TRUE for a non-UTF
                  8-bit code unit. *)
               not
                 (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0)
+        in
+        (* pcre2_match.c:6295-6326 — get status of next character. *)
+        if eptr >= mb.end_subject then
+          let rc = scheck_partial mb eptr in
+          if rc < 0 then rc
+          else (word_boundary_tail [@tailcall]) f prev_is_word false
+        else if utf then (
+          (* pcre2_match.c:6304-6312 — nextptr = Feptr + 1;
+             FORWARDCHARTEST(nextptr, mb->end_subject);
+             GETCHAR(fc, Feptr). *)
+          let nextptr =
+            Utf.forwardchartest mb.subject (eptr + 1) mb.end_subject
           in
-          (* pcre2_match.c:6296-6330 — get status of next character. *)
-          if eptr >= mb.end_subject then
-            let rc = scheck_partial mb eptr in
-            if rc < 0 then rc
-            else (word_boundary_tail [@tailcall]) f prev_is_word false
-          else if utf then (
-            (* pcre2_match.c:6304-6312 — nextptr = Feptr + 1;
-               FORWARDCHARTEST(nextptr, mb->end_subject);
-               GETCHAR(fc, Feptr). *)
-            let nextptr =
-              Utf.forwardchartest mb.subject (eptr + 1) mb.end_subject
-            in
-            let fc = Utf.getchar mb.subject eptr in
-            if nextptr > mb.last_used_ptr then mb.last_used_ptr <- nextptr;
+          let fc = Utf.getchar mb.subject eptr in
+          if nextptr > mb.last_used_ptr then mb.last_used_ptr <- nextptr;
+          if ucp_op then
+            (* pcre2_match.c:6316-6322 — the UCD probe. *)
+            let chartype = Ucd.chartype fc in
+            let category = Tables.ucp_gentype.(chartype) in
+            (word_boundary_tail [@tailcall]) f prev_is_word
+              (Int.equal category Ucp.ucp_l
+              || Int.equal category Ucp.ucp_n
+              || Int.equal chartype Ucp.ucp_mn
+              || Int.equal chartype Ucp.ucp_pc)
+          else
+            (* pcre2_match.c:6325 — CHMAX_255(fc) && ctype_word. *)
             (word_boundary_tail [@tailcall]) f prev_is_word
               (fc <= 255
               && not
                    (Int.equal
                       (Chartables.ctypes fc land Chartables.ctype_word)
                       0)))
+        else
+          let nextptr = eptr + 1 in
+          (* safe: eptr < mb.end_subject <= String.length mb.subject
+             (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
+          let fc = Char.code (String.unsafe_get mb.subject eptr) in
+          if nextptr > mb.last_used_ptr then mb.last_used_ptr <- nextptr;
+          if ucp_op then
+            (* pcre2_match.c:6316-6322 — the UCD probe, without UTF. *)
+            let chartype = Ucd.chartype fc in
+            let category = Tables.ucp_gentype.(chartype) in
+            (word_boundary_tail [@tailcall]) f prev_is_word
+              (Int.equal category Ucp.ucp_l
+              || Int.equal category Ucp.ucp_n
+              || Int.equal chartype Ucp.ucp_mn
+              || Int.equal chartype Ucp.ucp_pc)
           else
-            let nextptr = eptr + 1 in
-            (* safe: eptr < mb.end_subject <= String.length mb.subject
-               (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
-            let fc = Char.code (String.unsafe_get mb.subject eptr) in
-            if nextptr > mb.last_used_ptr then mb.last_used_ptr <- nextptr;
             (word_boundary_tail [@tailcall]) f prev_is_word
               (not
                  (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0))
@@ -3576,9 +3741,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
       let fr = a.Frames.frames in
       (rmatch [@tailcall]) f fr.(Frames.base a f + Frames.slot_ecode) rm201 0
   (* pcre2_match.c:2218-2224 — OP_XCLASS min loop:
-     GETCHARINCTEST(fc, Feptr); PRIV(xclass)(fc, Lxclass_data, utf). The
-     Xclass int result: 1 match, 0 no match, negative = XCL_PROP item
-     reached (M7 — surfaced as the unported-arm marker, see xclass.ml). *)
+     GETCHARINCTEST(fc, Feptr); PRIV(xclass)(fc, Lxclass_data, utf). *)
   and xclass_min (f : int) (i : int) (reptype : int) : int =
     let fr = a.Frames.frames in
     let fb = Frames.base a f in
@@ -3597,11 +3760,12 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         fr.(fb + Frames.slot_eptr) <-
           (if utf && c0 >= 0xc0 then eptr + 1 + Utf.get_extralen c0
            else eptr + 1);
-        let rc =
-          Xclass.xclass fc mb.start_code fr.(fb + Frames.slot_temp_sptr_1) utf
-        in
-        if rc < 0 then error_unported
-        else if Int.equal rc 0 then (backtrack [@tailcall]) f match_nomatch
+        if
+          not
+            (Xclass.xclass fc mb.start_code
+               fr.(fb + Frames.slot_temp_sptr_1)
+               utf)
+        then (backtrack [@tailcall]) f match_nomatch
         else (xclass_min [@tailcall]) f (i + 1) reptype)
     else if
       (* pcre2_match.c:2226-2228 — if (Lmin == Lmax) continue. *)
@@ -3635,12 +3799,12 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
           if utf && c0 >= 0xc0 then Utf.getutf8 c0 mb.subject eptr else c0
         in
         let len = if utf && c0 >= 0xc0 then 1 + Utf.get_extralen c0 else 1 in
-        let rc =
-          Xclass.xclass fc mb.start_code fr.(fb + Frames.slot_temp_sptr_1) utf
-        in
-        if rc < 0 then error_unported
-        else if Int.equal rc 0 then
-          (xclass_maxend [@tailcall]) f reptype (* break, 2268 *)
+        if
+          not
+            (Xclass.xclass fc mb.start_code
+               fr.(fb + Frames.slot_temp_sptr_1)
+               utf)
+        then (xclass_maxend [@tailcall]) f reptype (* break, 2268 *)
         else (
           fr.(fb + Frames.slot_eptr) <- eptr + len;
           (xclass_maxscan [@tailcall]) f (i + 1) reptype)
@@ -3667,14 +3831,37 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
        type. *)
     let lctype = Char.code (Bytes.get mb.start_code ecode) in
     let ecode = ecode + 1 in
-    if
-      Int.equal lctype Opcodes.op_prop
-      || Int.equal lctype Opcodes.op_notprop
-      || Int.equal lctype Opcodes.op_extuni
-    then
-      (* pcre2_match.c:2708-2714 — the proptype/Lpropvalue reads and every
-         property loop (2726-2977, 3517-3805, 4116-4402), and the
-         OP_EXTUNI loops (2979-2996, 3807-3844, 4404-4443): M7. *)
+    if Int.equal lctype Opcodes.op_prop || Int.equal lctype Opcodes.op_notprop
+    then (
+      (* pcre2_match.c:2708-2714 — proptype = *Fecode++; Lpropvalue =
+         *Fecode++. proptype does NOT need a frame slot (C:2641-2643: it
+         is not used within an RMATCH loop — each minimize resume label
+         RM208-RM217/RM223-RM225 stands for one property type). *)
+      let proptype = Char.code (Bytes.get mb.start_code ecode) in
+      let lpropvalue = Char.code (Bytes.get mb.start_code (ecode + 1)) in
+      let ecode = ecode + 2 in
+      fr.(fb + Frames.slot_temp_32_0) <- lmin (* Lmin *);
+      fr.(fb + Frames.slot_temp_32_1) <- lmax (* Lmax *);
+      fr.(fb + Frames.slot_temp_32_2) <- lctype (* Lctype *);
+      fr.(fb + Frames.slot_temp_32_3) <- lpropvalue (* Lpropvalue *);
+      fr.(fb + Frames.slot_ecode) <- ecode;
+      (* pcre2_match.c:2717-2727 — first, ensure the minimum number of
+         matches are present: property tests in all modes. *)
+      if lmin > 0 then
+        if proptype > Opcodes.pt_bool then Errors.error_internal
+          (* 2969-2972 — this should not occur *)
+        else if
+          Int.equal proptype Opcodes.pt_any
+          && Int.equal lctype Opcodes.op_notprop
+        then
+          (* pcre2_match.c:2731-2732 — PT_ANY hoists the notmatch check
+             ahead of its min loop: NOMATCH before consuming anything. *)
+          (backtrack [@tailcall]) f match_nomatch
+        else (propmin [@tailcall]) f 1 proptype reptype
+      else (repeattype_prop_post_min [@tailcall]) f proptype reptype)
+    else if Int.equal lctype Opcodes.op_extuni then
+      (* pcre2_match.c:2976-2996 (+ 3804-3827, 4401-4467) — the OP_EXTUNI
+         repeat loops: STUB, the \X grapheme chunk (08-ucp.md). *)
       error_unported
     else (
       fr.(fb + Frames.slot_temp_32_0) <- lmin (* Lmin *);
@@ -3916,6 +4103,179 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
           fr.(fb + Frames.slot_eptr) <- eptr + 1;
           (typemin_ctype [@tailcall]) f (i + 1) mask negated reptype)
     else (repeattype_post_min [@tailcall]) f reptype
+  and propmin (f : int) (i : int) (ptype : int) (reptype : int) : int =
+    (* pcre2_match.c:2726-2974 — the property min loops (property tests
+       in all modes): for (i = 1; i <= Lmin; i++) { bound check +
+       SCHECK_PARTIAL; GETCHARINCTEST(fc, Feptr); <property test> ==
+       notmatch -> RRETURN(MATCH_NOMATCH) }.
+       DEVIATION(structure): the C writes 13 property-specific loops with
+       `BOOL notmatch = Lctype == OP_NOTPROP` hoisted (2728); merged here
+       on [ptype] through [prop_test] — per-iteration reads and
+       evaluation order identical. PT_ANY's pre-loop notmatch check
+       (2731-2732) is done by [repeattype] before entering; the caller
+       also excluded property types above PT_BOOL (2971-2972). *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if i <= fr.(fb + Frames.slot_temp_32_0) then (
+      let eptr = fr.(fb + Frames.slot_eptr) in
+      if eptr >= mb.end_subject then
+        let rc = scheck_partial mb eptr in
+        if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch
+      else
+        (* safe: eptr < mb.end_subject <= String.length mb.subject
+           (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
+        let c0 = Char.code (String.unsafe_get mb.subject eptr) in
+        let fc =
+          if utf && c0 >= 0xc0 then Utf.getutf8 c0 mb.subject eptr else c0
+        in
+        fr.(fb + Frames.slot_eptr) <-
+          (if utf && c0 >= 0xc0 then eptr + 1 + Utf.get_extralen c0
+           else eptr + 1);
+        if
+          Bool.equal
+            (prop_test fc ptype fr.(fb + Frames.slot_temp_32_3))
+            (Int.equal fr.(fb + Frames.slot_temp_32_2) Opcodes.op_notprop)
+        then (backtrack [@tailcall]) f match_nomatch
+        else (propmin [@tailcall]) f (i + 1) ptype reptype)
+    else (repeattype_prop_post_min [@tailcall]) f ptype reptype
+  and repeattype_prop_post_min (f : int) (ptype : int) (reptype : int) : int =
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    (* pcre2_match.c:3503-3505 — if (Lmin = Lmax) we are done: continue
+       with the main loop. *)
+    if Int.equal fr.(fb + Frames.slot_temp_32_0) fr.(fb + Frames.slot_temp_32_1)
+    then (dispatch [@tailcall]) f
+    else if Int.equal reptype reptype_min then
+      (* pcre2_match.c:3507-3517 — minimize: each property type's for(;;)
+         starts with an RMATCH at its own resume label (the label stands
+         for the un-framed proptype); the rest of each loop body is the
+         shared property-minimize resume in [backtrack]. RMATCH sites:
+         3522 RM208 PT_ANY, 3539 RM209 PT_LAMP, 3559 RM210 PT_GC, 3576
+         RM211 PT_PC, 3593 RM212 PT_SC, 3612 RM225 PT_SCX, 3633 RM213
+         PT_ALNUM, 3656 RM214 PT_SPACE/PT_PXSPACE, 3684 RM215 PT_WORD,
+         3707 RM216 PT_CLIST, 3743 RM217 PT_UCNC, 3762 RM224 PT_BIDICL,
+         3781 RM223 PT_BOOL; the switch default (3798-3800) is
+         PCRE2_ERROR_INTERNAL, hit before any RMATCH. *)
+      let rm =
+        if Int.equal ptype Opcodes.pt_any then rm208
+        else if Int.equal ptype Opcodes.pt_lamp then rm209
+        else if Int.equal ptype Opcodes.pt_gc then rm210
+        else if Int.equal ptype Opcodes.pt_pc then rm211
+        else if Int.equal ptype Opcodes.pt_sc then rm212
+        else if Int.equal ptype Opcodes.pt_scx then rm225
+        else if Int.equal ptype Opcodes.pt_alnum then rm213
+        else if
+          Int.equal ptype Opcodes.pt_space || Int.equal ptype Opcodes.pt_pxspace
+        then rm214
+        else if Int.equal ptype Opcodes.pt_word then rm215
+        else if Int.equal ptype Opcodes.pt_clist then rm216
+        else if Int.equal ptype Opcodes.pt_ucnc then rm217
+        else if Int.equal ptype Opcodes.pt_bidicl then rm224
+        else if Int.equal ptype Opcodes.pt_bool then rm223
+        else -1
+      in
+      if rm < 0 then Errors.error_internal
+      else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm 0
+    else (
+      (* pcre2_match.c:4110-4118 — maximize: Lstart_eptr = Feptr; the
+         property maximize switch's default (4379-4380) is
+         PCRE2_ERROR_INTERNAL, hit before any scan step. *)
+      fr.(fb + Frames.slot_temp_sptr_0) <- fr.(fb + Frames.slot_eptr);
+      if ptype > Opcodes.pt_bool then Errors.error_internal
+      else
+        (propmax_scan [@tailcall]) f
+          fr.(fb + Frames.slot_temp_32_0)
+          ptype reptype)
+  and propmax_scan (f : int) (i : int) (ptype : int) (reptype : int) : int =
+    (* pcre2_match.c:4115-4381 — the property maximize scans:
+       for (i = Lmin; i < Lmax; i++) { bound check + SCHECK_PARTIAL ->
+       break; GETCHARLENTEST(fc, Feptr, len); <property test> == notmatch
+       -> break; Feptr += len }.
+       DEVIATION(structure): the C writes 13 loops (with the PT_SPACE
+       ENDLOOP99 and PT_CLIST GOT_MAX gotos as loop exits); merged here
+       on [ptype] through [prop_test] — per-iteration reads and
+       evaluation order identical. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if i < fr.(fb + Frames.slot_temp_32_1) then
+      let eptr = fr.(fb + Frames.slot_eptr) in
+      if eptr >= mb.end_subject then
+        (* SCHECK_PARTIAL(); break. *)
+        let rc = scheck_partial mb eptr in
+        if rc < 0 then rc else (propmax_tail [@tailcall]) f reptype
+      else
+        (* safe: eptr < mb.end_subject <= String.length mb.subject
+           (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
+        let c0 = Char.code (String.unsafe_get mb.subject eptr) in
+        let fc =
+          if utf && c0 >= 0xc0 then Utf.getutf8 c0 mb.subject eptr else c0
+        in
+        let len = if utf && c0 >= 0xc0 then 1 + Utf.get_extralen c0 else 1 in
+        if
+          Bool.equal
+            (prop_test fc ptype fr.(fb + Frames.slot_temp_32_3))
+            (Int.equal fr.(fb + Frames.slot_temp_32_2) Opcodes.op_notprop)
+        then (propmax_tail [@tailcall]) f reptype (* break *)
+        else (
+          fr.(fb + Frames.slot_eptr) <- eptr + len;
+          (propmax_scan [@tailcall]) f (i + 1) ptype reptype)
+    else (propmax_tail [@tailcall]) f reptype
+  and propmax_tail (f : int) (reptype : int) : int =
+    (* pcre2_match.c:4383-4385 — Feptr is now past the end of the maximum
+       run; if possessive, no backtracking: continue the main loop at the
+       advanced Fecode. *)
+    if Int.equal reptype reptype_pos then (dispatch [@tailcall]) f
+    else (propmax_bt [@tailcall]) f
+  and propmax_bt (f : int) : int =
+    (* pcre2_match.c:4387-4398 — the property maximize backtracking
+       for(;;) head: after \C in UTF mode, Lstart_eptr might be in the
+       middle of a Unicode character, so <= ensures backtracking doesn't
+       go too far. The minimum position is tried in place (break -> main
+       loop); every position above it via RMATCH(Fecode, RM222). *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if fr.(fb + Frames.slot_eptr) <= fr.(fb + Frames.slot_temp_sptr_0) then
+      (dispatch [@tailcall]) f
+    else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm222 0
+  and prop_min_resume (f : int) (rrc : int) (ptype : int) (rmlabel : int) : int
+      =
+    (* pcre2_match.c:3519-3796 — the shared body of the 13 property
+       minimize for(;;) loops after their RMATCH ([rmlabel] identifies
+       the loop and re-enters it): if (rrc != MATCH_NOMATCH) RRETURN(rrc);
+       if (Lmin++ >= Lmax) RRETURN(MATCH_NOMATCH); bound check +
+       SCHECK_PARTIAL; GETCHARINCTEST(fc, Feptr); <property test> ==
+       (Lctype == OP_NOTPROP) -> RRETURN(MATCH_NOMATCH); loop.
+       DEVIATION(structure): merged on [ptype] through [prop_test], as at
+       [propmin]. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if not (Int.equal rrc match_nomatch) then (backtrack [@tailcall]) f rrc
+    else
+      let lmin = fr.(fb + Frames.slot_temp_32_0) in
+      fr.(fb + Frames.slot_temp_32_0) <- lmin + 1 (* Lmin++ *);
+      if lmin >= fr.(fb + Frames.slot_temp_32_1) then
+        (backtrack [@tailcall]) f match_nomatch
+      else
+        let eptr = fr.(fb + Frames.slot_eptr) in
+        if eptr >= mb.end_subject then
+          let rc = scheck_partial mb eptr in
+          if rc < 0 then rc else (backtrack [@tailcall]) f match_nomatch
+        else
+          (* safe: eptr < mb.end_subject <= String.length mb.subject
+             (checked above); 0 <= start_eptr <= eptr (mb invariant) *)
+          let c0 = Char.code (String.unsafe_get mb.subject eptr) in
+          let fc =
+            if utf && c0 >= 0xc0 then Utf.getutf8 c0 mb.subject eptr else c0
+          in
+          fr.(fb + Frames.slot_eptr) <-
+            (if utf && c0 >= 0xc0 then eptr + 1 + Utf.get_extralen c0
+             else eptr + 1);
+          if
+            Bool.equal
+              (prop_test fc ptype fr.(fb + Frames.slot_temp_32_3))
+              (Int.equal fr.(fb + Frames.slot_temp_32_2) Opcodes.op_notprop)
+          then (backtrack [@tailcall]) f match_nomatch
+          else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rmlabel 0
   and repeattype_post_min (f : int) (reptype : int) : int =
     let fr = a.Frames.frames in
     let fb = Frames.base a f in
@@ -3931,8 +4291,8 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm219 0
       else
         (* pcre2_match.c:3507-3512 + 3961-3965 — minimize, not UTF (the
-           property minimize loops are M7, unreachable: [repeattype]
-           excludes them): the for(;;) starts with RMATCH(Fecode, RM33);
+           property types route through [repeattype_prop_post_min], never
+           here): the for(;;) starts with RMATCH(Fecode, RM33);
            the rest of the loop body is the RM33 resume arm in
            [backtrack]. *)
         (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm33 0
@@ -4881,17 +5241,20 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
     else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm22 0
   and word_boundary_tail (f : int) (prev_is_word : bool) (cur_is_word : bool) :
       int =
-    (* pcre2_match.c:6330-6333 — now see if the situation is what we want:
+    (* pcre2_match.c:6328-6333 — now see if the situation is what we want:
+       ( *Fecode++ == OP_WORD_BOUNDARY || Fop == OP_UCP_WORD_BOUNDARY) ?
+       cur_is_word == prev_is_word : cur_is_word != prev_is_word —
        *Fecode++ advances past the opcode either way; RRETURN(NOMATCH)
        when a boundary opcode sees cur == prev, or a not-boundary opcode
-       sees cur != prev. The UCP variants are excluded by the caller
-       (M7). *)
+       sees cur != prev. *)
     let fr = a.Frames.frames in
     let fb = Frames.base a f in
     fr.(fb + Frames.slot_ecode) <- fr.(fb + Frames.slot_ecode) + 1;
     if
-      if Int.equal fr.(fb + Frames.slot_op) Opcodes.op_word_boundary then
-        Bool.equal cur_is_word prev_is_word
+      if
+        Int.equal fr.(fb + Frames.slot_op) Opcodes.op_word_boundary
+        || Int.equal fr.(fb + Frames.slot_op) Opcodes.op_ucp_word_boundary
+      then Bool.equal cur_is_word prev_is_word
       else not (Bool.equal cur_is_word prev_is_word)
     then (backtrack [@tailcall]) f match_nomatch
     else (dispatch [@tailcall]) f
@@ -5425,10 +5788,12 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            RM202 : 1317 CHARI UTF             RM203: 1361 CHARI UTF
            RM204 : 1678 NOTI UTF min          RM205: 1742 NOTI UTF max
            RM206 : 1818 NOTI UTF min          RM207: 1880 NOTI UTF max
-           RM208-RM219, RM223-RM225 : 3522-3838, 3612-3781 type repeat
-             min UTF/UCP arms
-           RM220 : 4437, RM221 : 4710, RM222 : 4394 type repeat max
-             UTF/UCP arms *)
+           RM208-RM217 : 3522-3743 property repeat minimize, in PT
+             order ANY LAMP GC PC SC ALNUM SPACE WORD CLIST UCNC
+           RM218 : 3811 EXTUNI min      RM219 : 3836 type min UTF
+           RM220 : 4437 EXTUNI max      RM221 : 4710 type max UTF
+           RM222 : 4394 property max    RM223 : 3781 PT_BOOL min
+           RM224 : 3762 PT_BIDICL min   RM225 : 3612 PT_SCX min *)
       let fb = Frames.base a f in
       match fr.(fb + Frames.slot_return_id) with
       | 1 ->
@@ -6315,14 +6680,12 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                 fr.(fb + Frames.slot_eptr) <-
                   (if utf && c0 >= 0xc0 then eptr + 1 + Utf.get_extralen c0
                    else eptr + 1);
-                let rc =
-                  Xclass.xclass fc mb.start_code
-                    fr.(fb + Frames.slot_temp_sptr_1)
-                    utf
-                in
-                if rc < 0 then error_unported
-                else if Int.equal rc 0 then
-                  (backtrack [@tailcall]) f match_nomatch
+                if
+                  not
+                    (Xclass.xclass fc mb.start_code
+                       fr.(fb + Frames.slot_temp_sptr_1)
+                       utf)
+                then (backtrack [@tailcall]) f match_nomatch
                 else (rmatch [@tailcall]) f fr.(fb + Frames.slot_ecode) rm100 0
       | 101 ->
           (* RM101 (pcre2_match.c:2278-2287) — OP_XCLASS repeat, maximize:
@@ -6713,11 +7076,67 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
               && Int.equal (Utf.peek mb.subject (eptr - 1)) Newline.char_cr
             then fr.(fb + Frames.slot_eptr) <- eptr - 1;
             (typemax_utf_bt [@tailcall]) f
-      | 208 | 209 | 210 | 211 | 212 | 213 | 214 | 215 | 216 | 217 | 218 | 220
-      | 222 | 223 | 224 | 225 ->
-          (* RM208..RM218, RM223..RM225 (property/EXTUNI minimize resumes,
-             pcre2_match.c:3517-3831) and RM220/RM222 (property/EXTUNI
-             maximize resumes, 4394-4437) — STUB: M7 (UCP). *)
+      | 208 ->
+          (* RM208 (pcre2_match.c:3519-3532) — PT_ANY minimize (the
+             prop_test-true == OP_NOTPROP comparison is the C's `if
+             (Lctype == OP_NOTPROP) RRETURN(MATCH_NOMATCH)` at 3531). *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_any rm208
+      | 209 ->
+          (* RM209 (pcre2_match.c:3535-3553) — PT_LAMP minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_lamp rm209
+      | 210 ->
+          (* RM210 (pcre2_match.c:3556-3570) — PT_GC minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_gc rm210
+      | 211 ->
+          (* RM211 (pcre2_match.c:3573-3587) — PT_PC minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_pc rm211
+      | 212 ->
+          (* RM212 (pcre2_match.c:3590-3604) — PT_SC minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_sc rm212
+      | 213 ->
+          (* RM213 (pcre2_match.c:3629-3645) — PT_ALNUM minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_alnum rm213
+      | 214 ->
+          (* RM214 (pcre2_match.c:3652-3677) — PT_SPACE/PT_PXSPACE
+             minimize (one shared loop in the C too). *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_space rm214
+      | 215 ->
+          (* RM215 (pcre2_match.c:3680-3700) — PT_WORD minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_word rm215
+      | 216 ->
+          (* RM216 (pcre2_match.c:3703-3737) — PT_CLIST minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_clist rm216
+      | 217 ->
+          (* RM217 (pcre2_match.c:3740-3756) — PT_UCNC minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_ucnc rm217
+      | 223 ->
+          (* RM223 (pcre2_match.c:3776-3795) — PT_BOOL minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_bool rm223
+      | 224 ->
+          (* RM224 (pcre2_match.c:3759-3773) — PT_BIDICL minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_bidicl rm224
+      | 225 ->
+          (* RM225 (pcre2_match.c:3607-3626) — PT_SCX minimize. *)
+          (prop_min_resume [@tailcall]) f rrc Opcodes.pt_scx rm225
+      | 222 ->
+          (* RM222 (pcre2_match.c:4391-4398) — property repeat, maximize:
+             rrc test, then Feptr--; if (utf) BACKCHAR(Feptr); back to
+             the for(;;) head. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else (
+            (* eptr - 1 >= Lstart_eptr >= 0 (the loop head only RMATCHes
+               when Feptr > Lstart_eptr); backchar_subject clamps its
+               reads. *)
+            fr.(fb + Frames.slot_eptr) <-
+              (if utf then
+                 backchar_subject mb.subject (fr.(fb + Frames.slot_eptr) - 1)
+               else fr.(fb + Frames.slot_eptr) - 1);
+            (propmax_bt [@tailcall]) f)
+      | 218 | 220 ->
+          (* RM218 (extuni minimize resume, pcre2_match.c:3807-3827) and
+             RM220 (extuni maximize resume, 4431-4466) — STUB: the \X
+             grapheme chunk (08-ucp.md). *)
           error_unported
       | _ ->
           (* pcre2_match.c:6498-6499 — default: PCRE2_ERROR_INTERNAL. *)
@@ -6922,17 +7341,17 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                above: for (i = re->max_lookbehind; i > 0 &&
                mb->check_subject > subject; i--) step back one character
                (skipping continuation bytes). *)
-            if not !skipped_bad_start then (
-              let i = ref re.Compile.max_lookbehind in
-              while !i > 0 && !cs > 0 do
-                decr cs;
-                while
-                  !cs > 0 && Int.equal (Char.code subject.[!cs] land 0xc0) 0x80
-                do
-                  decr cs
-                done;
-                decr i
-              done);
+            (if not !skipped_bad_start then
+               let i = ref re.Compile.max_lookbehind in
+               while !i > 0 && !cs > 0 do
+                 decr cs;
+                 while
+                   !cs > 0 && Int.equal (Char.code subject.[!cs] land 0xc0) 0x80
+                 do
+                   decr cs
+                 done;
+                 decr i
+               done);
             (* pcre2_match.c:6885-6928 — validate the relevant portion of
                the subject. There's a loop in case we encounter bad UTF
                in the characters preceding start_match which we are
@@ -7332,7 +7751,8 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                         else false
                       in
                       if not ok then
-                        (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
+                        (endloop [@tailcall]) match_nomatch start_match
+                          req_cu_ptr
                       else (tail_opts [@tailcall]) start_match req_cu_ptr
                     else (tail_opts [@tailcall]) start_match req_cu_ptr
                   else if
@@ -7534,7 +7954,8 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                           (* pcre2_match.c:7464-7471 — if we can't find the
                              required code unit, break the bumpalong loop,
                              forcing a match failure. *)
-                          (endloop [@tailcall]) match_nomatch start_match req_cu_ptr
+                          (endloop [@tailcall]) match_nomatch start_match
+                            req_cu_ptr
                         else
                           (* pcre2_match.c:7473-7478 — save the point where
                              we found it, so that we don't search again next
@@ -10038,3 +10459,128 @@ let () =
      the for(;;) advances again, 7687-7698) — oracle
      /X/utf,match_invalid_utf on "AB\xfe\xffXY": 0: X at (4,5). *)
   expect_ov_at (compile ~options:miu "X") "AB\xfe\xffXY" 0 [| 4; 5 |]
+
+(* Unicode property matching (this chunk): OP_PROP/OP_NOTPROP + the
+   property repeat strategies (min/minimize/maximize + RM208-RM217/
+   RM222-RM225), XCL_PROP/XCL_NOTPROP items, and the UCP word
+   boundaries, through whole compiled patterns. EVERY expected value
+   below is pinned against the C oracle (pcre2test on the real 10.44
+   library, via test/pcre2test/pcre2test_ml.exe --driver=oracle). *)
+let () =
+  let compile ?(options = 0) pat =
+    match Compile.pcre2_compile pat ~options with
+    | Error _ -> assert false
+    | Ok re -> re
+  in
+  let run ?(options = 0) (re : Compile.re) subj =
+    let oveccount = re.Compile.top_bracket + 1 in
+    let m =
+      {
+        ovector = Array.make (2 * oveccount) Frames.unset;
+        oveccount;
+        rc = 0;
+        startchar = 0;
+        leftchar = 0;
+        rightchar = 0;
+        mark = Frames.unset;
+      }
+    in
+    let rc = pcre2_match re ~subject:subj ~start_offset:0 ~options m in
+    (rc, m)
+  in
+  let expect_ov ?options re subj expected =
+    match run ?options re subj with
+    | rc, m ->
+        assert (rc > 0);
+        Array.iteri (fun i e -> assert (Int.equal m.ovector.(i) e)) expected
+  in
+  let expect_nomatch ?options re subj =
+    match run ?options re subj with
+    | rc, _ -> assert (Int.equal rc Errors.error_nomatch)
+  in
+  let u = Options.utf in
+  let uu = Options.utf lor Options.ucp in
+  (* PT_GC greedy repeat over mixed scripts — oracle /\p{L}+/utf on
+     "abcαβ123": 0: abc\x{3b1}\x{3b2}. *)
+  expect_ov (compile ~options:u "\\p{L}+") "abc\xce\xb1\xce\xb2123" [| 0; 7 |];
+  (* PT_SC single, hit and miss — oracle /\p{Greek}/utf: "XαY" -> 0:
+     \x{3b1}; "XY" -> no match. *)
+  (let re = compile ~options:u "\\p{Greek}" in
+   expect_ov re "X\xce\xb1Y" [| 1; 3 |];
+   expect_nomatch re "XY");
+  (* PT_PC (particular category Sc = currency) — oracle /\p{Sc}/utf on
+     "x€y": 0: \x{20ac}. *)
+  expect_ov (compile ~options:u "\\p{Sc}") "x\xe2\x82\xacy" [| 1; 4 |];
+  (* PT_SCX: U+0964 DEVANAGARI DANDA is script Common but Devanagari is
+     in its Script Extensions — oracle /\p{scx:Deva}/utf on "\x{964}":
+     0: \x{964}. *)
+  expect_ov (compile ~options:u "\\p{scx:Deva}") "\xe0\xa5\xa4" [| 0; 3 |];
+  (* PT_ALNUM (\p{Xan}) takes ARABIC-INDIC DIGIT ZERO but not '!' —
+     oracle /\p{Xan}+/utf on "ab\x{660}12!": 0: ab\x{660}12. *)
+  expect_ov (compile ~options:u "\\p{Xan}+") "ab\xd9\xa012!" [| 0; 6 |];
+  (* PT_WORD (\p{Xwd}) takes '_' (Pc) and COMBINING GRAVE (Mn) — oracle
+     /\p{Xwd}+/utf on "a_\x{300}b c": 0: a_\x{300}b. *)
+  expect_ov (compile ~options:u "\\p{Xwd}+") "a_\xcc\x80b c" [| 0; 5 |];
+  (* PT_CLIST: MICRO SIGN caselessly matches GREEK SMALL MU through its
+     caseless set (the compiler turns multi-case (?i) singles into
+     OP_PROP PT_CLIST) — oracle /(?i)µ/utf on "\x{3bc}": 0: \x{3bc} —
+     and KELVIN SIGN is in k's set — oracle /(?i)k+/utf on "\x{212a}k":
+     0: \x{212a}k. *)
+  expect_ov (compile ~options:u "(?i)\xc2\xb5") "\xce\xbc" [| 0; 2 |];
+  expect_ov (compile ~options:u "(?i)k+") "\xe2\x84\xaak" [| 0; 4 |];
+  (* ...and LATIN SMALL LETTER LONG S in s's set (a PT_CLIST repeat) —
+     oracle /(?i)s+/utf on "\x{17f}s": 0: \x{17f}s. *)
+  expect_ov (compile ~options:u "(?i)s+") "\xc5\xbfs" [| 0; 3 |];
+  (* OP_UCP_WORD_BOUNDARY: é is a word character under UCP, so no
+     boundary before 'w' — oracle /\bword\b/ucp,utf: "\x{e9}word\x{e9}"
+     -> no match; ".word." -> 0: word — and OP_NOT_UCP_WORD_BOUNDARY —
+     oracle /\Bword/ucp,utf on "\x{e9}word": 0: word. *)
+  (let re = compile ~options:uu "\\bword\\b" in
+   expect_nomatch re "\xc3\xa9word\xc3\xa9";
+   expect_ov re ".word." [| 1; 5 |]);
+  expect_ov (compile ~options:uu "\\Bword") "\xc3\xa9word" [| 2; 6 |];
+  (* PT_BIDICL — oracle /\p{bidi_class:R}/utf on HEBREW ALEF: 0:
+     \x{5d0}. *)
+  expect_ov (compile ~options:u "\\p{bidi_class:R}") "\xd7\x90" [| 0; 2 |];
+  (* PT_BOOL — oracle /\p{Cased}+/utf on "aAα0": 0: aA\x{3b1}. *)
+  expect_ov (compile ~options:u "\\p{Cased}+") "aA\xce\xb10" [| 0; 4 |];
+  (* PT_PC exact + upto (the {2,} decomposition exercises the property
+     min loop then the maximize scan) — oracle /\p{Lu}{2,}/utf on
+     "xABCy": 0: ABC. *)
+  expect_ov (compile ~options:u "\\p{Lu}{2,}") "xABCy" [| 1; 4 |];
+  (* OP_NOTPROP repeat — oracle /\P{L}+/utf on "ab12!;cd": 0: 12!;. *)
+  expect_ov (compile ~options:u "\\P{L}+") "ab12!;cd" [| 2; 6 |];
+  (* Property minimize resumes (the RM-label loops) — oracle
+     /\p{Han}*?X/utf on "\x{2e80}\x{3105}X": 0: X (bump-along past the
+     non-Han) and /\p{Greek}+?X/utf on "ααX": 0: whole. *)
+  expect_ov
+    (compile ~options:u "\\p{Han}*?X")
+    "\xe2\xba\x80\xe3\x84\x85X" [| 6; 7 |];
+  expect_ov (compile ~options:u "\\p{Greek}+?X") "\xce\xb1\xce\xb1X" [| 0; 5 |];
+  (* Property maximize backtrack (RM222): \p{L}+ eats β, then backs up
+     one character — oracle /\p{L}+\x{3b2}/utf on "ααβ": 0: whole. *)
+  expect_ov
+    (compile ~options:u "\\p{L}+\xce\xb2")
+    "\xce\xb1\xce\xb1\xce\xb2" [| 0; 6 |];
+  (* PT_PC minimize with a bounded range — oracle /\p{Nd}{2,3}?\./utf
+     on "\x{660}\x{661}\x{662}.": 0: whole. *)
+  expect_ov
+    (compile ~options:u "\\p{Nd}{2,3}?\\.")
+    "\xd9\xa0\xd9\xa1\xd9\xa2." [| 0; 7 |];
+  (* Property min loop count — oracle /\p{L}{3}/utf: "abαc" -> 0:
+     ab\x{3b1}; "ab1c" -> no match. *)
+  (let re = compile ~options:u "\\p{L}{3}" in
+   expect_ov re "ab\xce\xb1c" [| 0; 4 |];
+   expect_nomatch re "ab1c");
+  (* XCL_PROP inside a class (bitmap + property item) — oracle
+     /[\p{L}0]+/utf on "9aα0b8": 0: a\x{3b1}0b. *)
+  expect_ov (compile ~options:u "[\\p{L}0]+") "9a\xce\xb10b8" [| 1; 6 |];
+  (* Negated class with a property item — oracle /[^\p{L}]+/utf on
+     "ab€0\x{300}cd": 0: \x{20ac}0\x{300}. *)
+  expect_ov
+    (compile ~options:u "[^\\p{L}]+")
+    "ab\xe2\x82\xac0\xcc\x80cd" [| 2; 8 |];
+  (* The XCLASS-only PT_PXPUNCT (UCP [[:punct:]]) takes FULLWIDTH
+     EXCLAMATION MARK — oracle /[[:punct:]]+/ucp,utf on "a\x{ff01}!b":
+     0: \x{ff01}!. *)
+  expect_ov (compile ~options:uu "[[:punct:]]+") "a\xef\xbc\x81!b" [| 1; 5 |]

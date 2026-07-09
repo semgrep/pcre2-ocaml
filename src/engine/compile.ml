@@ -1996,7 +1996,8 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                     let tabopt = if tabopt < 0 then -tabopt else tabopt in
                     if Int.equal tabopt 1 then
                       Bytes.set pbits 1
-                        (Char.chr (Char.code (Bytes.get pbits 1) land lnot 0x3c))
+                        (Char.chr
+                           (Char.code (Bytes.get pbits 1) land lnot 0x3c))
                     else if Int.equal tabopt 2 then
                       Bytes.set pbits 11
                         (Char.chr (Char.code (Bytes.get pbits 11) land 0x7f));
@@ -2010,8 +2011,8 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                         Bytes.set classbits i
                           (Char.chr
                              (Char.code (Bytes.get classbits i)
-                             lor (lnot (Char.code (Bytes.get pbits i))
-                                 land 0xff)))
+                             lor (lnot (Char.code (Bytes.get pbits i)) land 0xff)
+                             ))
                       done
                     else
                       for i = 0 to 31 do
@@ -8009,19 +8010,16 @@ let () =
   (* /[\p{L}\d]/utf: bitmap (0-9) + XCL_PROP; flags = XCL_MAP lor
      XCL_HASPROP. Oracle dump `[0-9\p{L}]`, item spanning offsets 3-43
      (length 40). *)
-  let cb, _, _, _, _, _, _, _ =
-    compile2 ~options:Options.utf "[\\p{L}\\d]"
-  in
+  let cb, _, _, _, _, _, _, _ = compile2 ~options:Options.utf "[\\p{L}\\d]" in
   assert (Int.equal (Bytes.length cb.start_code) 40);
   assert (Int.equal (Char.code (Bytes.get cb.start_code 0)) Opcodes.op_xclass);
   assert (Int.equal (get cb.start_code 1) 40);
-  assert
-    (Int.equal
-       (Char.code (Bytes.get cb.start_code 3))
-       (Opcodes.xcl_map lor Opcodes.xcl_hasprop));
+  assert (
+    Int.equal
+      (Char.code (Bytes.get cb.start_code 3))
+      (Opcodes.xcl_map lor Opcodes.xcl_hasprop));
   (* The 32-byte map covers 0x30-0x39 ('0' bit set, 'a' clear)... *)
-  assert
-    (Int.equal (Char.code (Bytes.get cb.start_code (4 + (0x30 / 8)))) 0xff);
+  assert (Int.equal (Char.code (Bytes.get cb.start_code (4 + (0x30 / 8)))) 0xff);
   assert (Int.equal (Char.code (Bytes.get cb.start_code (4 + (0x61 / 8)))) 0);
   (* ...followed by the property item and XCL_END. *)
   List.iteri
@@ -8044,9 +8042,7 @@ let () =
       0;
       Opcodes.xcl_end;
     ];
-  let cb, _, _, _, _, _, _, _ =
-    compile2 ~options:Options.ucp "[^[:^print:]]"
-  in
+  let cb, _, _, _, _, _, _, _ = compile2 ~options:Options.ucp "[^[:^print:]]" in
   assert_code cb
     [
       Opcodes.op_xclass;

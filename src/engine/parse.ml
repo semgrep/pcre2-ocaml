@@ -1877,7 +1877,7 @@ let get_ucp (cx : parse_context) (ptrptr : int ref) (negptr : bool ref)
        memmoves (2273-2276) become string concatenation on the value
        part. *)
     let lookup_name =
-      if not (Int.equal !vptr (-1)) then (
+      if not (Int.equal !vptr (-1)) then
         let prop = Bytes.sub_string name 0 !vptr in
         let value = Bytes.sub_string name (!vptr + 1) (!i - !vptr - 1) in
         if String.equal prop "bidiclass" || String.equal prop "bc" then
@@ -1889,7 +1889,7 @@ let get_ucp (cx : parse_context) (ptrptr : int ref) (negptr : bool ref)
         then (
           ptscript := Opcodes.pt_scx;
           Some value)
-        else None (* ERR47 (pcre2_compile.c:2267-2271) *))
+        else None (* ERR47 (pcre2_compile.c:2267-2271) *)
       else Some (Bytes.sub_string name 0 !i)
     in
     match lookup_name with
@@ -3303,7 +3303,7 @@ let parse_regex (cx : parse_context) ~(options : int)
                          ~xoptions:!xoptions)
                    else if
                      Int.equal !escape esc_big_p || Int.equal !escape esc_p
-                   then (
+                   then
                      (* pcre2_compile.c:3327-3346 — \P and \p Unicode
                         property matching (SUPPORT_UNICODE is defined in
                         the reference configuration, so the ERR45 arm does
@@ -3317,13 +3317,13 @@ let parse_regex (cx : parse_context) ~(options : int)
                      else (
                        if !negated then
                          escape :=
-                           (if Int.equal !escape esc_big_p then esc_p
-                            else esc_big_p);
+                           if Int.equal !escape esc_big_p then esc_p
+                           else esc_big_p;
                        buf.(!pp) <- meta_escape + !escape;
                        incr pp;
                        buf.(!pp) <- (!ptype lsl 16) lor !pdata;
                        incr pp;
-                       okquantifier := true (* End \P and \p *)))
+                       okquantifier := true (* End \P and \p *))
                    else if Int.equal !escape esc_g || Int.equal !escape esc_k
                    then (
                      if
@@ -3884,8 +3884,8 @@ let parse_regex (cx : parse_context) ~(options : int)
                                raise_notrace Goto_failed;
                              if !negated then
                                escape :=
-                                 (if Int.equal !escape esc_big_p then esc_p
-                                  else esc_big_p);
+                                 if Int.equal !escape esc_big_p then esc_p
+                                 else esc_big_p;
                              buf.(!pp) <- meta_escape + !escape;
                              incr pp;
                              buf.(!pp) <- (!ptype lsl 16) lor !pdata;

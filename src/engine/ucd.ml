@@ -33,6 +33,67 @@ let record_index (ch : int) : int =
    type (Ucp.ucp_cc..ucp_zs) from ch's ucd_record. *)
 let chartype (ch : int) : int = Ucd_tables.chartype (record_index ch)
 
+(* pcre2_internal.h:1885 — UCD_SCRIPT(ch): the script (Ucp.ucp_latin..)
+   from ch's ucd_record. *)
+let script (ch : int) : int = Ucd_tables.script (record_index ch)
+
+(* pcre2_internal.h:1887 — UCD_GRAPHBREAK(ch): the grapheme break
+   property (Ucp.ucp_gb_cr..ucp_gb_extended_pictographic) from ch's
+   ucd_record. *)
+let gbprop (ch : int) : int = Ucd_tables.gbprop (record_index ch)
+
+(* pcre2_internal.h:1869-1882 — the packed uint16 record fields:
+     UCD_SCRIPTX_PROP(prop)   = prop->scriptx_bidiclass & UCD_SCRIPTX_MASK
+                                (0x3ff, 1876)
+     UCD_BIDICLASS_PROP(prop) = prop->scriptx_bidiclass
+                                >> UCD_BIDICLASS_SHIFT (11, 1877)
+     UCD_BPROPS_PROP(prop)    = prop->bprops & UCD_BPROPS_MASK (0xfff, 1878)
+   These take the ucd_record (here: its index [ri] = [record_index ch],
+   the C's GET_UCD pointer), letting a caller that probes several fields
+   fetch the record once, as the C does. *)
+let scriptx_prop (ri : int) : int = Ucd_tables.scriptx_bidiclass ri land 0x3ff
+let bidiclass_prop (ri : int) : int = Ucd_tables.scriptx_bidiclass ri lsr 11
+let bprops_prop (ri : int) : int = Ucd_tables.bprops ri land 0xfff
+
+(* pcre2_internal.h:1892 — UCD_BIDICLASS(ch): the bidi class
+   (Ucp.ucp_bidi_al..ucp_bidi_ws) from ch's ucd_record. *)
+let bidiclass (ch : int) : int = bidiclass_prop (record_index ch)
+
+(* pcre2_internal.h:1894-1898 — the scriptx and bprops fields are offsets
+   into vectors of 32-bit words that form bitmaps, tested by bit number:
+   MAPBIT(map,n) = map[n/32] & (1u << (n%32)). [n] is non-negative, so
+   lsr 5 / land 31 are the C's unsigned n/32 and n%32. *)
+
+(* MAPBIT(PRIV(ucd_script_sets) + UCD_SCRIPTX_PROP(prop), n) != 0
+   (pcre2_match.c:2525, pcre2_xclass.c:168): is script [n] in record
+   [ri]'s Script Extensions set? In bounds: scriptx_prop is a word offset
+   to the start of a ucd_script_sets_item_size = 3-word item
+   (pcre2_ucp.h:390-392, validated at generation), and every PT_SCX
+   property value reaching a compiled pattern is <= ucp_old_uyghur = 67
+   (the only Ucptables.utt entry type carrying PT_SCX values; scripts
+   beyond 67 have no cross-script characters and get PT_SC entries,
+   pcre2_ucp.h:215-218 + pcre2_ucptables.c), so n lsr 5 <= 2. *)
+let script_set_contains (ri : int) (n : int) : bool =
+  not
+    (Int.equal
+       (Ucd_tables.ucd_script_sets.(scriptx_prop ri + (n lsr 5))
+       land (1 lsl (n land 31)))
+       0)
+
+(* MAPBIT(PRIV(ucd_boolprop_sets) + UCD_BPROPS_PROP(prop), n) != 0
+   (pcre2_match.c:2600-2601, pcre2_xclass.c:227-228): does record [ri]
+   have Boolean property [n]? In bounds: bprops_prop is a word offset to
+   the start of a ucd_boolprop_sets_item_size = 2-word item
+   (pcre2_ucp.h:162-164, validated at generation) and every PT_BOOL
+   property value is < ucp_bprop_count = 52 (pcre2_ucp.h:103-160), so
+   n lsr 5 <= 1. *)
+let boolprop_set_contains (ri : int) (n : int) : bool =
+  not
+    (Int.equal
+       (Ucd_tables.ucd_boolprop_sets.(bprops_prop ri + (n lsr 5))
+       land (1 lsl (n land 31)))
+       0)
+
 (* pcre2_internal.h:1888 — UCD_CASESET(ch): offset into
    Ucd_tables.ucd_caseless_sets of ch's multi-character caseless set, or 0
    if it has none. *)
@@ -77,4 +138,50 @@ let () =
   assert (Int.equal (othercase 0x10ffff) 0x10ffff);
   assert (Int.equal (chartype 0x200000) Ucp.ucp_cn);
   assert (Int.equal (caseset 0x7fffffff) 0);
-  assert (Int.equal (othercase 0x200000) 0x200000)
+  assert (Int.equal (othercase 0x200000) 0x200000);
+  (* Script, bidi class, script-extension and Boolean-property probes
+     (values per UCD 15.0.0, the vendored tables' version): Latin a,
+     GREEK SMALL LETTER ALPHA, CYRILLIC A, DEVANAGARI KA; U+0964
+     DEVANAGARI DANDA is script Common but its Script Extensions set
+     holds Devanagari and Bengali (among ~20 Indic scripts) — the PT_SCX
+     shape; a's own-script probe goes through the "== prop->script" arm,
+     so its (empty-set) scriptx bit for Latin is clear. *)
+  assert (Int.equal (script (Char.code 'a')) Ucp.ucp_latin);
+  assert (Int.equal (script 0x3b1) Ucp.ucp_greek);
+  assert (Int.equal (script 0x430) Ucp.ucp_cyrillic);
+  assert (Int.equal (script 0x915) Ucp.ucp_devanagari);
+  assert (Int.equal (script 0x964) Ucp.ucp_common);
+  assert (script_set_contains (record_index 0x964) Ucp.ucp_devanagari);
+  assert (script_set_contains (record_index 0x964) Ucp.ucp_bengali);
+  assert (not (script_set_contains (record_index 0x964) Ucp.ucp_greek));
+  assert (not (script_set_contains (record_index (Char.code 'a')) Ucp.ucp_latin));
+  (* U+30FC KATAKANA-HIRAGANA PROLONGED SOUND MARK: script Common, scx
+     {Hiragana, Katakana}. *)
+  assert (Int.equal (script 0x30fc) Ucp.ucp_common);
+  assert (script_set_contains (record_index 0x30fc) Ucp.ucp_katakana);
+  assert (script_set_contains (record_index 0x30fc) Ucp.ucp_hiragana);
+  (* Bidi classes: 'a' L, ALEF R, ARABIC LETTER AIN AL, '0' EN. *)
+  assert (Int.equal (bidiclass (Char.code 'a')) Ucp.ucp_bidi_l);
+  assert (Int.equal (bidiclass 0x5d0) Ucp.ucp_bidi_r);
+  assert (Int.equal (bidiclass 0x639) Ucp.ucp_bidi_al);
+  assert (Int.equal (bidiclass (Char.code '0')) Ucp.ucp_bidi_en);
+  (* Boolean properties: Cased holds for a/A but not 0 or space; ASCII
+     for 'a' but not U+00E9; White_Space for space. *)
+  assert (boolprop_set_contains (record_index (Char.code 'a')) Ucp.ucp_cased);
+  assert (boolprop_set_contains (record_index (Char.code 'A')) Ucp.ucp_cased);
+  assert (
+    not (boolprop_set_contains (record_index (Char.code '0')) Ucp.ucp_cased));
+  assert (
+    not (boolprop_set_contains (record_index (Char.code ' ')) Ucp.ucp_cased));
+  assert (boolprop_set_contains (record_index (Char.code 'a')) Ucp.ucp_ascii);
+  assert (not (boolprop_set_contains (record_index 0xe9) Ucp.ucp_ascii));
+  assert (
+    boolprop_set_contains (record_index (Char.code ' ')) Ucp.ucp_white_space);
+  (* Grapheme break properties: CR/LF/ZWJ/COMBINING GRAVE (Extend)/
+     REGIONAL INDICATOR U+1F1E6. *)
+  assert (Int.equal (gbprop 0x0d) Ucp.ucp_gb_cr);
+  assert (Int.equal (gbprop 0x0a) Ucp.ucp_gb_lf);
+  assert (Int.equal (gbprop 0x200d) Ucp.ucp_gb_zwj);
+  assert (Int.equal (gbprop 0x300) Ucp.ucp_gb_extend);
+  assert (Int.equal (gbprop 0x1f1e6) Ucp.ucp_gb_regional_indicator);
+  assert (Int.equal (gbprop (Char.code 'a')) Ucp.ucp_gb_other)
