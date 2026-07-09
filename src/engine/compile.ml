@@ -106,8 +106,11 @@ let put (code : Bytes.t) (n : int) (d : int) : unit =
   Bytes.set code (n + 1) (Char.chr (d land 0xff))
 
 (* pcre2_intmodedep.h:108-109 — GET(a,n): fetch a LINK_SIZE = 2 big-endian
-   offset. Char.code yields 0..255, so the result is already "unsigned". *)
-let get (code : Bytes.t) (n : int) : int =
+   offset. Char.code yields 0..255, so the result is already "unsigned".
+   [@inline always]: the C GET is a macro — two byte loads; the
+   interpreter's KET/ALT link reads are profile-hot, and Closure honors
+   the attribute across modules (§8; targeted, NOT a global -inline). *)
+let[@inline always] get (code : Bytes.t) (n : int) : int =
   (Char.code (Bytes.get code n) lsl 8) lor Char.code (Bytes.get code (n + 1))
 
 (* pcre2_intmodedep.h:192-195 — PUT2/GET2: 16-bit quantities (repeat
@@ -119,7 +122,9 @@ let put2 (code : Bytes.t) (n : int) (d : int) : unit =
   Bytes.set code n (Char.chr ((d lsr 8) land 0xff));
   Bytes.set code (n + 1) (Char.chr (d land 0xff))
 
-let get2 (code : Bytes.t) (n : int) : int =
+(* [@inline always]: as [get] — the C GET2 is a macro; capture-number
+   reads in the CBRA/OP_CLOSE dispatch arms are profile-hot (§8). *)
+let[@inline always] get2 (code : Bytes.t) (n : int) : int =
   (Char.code (Bytes.get code n) lsl 8) lor Char.code (Bytes.get code (n + 1))
 
 (* pcre2_intmodedep.h:547-548 — PUTINC(a,n,d) / PUT2INC(a,n,d): store, then
