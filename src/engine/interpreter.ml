@@ -23,8 +23,13 @@
    (5349-5411; the OP_ONCE/OP_SCRIPT_RUN/OP_SBRA head at 5391-5394 is
    live; the OP_SCRIPT_RUN ket action defers to M7), OP_ALT and OP_KET/
    OP_KETRMIN/OP_KETRMAX with resume labels RM1/RM2/RM6/RM7/RM9/RM10
-   (5893-6127; the condassert/recursion ket actions defer to M5), the
-   lookaround/atomic/possessive family — OP_ASSERT_ACCEPT (832-840), the
+   (5893-6127), the conditional/recursion family — OP_COND/OP_SCOND with
+   the condition opcodes and the assertion-condition protocol
+   (5603-5778, resume labels RM5/RM35), OP_RECURSE with RECURSELOOP
+   detection (5417-5497, resume label RM11), OP_FAIL (6359-6360), and
+   their ket actions (the GF_CONDASSERT return 5934-5948, whole-pattern
+   recursion 5955-5984, recursed-group capture reinstate 6056-6074) —
+   the lookaround/atomic/possessive family — OP_ASSERT_ACCEPT (832-840), the
    possessive brackets OP_BRAPOSZERO/OP_BRAPOS/OP_SBRAPOS/OP_CBRAPOS/
    OP_SCBRAPOS with resume label RM8 (5249-5334), the assertion brackets
    OP_ASSERT/OP_ASSERTBACK/OP_ASSERT_NA/OP_ASSERTBACK_NA (RM3) and
@@ -673,8 +678,10 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
        owning chunk. *)
     match op with
     | 166 ->
-        (* OP_CLOSE (pcre2_match.c:800-829) — STUB: M5
-           conditionals/recursion chunk (rides with OP_ACCEPT). *)
+        (* OP_CLOSE (pcre2_match.c:800-829) — STUB: M5 verbs chunk
+           (OP_CLOSE is only compiled before OP_ACCEPT, to close open
+           capturing brackets; both arms ride together, including their
+           Fcurrent_recurse gates). *)
         error_unported
     | 165 ->
         (* OP_ASSERT_ACCEPT (pcre2_match.c:832-840) — real or forced end
@@ -1481,9 +1488,45 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         fr.(fb + Frames.slot_temp_32_0) <- Frames.gf_nocapture lor op;
         (grouploop [@tailcall]) f
     | 117 ->
-        (* OP_RECURSE (pcre2_match.c:5427-5508) — STUB: M5 recursion
-           chunk. *)
-        error_unported
+        (* OP_RECURSE (pcre2_match.c:5417-5497) — pattern recursion either
+           matches the current regex, or some subexpression. The offset
+           data is the offset to the starting bracket from the start of
+           the whole pattern, so that it works from duplicated
+           subpatterns. For a whole-pattern recursion, we have to infer
+           the number zero. Frame temporaries (pcre2_match.c:5424-5425):
+           Lframe_type = temp_32[0], Lstart_branch = temp_sptr[0]. *)
+        let bracode = Compile.get mb.start_code (ecode + 1) in
+        let number =
+          if Int.equal bracode 0 then 0
+          else Compile.get2 mb.start_code (bracode + 1 + Limits.link_size)
+        in
+        (* pcre2_match.c:5431-5454 — if we are already in a pattern
+           recursion, check for repeating the same one without changing
+           the subject pointer or the last referenced character in the
+           subject. This should catch convoluted mutual recursions; some
+           simple cases are caught at compile time. However, there are
+           rare cases when this check needs to be turned off; actual
+           recursion loops are then caught by the match or heap limits. *)
+        let rc =
+          if
+            not
+              (Int.equal
+                 fr.(fb + Frames.slot_current_recurse)
+                 Frames.recurse_unset)
+          then
+            recurse_loop_check f fr.(fb + Frames.slot_last_group_offset) number
+          else 0
+        in
+        if rc < 0 then rc (* direct return, NOT RRETURN (5449) *)
+        else (
+          (* pcre2_match.c:5456-5461 — remember the current last
+             referenced character and then run the recursion branch by
+             branch. *)
+          fr.(fb + Frames.slot_recurse_last_used) <- mb.last_used_ptr;
+          fr.(fb + Frames.slot_temp_sptr_0) <- bracode (* Lstart_branch *);
+          fr.(fb + Frames.slot_temp_32_0) <- Frames.gf_recurse lor number
+          (* Lframe_type *);
+          (recurse_loop [@tailcall]) f)
     | 127 | 129 | 131 | 132 ->
         (* OP_ASSERT, OP_ASSERTBACK, OP_ASSERT_NA, OP_ASSERTBACK_NA
            (pcre2_match.c:5511-5536) — positive assertions: loop over the
@@ -1509,11 +1552,113 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            callout support chunk (M8). *)
         error_unported
     | 139 | 144 ->
-        (* OP_COND, OP_SCOND (pcre2_match.c:5609-5787; the condition
-           opcodes OP_CREF/OP_DNCREF/OP_RREF/OP_DNRREF/OP_FALSE/OP_TRUE
-           are read INSIDE this arm, 5641-5700) — STUB: M5 conditionals
-           chunk. *)
-        error_unported
+        (* OP_COND, OP_SCOND (pcre2_match.c:5603-5778) — conditional
+           group: compilation checked that there are no more than two
+           branches. If the condition is false, skipping the first branch
+           takes us past the end of the item if there is only one branch,
+           but that's exactly what we want. *)
+        (* pcre2_match.c:5612-5621 — Flength (frame slot: it must survive
+           the assertion-condition RMATCH) will be added to Fecode when
+           the condition is false, to get to the second branch. Setting
+           it to the offset to the ALT or KET, then incrementing Fecode
+           achieves this effect. However, if the second branch is
+           non-existent, we must point to the KET so that the end of the
+           group is correctly processed. We now have Fecode pointing to
+           the condition or callout. *)
+        let flength = Compile.get mb.start_code (ecode + 1) in
+        let flength =
+          if
+            not
+              (Int.equal
+                 (Char.code (Bytes.get mb.start_code (ecode + flength)))
+                 Opcodes.op_alt)
+          then flength - (1 + Limits.link_size)
+          else flength
+        in
+        fr.(fb + Frames.slot_length) <- flength;
+        let ecode = ecode + 1 + Limits.link_size in
+        fr.(fb + Frames.slot_ecode) <- ecode;
+        (* pcre2_match.c:5623-5638 — because of the way auto-callout works
+           during compile, a callout item can be inserted between OP_COND
+           and an assertion condition. Callout support is M8: no callout
+           opcode compiles until then, so *Fecode is always the condition
+           here; site kept for evaluation order. *)
+        (* pcre2_match.c:5640-5643 — test the various possible
+           conditions: condition = FALSE; switch ( *Fecode ). *)
+        let cond_op = Char.code (Bytes.get mb.start_code ecode) in
+        if Int.equal cond_op Opcodes.op_rref then
+          (* OP_RREF (pcre2_match.c:5645-5651) — group recursion test. *)
+          let condition =
+            (not
+               (Int.equal
+                  fr.(fb + Frames.slot_current_recurse)
+                  Frames.recurse_unset))
+            &&
+            let number = Compile.get2 mb.start_code (ecode + 1) in
+            Int.equal number Opcodes.rref_any
+            || Int.equal number fr.(fb + Frames.slot_current_recurse)
+          in
+          (cond_choose [@tailcall]) f condition
+        else if Int.equal cond_op Opcodes.op_dnrref then
+          (* OP_DNRREF (pcre2_match.c:5653-5666) — duplicate named group
+             recursion test: scan the list of groups to which the name
+             refers for the current recursion number. *)
+          let condition =
+            (not
+               (Int.equal
+                  fr.(fb + Frames.slot_current_recurse)
+                  Frames.recurse_unset))
+            && dnrref_scan
+                 fr.(fb + Frames.slot_current_recurse)
+                 (Compile.get2 mb.start_code (ecode + 1 + Limits.imm2_size))
+                 (Compile.get2 mb.start_code (ecode + 1) * mb.name_entry_size)
+          in
+          (cond_choose [@tailcall]) f condition
+        else if Int.equal cond_op Opcodes.op_cref then
+          (* OP_CREF (pcre2_match.c:5668-5671) — numbered group used
+             test: offset = doubled ref number. *)
+          let offset = (Compile.get2 mb.start_code (ecode + 1) lsl 1) - 2 in
+          let condition =
+            offset < fr.(fb + Frames.slot_offset_top)
+            && not
+                 (Int.equal fr.(fb + Frames.slot_ovector + offset) Frames.unset)
+          in
+          (cond_choose [@tailcall]) f condition
+        else if Int.equal cond_op Opcodes.op_dncref then
+          (* OP_DNCREF (pcre2_match.c:5673-5685) — duplicate named group
+             used test: scan the list of groups to which the name refers
+             for one that is set. *)
+          let condition =
+            dncref_scan f
+              (Compile.get2 mb.start_code (ecode + 1 + Limits.imm2_size))
+              (Compile.get2 mb.start_code (ecode + 1) * mb.name_entry_size)
+          in
+          (cond_choose [@tailcall]) f condition
+        else if
+          Int.equal cond_op Opcodes.op_false
+          || Int.equal cond_op Opcodes.op_fail
+        then
+          (* OP_FALSE, OP_FAIL (pcre2_match.c:5687-5689) — the assertion
+             (?!) becomes OP_FAIL; condition stays FALSE. *)
+          (cond_choose [@tailcall]) f false
+        else if Int.equal cond_op Opcodes.op_true then
+          (* OP_TRUE (pcre2_match.c:5691-5693). *)
+          (cond_choose [@tailcall]) f true
+        else (
+          (* default (pcre2_match.c:5694-5757) — the condition is an
+             assertion: run code similar to the assertion code above.
+             Lpositive = temp_32[0], Lstart_branch = temp_sptr[0]
+             (5698-5699). Fecode stays on the condition opcode for the
+             whole branch loop. *)
+          fr.(fb + Frames.slot_temp_32_0) <-
+            (if
+               Int.equal cond_op Opcodes.op_assert
+               || Int.equal cond_op Opcodes.op_assertback
+             then 1
+             else 0)
+          (* Lpositive *);
+          fr.(fb + Frames.slot_temp_sptr_0) <- ecode (* Lstart_branch *);
+          (cond_assert_loop [@tailcall]) f)
     | 125 ->
         (* OP_REVERSE (pcre2_match.c:5793-5819) — move the subject pointer
            back by one fixed amount, at the start of each fixed-length
@@ -1530,14 +1675,14 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
              count is code unit count. *)
           number > fr.(fb + Frames.slot_eptr) - mb.start_subject
         then (backtrack [@tailcall]) f match_nomatch
-        else (
+        else
           let eptr = fr.(fb + Frames.slot_eptr) - number in
           fr.(fb + Frames.slot_eptr) <- eptr;
           (* pcre2_match.c:5815-5818 — save the earliest consulted
              character, then skip to next opcode. *)
           if eptr < mb.start_used_ptr then mb.start_used_ptr <- eptr;
           fr.(fb + Frames.slot_ecode) <- ecode + 1 + Limits.imm2_size;
-          (dispatch [@tailcall]) f)
+          (dispatch [@tailcall]) f
     | 126 ->
         (* OP_VREVERSE (pcre2_match.c:5834-5883) — move the subject
            pointer back by a variable amount, at the start of each
@@ -1545,8 +1690,8 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
            matching the branch after moving back different numbers of
            characters. Frame temporaries (5830-5832): Lmin/Lmax =
            temp_32[0..1], Leptr = temp_sptr[0]. *)
-        fr.(fb + Frames.slot_temp_32_0) <-
-          Compile.get2 mb.start_code (ecode + 1) (* Lmin *);
+        fr.(fb + Frames.slot_temp_32_0) <- Compile.get2 mb.start_code (ecode + 1)
+        (* Lmin *);
         fr.(fb + Frames.slot_temp_32_1) <-
           Compile.get2 mb.start_code (ecode + 1 + Limits.imm2_size)
         (* Lmax *);
@@ -1634,32 +1779,75 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                (Frames.gf_idmask
                   fr.(Frames.base a (p + 1) + Frames.slot_group_frame_type))
                Frames.gf_condassert
-        then
+        then (
           (* pcre2_match.c:5934-5948 — the end of an assertion that is a
-             condition — STUB: M5 conditionals chunk (GF_CONDASSERT frames
-             are only created by OP_COND's assertion conditions,
-             5711-5717). *)
-          error_unported
+             condition: return a match, discarding any intermediate
+             backtracking points. Copy back the mark setting and the
+             captures into the frame before N (= P, the frame that
+             dispatched OP_COND and owns the RM5 resume) so that they are
+             set on return. Doing this for all assertions, both positive
+             and negative, seems to match what Perl does. Fback_frame =
+             F - P (frame units here, frames.ml DEVIATION). *)
+          let pb = Frames.base a p in
+          Array.blit fr (fb + Frames.slot_ovector) fr (pb + Frames.slot_ovector)
+            fr.(fb + Frames.slot_offset_top);
+          fr.(pb + Frames.slot_offset_top) <- fr.(fb + Frames.slot_offset_top);
+          fr.(pb + Frames.slot_mark) <- fr.(fb + Frames.slot_mark);
+          fr.(fb + Frames.slot_back_frame) <- f - p;
+          (backtrack [@tailcall]) f match_match)
         else
           (* pcre2_match.c:5952-6085 — actions relating to the starting
              opcode: switch ( *bracode). *)
           match bra_op with
           | 135 ->
-              (* OP_BRA (pcre2_match.c:5964-5984) — nothing to be done
-                 unless this is the end of a whole-pattern recursion
-                 (recursing in group 0 with OP_END immediately following
-                 this ket). *)
+              (* OP_BRA (pcre2_match.c:5955-5966) — whole pattern
+                 recursion is handled as a recursion into group 0, but
+                 the entire pattern is wrapped in OP_BRA/OP_KET rather
+                 than a capturing group, so the end of such a recursion
+                 must be handled here. It is detected by checking for an
+                 immediately following OP_END when we are recursing in
+                 group 0. If this is not the end of a whole-pattern
+                 recursion, there is nothing to be done. *)
               if
                 Int.equal fr.(fb + Frames.slot_current_recurse) 0
                 && Int.equal
                      (Char.code
                         (Bytes.get mb.start_code (ecode + 1 + Limits.link_size)))
                      Opcodes.op_end
-              then
-                (* pcre2_match.c:5967-5984 — STUB: M5 recursion chunk
-                   (Fcurrent_recurse stays RECURSE_UNSET until OP_RECURSE
-                   lands, so this is unreachable now). *)
-                error_unported
+              then (
+                (* pcre2_match.c:5967-5973 — it is the end of
+                   whole-pattern recursion: point N to the most recent
+                   group frame (the GF_RECURSE frame recorded by
+                   OP_RECURSE's RM11 RMATCH) and P to its predecessor
+                   (the frame that dispatched OP_RECURSE), and unchain
+                   it. The C's PCRE2_ERROR_INTERNAL is a direct return,
+                   NOT RRETURN (5970). *)
+                let offset = fr.(fb + Frames.slot_last_group_offset) in
+                if Int.equal offset Frames.unset then Errors.error_internal
+                else
+                  let pb = Frames.base a (offset - 1) in
+                  fr.(fb + Frames.slot_last_group_offset) <-
+                    fr.(pb + Frames.slot_last_group_offset);
+                  (* pcre2_match.c:5975-5984 — reinstate the previous set
+                     of captures and then carry on after the recursion
+                     call. In bounds: offset_top <= 2 * top_bracket in
+                     every frame. *)
+                  Array.blit fr (pb + Frames.slot_ovector) fr
+                    (fb + Frames.slot_ovector)
+                    fr.(fb + Frames.slot_offset_top);
+                  fr.(fb + Frames.slot_offset_top) <-
+                    fr.(pb + Frames.slot_offset_top);
+                  fr.(fb + Frames.slot_capture_last) <-
+                    fr.(pb + Frames.slot_capture_last);
+                  fr.(fb + Frames.slot_current_recurse) <-
+                    fr.(pb + Frames.slot_current_recurse);
+                  (* P->ecode is the OP_RECURSE position (RMATCH stored
+                     the branch start in the NEW frame only); step past
+                     the 1 + LINK_SIZE item and continue with the next
+                     opcode. *)
+                  fr.(fb + Frames.slot_ecode) <-
+                    fr.(pb + Frames.slot_ecode) + 1 + Limits.link_size;
+                  (dispatch [@tailcall]) f)
               else (op_ket_tail [@tailcall]) f p bracode
           | 139 | 144 ->
               (* OP_COND, OP_SCOND (pcre2_match.c:5986-5988) — no need to
@@ -1683,7 +1871,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                         fr.(Frames.base a p + Frames.slot_eptr))
               then (backtrack [@tailcall]) f match_nomatch
               else (op_ket_assert_na [@tailcall]) f p bracode
-              (* fallthrough from OP_ASSERTBACK_NA in C *)
+                (* fallthrough from OP_ASSERTBACK_NA in C *)
           | 131 ->
               (* OP_ASSERT_NA (pcre2_match.c:5999-6002). *)
               (op_ket_assert_na [@tailcall]) f p bracode
@@ -1705,7 +1893,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                         fr.(Frames.base a p + Frames.slot_eptr))
               then (backtrack [@tailcall]) f match_nomatch
               else (op_ket_assert [@tailcall]) f p bracode
-              (* fallthrough from OP_ASSERTBACK in C *)
+                (* fallthrough from OP_ASSERTBACK in C *)
           | 127 ->
               (* OP_ASSERT (pcre2_match.c:6013-6016). *)
               (op_ket_assert [@tailcall]) f p bracode
@@ -1746,13 +1934,31 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
               let number =
                 Compile.get2 mb.start_code (bracode + 1 + Limits.link_size)
               in
-              if Int.equal fr.(fb + Frames.slot_current_recurse) number then
-                (* pcre2_match.c:6062-6075 — a recursively called group:
-                   reinstate the previous captures and carry on after the
-                   recursion call — STUB: M5 recursion chunk
-                   (Fcurrent_recurse stays RECURSE_UNSET until OP_RECURSE
-                   lands, so this is unreachable now). *)
-                error_unported
+              if Int.equal fr.(fb + Frames.slot_current_recurse) number then (
+                (* pcre2_match.c:6062-6074 — handle a recursively called
+                   group: reinstate the previous set of captures and then
+                   carry on after the recursion call. The C recomputes
+                   P = N - frame_size (6067); the generic unchain above
+                   already established that as [p] (>= 0: the recursed
+                   group's frame is the GF_RECURSE frame recorded by
+                   OP_RECURSE's RM11 RMATCH). In bounds: offset_top <=
+                   2 * top_bracket in every frame. *)
+                let pb = Frames.base a p in
+                Array.blit fr (pb + Frames.slot_ovector) fr
+                  (fb + Frames.slot_ovector)
+                  fr.(fb + Frames.slot_offset_top);
+                fr.(fb + Frames.slot_offset_top) <-
+                  fr.(pb + Frames.slot_offset_top);
+                fr.(fb + Frames.slot_capture_last) <-
+                  fr.(pb + Frames.slot_capture_last);
+                fr.(fb + Frames.slot_current_recurse) <-
+                  fr.(pb + Frames.slot_current_recurse);
+                (* P->ecode is the OP_RECURSE position; step past the
+                   1 + LINK_SIZE item and continue with the next
+                   opcode. *)
+                fr.(fb + Frames.slot_ecode) <-
+                  fr.(pb + Frames.slot_ecode) + 1 + Limits.link_size;
+                (dispatch [@tailcall]) f)
               else
                 (* pcre2_match.c:6077-6084 — deal with actual capturing.
                    In bounds: 1 <= number <= top_bracket in a compiled
@@ -1937,8 +2143,8 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
         (* OP_MARK (pcre2_match.c:6340-6356) — STUB: M5 verbs chunk. *)
         error_unported
     | 163 ->
-        (* OP_FAIL (pcre2_match.c:6359-6363) — STUB: M5 verbs chunk. *)
-        error_unported
+        (* OP_FAIL (pcre2_match.c:6359-6360) — RRETURN(MATCH_NOMATCH). *)
+        (backtrack [@tailcall]) f match_nomatch
     | 161 | 162 | 155 | 156 | 157 | 158 | 159 | 160 ->
         (* OP_COMMIT, OP_COMMIT_ARG, OP_PRUNE, OP_PRUNE_ARG, OP_SKIP,
            OP_SKIP_ARG, OP_THEN, OP_THEN_ARG (pcre2_match.c:6366-6442) —
@@ -3310,6 +3516,129 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
       (ecode + Opcodes.op_lengths.(Char.code (Bytes.get mb.start_code ecode)))
       rm4
       fr.(fb + Frames.slot_temp_32_0)
+  and recurse_loop_check (f : int) (offset : int) (number : int) : int =
+    (* pcre2_match.c:5438-5454 — the OP_RECURSE loop-detection walk over
+       the chained group frames: offset starts at Flast_group_offset (a
+       frame index here, frames.ml DEVIATION; -1 = PCRE2_UNSET), N is the
+       frame at [offset] and P its predecessor. When the most recent
+       GF_RECURSE frame for the same group [number] is found, repeating
+       it without changing the subject pointer or the last referenced
+       character is PCRE2_ERROR_RECURSELOOP — a direct return in the C
+       (5449), not RRETURN — unless PCRE2_DISABLE_RECURSELOOP_CHECK is
+       set; either way the walk stops there (break, 5450). Returns 0 to
+       continue with the recursion. Terminates: the last_group_offset
+       chain strictly descends to PCRE2_UNSET. *)
+    if Int.equal offset Frames.unset then 0
+    else
+      let fr = a.Frames.frames in
+      let nb = Frames.base a offset in
+      let pb = Frames.base a (offset - 1) in
+      if
+        Int.equal
+          fr.(nb + Frames.slot_group_frame_type)
+          (Frames.gf_recurse lor number)
+      then
+        if
+          Int.equal
+            fr.(Frames.base a f + Frames.slot_eptr)
+            fr.(pb + Frames.slot_eptr)
+          && Int.equal mb.last_used_ptr fr.(pb + Frames.slot_recurse_last_used)
+          && Int.equal (mb.moptions land Options.disable_recurseloop_check) 0
+        then Errors.error_recurseloop
+        else 0 (* break, 5450 *)
+      else
+        (recurse_loop_check [@tailcall]) f
+          fr.(pb + Frames.slot_last_group_offset)
+          number
+  and recurse_loop (f : int) : int =
+    (* pcre2_match.c:5463-5468 — the OP_RECURSE for(;;) head: run the
+       branch at Lstart_branch, passing the remembered GF_RECURSE frame
+       type (RM11); the rest of the loop body is the RM11 resume arm in
+       [backtrack]. Entered with Lstart_branch at the recursed bracket
+       (first call) or at an OP_ALT (RM11 branch walk);
+       OP_lengths[*Lstart_branch] steps over either item. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    let start_branch = fr.(fb + Frames.slot_temp_sptr_0) in
+    (rmatch [@tailcall]) f
+      (start_branch
+      + Opcodes.op_lengths.(Char.code (Bytes.get mb.start_code start_branch)))
+      rm11
+      fr.(fb + Frames.slot_temp_32_0)
+  and dnrref_scan (current_recurse : int) (count : int) (slot : int) : bool =
+    (* pcre2_match.c:5656-5665 — the OP_DNRREF group-list walk:
+       while (count-- > 0) test each group number the name refers to
+       against the current recursion. GET2(slot, 0) is the group number
+       at the head of a name-table entry. *)
+    if count <= 0 then false
+    else if Int.equal (Compile.get2 mb.name_table slot) current_recurse then
+      true
+    else
+      (dnrref_scan [@tailcall]) current_recurse (count - 1)
+        (slot + mb.name_entry_size)
+  and dncref_scan (f : int) (count : int) (slot : int) : bool =
+    (* pcre2_match.c:5675-5684 — the OP_DNCREF group-list walk:
+       while (count-- > 0) test whether any group the name refers to is
+       set, exactly as OP_CREF tests its single group. *)
+    if count <= 0 then false
+    else
+      let fr = a.Frames.frames in
+      let fb = Frames.base a f in
+      let offset = (Compile.get2 mb.name_table slot lsl 1) - 2 in
+      if
+        offset < fr.(fb + Frames.slot_offset_top)
+        && not (Int.equal fr.(fb + Frames.slot_ovector + offset) Frames.unset)
+      then true
+      else (dncref_scan [@tailcall]) f (count - 1) (slot + mb.name_entry_size)
+  and cond_assert_loop (f : int) : int =
+    (* pcre2_match.c:5705-5708 — the assertion-condition for(;;) head:
+       record a backtracking point for the branch at Lstart_branch with a
+       GF_CONDASSERT frame carrying the condition opcode (Fecode stays on
+       that opcode for the whole loop); the rest of the loop body is the
+       RM5 resume arm in [backtrack]. Entered with Lstart_branch at the
+       assertion bracket (first call) or at an OP_ALT (RM5 branch walk);
+       OP_lengths[*Lstart_branch] steps over either item. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    let start_branch = fr.(fb + Frames.slot_temp_sptr_0) in
+    (rmatch [@tailcall]) f
+      (start_branch
+      + Opcodes.op_lengths.(Char.code (Bytes.get mb.start_code start_branch)))
+      rm5
+      (Frames.gf_condassert
+      lor Char.code (Bytes.get mb.start_code fr.(fb + Frames.slot_ecode)))
+  and cond_assert_end (f : int) (condition : bool) : int =
+    (* pcre2_match.c:5750-5756 — out of the branch loop: if the condition
+       is true, find the end of the assertion so that advancing past it
+       gets us to the start of the first branch: do Fecode +=
+       GET(Fecode, 1); while ( *Fecode == OP_ALT ) — the [skip_alts]
+       walk. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    if condition then
+      fr.(fb + Frames.slot_ecode) <- skip_alts fr.(fb + Frames.slot_ecode);
+    (cond_choose [@tailcall]) f condition
+  and cond_choose (f : int) (condition : bool) : int =
+    (* pcre2_match.c:5763-5778 — choose branch according to the
+       condition: Fecode += condition ? OP_lengths[*Fecode] : Flength.
+       If the opcode is OP_SCOND it means we are at a repeated
+       conditional group that might match an empty string: we must
+       descend a level so that the start is remembered for checking
+       (RM35 — its resume is RRETURN(rrc)); for OP_COND we can just
+       continue at this level. *)
+    let fr = a.Frames.frames in
+    let fb = Frames.base a f in
+    let ecode = fr.(fb + Frames.slot_ecode) in
+    let ecode =
+      if condition then
+        ecode + Opcodes.op_lengths.(Char.code (Bytes.get mb.start_code ecode))
+      else ecode + fr.(fb + Frames.slot_length)
+    in
+    fr.(fb + Frames.slot_ecode) <- ecode;
+    if Int.equal fr.(fb + Frames.slot_op) Opcodes.op_scond then
+      (rmatch [@tailcall]) f ecode rm35
+        (Frames.gf_nocapture lor Opcodes.op_scond)
+    else (dispatch [@tailcall]) f
   and once_adjust (e : int) : int =
     (* pcre2_match.c:6025-6030 — adjust the code pointer within the
        backtrack frame so that it points to the final branch: for(;;)
@@ -3318,7 +3647,8 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
        to its ket in a complete compiled program (mb invariant). *)
     let y = Compile.get mb.start_code (e + 1) in
     if
-      not (Int.equal (Char.code (Bytes.get mb.start_code (e + y))) Opcodes.op_alt)
+      not
+        (Int.equal (Char.code (Bytes.get mb.start_code (e + y))) Opcodes.op_alt)
     then e
     else (once_adjust [@tailcall]) (e + y)
   and op_ket_assert_na (f : int) (p : int) (bracode : int) : int =
@@ -3377,9 +3707,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
          OP_KETRPOS is only compiled as the ket of the BRAPOS bracket
          family, never OP_BRA/OP_COND (mb invariant), so the P computation
          above took the non-NULL branch. *)
-      Array.blit fr
-        (fb + Frames.slot_eptr)
-        fr
+      Array.blit fr (fb + Frames.slot_eptr) fr
         (Frames.base a p + Frames.slot_eptr)
         (a.Frames.frame_size_ints - Frames.slot_eptr);
       (backtrack [@tailcall]) f match_ketrpos)
@@ -3994,9 +4322,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                is only produced by the OP_ASSERT_ACCEPT arm, which sets
                it) and offset_top <= 2 * top_bracket in both frames. *)
             let ab = Frames.base a !assert_accept_frame in
-            Array.blit fr
-              (ab + Frames.slot_ovector)
-              fr
+            Array.blit fr (ab + Frames.slot_ovector) fr
               (fb + Frames.slot_ovector)
               fr.(ab + Frames.slot_offset_top);
             fr.(fb + Frames.slot_offset_top) <- fr.(ab + Frames.slot_offset_top);
@@ -4035,7 +4361,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
             (* pcre2_match.c:5557-5559 — assertion matched, therefore it
                fails. *)
             (backtrack [@tailcall]) f match_nomatch
-          else if Int.equal rrc match_nomatch || Int.equal rrc match_then then
+          else if Int.equal rrc match_nomatch || Int.equal rrc match_then then (
             (* pcre2_match.c:5561-5565 — branch failed, try next if
                present. *)
             let ecode =
@@ -4054,7 +4380,7 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                  so carry on. *)
               fr.(fb + Frames.slot_ecode) <- ecode + 1 + Limits.link_size;
               (dispatch [@tailcall]) f)
-            else (assert_not_loop [@tailcall]) f
+            else (assert_not_loop [@tailcall]) f)
           else if
             Int.equal rrc match_commit || Int.equal rrc match_skip
             || Int.equal rrc match_prune
@@ -4112,9 +4438,90 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                    Opcodes.op_alt)
             then (possessive_group_done [@tailcall]) f
             else (possessive_group_loop [@tailcall]) f
-      | 5 | 11 | 35 ->
-          (* RM5 RM11 RM35 — STUB: M5 conditionals/recursion chunks. *)
-          error_unported
+      | 5 ->
+          (* L_RM5 (pcre2_match.c:5710-5745) — an assertion-condition
+             branch came back: switch (rrc). *)
+          if Int.equal rrc match_accept then (
+            (* pcre2_match.c:5712-5717 — MATCH_ACCEPT: save captures from
+               the frame remembered by OP_ASSERT_ACCEPT. In bounds: as at
+               the RM3 resume ([assert_accept_frame] is a valid frame
+               index and offset_top <= 2 * top_bracket in both frames). *)
+            let ab = Frames.base a !assert_accept_frame in
+            Array.blit fr (ab + Frames.slot_ovector) fr
+              (fb + Frames.slot_ovector)
+              fr.(ab + Frames.slot_offset_top);
+            fr.(fb + Frames.slot_offset_top) <- fr.(ab + Frames.slot_offset_top);
+            (* fallthrough from MATCH_ACCEPT in C (5719-5724): in the
+               case of a match, the captures have already been put into
+               the current frame — condition = Lpositive (TRUE for a
+               positive assertion), then out of the branch loop. *)
+            (cond_assert_end [@tailcall]) f
+              (not (Int.equal fr.(fb + Frames.slot_temp_32_0) 0)))
+          else if Int.equal rrc match_match then
+            (* pcre2_match.c:5722-5724 — condition = Lpositive. *)
+            (cond_assert_end [@tailcall]) f
+              (not (Int.equal fr.(fb + Frames.slot_temp_32_0) 0))
+          else if Int.equal rrc match_nomatch || Int.equal rrc match_then then (
+            (* pcre2_match.c:5726-5734 — PCRE doesn't allow the effect of
+               ( *THEN) to escape beyond an assertion; it is therefore
+               always treated as NOMATCH (M5 verbs; no opcode can return
+               MATCH_THEN until then). Try the next branch if present;
+               otherwise condition = !Lpositive (TRUE for a negative
+               assertion). *)
+            let sb =
+              fr.(fb + Frames.slot_temp_sptr_0)
+              + Compile.get mb.start_code (fr.(fb + Frames.slot_temp_sptr_0) + 1)
+            in
+            fr.(fb + Frames.slot_temp_sptr_0) <- sb (* Lstart_branch *);
+            if Int.equal (Char.code (Bytes.get mb.start_code sb)) Opcodes.op_alt
+            then (cond_assert_loop [@tailcall]) f
+            else
+              (cond_assert_end [@tailcall]) f
+                (Int.equal fr.(fb + Frames.slot_temp_32_0) 0))
+          else if
+            Int.equal rrc match_commit || Int.equal rrc match_skip
+            || Int.equal rrc match_prune
+          then
+            (* pcre2_match.c:5736-5742 — these force no match without
+               checking other branches: condition = !Lpositive (M5 verbs;
+               no opcode can return these yet; kept in the C's case
+               order). *)
+            (cond_assert_end [@tailcall]) f
+              (Int.equal fr.(fb + Frames.slot_temp_32_0) 0)
+          else
+            (* pcre2_match.c:5744-5745 — default: pass back any other
+               return. *)
+            (backtrack [@tailcall]) f rrc
+      | 11 ->
+          (* L_RM11 (pcre2_match.c:5469-5495) — a recursion branch came
+             back: next_ecode = Lstart_branch + GET(Lstart_branch, 1).
+             The backtracking-verb range handling (5471-5488) consults
+             mb->verb_current_recurse / mb->verb_ecode_ptr: M5 verbs
+             chunk — no opcode can return a MATCH_BACKTRACK_MIN..MAX
+             code until then; site kept for evaluation order. Carrying
+             on after ( *ACCEPT) in a recursion is handled in the
+             OP_ACCEPT code; nothing needs to be done here (5490-5491).
+             Anything but NOMATCH passes back; otherwise try the next
+             branch, failing the recursion when there is none. *)
+          if not (Int.equal rrc match_nomatch) then
+            (backtrack [@tailcall]) f rrc
+          else
+            let next_ecode =
+              fr.(fb + Frames.slot_temp_sptr_0)
+              + Compile.get mb.start_code (fr.(fb + Frames.slot_temp_sptr_0) + 1)
+            in
+            fr.(fb + Frames.slot_temp_sptr_0) <- next_ecode (* Lstart_branch *);
+            if
+              not
+                (Int.equal
+                   (Char.code (Bytes.get mb.start_code next_ecode))
+                   Opcodes.op_alt)
+            then (backtrack [@tailcall]) f match_nomatch
+            else (recurse_loop [@tailcall]) f
+      | 35 ->
+          (* L_RM35 (pcre2_match.c:5776) — OP_SCOND descend:
+             RRETURN(rrc). *)
+          (backtrack [@tailcall]) f rrc
       | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 36 ->
           (* RM12..RM19 RM36 — STUB: M5 verbs chunk. *)
           error_unported
@@ -5247,12 +5654,10 @@ let () =
     Int.equal
       Opcodes.op_lengths.(Opcodes.op_scbrapos)
       (1 + Limits.link_size + Limits.imm2_size));
-  assert (
-    Int.equal Opcodes.op_lengths.(Opcodes.op_brapos) (1 + Limits.link_size));
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_brapos) (1 + Limits.link_size));
   assert (
     Int.equal Opcodes.op_lengths.(Opcodes.op_sbrapos) (1 + Limits.link_size));
-  assert (
-    Int.equal Opcodes.op_lengths.(Opcodes.op_assert) (1 + Limits.link_size));
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_assert) (1 + Limits.link_size));
   assert (
     Int.equal Opcodes.op_lengths.(Opcodes.op_assert_not) (1 + Limits.link_size));
   assert (
@@ -5304,6 +5709,30 @@ let () =
   assert (Int.equal Opcodes.op_true 150);
   assert (Int.equal Opcodes.op_define 168);
   assert (Int.equal Opcodes.op_table_length 171);
+  (* Conditional / recursion opcodes now guarding live behavior
+     (conditionals/recursion match chunk): the condition opcodes read
+     inside OP_COND (pcre2_internal.h:1607-1612), OP_RECURSE, OP_FAIL,
+     RREF_ANY (pcre2_internal.h:1816), and the OP_lengths entries the
+     condition dispatch steps by (pcre2_internal.h:1786-1803). *)
+  assert (Int.equal Opcodes.op_recurse 117);
+  assert (Int.equal Opcodes.op_dncref 146);
+  assert (Int.equal Opcodes.op_rref 147);
+  assert (Int.equal Opcodes.op_dnrref 148);
+  assert (Int.equal Opcodes.op_false 149);
+  assert (Int.equal Opcodes.op_fail 163);
+  assert (Int.equal Opcodes.rref_any 0xffff);
+  assert (
+    Int.equal Opcodes.op_lengths.(Opcodes.op_recurse) (1 + Limits.link_size));
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_cond) (1 + Limits.link_size));
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_scond) (1 + Limits.link_size));
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_cref) (1 + Limits.imm2_size));
+  assert (
+    Int.equal Opcodes.op_lengths.(Opcodes.op_dncref) (1 + (2 * Limits.imm2_size)));
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_rref) (1 + Limits.imm2_size));
+  assert (
+    Int.equal Opcodes.op_lengths.(Opcodes.op_dnrref) (1 + (2 * Limits.imm2_size)));
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_false) 1);
+  assert (Int.equal Opcodes.op_lengths.(Opcodes.op_true) 1);
   (* RM label constants match the C enum (pcre2_match.c:155-169). *)
   assert (Int.equal rm1 1);
   assert (Int.equal rm37 37);
@@ -5484,21 +5913,13 @@ let () =
       assert (Int.equal ov.(0) 0);
       assert (Int.equal ov.(1) 1)
 
-(* Malformed / not-yet-ported programs: OP_DEFINE has no case in the C
-   switch -> PCRE2_ERROR_INTERNAL; a stubbed opcode returns the
-   scaffolding marker (this last check is removed with the stub —
-   OP_RECURSE belongs to the M5 recursion chunk). *)
+(* Malformed programs: OP_DEFINE has no case in the C switch ->
+   PCRE2_ERROR_INTERNAL. *)
 let () =
-  (match
-     match_internal ~code:(mk_code [ Opcodes.op_define ]) ~top_bracket:0 "a" 0
-   with
-  | rc, _ -> assert (Int.equal rc Errors.error_internal));
   match
-    match_internal
-      ~code:(mk_code [ Opcodes.op_recurse; 0; 0; Opcodes.op_end ])
-      ~top_bracket:0 "a" 0
+    match_internal ~code:(mk_code [ Opcodes.op_define ]) ~top_bracket:0 "a" 0
   with
-  | rc, _ -> assert (Int.equal rc error_unported)
+  | rc, _ -> assert (Int.equal rc Errors.error_internal)
 
 (* Direct match_block block: observability the (rc, ovector) surface
    hides — hitend, mark, last_used_ptr, counters — asserted against the
@@ -6521,10 +6942,7 @@ let () =
      testinput1:28 — oracle: 0: abde, 1: de, 2: abd, 3: e (captures made
      inside a matched positive assertion persist: execution continues
      forward in the deeper frames). *)
-  expect_ov
-    (compile "^(?=ab(de))(abd)(e)")
-    "abde"
-    [| 0; 4; 2; 4; 0; 3; 3; 4 |];
+  expect_ov (compile "^(?=ab(de))(abd)(e)") "abde" [| 0; 4; 2; 4; 0; 3; 3; 4 |];
   expect_ov (compile "(?=(a))a") "a" [| 0; 1; 0; 1 |];
   (* Negative lookahead — oracle: /(?!x)a/ on "a" -> 0: a. *)
   expect_ov (compile "(?!x)a") "a" [| 0; 1 |];
@@ -6586,8 +7004,152 @@ let () =
   expect_ov (compile "(?<=(a{2,4}))x") "aaaaax" [| 5; 6; 1; 5 |];
   (* Lookbehind captures survive; hard partial does not fire once the
      match completes — oracle: 0: d, 1: abc. *)
-  expect_ov
-    ~options:Options.partial_hard
-    (compile "(?<=(abc))d")
-    "abcd"
+  expect_ov ~options:Options.partial_hard (compile "(?<=(abc))d") "abcd"
     [| 3; 4; 0; 3 |]
+
+(* Conditionals and recursion (this chunk): the OP_COND/OP_SCOND
+   condition opcodes (OP_CREF/OP_DNCREF/OP_RREF/OP_DNRREF/OP_FALSE/
+   OP_TRUE), the assertion-condition protocol (RM5 + the GF_CONDASSERT
+   ket return), OP_RECURSE with the RM11 branch loop and the recursion
+   ket actions (whole-pattern end + recursed-group capture reinstate,
+   i.e. Perl's captures-discard-on-exit semantics), RECURSELOOP (-52)
+   detection with its PCRE2_DISABLE_RECURSELOOP_CHECK gate, OP_FAIL, and
+   the quantified-recursion compile case. Whole compiled patterns through
+   the [pcre2_match] driver (limit knobs via [match_internal]); EVERY
+   expected value below is pinned against the C oracle (pcre2test on the
+   real 10.44 library). *)
+let () =
+  let compile pat =
+    match Compile.pcre2_compile pat ~options:0 with
+    | Error _ -> assert false
+    | Ok re -> re
+  in
+  let run (re : Compile.re) subj =
+    let oveccount = re.Compile.top_bracket + 1 in
+    let m =
+      {
+        ovector = Array.make (2 * oveccount) Frames.unset;
+        oveccount;
+        rc = 0;
+        startchar = 0;
+        leftchar = 0;
+        rightchar = 0;
+        mark = Frames.unset;
+      }
+    in
+    let rc = pcre2_match re ~subject:subj ~start_offset:0 ~options:0 m in
+    (rc, m)
+  in
+  let expect_ov re subj expected =
+    match run re subj with
+    | rc, m ->
+        assert (rc > 0);
+        assert (Int.equal (Array.length m.ovector) (Array.length expected));
+        Array.iteri (fun i e -> assert (Int.equal m.ovector.(i) e)) expected
+  in
+  let expect_nomatch re subj =
+    match run re subj with rc, _ -> assert (Int.equal rc Errors.error_nomatch)
+  in
+  let expect_rc re subj code =
+    match run re subj with rc, _ -> assert (Int.equal rc code)
+  in
+  (* Group-set condition (OP_CREF), both paths — oracle: aA -> 0: aA,
+     1: a; bB -> 0: bB, 1: <unset>; aB and bA -> no match. *)
+  (let re = compile "(?:(a)|b)(?(1)A|B)" in
+   expect_ov re "aA" [| 0; 2; 0; 1 |];
+   expect_ov re "bB" [| 0; 2; -1; -1 |];
+   expect_nomatch re "aB";
+   expect_nomatch re "bA");
+  (* Unset optional group takes the false branch — oracle: 0: c,
+     1: <unset>. *)
+  (let re = compile "(a)?(?(1)b|c)" in
+   expect_ov re "ab" [| 0; 2; 0; 1 |];
+   expect_ov re "c" [| 0; 1; -1; -1 |]);
+  (* Named-group condition (a non-duplicated name compiles to OP_CREF) —
+     oracle: 0: ab, 1: a. *)
+  expect_ov (compile "(?<n>a)(?(<n>)b|c)") "ab" [| 0; 2; 0; 1 |];
+  (* Duplicate-name condition (the OP_DNCREF group-list scan) — oracle:
+     aX -> 1: a, 2: <unset>; bX -> 1: <unset>, 2: b. *)
+  (let re = compile "(?J)(?:(?<n>a)|(?<n>b))(?(<n>)X|Y)" in
+   expect_ov re "aX" [| 0; 2; 0; 1; -1; -1 |];
+   expect_ov re "bX" [| 0; 2; -1; -1; 0; 1 |]);
+  (* Recursion condition (OP_RREF): false outside a recursion — oracle:
+     0: x — and true inside one — oracle: 0: ba. *)
+  expect_ov (compile "(?(R)r|x)") "x" [| 0; 1 |];
+  expect_ov (compile "(?(R)a|b(?R))") "ba" [| 0; 2 |];
+  (* Assertion conditions (GF_CONDASSERT frames + RM5; the positive kind
+     rewrites Fecode past the assertion when true) — oracle: ab / x
+     match, a fails; the negative kind picks the first branch on x. *)
+  (let re = compile "(?(?=ab)ab|x)" in
+   expect_ov re "ab" [| 0; 2 |];
+   expect_ov re "x" [| 0; 1 |];
+   expect_nomatch re "a");
+  (let re = compile "(?(?!a)x|ab)" in
+   expect_ov re "x" [| 0; 1 |];
+   expect_ov re "ab" [| 0; 2 |]);
+  (* DEFINE (OP_FALSE, single-branch skip) + named recursion — oracle:
+     0: abab, 1: <unset>. *)
+  expect_ov (compile "(?(DEFINE)(?<f>ab))(?&f)+") "abab" [| 0; 4; -1; -1 |];
+  (* VERSION conditions compile to OP_TRUE — oracle: 0: yes. *)
+  expect_ov (compile "(?(VERSION>=10)yes|no)") "yes" [| 0; 3 |];
+  (* OP_SCOND: a repeated conditional group that might match an empty
+     string descends a level (RM35) — oracle: 0: abc, 1: a / 0: ac,
+     1: a. *)
+  (let re = compile "(a)(?(1)b|)*c" in
+   expect_ov re "abc" [| 0; 3; 0; 1 |];
+   expect_ov re "ac" [| 0; 2; 0; 1 |]);
+  (* Numbered recursion, nested calls — oracle: 0: aabb, 1: aabb; the
+     anchored variant fails on an unbalanced subject. *)
+  (let re = compile "^(a(?1)?b)$" in
+   expect_ov re "aabb" [| 0; 4; 0; 4 |];
+   expect_nomatch re "aab");
+  (* Whole-pattern recursion: the OP_BRA ket action reinstates and
+     carries on after the (?R) call — oracle: 0: abcabc. *)
+  expect_ov (compile "abc(?R)?") "abcabc" [| 0; 6 |];
+  (* Captures made inside a recursion are discarded on exit (Perl
+     semantics, the recursed-group ket reinstate): group 2 is set only
+     inside the (?&f) call, so \2 is unset outside and the reference
+     fails — oracle: no match on both. *)
+  (let re = compile "(?(DEFINE)(?<f>(a)))(?&f)\\2" in
+   expect_nomatch re "a";
+   expect_nomatch re "aa");
+  (* The reinstate also restores the PREVIOUS captures: after (?1)
+     returns, group 1 is unset again and is then captured by the
+     top-level (a) — oracle: 0: aa, 1: a (the second 'a'). *)
+  expect_ov (compile "(?1)(a)") "aa" [| 0; 2; 1; 2 |];
+  (* Recursion in an alternation branch — oracle: 0: a, 1: a, 2: a. *)
+  expect_ov (compile "((a)|(?1)b)") "ab" [| 0; 1; 0; 1; 0; 1 |];
+  (* PCRE2_ERROR_RECURSELOOP (-52), a direct return: repeating the same
+     group's recursion at the same subject position with the same last
+     consulted character — oracle: error -52 for all three (the third
+     recurses group 1 at position 0 twice via the second branch). *)
+  expect_rc (compile "(?R)") "a" Errors.error_recurseloop;
+  expect_rc (compile "((?1))") "a" Errors.error_recurseloop;
+  expect_rc (compile "((a)|(?1)b)") "b" Errors.error_recurseloop;
+  (* PCRE2_DISABLE_RECURSELOOP_CHECK: the -52 check is skipped and the
+     runaway recursion is caught by the limits instead — oracle
+     (pcre2test disable_recurseloop_check with depth_limit=100 /
+     heap_limit=1): -53 / -63. *)
+  (let code, top_bracket = compile_whole "(?R)" in
+   (match
+      match_internal ~moptions:Options.disable_recurseloop_check
+        ~match_limit_depth:100 ~code ~top_bracket "a" 0
+    with
+   | rc, _ -> assert (Int.equal rc Errors.error_depthlimit));
+   match
+     match_internal ~moptions:Options.disable_recurseloop_check ~heap_limit:1
+       ~code ~top_bracket "a" 0
+   with
+   | rc, _ -> assert (Int.equal rc Errors.error_heaplimit));
+  (* OP_FAIL: the empty negative lookahead (?!) compiles to it — oracle:
+     no match. *)
+  expect_nomatch (compile "Z(?!)") "Z";
+  (* Quantified recursion (compile-side replication + OP_BRA wrap +
+     bracket-repeat fallthrough): fixed, lazy, ranged, possessive,
+     query and star forms — oracle values from pcre2test. *)
+  expect_ov (compile "(x)(?1){2}") "xxx" [| 0; 3; 0; 1 |];
+  expect_ov (compile "(x)(?1){2}?y") "xxxy" [| 0; 4; 0; 1 |];
+  expect_ov (compile "(x)(?1){2,4}y") "xxxxxy" [| 0; 6; 0; 1 |];
+  expect_ov (compile "(x)(?1)++y") "xxxy" [| 0; 4; 0; 1 |];
+  expect_ov (compile "(x)(?1)?y") "xy" [| 0; 2; 0; 1 |];
+  expect_ov (compile "(x)(?1)*y") "xy" [| 0; 2; 0; 1 |]

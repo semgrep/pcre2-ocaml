@@ -7,6 +7,11 @@ recursion frames with capture save/restore; RECURSELOOP (−52) detection +
 DISABLE_RECURSELOOP_CHECK.
 
 **Gate G4** (verbatim from plan): testinput1 conditional/recursion ranges + testinput2
+
+**GATE MET 2026-07-09** — testinput1 conditional/recursion ranges and testinput2
+recursion sections all pass (t1 1078/1290 = 83.6%, t2 614/746). Frontier
+testinput1:831 = backtracking verbs (06 doc). Residual conditional-adjacent units
+blocked only on verbs-in-pattern ((*COMMIT) at t1:1168) or callout conditions (M8).
 recursion sections.
 
 ## Chunks
@@ -21,11 +26,11 @@ recursion sections.
   ERR15/ERR29/ERR40 paths (pcre2_compile.c: recursion arms 8050-8370 + driver fixup pass
   in 10126-11001) — note: ERR40 is the verb-name arm's error (pcre2_compile.c:3034),
   which rides the M5 verbs chunk; the quantified-recursion repeat case
-  (pcre2_compile.c:7354-7422, OP_RECURSE in the repeat arm) still defers loudly and
-  belongs with the match-side recursion chunk
-- [ ] match: OP_COND/OP_SCOND — condition evaluation incl. assertion conditions
+  (pcre2_compile.c:7354-7422, OP_RECURSE in the repeat arm) landed with the match-side
+  recursion chunk (replication + OP_BRA wrap + repeated-bracket fallthrough)
+- [x] match: OP_COND/OP_SCOND — condition evaluation incl. assertion conditions
   (pcre2_match.c: OP_COND arms within 5511-5900)
-- [ ] match: OP_RECURSE — recursion frame push/pop, ovector save/restore semantics, capture
+- [x] match: OP_RECURSE — recursion frame push/pop, ovector save/restore semantics, capture
   visibility rules, RECURSELOOP −52 + DISABLE_RECURSELOOP_CHECK option
   (pcre2_match.c:5427-5505 + recursion KET arms in 5906-6335)
 

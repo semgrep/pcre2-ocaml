@@ -900,8 +900,7 @@ let opcode_possessify =
    name) are live. The arms for conditionals/lookarounds (M4/M5), verbs,
    recursion and string callouts are deferred — they fail loudly with
    Parse.err_deferred (identically in both phases, before any
-   phase-dependent work); within the repeat arm, an OP_RECURSE previous
-   item likewise defers (M5). The C local `offset` (pcre2_compile.c:5658)
+   phase-dependent work). The C local `offset` (pcre2_compile.c:5658)
    becomes a per-arm let binding in the backref arms; the still-deferred
    conditional arms bring their own uses with them. The class locals
    (negate_class, should_flip_negation,
@@ -2662,123 +2661,14 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
            alternative. For anything in parentheses, we must not ignore if
            {1} is possessive. *)
         (try
-           if
-             Int.equal op_previous Opcodes.op_char
-             || Int.equal op_previous Opcodes.op_chari
-             || Int.equal op_previous Opcodes.op_not
-             || Int.equal op_previous Opcodes.op_noti
-           then (
-             (* pcre2_compile.c:7267-7278 — if previous was a character or
-                negated character match, abolish the item and generate a
-                repeat item instead. If a char item has a minimum of more
-                than one, ensure that it is set in reqcu - it might not be
-                if a sequence such as x{3} is the first thing in a branch
-                because the x will have gone into firstcu instead. *)
-             if Int.equal !repeat_max 1 && Int.equal !repeat_min 1 then
-               raise_notrace End_repeat;
-             op_type := chartypeoffset.(op_previous - Opcodes.op_char);
-
-             (* pcre2_compile.c:7280-7289 — deal with UTF characters that
-                take up more than one code unit (MAYBE_UTF_MULTI;
-                NOT_FIRSTCU(c) = (c & 0xc0) == 0x80,
-                pcre2_intmodedep.h:296). DEVIATION: multi-code-unit
-                literal emission is M6 (docs/ocaml-engine/07-utf.md); no
-                M1 arm can emit one, so this defers loudly instead of
-                saving the character into mcbuffer. *)
-             if
-               utf
-               && Int.equal
-                    (Char.code (Bytes.get cb.start_code (!code - 1)) land 0xc0)
-                    0x80
-             then (
-               errorcodeptr := Parse.err_deferred;
-               return_from_branch 0);
-
-             (* pcre2_compile.c:7293-7308 — handle the case of a single
-                code unit - either with no UTF support, or with UTF
-                disabled, or for a single-code-unit UTF character. In the
-                latter case, for a repeated positive match, get the
-                caseless flag for the required code unit from the previous
-                character, because a class like [Aa] sets a caseless A but
-                by now the req_caseopt flag has been reset. *)
-             let mcbuffer0 = Char.code (Bytes.get cb.start_code (!code - 1)) in
-             if op_previous <= Opcodes.op_chari && !repeat_min > 1 then (
-               reqcu := mcbuffer0;
-               reqcuflags := cb.req_varyopt;
-               if Int.equal op_previous Opcodes.op_chari then
-                 reqcuflags := !reqcuflags lor req_caseless);
-
-             (* goto OUTPUT_SINGLE_REPEAT — code shared with single
-                character types (pcre2_compile.c:7309) *)
-             output_single_repeat ~mclength:1 ~mcbuffer0 ~prop_type:(-1)
-               ~prop_value:(-1))
-           else if
-             Int.equal op_previous Opcodes.op_xclass
-             || Int.equal op_previous Opcodes.op_class
-             || Int.equal op_previous Opcodes.op_nclass
-             || Int.equal op_previous Opcodes.op_ref
-             || Int.equal op_previous Opcodes.op_refi
-             || Int.equal op_previous Opcodes.op_dnref
-             || Int.equal op_previous Opcodes.op_dnrefi
-           then (
-             (* pcre2_compile.c:7311-7344 — if previous was a character
-                class or a back reference, we put the repeat stuff after
-                it, but just skip the item if the repeat was {0,0}.
-                (OP_REF/OP_REFI/OP_DNREF/OP_DNREFI previous items arrive
-                with M2, OP_XCLASS with M6; only the class opcodes can be
-                previous in M1.) *)
-             if Int.equal !repeat_max 0 then (
-               code := !previous;
-               raise_notrace End_repeat);
-             if Int.equal !repeat_max 1 && Int.equal !repeat_min 1 then
-               raise_notrace End_repeat;
-
-             (* pcre2_compile.c:7331-7343 *)
-             if
-               Int.equal !repeat_min 0
-               && Int.equal !repeat_max Limits.repeat_unlimited
-             then emit_cu (Opcodes.op_crstar + !repeat_type)
-             else if
-               Int.equal !repeat_min 1
-               && Int.equal !repeat_max Limits.repeat_unlimited
-             then emit_cu (Opcodes.op_crplus + !repeat_type)
-             else if Int.equal !repeat_min 0 && Int.equal !repeat_max 1 then
-               emit_cu (Opcodes.op_crquery + !repeat_type)
-             else (
-               emit_cu (Opcodes.op_crrange + !repeat_type);
-               put2inc cb.start_code code !repeat_min;
-               if Int.equal !repeat_max Limits.repeat_unlimited then
-                 repeat_max := 0 (* 2-byte encoding for max *);
-               put2inc cb.start_code code !repeat_max))
-           else if Int.equal op_previous Opcodes.op_fail then
-             (* pcre2_compile.c:7346-7352 — if previous is OP_FAIL, it was
-                generated by an empty class [] (PCRE2_ALLOW_EMPTY_CLASS is
-                set). The other ways in which OP_FAIL can be generated,
-                that is by ( *FAIL) or (?!), disallow a quantifier at parse
-                time. We can just ignore this repeat. *)
-             raise_notrace End_repeat
-           else if Int.equal op_previous Opcodes.op_recurse then (
-             (* pcre2_compile.c:7354-7422 — repeated recursion:
-                replication for a non-zero minimum, then wrapping in
-                OP_BRA brackets and falling through to the repeated-
-                bracket case. M5 (docs/ocaml-engine/
-                05-conditionals-recursion.md); unreachable in M1 because
-                META_RECURSE itself defers above. Deferred loudly. *)
-             errorcodeptr := Parse.err_deferred;
-             return_from_branch 0)
-           else if
-             Int.equal op_previous Opcodes.op_assert
-             || Int.equal op_previous Opcodes.op_assert_not
-             || Int.equal op_previous Opcodes.op_assert_na
-             || Int.equal op_previous Opcodes.op_assertback
-             || Int.equal op_previous Opcodes.op_assertback_not
-             || Int.equal op_previous Opcodes.op_assertback_na
-             || Int.equal op_previous Opcodes.op_once
-             || Int.equal op_previous Opcodes.op_script_run
-             || Int.equal op_previous Opcodes.op_bra
-             || Int.equal op_previous Opcodes.op_cbra
-             || Int.equal op_previous Opcodes.op_cond
-           then (
+           (* pcre2_compile.c:7424-7749 — the repeated-bracket case body,
+              factored as a function (port-conventions §2) because the
+              quantified-recursion case (7410-7422) falls through into it
+              after wrapping the OP_RECURSE call in OP_BRA brackets
+              (fallthrough from OP_RECURSE in C). [op_previous] is the C's
+              mutable op_previous at the case entry: OP_BRA after the
+              recursion wrap (7413). *)
+           let repeat_bracket_group (op_previous : int) : unit =
              (* pcre2_compile.c:7424-7446 — if previous was a bracket
                 group, we may have to replicate it in certain cases. Note
                 that at this point we can encounter only the "basic"
@@ -3140,7 +3030,213 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                    (* pcre2_compile.c:7745-7747 — non-possessive
                       quantifier. *)
                    Bytes.set cb.start_code ketcode
-                     (Char.chr (Opcodes.op_ketrmax + !repeat_type))))
+                     (Char.chr (Opcodes.op_ketrmax + !repeat_type)))
+           in
+           if
+             Int.equal op_previous Opcodes.op_char
+             || Int.equal op_previous Opcodes.op_chari
+             || Int.equal op_previous Opcodes.op_not
+             || Int.equal op_previous Opcodes.op_noti
+           then (
+             (* pcre2_compile.c:7267-7278 — if previous was a character or
+                negated character match, abolish the item and generate a
+                repeat item instead. If a char item has a minimum of more
+                than one, ensure that it is set in reqcu - it might not be
+                if a sequence such as x{3} is the first thing in a branch
+                because the x will have gone into firstcu instead. *)
+             if Int.equal !repeat_max 1 && Int.equal !repeat_min 1 then
+               raise_notrace End_repeat;
+             op_type := chartypeoffset.(op_previous - Opcodes.op_char);
+
+             (* pcre2_compile.c:7280-7289 — deal with UTF characters that
+                take up more than one code unit (MAYBE_UTF_MULTI;
+                NOT_FIRSTCU(c) = (c & 0xc0) == 0x80,
+                pcre2_intmodedep.h:296). DEVIATION: multi-code-unit
+                literal emission is M6 (docs/ocaml-engine/07-utf.md); no
+                M1 arm can emit one, so this defers loudly instead of
+                saving the character into mcbuffer. *)
+             if
+               utf
+               && Int.equal
+                    (Char.code (Bytes.get cb.start_code (!code - 1)) land 0xc0)
+                    0x80
+             then (
+               errorcodeptr := Parse.err_deferred;
+               return_from_branch 0);
+
+             (* pcre2_compile.c:7293-7308 — handle the case of a single
+                code unit - either with no UTF support, or with UTF
+                disabled, or for a single-code-unit UTF character. In the
+                latter case, for a repeated positive match, get the
+                caseless flag for the required code unit from the previous
+                character, because a class like [Aa] sets a caseless A but
+                by now the req_caseopt flag has been reset. *)
+             let mcbuffer0 = Char.code (Bytes.get cb.start_code (!code - 1)) in
+             if op_previous <= Opcodes.op_chari && !repeat_min > 1 then (
+               reqcu := mcbuffer0;
+               reqcuflags := cb.req_varyopt;
+               if Int.equal op_previous Opcodes.op_chari then
+                 reqcuflags := !reqcuflags lor req_caseless);
+
+             (* goto OUTPUT_SINGLE_REPEAT — code shared with single
+                character types (pcre2_compile.c:7309) *)
+             output_single_repeat ~mclength:1 ~mcbuffer0 ~prop_type:(-1)
+               ~prop_value:(-1))
+           else if
+             Int.equal op_previous Opcodes.op_xclass
+             || Int.equal op_previous Opcodes.op_class
+             || Int.equal op_previous Opcodes.op_nclass
+             || Int.equal op_previous Opcodes.op_ref
+             || Int.equal op_previous Opcodes.op_refi
+             || Int.equal op_previous Opcodes.op_dnref
+             || Int.equal op_previous Opcodes.op_dnrefi
+           then (
+             (* pcre2_compile.c:7311-7344 — if previous was a character
+                class or a back reference, we put the repeat stuff after
+                it, but just skip the item if the repeat was {0,0}.
+                (OP_REF/OP_REFI/OP_DNREF/OP_DNREFI previous items arrive
+                with M2, OP_XCLASS with M6; only the class opcodes can be
+                previous in M1.) *)
+             if Int.equal !repeat_max 0 then (
+               code := !previous;
+               raise_notrace End_repeat);
+             if Int.equal !repeat_max 1 && Int.equal !repeat_min 1 then
+               raise_notrace End_repeat;
+
+             (* pcre2_compile.c:7331-7343 *)
+             if
+               Int.equal !repeat_min 0
+               && Int.equal !repeat_max Limits.repeat_unlimited
+             then emit_cu (Opcodes.op_crstar + !repeat_type)
+             else if
+               Int.equal !repeat_min 1
+               && Int.equal !repeat_max Limits.repeat_unlimited
+             then emit_cu (Opcodes.op_crplus + !repeat_type)
+             else if Int.equal !repeat_min 0 && Int.equal !repeat_max 1 then
+               emit_cu (Opcodes.op_crquery + !repeat_type)
+             else (
+               emit_cu (Opcodes.op_crrange + !repeat_type);
+               put2inc cb.start_code code !repeat_min;
+               if Int.equal !repeat_max Limits.repeat_unlimited then
+                 repeat_max := 0 (* 2-byte encoding for max *);
+               put2inc cb.start_code code !repeat_max))
+           else if Int.equal op_previous Opcodes.op_fail then
+             (* pcre2_compile.c:7346-7352 — if previous is OP_FAIL, it was
+                generated by an empty class [] (PCRE2_ALLOW_EMPTY_CLASS is
+                set). The other ways in which OP_FAIL can be generated,
+                that is by ( *FAIL) or (?!), disallow a quantifier at parse
+                time. We can just ignore this repeat. *)
+             raise_notrace End_repeat
+           else if Int.equal op_previous Opcodes.op_recurse then (
+             (* pcre2_compile.c:7354-7365 — prior to 10.30, repeated
+                recursions were wrapped in OP_ONCE brackets because
+                pcre2_match() could not handle backtracking into
+                recursively called groups. Now that this backtracking is
+                available, we no longer need to do this. However, we still
+                need to replicate recursions as we do for groups so as to
+                have independent backtracking points. We can replicate for
+                the minimum number of repeats directly. For optional
+                repeats we now wrap the recursion in OP_BRA brackets and
+                make use of the bracket repetition. *)
+             if
+               Int.equal !repeat_max 1 && Int.equal !repeat_min 1
+               && not !possessive_quantifier
+             then raise_notrace End_repeat;
+
+             (* pcre2_compile.c:7367-7408 — generate unwrapped repeats
+                for a non-zero minimum, except when the minimum is 1 and
+                the maximum unlimited, because that can be handled with
+                OP_BRA terminated by OP_KETRMAX/MIN. When the maximum is
+                equal to the minimum, we just need to generate the
+                appropriate additional copies. Otherwise we need to
+                generate one more, to simulate the situation when the
+                minimum is zero. The C's `break` on the fixed-count path
+                exits the switch to the possessive post-pass below;
+                [fall_through] = false routes that here. *)
+             let fall_through =
+               if
+                 !repeat_min > 0
+                 && not
+                      (Int.equal !repeat_min 1
+                      && Int.equal !repeat_max Limits.repeat_unlimited)
+               then (
+                 let replicate =
+                   if Int.equal !repeat_min !repeat_max then !repeat_min - 1
+                   else !repeat_min
+                 in
+                 (match lengthptr with
+                 | Some length ->
+                     (* pcre2_compile.c:7379-7393 — in the pre-compile
+                        phase, we don't actually do the replication; just
+                        adjust the length as if we had. DEVIATION:
+                        PRIV(ckd_smul)'s overflow cannot occur in 63-bit
+                        OCaml int arithmetic (replicate <= 65535), so
+                        only the OFLOW_MAX comparison is ported, as in
+                        the bracket-repeat blocks. *)
+                     let delta = replicate * (1 + Limits.link_size) in
+                     if oflow_max - !length < delta then (
+                       errorcodeptr := Errors.err20;
+                       return_from_branch 0);
+                     length := !length + delta
+                 | None ->
+                     (* pcre2_compile.c:7395-7400 — append [replicate]
+                        copies of the 1 + LINK_SIZE OP_RECURSE item,
+                        leaving previous on the last copy. *)
+                     for _i = 1 to replicate do
+                       Bytes.blit cb.start_code !previous cb.start_code !code
+                         (1 + Limits.link_size);
+                       previous := !code;
+                       code := !code + 1 + Limits.link_size
+                     done);
+
+                 (* pcre2_compile.c:7402-7408 — if the number of repeats
+                    is fixed, we are done (break). Otherwise, adjust the
+                    counts and fall through. *)
+                 if Int.equal !repeat_min !repeat_max then false
+                 else (
+                   if not (Int.equal !repeat_max Limits.repeat_unlimited) then
+                     repeat_max := !repeat_max - !repeat_min;
+                   repeat_min := 0;
+                   true))
+               else true
+             in
+             if fall_through then (
+               (* pcre2_compile.c:7410-7419 — wrap the recursion call in
+                  OP_BRA brackets. Bytes.blit = the C's memmove
+                  (overlap-safe). *)
+               Bytes.blit cb.start_code !previous cb.start_code
+                 (!previous + 1 + Limits.link_size)
+                 (1 + Limits.link_size);
+               (* op_previous = *previous = OP_BRA — passed to
+                  [repeat_bracket_group] below. *)
+               Bytes.set cb.start_code !previous (Char.chr Opcodes.op_bra);
+               put cb.start_code (!previous + 1) (2 + (2 * Limits.link_size));
+               Bytes.set cb.start_code
+                 (!previous + 2 + (2 * Limits.link_size))
+                 (Char.chr Opcodes.op_ket);
+               put cb.start_code
+                 (!previous + 3 + (2 * Limits.link_size))
+                 (2 + (2 * Limits.link_size));
+               code := !code + 2 + (2 * Limits.link_size);
+               length_prevgroup := 3 + (3 * Limits.link_size);
+               group_return := -1 (* Set "may match empty string" *);
+
+               (* pcre2_compile.c:7421-7422 — now treat as a repeated
+                  OP_BRA (fallthrough from OP_RECURSE in C). *)
+               repeat_bracket_group Opcodes.op_bra))
+           else if
+             Int.equal op_previous Opcodes.op_assert
+             || Int.equal op_previous Opcodes.op_assert_not
+             || Int.equal op_previous Opcodes.op_assert_na
+             || Int.equal op_previous Opcodes.op_assertback
+             || Int.equal op_previous Opcodes.op_assertback_not
+             || Int.equal op_previous Opcodes.op_assertback_na
+             || Int.equal op_previous Opcodes.op_once
+             || Int.equal op_previous Opcodes.op_script_run
+             || Int.equal op_previous Opcodes.op_bra
+             || Int.equal op_previous Opcodes.op_cbra
+             || Int.equal op_previous Opcodes.op_cond
+           then repeat_bracket_group op_previous
            else if op_previous >= Opcodes.op_eodn then (
              (* pcre2_compile.c:7760-7765 — default case: not a character
                 type - internal error. *)
