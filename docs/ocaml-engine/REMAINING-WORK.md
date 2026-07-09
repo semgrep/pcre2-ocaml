@@ -1,8 +1,9 @@
 # Remaining work & handoff context — pure-OCaml PCRE2 engine
 
-Snapshot date: 2026-07-10 (after commit `35c6fb6`). This file is the single
-place to resume from. Read it with the tail of `ORCHESTRATOR_LOG.md`; the
-approved master plan is at
+Snapshot date: 2026-07-08 (after the G8 campaign series; supersedes the
+2026-07-10-dated snapshot at `35c6fb6` — that machine clock ran ahead). This
+file is the single place to resume from. Read it with the tail of
+`ORCHESTRATOR_LOG.md`; the approved master plan is at
 `/home/ubuntu/.claude/plans/let-s-try-researching-and-shiny-spindle.md`.
 
 ## 1. Where the project stands
@@ -23,66 +24,60 @@ are byte-identical to `pcre2test -d`. ~60 commits, every engine chunk
 fidelity-reviewed (findings log in ORCHESTRATOR_LOG.md); oracle baseline
 never regressed.
 
-## 0. WORKING-TREE STATE AT HANDOFF (read this first)
+## 0. G8 CAMPAIGN SERIES — RESOLVED (2026-07-08)
 
-**Clean resume point = commit `81269db` (HEAD).** Everything through it is
-committed and verified: full parity, bench suite, this doc.
+The §0 tangle recorded at `98044cf` was discarded exactly as recommended
+(tree reset to `81269db`; the tangle patch remains durably at
+`/home/ubuntu/.claude/plans/pcre2-worktree-handoff-20260710.patch`, never
+salvaged) and the crash fix was redone cleanly. The campaigns then surfaced
+a chain of FOUR further defects, each fixed, reviewed, and committed
+separately (full detail in the ORCHESTRATOR_LOG rows for these SHAs):
 
-**The working tree is DIRTY with an unverified multi-agent tangle — do NOT
-trust or build on it as-is.** When the fuzz-crash FIX agent was killed
-mid-work, the tree also still held tail edits from the (by-then-finished)
-bench and fuzz agents. Uncommitted, vs HEAD:
-- `src/engine/study.ml` (~849-line churn), `newline.ml`, `parse.ml`,
-  `errors.ml`, `interpreter.ml` (the interpreter.ml hunk is only a cosmetic
-  `let…in`/`match` reformat of one assert — NOT the crash fix)
-- `bench/bench.ml`, `bench/bench_json.ml`, `bench/compare.ml`,
-  `fuzz/fuzz_diff.ml` (post-commit tail edits from those agents)
-- untracked: `docs/ocaml-engine/CONTINUATION.md` (the killed agent's OWN
-  handoff doc — redundant with THIS file; this file is canonical/committed),
-  and `fuzz/corpus/regressions/204387-b7915f8f.txt` (the crash repro from
-  the 1M campaign — a legitimate artifact, but it currently CRASHES the
-  engine so committing it would make `runner --regressions` report DIVERGE).
+- `e8eeaa8` — the original crash: was_newline/BACKCHAR OOB read BEFORE the
+  subject under MATCH_INVALID_UTF (upstream C bug #1). Engine pins stop@-1
+  read-0.
+- `13454e2` — seed-101 SIGSEGV in the C oracle: 8-bit GET_UCD has no bounds
+  guard (upstream C bug #2); dev-only oracle patch clamps to
+  MAX_UTF_CODE_POINT ≡ engine ucd.ml pin; oracle stubs now pad
+  pattern/subject with 8 zero slack bytes each side (bounded-overrun
+  families read deterministic 0x00). Also: fuzz_diff `--dump-case N`.
+- `5c790c2` — seed-20260708 GPF in OUR dev-only stubs: match_data->mark is
+  uninitialized on early-error rcs; oracle_test_exec now reads mark only
+  for rc >= 0/-1/-2 (pcre2test's consumed set).
+- `afa9b41` — engine↔oracle divergence: OP_VREVERSE stop test uses
+  start_subject where OP_REVERSE uses check_subject (upstream C bug #3,
+  confirmed live in 10.46 — corrupted ovector). Pin: C-literal stop test
+  kept; only the BACKCHAR walk bounded; a check_subject floor was REJECTED
+  (it would fork DEFINED C behavior — nested lookbehinds walk below
+  check_subject because 10.44's max_lookbehind undercounts nesting,
+  pcre2_compile.c:9604-9612).
+- `3417078` — word-boundary prev-char probe below the subject (family
+  member #4): Utf.peek admitted negative indices (String.unsafe_get s (-1),
+  §8 violation) AND the old 0-clamp flipped prev_is_word on UCP-letter
+  continuation bytes (real divergence, fixed + assert-pinned).
 
-Status of the tangle: **it compiles** (`dune build @src/all @oracle/all
-@test/all` = 0) but its conformance/fuzz correctness is **UNVERIFIED**, and
-**the crash is NOT confirmed fixed** (no repro-specific assert landed in the
-engine sources; the study.ml churn's purpose is unclear and unreviewed).
-
-Preserved durably (survives any `git`/`dune` operation on the tree):
-- `/home/ubuntu/.claude/plans/pcre2-worktree-handoff-20260710.patch`
-  (`git diff HEAD`, 2957 lines — the entire tangle)
-- `/home/ubuntu/.claude/plans/pcre2-CONTINUATION-untracked.md`
-  (copy of the killed agent's CONTINUATION.md)
-
-**Recommendation: do NOT salvage the tangle.** Reset the tree to `81269db`
-(`git checkout -- . && git clean -fd docs/ocaml-engine/CONTINUATION.md
-fuzz/corpus/regressions/204387-b7915f8f.txt` — or `git stash -u` if you want
-it recoverable) and redo the crash fix cleanly (§2.1). The crash fix is a
-tiny, well-scoped task; a large unreviewed study.ml rewrite is not what it
-should have produced. Cherry-pick specific hunks from the patch only if a
-fresh diagnosis points at the same lines. The bench/fuzz tail edits are
-minor and can be re-derived or diffed from the patch if wanted.
+Standing consequences:
+- The **oracle build carries two dev-only patches** (`oracle/patches/`,
+  wired in flake.nix) pinning C UB to the engine's documented behavior.
+  vendor/ stays pristine; the published package is unaffected. **After any
+  flake/patch change run `dune clean`** — discover.exe caches the oracle
+  path in `oracle/c_library_flags.sexp` and a stale link is silent.
+- Regression corpus = **7 repros**, all replaying green via
+  `runner --regressions` and in CI.
+- **Three upstream-reportable PCRE2 C bugs** (was_newline BACKCHAR OOB;
+  8-bit GET_UCD unguarded; VREVERSE start_subject/check_subject asymmetry)
+  — all documented in the oracle patch headers / DEVIATION comments; not
+  yet reported upstream (user decision).
+- Residual documented-open: extuni/repeat-maximize backtrack walks are
+  memory-safe but unpinned for \C-manufactured below-subject crossings
+  (divergence-only, inside C's UB zone; 0 hits in 600k+ cases) — log row
+  for 3417078.
 
 ## 2. What is left, in order
 
-### 2.1 fuzz-crash FIX (blocks G8) — REDO CLEANLY from 81269db
-The 1M-case campaign (seed 42) found one crash: exec of
-`(*LIMIT_MATCH=80000)()()((()()))`-shaped input raises
-`Invalid_argument("index out of bounds")` through `Engine.exec_full`.
-Minimized repro preserved in the patch (and untracked at
-`fuzz/corpus/regressions/204387-b7915f8f.txt`); if the tree is reset,
-recover the repro's exact pattern/subject/options from the patch file
-(`§0`) before starting.
-The first attempt was killed mid-work and left an unreviewed tangle (§0) —
-**discard it and start fresh from `81269db`.** Scope: root-cause vs the C
-(no defensive clamping; match oracle behavior exactly; likely
-ovector/frame-slot indexing for the nested-empty-groups shape, or a
-study/minlength edge), zero conformance delta, repro replays green, re-run
-200k cases on seed 42 + 2 more seeds, add a module-init assert pinning the
-repro (engine result = oracle result, both as values). After it lands +
-review + commit: re-run a full clean 1M campaign, then **mark G8** in
-`09-long-tail.md` (conformance half already met). This is a well-scoped
-single-executor task — good candidate for a stronger model (Opus 4.8).
+### 2.1 fuzz-crash FIX + G8 — DONE
+See §0. G8's fuzz half: 200k×{42,101,20260708} + 1M seed-42 all clean at
+`3417078`; gate marked in `09-long-tail.md`.
 
 ### 2.2 THE PERF GAP (M10 — the main remaining engineering)
 **Gate: engine/oracle ≤ 2.0x, geomean AND per-benchmark** (user's hard
@@ -101,6 +96,12 @@ Diagnosis (measured, in the log row for `35c6fb6`):
   closure graph is rebuilt at every attempt via `attempt`
   (`interpreter.ml:8269-8291`). Email benchmark: 2.6 GB minor heap/rep →
   93.6x. First-char-selective patterns (ipv4) drop to 18x.
+
+A detailed, code-verified implementation plan for chunk 1 (capture
+inventory, target `match_state` record shape, P0–P6 mechanical steps,
+risk register, alloc-gate) is at
+`/home/ubuntu/.claude/plans/pcre2-perf-chunk1-hoist-plan.md` (line numbers
+valid at `e8eeaa8`; re-anchor by function name).
 
 Plan, two sequential chunks (both touch `interpreter.ml` — do NOT
 parallelize with the crash fix):
