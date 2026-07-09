@@ -28,8 +28,8 @@
    [not_firstcu], cited against pcre2_intmodedep.h:352-353. *)
 
 (* DEVIATION (defined behavior where the C is undefined): continuation
-   bytes are read through [peek], which returns 0 beyond the end of the
-   string. PCRE2 documents NO_UTF_CHECK with an invalid string as
+   bytes are read through [peek], which returns 0 outside the string on
+   EITHER side. PCRE2 documents NO_UTF_CHECK with an invalid string as
    undefined; in practice a truncated multi-byte sequence at the end of a
    pcre2test pattern makes the C read the trailing NUL of the
    zero-terminated pattern (compile.ml's [byte_at] in the pso scan is the
@@ -37,11 +37,19 @@
    is unowned memory. Returning 0 for every out-of-range read reproduces
    the C's NUL byte-for-byte at the first overrun position and keeps
    every further read defined — errors stay values, no exception can
-   escape compile or match (port-conventions §5, §6). *)
+   escape compile or match (port-conventions §5, §6). The negative side
+   is reachable too: the word-boundary previous-character probe
+   (pcre2_match.c:6269-6277) computes lastptr = Feptr - 1 with only a
+   `Feptr == mb->check_subject` guard, so at Feptr = start_subject <
+   check_subject the C reads subject[-1] — the BACKCHAR-before-subject
+   UB family. Reading 0 there agrees with the whole family pin: the
+   padded oracle's slack byte at subject[-1] is 0, Newline.was_newline's
+   walk reads 0 at position -1, and the C-on-LE header-byte accident
+   reads 0 as well. *)
 let peek (s : string) (i : int) : int =
-  if i < String.length s then
-    (* safe: 0 <= i — every caller passes pos + k with pos >= 0, k >= 1 —
-       and i < String.length s checked on this branch *)
+  if i >= 0 && i < String.length s then
+    (* safe: 0 <= i and i < String.length s checked in the two conjuncts
+       above *)
     Char.code (String.unsafe_get s i)
   else 0
 

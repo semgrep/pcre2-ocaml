@@ -551,10 +551,12 @@ let backchar_subject (s : string) (pos : int) : int =
   !p
 
 (* GETCHAR (pcre2_intmodedep.h:298-303) over the subject with the lead
-   byte read through Utf.peek: for the few sites where, under
-   PCRE2_NO_UTF_CHECK garbage, a decode may be asked for at a position at
-   or past the subject end (the C reads unowned memory there — see the
-   Utf.peek DEVIATION note). On every valid-UTF path the position is in
+   byte read through Utf.peek: for the few sites where a decode may be
+   asked for at a position outside the subject — at or past the end under
+   PCRE2_NO_UTF_CHECK garbage, or at the pinned position -1 from the
+   word-boundary previous-character probe (the C reads unowned memory in
+   both cases — see the Utf.peek DEVIATION note; peek returns 0 there, so
+   the decode yields fc = 0). On every valid-UTF path the position is in
    bounds and this is exactly GETCHAR. *)
 let getchar_subject (s : string) (pos : int) : int =
   let c = Utf.peek s pos in
@@ -2771,15 +2773,37 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                not count nested lookbehinds (pcre2_compile.c:9604-9612),
                so OP_VREVERSE legitimately walks below it on valid UTF —
                and eptr <> check_subject above therefore does NOT give
-               eptr - 1 >= check_subject. When eptr = 0 < check_subject
-               the C probes subject[-1] here (BACKCHAR-before-subject UB
-               family; the oracle reads its zero slack) — on that path
-               lastptr is -1 and getchar_subject reads 0 on this LE host
-               (see the out-of-scope note in the orchestrator log; a
-               dedicated defined pin for this probe is still owed). For
-               eptr > 0 the reads are in-string; backchar_subject bounds
-               its walk at 0. *)
-            let lastptr = backchar_subject mb.subject (eptr - 1) in
+               eptr - 1 >= check_subject.
+               DEVIATION (defined behavior where the C is undefined; the
+               same BACKCHAR-before-subject family and crossing pin as
+               op_vreverse_utf_loop): the C's read goes below the subject
+               in two ways — (a) eptr = 0 < check_subject (valid UTF,
+               nested lookbehind: lastptr = subject - 1 directly), and
+               (b) eptr > 0 with the code units from start_subject up to
+               eptr - 1 all continuation bytes (invalid prefix; the
+               unbounded BACKCHAR at 6275 crosses). In both, the padded
+               oracle's walk stops on the slack zero at subject[-1] and
+               GETCHAR reads fc = 0 there. Pinned identically: a start
+               below 0, or a bounded walk landing on a continuation byte
+               (exactly the crossing condition), resolves to lastptr =
+               -1, where getchar_subject reads the pinned 0 (Utf.peek);
+               start_used_ptr may become -1 exactly as the C's
+               subject - 1 does (its consumers are order comparisons and
+               raw offset copies, like the C's pointer compares). For a
+               non-crossing walk the reads are in-string. *)
+            let lastptr =
+              if eptr - 1 < 0 then -1
+              else
+                let p = backchar_subject mb.subject (eptr - 1) in
+                if
+                  (* safe: 0 <= p <= eptr - 1 < eptr <= mb.end_subject <=
+                     String.length mb.subject *)
+                  Int.equal
+                    (Char.code (String.unsafe_get mb.subject p) land 0xc0)
+                    0x80
+                then -1
+                else p
+            in
             let fc = getchar_subject mb.subject lastptr in
             if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
             if ucp_op then
@@ -2800,8 +2824,13 @@ let match_ ~(start_eptr : int) ~(start_ecode : int) ~(top_bracket : int)
                       0))
           else
             let lastptr = eptr - 1 in
-            (* safe: 0 <= check_subject = start_subject <= lastptr
-               (checked above) and lastptr < eptr <= end_subject <=
+            (* safe: non-UTF mode never moves check_subject off the
+               subject start (pcre2_match.c:6795; only the UTF check
+               block, 6809-6928, and the invalid-UTF fragment restart,
+               7674 / interpreter.ml mirror in the allow_invalid path,
+               change it -- both UTF-only), so check_subject =
+               start_subject = 0 and eptr <> check_subject above gives
+               0 <= lastptr; lastptr < eptr <= end_subject <=
                String.length mb.subject *)
             let fc = Char.code (String.unsafe_get mb.subject lastptr) in
             if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;

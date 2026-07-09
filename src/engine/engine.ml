@@ -505,3 +505,51 @@ let () =
           { ovector = [| 7; 7; 2; 6 |]; mark = None; start_char = 7 } ->
           ()
       | _ -> assert false)
+
+(* The word-boundary previous-character probe below check_subject (the
+   pinned form of pcre2_match.c:6269-6277, whose only guard is Feptr ==
+   mb->check_subject — see the DEVIATION note on the word-boundary arm in
+   Interpreter). Two shapes, both engine == patched oracle:
+
+   1. Fully valid UTF: the inner OP_VREVERSE walks to offset 0 <
+      check_subject (= 5 - max_lookbehind(4) = 1, nested-lookbehind
+      undercount), so \b runs at eptr = 0 with eptr <> check_subject and
+      the C computes lastptr = subject - 1 — an out-of-bounds read (the
+      padded oracle reads its slack 0). Pinned: lastptr = -1 reads fc = 0
+      (non-word), 'a' at 0 is a word char, the boundary holds, and the
+      inner branch matches a{3,4} max-first: group 1 = (0,4). *)
+let () =
+  match compile "(?<=(?<=\\b(a{3,4}))a)" (Int32.of_int Options.utf) with
+  | Result.Error _ -> assert false
+  | Ok re -> (
+      match exec_full re "aaaaaa" 5 0l with
+      | Match
+          { ovector = [| 5; 5; 0; 4 |]; mark = None; start_char = 5 } ->
+          ()
+      | _ -> assert false)
+
+(* 2. The pre-fix OBSERVABLE divergence (UCP): subject \xb5\xf8a under
+      MATCH_INVALID_UTF has fragment start (= check_subject) 2; the
+      lookbehind's OP_VREVERSE lands on the invalid non-continuation
+      byte at 1, and \b (OP_UCP_WORD_BOUNDARY) probes the previous
+      character: the bounded walk from offset 0 lands on the
+      continuation byte \xb5 — C's unbounded BACKCHAR crosses to
+      subject[-1] (slack 0 in the oracle, fc = 0, non-word). The
+      engine's former 0-clamp read fc = 0xb5 = U+00B5 MICRO SIGN, a UCP
+      letter, flipping prev_is_word and matching the branch from 1
+      (group 1 = (1,2)) where the oracle matched from 2 — the divergence
+      this pin fixes. Pinned: the crossing resolves to lastptr = -1,
+      fc = 0, the branch from 1 fails at \b, and the shorter candidate
+      wins: group 1 = (2,2), empty match at 3. *)
+let () =
+  let copts =
+    Int32.of_int (Options.utf lor Options.ucp lor Options.match_invalid_utf)
+  in
+  match compile "(?<=\\b(.{0,2})a)" copts with
+  | Result.Error _ -> assert false
+  | Ok re -> (
+      match exec_full re "\xb5\xf8a" 0 0l with
+      | Match
+          { ovector = [| 3; 3; 2; 2 |]; mark = None; start_char = 3 } ->
+          ()
+      | _ -> assert false)
