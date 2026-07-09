@@ -52,9 +52,24 @@ let match_ mb a … =
 
 A function nested inside another function and referencing the outer function's
 variables is a **closure**: at run time, *entering* `match_` allocates a heap
-block that captures the current values of `mb`, `a`, `utf`, the `ref`s, etc. For
-a *mutually-recursive* group OCaml allocates **one shared closure block** with
-an infix entry point per function, all sharing the captured environment.
+block that captures the current values of `mb`, `a`, `utf`, the `ref`s, etc. A
+*mutually-recursive* group defined together is allocated together in **one
+shared closure block** (`Closure_tag`): the first function sits at the block
+head, and each function *after the first* is reached through an infix header
+(`Infix_tag`) embedded in the same block — a pointer to that function points
+into the middle of the block, and the GC uses the infix header to recover the
+block start. All the functions share one copy of the captured environment.
+
+Sources for that representation (OCaml 4.14): `caml/mlvalues.h` — `Closure_tag`
+(247), `Infix_tag` (249, "an infix header inside a closure … can only occur in
+blocks with tag `Closure_tag`"), `Closinfo_val`/`Start_env_closinfo` (the offset
+to the shared environment); `stdlib/obj.ml` exposes `closure_tag`/`infix_tag`.
+At the compiler level (non-flambda), the whole recursive group is one Clambda
+node — `Uclosure of ufunction list * ulambda list` (`compiler-libs/clambda.mli`),
+the `ufunction list` being the functions in the single block and the `ulambda
+list` the shared free-variable environment; selecting one function is `Uoffset`
+(the infix pointer). The OCaml manual documents the same tags under "Interfacing
+C with OCaml → representation of OCaml data types."
 
 Crucially, those captures differ on every call (`a` is a fresh arena, the
 `ref`s are fresh), so the compiler **cannot** hoist the block — it genuinely
