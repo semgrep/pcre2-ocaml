@@ -17,6 +17,21 @@ let error_bad_options = 117 (* pcre2.h.generic:239 *)
 let error_parentheses_nest_too_deep = 119 (* pcre2.h.generic:241 *)
 let error_backslash_k_in_lookaround = 199 (* pcre2.h.generic:322 *)
 
+(* pcre2_compile.c:794-812 — compile error code numbers: ERRn has the value
+   COMPILE_ERROR_BASE + n (their public pcre2.h values are exactly 100
+   greater than the enum offsets, i.e. errn = 100 + n). Constants are added
+   here as ported code needs them; the message texts are in
+   compile_error_texts below. *)
+let err4 = compile_error_base + 4 (* numbers out of order in {} quantifier *)
+let err5 = compile_error_base + 5 (* number too big in {} quantifier *)
+let err15 = compile_error_base + 15 (* reference to non-existent subpattern *)
+let err26 = compile_error_base + 26 (* a relative value of zero not allowed *)
+let err42 = compile_error_base + 42 (* syntax error in subpattern name *)
+let err44 = compile_error_base + 44 (* name must start with a non-digit *)
+let err48 = compile_error_base + 48 (* subpattern name is too long *)
+let err60 = compile_error_base + 60 (* ( *VERB) not recognized or malformed *)
+let err62 = compile_error_base + 62 (* subpattern name expected *)
+
 (* "Expected" matching error codes: pcre2.h.generic:327-328. *)
 let error_nomatch = -1
 let error_partial = -2
