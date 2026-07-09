@@ -13,18 +13,26 @@
 
    DEVIATION (defined behavior where the C is undefined): code points
    above MAX_UTF_CODE_POINT are clamped to 0x10ffff before indexing. Such
-   values only arise from decoding invalid UTF under PCRE2_NO_UTF_CHECK
-   (5/6-byte forms in Utf.getutf8), which PCRE2 documents as undefined:
-   the 8-bit GET_UCD is a bare REAL_GET_UCD and indexes off the end of
-   stage1 (pcre2_internal.h:1869-1873 guards only in the 32-bit library,
-   where GET_UCD returns PRIV(dummy_ucd_record) — script Unknown, type
-   Cn, no case set, no other case, pcre2_ucd.c:95-108). Clamping yields
-   U+10FFFF's record, whose fields agree with the dummy record for
-   chartype/caseset/other_case/script/gbprop/scriptx (asserted below);
-   bidiclass (bidiBN vs the dummy's bidiL) and bprops (non-empty set vs
-   the dummy's empty) DIVERGE — reachable only under NO_UTF_CHECK garbage
-   where the 8-bit C is undefined, so no defined-behavior divergence
-   exists. No dummy row needed in the generated tables. *)
+   values arise from decoding invalid UTF (5/6-byte forms / invalid lead
+   bytes in Utf.getutf8) — reachable both under PCRE2_NO_UTF_CHECK garbage
+   AND under PCRE2_MATCH_INVALID_UTF: an invalid lead byte such as 0xff
+   (>= 0xc0) sent through GETCHARINCTEST in the OP_XCLASS \p{...} path
+   decodes to a code point >= 0x40000000 (fuzz_diff seed 101 case 153814,
+   subject 0xff 0x60 under match_invalid_utf; ASan pcre2_xclass.c:137).
+   PCRE2 documents this as undefined: the 8-bit GET_UCD is a bare
+   REAL_GET_UCD and indexes off the end of stage1 (pcre2_internal.h:
+   1869-1873 guards only in the 32-bit library, where GET_UCD returns
+   PRIV(dummy_ucd_record) — script Unknown, type Cn, no case set, no other
+   case, pcre2_ucd.c:95-108). Clamping yields U+10FFFF's record, whose
+   fields agree with the dummy record for chartype/caseset/other_case/
+   script/gbprop/scriptx (asserted below); bidiclass (bidiBN vs the
+   dummy's bidiL) and bprops (non-empty set vs the dummy's empty) DIVERGE
+   from the dummy — but only under 8-bit C UB, so no defined-behavior
+   divergence exists. The dev-only differential oracle's libpcre2 build is
+   patched to clamp GET_UCD to MAX_UTF_CODE_POINT identically (see
+   oracle/patches/pcre2-10.44-oracle-ucd-clamp.patch), so oracle == engine
+   record-for-record on these code points. No dummy row needed in the
+   generated tables. *)
 let record_index (ch : int) : int =
   let ch = if ch > 0x10ffff then 0x10ffff else ch in
   Ucd_tables.stage2

@@ -1039,6 +1039,68 @@ let draw_bits r pool max_k =
   done;
   !v
 
+(* --dump-case N: deterministically re-derive the N-th generated case for
+   the given seed and print it (pattern, compile draws, and every
+   subject/offset/match-option exec draw) WITHOUT executing case N against
+   either implementation.  This exists to extract cases that kill the whole
+   process (e.g. C-oracle undefined behaviour turning into SIGSEGV): the
+   crashing case index from a run can be replayed here safely because
+   nothing is executed for case N.
+
+   RNG-path fidelity: cases 1..N-1 must consume the RNG exactly as a real
+   run does.  Generation is RNG-only EXCEPT that a divergence found while
+   sweeping case i's exec draws exits that sweep early (skipping the
+   remaining draws' RNG consumption), so the prefix cases ARE executed by
+   dump mode, exactly like a real run.  That is safe: a process crash at
+   case N means the prefix completed.  Shrinking and repro-writing consume
+   no RNG, so the dump skips them (and ignores --max-failures, which would
+   only stop a real run early).  For case N itself nothing is executed: the
+   full 4-draw sweep is printed even though a real run may have stopped
+   partway through it (crash or divergence) -- the extra draws are harmless
+   because nothing after case N consumes the RNG. *)
+let dump_case_print ~seed ~case_no r (base : case) lits =
+  let epat = effective_pat base in
+  Printf.printf "# fuzz-diff dump-case (no execution; see --dump-case)\n";
+  Printf.printf "# seed=%d case=%d\n" seed case_no;
+  Printf.printf "# pattern (ascii): %s\n" (String.escaped epat);
+  Printf.printf "# pattern (hex): %s\n" (hex_bytes epat);
+  Printf.printf "# compile: options=0x%08x extra=0x%08x newline=%d bsr=%d\n"
+    base.copts base.extra base.newline base.bsr;
+  (* Draw 0 is the compile-level base check: diff_case on [base] runs one
+     exec with the empty subject, offset 0, mopts 0 (no RNG consumed). *)
+  let draws = ref [ { base with subj = ""; off = 0; mopts = 0 } ] in
+  (* Replicate the exec sweep's RNG consumption (search loop below) verbatim,
+     minus execution and minus early exit. *)
+  let ndraw = 4 in
+  for _ = 1 to ndraw do
+    let subj = gen_subject r lits in
+    let noff = if String.length subj = 0 then 1 else rrange r 1 2 in
+    for o = 1 to noff do
+      let off =
+        if o = 1 then 0
+        else
+          let l = String.length subj in
+          rrange r 0 (l + 1)
+      in
+      let mopts = draw_bits r match_pool 3 in
+      draws := { base with subj; off; mopts } :: !draws
+    done
+  done;
+  let draws = List.rev !draws in
+  List.iteri
+    (fun i c ->
+      Printf.printf "# draw %d: subject(hex)=[%s] offset=%d mopts=0x%08x\n" i
+        (hex_bytes c.subj) c.off c.mopts)
+    draws;
+  (* Replayable pcre2test-format unit (same shape write_repro emits), with
+     one data line per draw in sweep order. *)
+  Printf.printf "/%s/%s\n" (hex_bytes epat) (compile_modifiers base);
+  List.iter
+    (fun c ->
+      Printf.printf "    %s\\=%s\n" (byte_escapes c.subj) (data_modifiers c))
+    draws;
+  print_newline ()
+
 (* A coarse signature to dedup distinct bug CLASSES: quoted mark strings ->
    S, bracketed ovectors -> V, integers kept (rc/offset values distinguish
    genuinely different divergences). *)
@@ -1064,7 +1126,7 @@ let signature kind reason =
 let usage () =
   prerr_endline
     "usage: fuzz_diff [--cases N] [--seed S] [--max-failures N] [--verbose] \
-     [--selftest]";
+     [--dump-case N] [--selftest]";
   exit 2
 
 let () =
@@ -1073,6 +1135,7 @@ let () =
   let max_failures = ref 10 in
   let verbose = ref false in
   let selftest = ref false in
+  let dump_case = ref 0 in
   let rec parse = function
     | [] -> ()
     | "--cases" :: n :: t -> cases := int_of_string n; parse t
@@ -1080,10 +1143,12 @@ let () =
     | "--max-failures" :: n :: t -> max_failures := int_of_string n; parse t
     | "--verbose" :: t -> verbose := true; parse t
     | "--selftest" :: t -> selftest := true; parse t
+    | "--dump-case" :: n :: t -> dump_case := int_of_string n; parse t
     | "--help" :: _ | "-help" :: _ -> usage ()
     | a :: _ -> Printf.eprintf "fuzz_diff: unknown argument %s\n" a; usage ()
   in
   parse (List.tl (Array.to_list Sys.argv));
+  if !dump_case > 0 then cases := !dump_case;
 
   if !selftest then (
     (* Self-check the shrinker + repro plumbing without needing a real bug. *)
@@ -1156,6 +1221,9 @@ let () =
       { pat; copts; newline; bsr; extra; limit = 80000; subj = ""; off = 0;
         mopts = 0 }
     in
+    if !dump_case = !ci then (
+      dump_case_print ~seed:!seed ~case_no:!ci r base lits;
+      exit 0);
     let found = ref None in
     (match diff_case base with
     | Some (((Compile_diff | Info_diff) as k), reason) -> found := Some (k, reason, base)
@@ -1193,6 +1261,12 @@ let () =
        tprev := now);
     match !found with
     | None -> ()
+    | Some _ when !dump_case > 0 ->
+        (* dump-mode prefix: the divergence's RNG consumption (the sweep's
+           early exit) already happened above; shrink/write consume no RNG,
+           so skipping them keeps the path identical while avoiding side
+           effects on the way to case N. *)
+        ()
     | Some (kind, reason, c) ->
         let minimized = shrink c in
         (* recompute kind/reason on the minimized case for accuracy *)

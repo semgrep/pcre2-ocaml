@@ -1,6 +1,8 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "caml/alloc.h"
 #include "caml/config.h"
@@ -20,6 +22,42 @@
 #else
 #define UNUSED __attribute__((unused))
 #endif
+
+/* --- Dev-only oracle overrun guard (pattern + subject slack buffers) ------
+ *
+ * PCRE2 10.44 has bounded out-of-bounds reads a few bytes before/after the
+ * pattern/subject (undefined behaviour) that the pure OCaml engine pins to a
+ * defined "reads-as-zero" model:
+ *   - forward GETCHAR-past-end (invalid trailing UTF-8 -> GETUTF8INC reads up
+ *     to 5 code units past the subject end; ASan pcre2_match.c:2221), and
+ *   - backward was_newline/BACKCHAR under PCRE2_MATCH_INVALID_UTF (reads the
+ *     code unit before the subject; fuzz repro 204387 / commit e8eeaa8).
+ * Passed String_val directly these land in the adjacent OCaml block -- usually
+ * mapped (header before, NUL padding after) but occasionally an unmapped page
+ * (rare SIGSEGV), and the final OCaml padding byte is the padding COUNT, not
+ * always 0x00. Copying pattern/subject into buffers with SLACK zero bytes on
+ * BOTH sides makes every bounded overrun read deterministic 0x00 -- the same
+ * value the engine reads -- and keeps the byte before the subject 0x00 so the
+ * 204387 backward-walk analysis stays valid. (The separate unbounded GET_UCD
+ * out-of-range read is handled by oracle/patches/, not by this slack.) */
+#define ORACLE_OVERRUN_SLACK 8
+
+/* Dev-only: on allocation failure abort() rather than return NULL -- a NULL
+ * flowing into pcre2 would SIGSEGV (10.44 skips arg sanity in jit paths) and a
+ * NULL-checked path would masquerade as a spurious oracle-error divergence. */
+static unsigned char *oracle_slack_dup(const unsigned char *src, size_t len) {
+        unsigned char *base = (unsigned char *)calloc(len + 2 * ORACLE_OVERRUN_SLACK, 1);
+        if (base == NULL) {
+                fprintf(stderr, "oracle_slack_dup: out of memory (len=%zu)\n", len);
+                abort();
+        }
+        if (len != 0) memcpy(base + ORACLE_OVERRUN_SLACK, src, len);
+        return base + ORACLE_OVERRUN_SLACK;
+}
+
+static void oracle_slack_free(unsigned char *interior) {
+        if (interior != NULL) free(interior - ORACLE_OVERRUN_SLACK);
+}
 
 const int oracle_OPTION_SOME_TAG = 0;
 const int oracle_RESULT_OK_TAG = 0;
@@ -95,8 +133,12 @@ CAMLprim value oracle_compile_unboxed(value pattern /* : string */,
         // SAFETY: Passing in the value of String_val(subject) here is fine
         // since a GC cannot occur (and the resulting value, which is held across GC, does not refer
         // to the string).
-        pcre2_code *regex = pcre2_compile((PCRE2_SPTR)String_val(pattern), pattern_len, options,
-                                          &error_code, &error_offset, ccontext);
+        // Slack-padded copy so any bounded compile-time overrun reads 0x00.
+        unsigned char *pat_buf =
+            oracle_slack_dup((const unsigned char *)String_val(pattern), pattern_len);
+        pcre2_code *regex = pcre2_compile((PCRE2_SPTR)pat_buf, pattern_len, options, &error_code,
+                                          &error_offset, ccontext);
+        oracle_slack_free(pat_buf);
         pcre2_compile_context_free(ccontext);
 
         if (!regex) {
@@ -162,8 +204,12 @@ CAMLprim value oracle_match_unboxed(value ocaml_re /* : _ regex */, value subjec
         pcre2_match_context *mcontext = NULL;
         pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
 
-        int ret = pcre2_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset, options,
-                              match_data, mcontext);
+        // Slack-padded copy so any bounded subject overrun reads 0x00.
+        unsigned char *subj_buf =
+            oracle_slack_dup((const unsigned char *)String_val(subject), subject_length);
+        int ret = pcre2_match(re, (PCRE2_SPTR)subj_buf, subject_length, offset, options, match_data,
+                              mcontext);
+        oracle_slack_free(subj_buf);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (ret == PCRE2_ERROR_NOMATCH || ret == PCRE2_ERROR_PARTIAL) {
@@ -311,8 +357,12 @@ CAMLprim value oracle_jit_match_unboxed(value ocaml_re /* : jit regex */, value 
 
         // SAFETY: Passing in the value of String_val(subject) here is fine
         // since a GC cannot occur.
-        int ret = pcre2_jit_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset,
-                                  options, match_data, mcontext);
+        // Slack-padded copy so any bounded subject overrun reads 0x00.
+        unsigned char *subj_buf =
+            oracle_slack_dup((const unsigned char *)String_val(subject), subject_length);
+        int ret = pcre2_jit_match(re, (PCRE2_SPTR)subj_buf, subject_length, offset, options,
+                                  match_data, mcontext);
+        oracle_slack_free(subj_buf);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (ret == PCRE2_ERROR_NOMATCH || ret == PCRE2_ERROR_PARTIAL) {
@@ -473,8 +523,13 @@ CAMLprim value oracle_capture_unboxed(
         // full oracle_match.
         // SAFETY: Passing in the value of String_val(subject) here is fine
         // since a GC cannot occur.
-        int num_captures = pcre2_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset,
-                                       options, match_data, mcontext);
+        // Slack-padded copy so any bounded subject overrun reads 0x00.
+        unsigned char *subj_buf =
+            oracle_slack_dup((const unsigned char *)String_val(subject), subject_length);
+        int num_captures =
+            pcre2_match(re, (PCRE2_SPTR)subj_buf, subject_length, offset, options, match_data,
+                        mcontext);
+        oracle_slack_free(subj_buf);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (num_captures == PCRE2_ERROR_NOMATCH || num_captures == PCRE2_ERROR_PARTIAL) {
@@ -585,8 +640,12 @@ CAMLprim value oracle_jit_capture_unboxed(
         // SAFETY: Passing in the value of String_val(subject) here is fine
         // since a GC cannot occur.
         // TODO: Compare notes on using pcre2_jit_match in oracle_jit_match_unboxed.
-        int num_captures = pcre2_jit_match(re, (PCRE2_SPTR)String_val(subject), subject_length,
-                                           offset, options, match_data, mcontext);
+        // Slack-padded copy so any bounded subject overrun reads 0x00.
+        unsigned char *subj_buf =
+            oracle_slack_dup((const unsigned char *)String_val(subject), subject_length);
+        int num_captures = pcre2_jit_match(re, (PCRE2_SPTR)subj_buf, subject_length, offset, options,
+                                           match_data, mcontext);
+        oracle_slack_free(subj_buf);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (num_captures == PCRE2_ERROR_NOMATCH || num_captures == PCRE2_ERROR_PARTIAL) {

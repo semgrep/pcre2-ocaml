@@ -1,0 +1,51 @@
+Dev-only oracle hardening — NOT an upstream/vendor change.
+
+This patch is applied ONLY to the nix `pcre2c1044` derivation that backs the
+differential-testing C oracle (oracle/, fuzz/, test/conformance/). It is never
+applied to vendor/ (which stays a pristine copy of the 10.44 release) and never
+ships in the published `pcre2` OCaml package.
+
+Root cause it pins
+------------------
+In the 8-bit (and 16-bit) libraries, GET_UCD(ch) is a bare REAL_GET_UCD(ch)
+with NO bounds guard — the `ch > MAX_UTF_CODE_POINT ? dummy_ucd_record` guard
+exists only in the 32-bit build (pcre2_internal.h). A code point above
+MAX_UTF_CODE_POINT (0x10FFFF) can be produced in 8-bit UTF mode by decoding an
+invalid lead byte: e.g. subject byte 0xFF (>= 0xc0) makes GETUTF8INC take its
+6-byte-lead branch, yielding a code point >= 0x40000000, which is then handed
+straight to GET_UCD by the OP_XCLASS \p{...} path (pcre2_xclass.c:137). The
+resulting REAL_GET_UCD indexes ucd_stage1[] tens of megabytes out of bounds —
+an out-of-bounds read that is usually into mapped (garbage) memory but
+occasionally into an unmapped page, producing a rare SIGSEGV inside libpcre2-8.
+
+Discovered by the differential fuzzer (seed 101, case 153814):
+  pattern  (*sr:(?<=_\N|\h{0,2}?(*script_run:[\s\p{Greek}0-9_](?*b{0,0}+)\G)))(?!Z{2,2}+)
+  compiled match_invalid_utf, subject 0xFF 0x60  ->  ASan: pcre2_xclass.c:137.
+Reachable under PCRE2_MATCH_INVALID_UTF (not only PCRE2_NO_UTF_CHECK). This is
+an upstream-reportable C UB gap; documented here rather than "fixed" in vendor/.
+
+What the patch does, and why clamp (not dummy record)
+-----------------------------------------------------
+The pure-OCaml engine already pins this UB to DEFINED behavior:
+src/engine/ucd.ml `record_index` clamps `ch > 0x10ffff` to 0x10ffff before
+indexing. To keep the differential oracle record-for-record IDENTICAL to the
+engine on such out-of-range code points (so no fuzzer exclusions are needed and
+coverage stays complete), the oracle's 8-bit GET_UCD must clamp to
+MAX_UTF_CODE_POINT too — NOT return the 32-bit build's dummy_ucd_record. The
+engine's DEVIATION note records that the dummy record differs from U+10FFFF's
+record on bidiclass and boolean-properties (bprops); using dummy_ucd_record
+here would make the oracle disagree with the engine on \p{bidi...} / boolean
+property draws over out-of-range code points — spurious differential diffs from
+C UB. Clamp-to-MAX makes oracle == engine exactly.
+
+--- a/src/pcre2_internal.h
++++ b/src/pcre2_internal.h
+@@ -1870,7 +1870,7 @@
+ #define GET_UCD(ch) ((ch > MAX_UTF_CODE_POINT)? \
+   PRIV(dummy_ucd_record) : REAL_GET_UCD(ch))
+ #else
+-#define GET_UCD(ch) REAL_GET_UCD(ch)
++#define GET_UCD(ch) REAL_GET_UCD((ch) > MAX_UTF_CODE_POINT ? MAX_UTF_CODE_POINT : (ch))
+ #endif
+
+ #define UCD_SCRIPTX_MASK 0x3ff

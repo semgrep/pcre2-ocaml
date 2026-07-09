@@ -28,7 +28,29 @@
             hash = "sha256-008C4RPPcZOh6/J3DTrFJwiNSF1OBH7RDl0hfG713pY=";
           };
           # The 10.42 derivation's sljit path fixups don't apply to 10.44.
-          patches = [ ];
+          #
+          # DEV-ONLY ORACLE HARDENING (NOT a vendor/ or upstream change).
+          # This clamp patch pins a C UB in the 8-bit library to the pure
+          # engine's documented DEFINED behavior so the differential fuzzer /
+          # conformance oracle never crashes and never diverges spuriously on
+          # out-of-range code points. In 8-bit UTF mode GET_UCD(ch) has NO
+          # bounds guard (the guard exists only in the 32-bit build); an
+          # over-long invalid lead byte decodes via GETUTF8INC to a code point
+          # above MAX_UTF_CODE_POINT -- the 6-byte-form leads with bit 0 set
+          # (0xFD, 0xFF) reach >= 0x40000000, while the other over-long leads
+          # (0xF5..0xFB families) decode to smaller but still out-of-range
+          # values -- all equally clamped. The OP_XCLASS \p{...} path feeds
+          # that code point to GET_UCD -> ucd_stage1[] indexed out of bounds
+          # (0xFF: tens of MB; ASan: pcre2_xclass.c:137; rare SIGSEGV inside
+          # libpcre2-8, found by fuzz_diff seed 101 case 153814 under
+          # PCRE2_MATCH_INVALID_UTF). The
+          # patch clamps ch to MAX_UTF_CODE_POINT (0x10FFFF) -- matching
+          # src/engine/ucd.ml record_index, NOT the 32-bit dummy record (which
+          # would differ on bidiclass/bprops and cause spurious diffs). This
+          # affects ONLY the dev oracle library; vendor/pcre2 stays pristine
+          # and the published `pcre2` OCaml package is unaffected. Upstream-
+          # reportable C bug; see oracle/patches/*.patch header for full detail.
+          patches = [ ./oracle/patches/pcre2-10.44-oracle-ucd-clamp.patch ];
           postPatch = "";
         });
       in let

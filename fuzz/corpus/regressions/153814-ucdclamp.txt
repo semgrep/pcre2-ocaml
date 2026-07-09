@@ -1,0 +1,11 @@
+# fuzz-diff repro (differential: pure engine vs C oracle)
+# seed=101 case=153814 kind=exec
+# reason: oracle SIGSEGV: 8-bit GET_UCD indexed with out-of-range code point (invalid lead 0xFF under match_invalid_utf); engine clamps to 0x10FFFF, oracle build patched to match (regression guard, manually minimized)
+# pattern (ascii): (?<=h{,2}\\p{Greek})
+# compile: options=0x04000000 extra=0x00000000 newline=0 bsr=0
+# exec: subject="\255`" offset=0 mopts=0x00000000
+# engine: rc=-1 ov=[] mark=<none> sc=0
+# oracle: rc=-1 ov=[-1;-1] mark=<none> sc=0
+/28 3f 3c 3d 68 7b 2c 32 7d 5c 70 7b 47 72 65 65 6b 7d 29/hex,match_invalid_utf
+    \xff\x60\=offset=0,mark,startchar
+
