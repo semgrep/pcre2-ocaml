@@ -57,11 +57,20 @@ let err20 = compile_error_base + 20 (* regular expression is too large *)
 let err22 = compile_error_base + 22 (* unmatched closing parenthesis *)
 let err23 = compile_error_base + 23 (* internal error: code overflow *)
 
+let err24 =
+  compile_error_base + 24 (* missing closing parenthesis for condition *)
+
 let err25 =
   compile_error_base + 25 (* length of lookbehind assertion is not limited *)
 
 let err26 = compile_error_base + 26 (* a relative value of zero not allowed *)
+
+let err27 =
+  compile_error_base
+  + 27 (* conditional subpattern contains more than two branches *)
+
 let err28 = compile_error_base + 28 (* assertion expected after (?( or (?(?C) *)
+let err29 = compile_error_base + 29 (* digit expected after (?+ or (?- *)
 let err30 = compile_error_base + 30 (* unknown POSIX class name *)
 let err34 = compile_error_base + 34 (* code point in \x{} or \o{} too large *)
 let err35 = compile_error_base + 35 (* lookbehind is too complicated *)
@@ -93,12 +102,19 @@ let err53 =
   compile_error_base
   + 53 (* internal error: previously-checked referenced subpattern not found *)
 
+let err54 =
+  compile_error_base + 54 (* DEFINE subpattern contains more than one branch *)
+
 let err55 = compile_error_base + 55 (* missing opening brace after \o *)
 
 let err56 =
   compile_error_base + 56 (* internal error: unknown newline setting *)
 
 let err57 = compile_error_base + 57 (* \g not followed by name/number *)
+let err58 = compile_error_base + 58
+(* (?R (recursive pattern call) must be followed
+   by a closing parenthesis *)
+
 let err60 = compile_error_base + 60 (* ( *VERB) not recognized or malformed *)
 let err61 = compile_error_base + 61 (* subpattern number is too big *)
 let err62 = compile_error_base + 62 (* subpattern name expected *)
@@ -136,6 +152,10 @@ let err77 =
 
 let err78 =
   compile_error_base + 78 (* digits missing in \x{} or \o{} or \N{U+} *)
+
+let err79 = compile_error_base + 79
+(* syntax error or number too big in
+   (?(VERSION condition *)
 
 let err83 =
   compile_error_base + 83 (* using \C is disabled by the application *)

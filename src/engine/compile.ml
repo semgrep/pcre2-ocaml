@@ -942,6 +942,12 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
   let group_return = ref 0 in
   let length_prevgroup = ref 0 in
   let groupsetfirstcu = ref false in
+  (* pcre2_compile.c:5658 — PCRE2_SIZE offset = 0. Function-level because
+     the OP_COND post-processing in group_process reads the value stored
+     by whichever arm last did GETPLUSOFFSET (the META_COND_* arms; also
+     the byname/backref arms), including the stale value for assertion and
+     VERSION conditions, which set no offset of their own. *)
+  let offset = ref 0 in
   let matched_char = ref false in
   let previous_matched_char = ref false in
   let had_accept = ref false in
@@ -1119,9 +1125,13 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
      arrive with M4/M5. *)
   let group_process ~(note_group_empty : bool) ~(bravalue : int)
       ~(skipunits : int) : unit =
+    (* The C's bravalue is mutable: the conditional post-processing below
+       (pcre2_compile.c:6894) turns OP_COND into OP_DEFINE as a flag to
+       suppress the char handling further down. *)
+    let bravalue = ref bravalue in
     (* pcre2_compile.c:6819-6825 *)
     cb.parens_depth <- cb.parens_depth + 1;
-    Bytes.set cb.start_code !code (Char.chr (bravalue land 0xff));
+    Bytes.set cb.start_code !code (Char.chr (!bravalue land 0xff));
     pptr := !pptr + 1;
     let tempcode = ref !code in
     let tempreqvary = cb.req_varyopt (* Save value before group *) in
@@ -1149,26 +1159,68 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
        Conditionals are handled below. *)
     if
       note_group_empty
-      && (not (Int.equal bravalue Opcodes.op_cond))
+      && (not (Int.equal !bravalue Opcodes.op_cond))
       && !group_return > 0
     then matched_char := true;
 
     (* pcre2_compile.c:6856-6859 — if we've just compiled an assertion,
        pop the assert depth. *)
-    if bravalue >= Opcodes.op_assert && bravalue <= Opcodes.op_assertback_na
+    if !bravalue >= Opcodes.op_assert && !bravalue <= Opcodes.op_assertback_na
     then cb.assert_depth <- cb.assert_depth - 1;
 
-    (* pcre2_compile.c:6861-6913 — for a conditional bracket, check that
-       there are no more than two branches in the group (ERR27), or just
-       one if it's a DEFINE group (ERR54, then the OP_DEFINE-to-OP_FALSE
-       rewrite and bravalue = OP_DEFINE). M5 owns conditionals
-       (docs/ocaml-engine/05-conditionals-recursion.md); unreachable here
-       until the META_COND arms stop deferring, kept loud (both phases,
-       where the C checks only in the real phase) so M5 cannot silently
-       miss it. *)
-    if Int.equal bravalue Opcodes.op_cond then (
-      errorcodeptr := Parse.err_deferred;
-      return_from_branch 0);
+    (* pcre2_compile.c:6861-6913 — at the end of compiling, code is still
+       pointing to the start of the group, while tempcode has been updated
+       to point past the end of the group. The parsed pattern pointer
+       (pptr) is on the closing META_KET.
+
+       If this is a conditional bracket, check that there are no more than
+       two branches in the group, or just one if it's a DEFINE group. We do
+       this in the real compile phase, not in the pre-pass, where the whole
+       group may not be available. *)
+    if Int.equal !bravalue Opcodes.op_cond && Option.is_none lengthptr then (
+      let tc = ref !code in
+      let condcount = ref 0 in
+
+      (* do { condcount++; tc += GET(tc,1); } while ( *tc != OP_KET) *)
+      let continue_ = ref true in
+      while !continue_ do
+        incr condcount;
+        tc := !tc + get cb.start_code (!tc + 1);
+        if Int.equal (Char.code (Bytes.get cb.start_code !tc)) Opcodes.op_ket
+        then continue_ := false
+      done;
+
+      (* pcre2_compile.c:6881-6895 — a DEFINE group is never obeyed inline
+         (the "condition" is always false). It must have only one branch.
+         Having checked this, change the opcode to OP_FALSE. *)
+      if
+        Int.equal
+          (Char.code (Bytes.get cb.start_code (!code + Limits.link_size + 1)))
+          Opcodes.op_define
+      then (
+        if !condcount > 1 then (
+          cb.erroroffset <- !offset;
+          errorcodeptr := Errors.err54;
+          return_from_branch 0);
+        Bytes.set cb.start_code
+          (!code + Limits.link_size + 1)
+          (Char.chr Opcodes.op_false);
+        bravalue := Opcodes.op_define
+        (* A flag to suppress char handling below *))
+      else (
+        (* pcre2_compile.c:6897-6912 — a "normal" conditional group. If
+           there is just one branch, we must not make use of its firstcu
+           or reqcu, because this is equivalent to an empty second branch.
+           Also, it may match an empty string. If there are two branches,
+           this item must match a character if the group must. *)
+        if !condcount > 2 then (
+          cb.erroroffset <- !offset;
+          errorcodeptr := Errors.err27;
+          return_from_branch 0);
+        if Int.equal !condcount 1 then (
+          subfirstcuflags := req_none;
+          subreqcuflags := req_none)
+        else if !group_return > 0 then matched_char := true));
 
     match lengthptr with
     | Some length ->
@@ -1194,8 +1246,8 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
 
         (* pcre2_compile.c:6939-6942 — for a DEFINE group, required and
            first character settings are not relevant. bravalue only
-           becomes OP_DEFINE inside the conditional block above (M5). *)
-        if not (Int.equal bravalue Opcodes.op_define) then (
+           becomes OP_DEFINE inside the conditional block above. *)
+        if not (Int.equal !bravalue Opcodes.op_define) then (
           (* pcre2_compile.c:6944-6955 — handle updating of the required
              and first code units for other types of group. Update for
              normal brackets of all kinds, and conditions with two
@@ -1209,7 +1261,7 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
           zerofirstcuflags := !firstcuflags;
           groupsetfirstcu := false;
 
-          if bravalue >= Opcodes.op_once (* Not an assertion *) then (
+          if !bravalue >= Opcodes.op_once (* Not an assertion *) then (
             (* pcre2_compile.c:6959-6975 — if we have not yet set a
                firstcu in this branch, take it from the subpattern,
                remembering that it was set here so that a repeat of more
@@ -1256,8 +1308,8 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
                effect for patterns like /(?=.*X)X$/ means we must only
                take the reqcu when the group also set a firstcu.
                Otherwise, in that example, 'X' ends up set for both. *)
-            (Int.equal bravalue Opcodes.op_assert
-            || Int.equal bravalue Opcodes.op_assert_na)
+            (Int.equal !bravalue Opcodes.op_assert
+            || Int.equal !bravalue Opcodes.op_assert_na)
             && !subreqcuflags < req_none
             && !subfirstcuflags < req_none
           then (
@@ -1290,6 +1342,28 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
     cb.backref_map <-
       (cb.backref_map lor if meta_arg < 32 then 1 lsl meta_arg else 1);
     if meta_arg > cb.top_backref then cb.top_backref <- meta_arg
+  in
+
+  (* pcre2_compile.c:8078-8087 — HANDLE_NUMERICAL_RECURSION: reached by
+     falling through from META_RECURSE, and by goto from named recursion
+     handling (pcre2_compile.c:7051-7055) with the group number of the
+     first group with the given name. Handle recursion by inserting the
+     number of the called group (the meta argument) after OP_RECURSE. At
+     the end of compiling the pattern is scanned and these numbers are
+     replaced by offsets within the pattern (the driver fixup pass,
+     pcre2_compile.c:10727-10784). It is done like this to avoid problems
+     with forward references and adjusting offsets when groups are
+     duplicated and moved. Note that a recursion does not have a set first
+     character. *)
+  let handle_numerical_recursion (meta_arg : int) : unit =
+    Bytes.set cb.start_code !code (Char.chr Opcodes.op_recurse);
+    put cb.start_code (!code + 1) meta_arg;
+    code := !code + 1 + Limits.link_size;
+    groupsetfirstcu := false;
+    cb.had_recurse <- true;
+    if Int.equal !firstcuflags req_unset then firstcuflags := req_none;
+    zerofirstcu := !firstcu;
+    zerofirstcuflags := !firstcuflags
   in
 
   (* pcre2_compile.c:5721-5723 — switch on next META item until the end of
@@ -2009,16 +2083,208 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
         Int.equal meta Parse.meta_cond_rnumber
         || Int.equal meta Parse.meta_cond_name
         || Int.equal meta Parse.meta_cond_rname
-        || Int.equal meta Parse.meta_cond_define
-        || Int.equal meta Parse.meta_cond_number
-        || Int.equal meta Parse.meta_cond_version
-        || Int.equal meta Parse.meta_cond_assert
       then (
-        (* pcre2_compile.c:6590-6745 — conditional subpatterns:
-           docs/ocaml-engine/05-conditionals-recursion.md. Deferred
-           loudly. *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+        (* pcre2_compile.c:6590-6694 — handle conditional subpatterns. The
+           case of (?(Rdigits) is ambiguous because it could be a numerical
+           check on recursion, or a name check on a group's being set. The
+           pre-pass sets up META_COND_RNUMBER as a name so that we can
+           handle it either way. We first try for a name; if not found,
+           process the number. bravalue = OP_COND for every exit. *)
+        pptr := !pptr + 1;
+        let length = cb.parsed_pattern.(!pptr) in
+        (* GETPLUSOFFSET(offset, pptr) *)
+        pptr := !pptr + 1;
+        offset := cb.parsed_pattern.(!pptr);
+        let name = !offset in
+
+        (* name = cb->start_pattern + offset *)
+
+        (* pcre2_compile.c:6611-6632 — in the first pass, the names
+           generated in the pre-pass are available, but the main name table
+           has not yet been created. Scan the list of names generated in
+           the pre-pass in order to get a number and whether or not this
+           name is duplicated. If it is not duplicated, we can handle it as
+           a numerical group. The PRIV(strncmp)
+           (pcre2_string_utils.c:156-167) becomes a code-unit loop over the
+           pattern; only its equality result is used. The C's `goto
+           GROUP_PROCESS_NOTE_EMPTY` from inside the loop becomes the
+           [handled] flag; its `break` on a duplicated name leaves i <
+           names_found. *)
+        let i = ref 0 in
+        let handled = ref false in
+        let broke = ref false in
+        while (not !handled) && (not !broke) && !i < cb.names_found do
+          let ng = cb.named_groups.(!i) in
+          let name_eq =
+            Int.equal length ng.Parse.length
+            &&
+            let rec cmp j =
+              if j >= length then true
+              else if
+                Char.equal cb.pattern.[name + j] cb.pattern.[ng.Parse.name + j]
+              then (cmp [@tailcall]) (j + 1)
+              else false
+            in
+            cmp 0
+          in
+          if name_eq then
+            if not ng.Parse.isdup then (
+              Bytes.set cb.start_code
+                (!code + 1 + Limits.link_size)
+                (Char.chr
+                   (if Int.equal meta Parse.meta_cond_rname then Opcodes.op_rref
+                    else Opcodes.op_cref));
+              put2 cb.start_code (!code + 2 + Limits.link_size) ng.Parse.number;
+              if ng.Parse.number > cb.top_backref then
+                cb.top_backref <- ng.Parse.number;
+              handled := true
+              (* goto GROUP_PROCESS_NOTE_EMPTY with
+                 skipunits = 1+IMM2_SIZE (below) *))
+            else broke := true (* Found a duplicated name *)
+          else incr i
+        done;
+
+        if !handled then
+          group_process ~note_group_empty:true ~bravalue:Opcodes.op_cond
+            ~skipunits:(1 + Limits.imm2_size)
+        else if !i >= cb.names_found then (
+          (* pcre2_compile.c:6634-6671 — if the name was not found we have
+             a bad reference, unless we are dealing with R<digits>, which
+             is treated as a recursion test by number. *)
+          let groupnumber = ref 0 in
+          (if Int.equal meta Parse.meta_cond_rnumber then
+             let j = ref 1 in
+             while !j < length do
+               groupnumber :=
+                 (!groupnumber * 10)
+                 + Char.code cb.pattern.[name + !j]
+                 - Char.code '0';
+               if !groupnumber > Limits.max_group_number then (
+                 errorcodeptr := Errors.err61;
+                 cb.erroroffset <- !offset + !j;
+                 return_from_branch 0);
+               incr j
+             done);
+
+          if
+            (not (Int.equal meta Parse.meta_cond_rnumber))
+            || !groupnumber > cb.bracount
+          then (
+            errorcodeptr := Errors.err15;
+            cb.erroroffset <- !offset;
+            return_from_branch 0);
+
+          (* pcre2_compile.c:6662-6670 — (?Rdigits) treated as a recursion
+             reference by number. A value of zero (which is the result of
+             both (?R) and (?R0)) means "any", and is translated into
+             RREF_ANY (which is 0xffff). *)
+          if Int.equal !groupnumber 0 then groupnumber := Opcodes.rref_any;
+          Bytes.set cb.start_code
+            (!code + 1 + Limits.link_size)
+            (Char.chr Opcodes.op_rref);
+          put2 cb.start_code (!code + 2 + Limits.link_size) !groupnumber;
+          group_process ~note_group_empty:true ~bravalue:Opcodes.op_cond
+            ~skipunits:(1 + Limits.imm2_size))
+        else (
+          (* pcre2_compile.c:6673-6693 — a duplicated name was found. Note
+             that if an R<digits> name is found (META_COND_RNUMBER), it is
+             a reference test, not a recursion test. In the compile pass we
+             have to search the main table in order to get the index and
+             count values. *)
+          Bytes.set cb.start_code
+            (!code + 1 + Limits.link_size)
+            (Char.chr
+               (if Int.equal meta Parse.meta_cond_rname then Opcodes.op_rref
+                else Opcodes.op_cref));
+
+          let count = ref 0 (* Values for first pass *) in
+          let index = ref 0 in
+          (match lengthptr with
+          | None ->
+              if
+                not
+                  (find_dupname_details ~name ~length index count errorcodeptr
+                     cb)
+              then return_from_branch 0
+          | Some _ -> ());
+
+          (* pcre2_compile.c:6686-6692 — add one to the opcode to change
+             CREF/RREF into DNCREF/DNRREF and insert appropriate data
+             values. *)
+          Bytes.set cb.start_code
+            (!code + 1 + Limits.link_size)
+            (Char.chr
+               (Char.code
+                  (Bytes.get cb.start_code (!code + 1 + Limits.link_size))
+               + 1));
+          put2 cb.start_code (!code + 2 + Limits.link_size) !index;
+          put2 cb.start_code
+            (!code + 2 + Limits.link_size + Limits.imm2_size)
+            !count;
+          group_process ~note_group_empty:true ~bravalue:Opcodes.op_cond
+            ~skipunits:(1 + (2 * Limits.imm2_size))))
+      else if Int.equal meta Parse.meta_cond_define then (
+        (* pcre2_compile.c:6696-6705 — the DEFINE condition is always
+           false. Its internal groups may never be called, so matched_char
+           must remain false, hence the jump to GROUP_PROCESS rather than
+           GROUP_PROCESS_NOTE_EMPTY. *)
+        pptr := !pptr + 1;
+        offset := cb.parsed_pattern.(!pptr);
+        Bytes.set cb.start_code
+          (!code + 1 + Limits.link_size)
+          (Char.chr Opcodes.op_define);
+        group_process ~note_group_empty:false ~bravalue:Opcodes.op_cond
+          ~skipunits:1)
+      else if Int.equal meta Parse.meta_cond_number then (
+        (* pcre2_compile.c:6707-6724 — conditional test of a group's being
+           set. *)
+        pptr := !pptr + 1;
+        offset := cb.parsed_pattern.(!pptr);
+        pptr := !pptr + 1;
+        let groupnumber = cb.parsed_pattern.(!pptr) in
+        if groupnumber > cb.bracount then (
+          errorcodeptr := Errors.err15;
+          cb.erroroffset <- !offset;
+          return_from_branch 0);
+        if groupnumber > cb.top_backref then cb.top_backref <- groupnumber;
+        offset := !offset - 2
+        (* Point at initial ( for too many branches error *);
+        Bytes.set cb.start_code
+          (!code + 1 + Limits.link_size)
+          (Char.chr Opcodes.op_cref);
+        put2 cb.start_code (!code + 2 + Limits.link_size) groupnumber;
+        group_process ~note_group_empty:true ~bravalue:Opcodes.op_cond
+          ~skipunits:(1 + Limits.imm2_size))
+      else if Int.equal meta Parse.meta_cond_version then (
+        (* pcre2_compile.c:6726-6739 — test for the PCRE2 version.
+           PCRE2_MAJOR = 10, PCRE2_MINOR = 44 (Engine.version). *)
+        if cb.parsed_pattern.(!pptr + 1) > 0 then
+          Bytes.set cb.start_code
+            (!code + 1 + Limits.link_size)
+            (Char.chr
+               (if
+                  10 > cb.parsed_pattern.(!pptr + 2)
+                  || Int.equal 10 cb.parsed_pattern.(!pptr + 2)
+                     && 44 >= cb.parsed_pattern.(!pptr + 3)
+                then Opcodes.op_true
+                else Opcodes.op_false))
+        else
+          Bytes.set cb.start_code
+            (!code + 1 + Limits.link_size)
+            (Char.chr
+               (if
+                  Int.equal 10 cb.parsed_pattern.(!pptr + 2)
+                  && Int.equal 44 cb.parsed_pattern.(!pptr + 3)
+                then Opcodes.op_true
+                else Opcodes.op_false));
+        pptr := !pptr + 3;
+        group_process ~note_group_empty:true ~bravalue:Opcodes.op_cond
+          ~skipunits:1)
+      else if Int.equal meta Parse.meta_cond_assert then
+        (* pcre2_compile.c:6741-6745 — the condition is an assertion,
+           possibly preceded by a callout. *)
+        group_process ~note_group_empty:true ~bravalue:Opcodes.op_cond
+          ~skipunits:0
       else if Int.equal meta Parse.meta_lookahead then (
         (* pcre2_compile.c:6748-6755 — handle all kinds of nested bracketed
            groups. The non-capturing, non-conditional cases are here;
@@ -2092,8 +2358,8 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
         pptr := !pptr + 1;
         let length = cb.parsed_pattern.(!pptr) in
         pptr := !pptr + 1;
-        let offset = cb.parsed_pattern.(!pptr) in
-        let name = offset in
+        offset := cb.parsed_pattern.(!pptr);
+        let name = !offset in
 
         (* pcre2_compile.c:7033-7064 — in the first pass, the names
            generated in the pre-pass are available, but the main name
@@ -2101,78 +2367,83 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
            generated in the pre-pass in order to get a number and whether
            or not this name is duplicated. The PRIV(strncmp)
            (pcre2_string_utils.c:156-167) becomes a code-unit loop over
-           the pattern; only its equality result is used. *)
+           the pattern; only its equality result is used. The C's `goto
+           HANDLE_NUMERICAL_RECURSION` from inside the loop becomes the
+           [recursed] flag guarding the loop and the post-loop code. *)
         let groupnumber = ref 0 in
+        let recursed = ref false in
         for i = 0 to cb.names_found - 1 do
-          let ng = cb.named_groups.(i) in
-          let name_eq =
-            Int.equal length ng.Parse.length
-            &&
-            let rec cmp j =
-              if j >= length then true
-              else if
-                Char.equal cb.pattern.[name + j] cb.pattern.[ng.Parse.name + j]
-              then (cmp [@tailcall]) (j + 1)
-              else false
+          if not !recursed then
+            let ng = cb.named_groups.(i) in
+            let name_eq =
+              Int.equal length ng.Parse.length
+              &&
+              let rec cmp j =
+                if j >= length then true
+                else if
+                  Char.equal
+                    cb.pattern.[name + j]
+                    cb.pattern.[ng.Parse.name + j]
+                then (cmp [@tailcall]) (j + 1)
+                else false
+              in
+              cmp 0
             in
-            cmp 0
-          in
-          if name_eq then (
-            is_dupname := ng.Parse.isdup;
-            groupnumber := ng.Parse.number;
+            if name_eq then (
+              is_dupname := ng.Parse.isdup;
+              groupnumber := ng.Parse.number;
 
-            (* pcre2_compile.c:7047-7055 — for a recursion, that's all
-               that is needed: goto HANDLE_NUMERICAL_RECURSION, applying
-               it to the first group with the given name. The target
-               label lives in the META_RECURSE arm (pcre2_compile.c:8078)
-               — M5, docs/ocaml-engine/05-conditionals-recursion.md —
-               and is unreachable here until parse_regex stops deferring
-               META_RECURSE_BYNAME emission. Deferred loudly. *)
-            if Int.equal meta Parse.meta_recurse_byname then (
-              errorcodeptr := Parse.err_deferred;
-              return_from_branch 0);
-
-            (* pcre2_compile.c:7057-7062 — for a back reference, update
-               the back reference map and the maximum back reference. *)
-            cb.backref_map <-
-              (cb.backref_map
-              lor if !groupnumber < 32 then 1 lsl !groupnumber else 1);
-            if !groupnumber > cb.top_backref then cb.top_backref <- !groupnumber)
+              (* pcre2_compile.c:7047-7055 — for a recursion, that's all
+                 that is needed. We can now go to the code that handles
+                 numerical recursion, applying it to the first group with
+                 the given name. *)
+              if Int.equal meta Parse.meta_recurse_byname then (
+                handle_numerical_recursion !groupnumber;
+                recursed := true)
+              else (
+                (* pcre2_compile.c:7057-7062 — for a back reference, update
+                   the back reference map and the maximum back reference. *)
+                cb.backref_map <-
+                  (cb.backref_map
+                  lor if !groupnumber < 32 then 1 lsl !groupnumber else 1);
+                if !groupnumber > cb.top_backref then
+                  cb.top_backref <- !groupnumber))
         done;
 
-        (* pcre2_compile.c:7066-7073 — if the name was not found we have a
-           bad reference. *)
-        if Int.equal !groupnumber 0 then (
-          errorcodeptr := Errors.err15;
-          cb.erroroffset <- offset;
-          return_from_branch 0);
+        if not !recursed then (
+          (* pcre2_compile.c:7066-7073 — if the name was not found we have a
+             bad reference. *)
+          if Int.equal !groupnumber 0 then (
+            errorcodeptr := Errors.err15;
+            cb.erroroffset <- !offset;
+            return_from_branch 0);
 
-        (* pcre2_compile.c:7075-7082 — if a back reference name is not
-           duplicated, we can handle it as a numerical reference: goto
-           HANDLE_SINGLE_REFERENCE. *)
-        if not !is_dupname then handle_single_reference !groupnumber
-        else
-          (* pcre2_compile.c:7084-7096 — if a back reference name is
-             duplicated, we generate a different opcode to a numerical
-             back reference. In the second pass we must search for the
-             index and count in the final name table. *)
-          let count = ref 0 (* Values for first pass *) in
-          let index = ref 0 in
-          (match lengthptr with
-          | None ->
-              if
-                not
-                  (find_dupname_details ~name ~length index count errorcodeptr
-                     cb)
-              then return_from_branch 0
-          | Some _ -> ());
-          if Int.equal !firstcuflags req_unset then firstcuflags := req_none;
-          emit_cu
-            (if not (Int.equal (!options land Options.caseless) 0) then
-               Opcodes.op_dnrefi
-             else Opcodes.op_dnref);
-          put2inc cb.start_code code !index;
-          put2inc cb.start_code code !count)
+          (* pcre2_compile.c:7075-7082 — if a back reference name is not
+             duplicated, we can handle it as a numerical reference: goto
+             HANDLE_SINGLE_REFERENCE. *)
+          if not !is_dupname then handle_single_reference !groupnumber
+          else
+            (* pcre2_compile.c:7084-7096 — if a back reference name is
+               duplicated, we generate a different opcode to a numerical
+               back reference. In the second pass we must search for the
+               index and count in the final name table. *)
+            let count = ref 0 (* Values for first pass *) in
+            let index = ref 0 in
+            (match lengthptr with
+            | None ->
+                if
+                  not
+                    (find_dupname_details ~name ~length index count errorcodeptr
+                       cb)
+                then return_from_branch 0
+            | Some _ -> ());
+            if Int.equal !firstcuflags req_unset then firstcuflags := req_none;
+            emit_cu
+              (if not (Int.equal (!options land Options.caseless) 0) then
+                 Opcodes.op_dnrefi
+               else Opcodes.op_dnref);
+            put2inc cb.start_code code !index;
+            put2inc cb.start_code code !count))
       else if Int.equal meta Parse.meta_callout_number then (
         (* pcre2_compile.c:7101-7111 — handle a numerical callout. *)
         Bytes.set cb.start_code !code (Char.chr Opcodes.op_callout);
@@ -3029,25 +3300,30 @@ let rec compile_branch (optionsptr : int ref) (xoptionsptr : int ref)
            64-bit environments. We only need the offset to the first
            occurrence, because if that doesn't fail, subsequent ones will
            also be OK. *)
-        let offset =
-          if meta_arg < 10 then cb.small_ref_offset.(meta_arg)
-          else (
-            (* GETPLUSOFFSET(offset, pptr) *)
-            pptr := !pptr + 1;
-            cb.parsed_pattern.(!pptr))
-        in
+        if meta_arg < 10 then offset := cb.small_ref_offset.(meta_arg)
+        else (
+          (* GETPLUSOFFSET(offset, pptr) *)
+          pptr := !pptr + 1;
+          offset := cb.parsed_pattern.(!pptr));
         if meta_arg > cb.bracount then (
-          cb.erroroffset <- offset;
+          cb.erroroffset <- !offset;
           errorcodeptr := Errors.err15 (* Non-existent subpattern *);
           return_from_branch 0);
         (* fallthrough to HANDLE_SINGLE_REFERENCE in C *)
         handle_single_reference meta_arg)
       else if Int.equal meta Parse.meta_recurse then (
-        (* pcre2_compile.c:8061-8087 — recursion:
-           docs/ocaml-engine/05-conditionals-recursion.md. Deferred
-           loudly. *)
-        errorcodeptr := Parse.err_deferred;
-        return_from_branch 0)
+        (* pcre2_compile.c:8061-8077 — handle recursion by inserting the
+           number of the called group (which is the meta argument) after
+           OP_RECURSE (see handle_numerical_recursion above). *)
+        pptr := !pptr + 1;
+        offset := cb.parsed_pattern.(!pptr);
+        (* GETPLUSOFFSET(offset, pptr) *)
+        if meta_arg > cb.bracount then (
+          cb.erroroffset <- !offset;
+          errorcodeptr := Errors.err15 (* Non-existent subpattern *);
+          return_from_branch 0);
+        (* fallthrough to HANDLE_NUMERICAL_RECURSION in C *)
+        handle_numerical_recursion meta_arg)
       else if Int.equal meta Parse.meta_capture then (
         (* pcre2_compile.c:8090-8098 — handle capturing parentheses; the
            number is the meta argument. *)
@@ -3703,12 +3979,197 @@ let rec is_startline (code : Bytes.t) (pos : int) (bracket_map : int)
     branch pos
   with Return_false -> false
 
-(* pcre2_compile.c:8905-9049 — find_recurse: scans a compiled pattern for
-   OP_RECURSE so the driver can convert recursion group numbers into
-   offsets. DEFERRED (M5, docs/ocaml-engine/05-conditionals-recursion.md):
-   nothing can set cb.had_recurse until the recursion parse/compile arms
-   land, so the driver's fixup loop (pcre2_compile.c:10727-10784, with
-   PRIV(find_bracket)) defers loudly there instead. *)
+(* ---------- Scan compiled regex for recursion reference ---------- *)
+
+(* pcre2_compile.c:8905-9049 — find_recurse. This function scans through a
+   compiled pattern until it finds an instance of OP_RECURSE.
+
+   Arguments:
+     code   the compiled-code buffer
+     pos    offset of the start of the expression (C: the code pointer)
+     utf    true in UTF mode
+
+   Returns: offset of the opcode for OP_RECURSE, or -1 (the C's NULL) if
+   not found. *)
+let find_recurse (code : Bytes.t) (pos : int) ~(utf : bool) : int =
+  (* DEVIATION: the MAYBE_UTF_MULTI switch (pcre2_compile.c:8982-9043),
+     which skips the extra code units of multi-unit UTF characters after
+     the opcodes that are followed by a character, is deferred to M6
+     (docs/ocaml-engine/07-utf8.md) with the rest of UTF compilation —
+     pcre2_compile rejects PCRE2_UTF before any OP_RECURSE can be
+     emitted, so it is unreachable here. *)
+  ignore utf;
+  let rec loop pos =
+    let c = Char.code (Bytes.get code pos) in
+    if Int.equal c Opcodes.op_end then -1
+    else if Int.equal c Opcodes.op_recurse then pos
+    else if
+      (* pcre2_compile.c:8928-8934 — XCLASS is used for classes that
+         cannot be represented just by a bit map. This includes negated
+         single high-valued characters. CALLOUT_STR is used for callouts
+         with string arguments. In both cases the length in the table is
+         zero; the actual length is stored in the compiled code. *)
+      Int.equal c Opcodes.op_xclass
+    then (loop [@tailcall]) (pos + get code (pos + 1))
+    else if Int.equal c Opcodes.op_callout_str then
+      (loop [@tailcall]) (pos + get code (pos + 1 + (2 * Limits.link_size)))
+    else
+      (* pcre2_compile.c:8936-8972 — otherwise, we can get the item's
+         length from the table, except that for repeated character types,
+         we have to test for \p and \P, which have an extra two code units
+         of parameters, and for MARK/PRUNE/SKIP/THEN with an argument, we
+         must add in its length. *)
+      let pos =
+        if
+          Int.equal c Opcodes.op_typestar
+          || Int.equal c Opcodes.op_typeminstar
+          || Int.equal c Opcodes.op_typeplus
+          || Int.equal c Opcodes.op_typeminplus
+          || Int.equal c Opcodes.op_typequery
+          || Int.equal c Opcodes.op_typeminquery
+          || Int.equal c Opcodes.op_typeposstar
+          || Int.equal c Opcodes.op_typeposplus
+          || Int.equal c Opcodes.op_typeposquery
+        then
+          if
+            Int.equal (Char.code (Bytes.get code (pos + 1))) Opcodes.op_prop
+            || Int.equal
+                 (Char.code (Bytes.get code (pos + 1)))
+                 Opcodes.op_notprop
+          then pos + 2
+          else pos
+        else if
+          Int.equal c Opcodes.op_typeposupto
+          || Int.equal c Opcodes.op_typeupto
+          || Int.equal c Opcodes.op_typeminupto
+          || Int.equal c Opcodes.op_typeexact
+        then
+          if
+            Int.equal
+              (Char.code (Bytes.get code (pos + 1 + Limits.imm2_size)))
+              Opcodes.op_prop
+            || Int.equal
+                 (Char.code (Bytes.get code (pos + 1 + Limits.imm2_size)))
+                 Opcodes.op_notprop
+          then pos + 2
+          else pos
+        else if
+          Int.equal c Opcodes.op_mark
+          || Int.equal c Opcodes.op_commit_arg
+          || Int.equal c Opcodes.op_prune_arg
+          || Int.equal c Opcodes.op_skip_arg
+          || Int.equal c Opcodes.op_then_arg
+        then pos + Char.code (Bytes.get code (pos + 1))
+        else pos
+      in
+      (* Add in the fixed length from the table
+         (pcre2_compile.c:8974-8976). *)
+      (loop [@tailcall]) (pos + Opcodes.op_lengths.(c))
+  in
+  loop pos
+
+(* ---------- Scan compiled regex for specific bracket ---------- *)
+
+(* pcre2_find_bracket.c:56-217 — PRIV(find_bracket). Scan a compiled
+   pattern for a capturing bracket with the given number, or for a
+   lookbehind if the number is negative. Called from the pcre2_compile
+   driver when resolving recursion offsets (and, later, from the study
+   functions).
+
+   Arguments:
+     code    the compiled-code buffer
+     pos     offset of the start of the expression (C: the code pointer)
+     utf     true in UTF mode
+     number  the required bracket number, or negative to find a lookbehind
+
+   Returns: offset of the opcode for the bracket, or -1 (the C's NULL) if
+   not found. *)
+let find_bracket (code : Bytes.t) (pos : int) ~(utf : bool) (number : int) : int
+    =
+  (* DEVIATION: as in find_recurse above, the MAYBE_UTF_MULTI switch
+     (pcre2_find_bracket.c:150-211) is deferred to M6; it is unreachable
+     while UTF compilation is rejected. *)
+  ignore utf;
+  let rec loop pos =
+    let c = Char.code (Bytes.get code pos) in
+    if Int.equal c Opcodes.op_end then -1
+    else if
+      (* pcre2_find_bracket.c:78-84 — XCLASS and CALLOUT_STR carry their
+         length in the compiled code. *)
+      Int.equal c Opcodes.op_xclass
+    then (loop [@tailcall]) (pos + get code (pos + 1))
+    else if Int.equal c Opcodes.op_callout_str then
+      (loop [@tailcall]) (pos + get code (pos + 1 + (2 * Limits.link_size)))
+    else if
+      (* pcre2_find_bracket.c:86-92 — handle lookbehind *)
+      Int.equal c Opcodes.op_reverse || Int.equal c Opcodes.op_vreverse
+    then
+      if number < 0 then pos
+      else (loop [@tailcall]) (pos + Opcodes.op_lengths.(c))
+    else if
+      (* pcre2_find_bracket.c:94-102 — handle capturing bracket *)
+      Int.equal c Opcodes.op_cbra
+      || Int.equal c Opcodes.op_scbra
+      || Int.equal c Opcodes.op_cbrapos
+      || Int.equal c Opcodes.op_scbrapos
+    then
+      let n = get2 code (pos + 1 + Limits.link_size) in
+      if Int.equal n number then pos
+      else (loop [@tailcall]) (pos + Opcodes.op_lengths.(c))
+    else
+      (* pcre2_find_bracket.c:104-140 — otherwise, we can get the item's
+         length from the table, except that for repeated character types,
+         we have to test for \p and \P, which have an extra two bytes of
+         parameters, and for MARK/PRUNE/SKIP/THEN with an argument, we
+         must add in its length. *)
+      let pos =
+        if
+          Int.equal c Opcodes.op_typestar
+          || Int.equal c Opcodes.op_typeminstar
+          || Int.equal c Opcodes.op_typeplus
+          || Int.equal c Opcodes.op_typeminplus
+          || Int.equal c Opcodes.op_typequery
+          || Int.equal c Opcodes.op_typeminquery
+          || Int.equal c Opcodes.op_typeposstar
+          || Int.equal c Opcodes.op_typeposplus
+          || Int.equal c Opcodes.op_typeposquery
+        then
+          if
+            Int.equal (Char.code (Bytes.get code (pos + 1))) Opcodes.op_prop
+            || Int.equal
+                 (Char.code (Bytes.get code (pos + 1)))
+                 Opcodes.op_notprop
+          then pos + 2
+          else pos
+        else if
+          Int.equal c Opcodes.op_typeupto
+          || Int.equal c Opcodes.op_typeminupto
+          || Int.equal c Opcodes.op_typeexact
+          || Int.equal c Opcodes.op_typeposupto
+        then
+          if
+            Int.equal
+              (Char.code (Bytes.get code (pos + 1 + Limits.imm2_size)))
+              Opcodes.op_prop
+            || Int.equal
+                 (Char.code (Bytes.get code (pos + 1 + Limits.imm2_size)))
+                 Opcodes.op_notprop
+          then pos + 2
+          else pos
+        else if
+          Int.equal c Opcodes.op_mark
+          || Int.equal c Opcodes.op_commit_arg
+          || Int.equal c Opcodes.op_prune_arg
+          || Int.equal c Opcodes.op_skip_arg
+          || Int.equal c Opcodes.op_then_arg
+        then pos + Char.code (Bytes.get code (pos + 1))
+        else pos
+      in
+      (* Add in the fixed length from the table
+         (pcre2_find_bracket.c:142-144). *)
+      (loop [@tailcall]) (pos + Opcodes.op_lengths.(c))
+  in
+  loop pos
 
 (* ---------- Check for asserted fixed first code unit ---------- *)
 
@@ -4618,7 +5079,8 @@ and recurse_or_backref_length ~(group : int) ~(offset : int) (pptr : int ref)
     match r with
     | None -> false
     | Some rc ->
-        if Int.equal rc.groupptr !gptr then true else (find_mutual [@tailcall]) rc.prev
+        if Int.equal rc.groupptr !gptr then true
+        else (find_mutual [@tailcall]) rc.prev
   in
   if find_mutual recurses then isnotfixed () (* Mutual recursion *);
   let this_recurse = { prev = recurses; groupptr = !gptr } in
@@ -5371,13 +5833,58 @@ let pcre2_compile ?(ccontext : compile_context = default_compile_context)
     else Bytes.set re.code !code (Char.chr Opcodes.op_end);
 
     (* pcre2_compile.c:10727-10784 — scan the pattern for recursion/
-       subroutine calls and convert the group numbers into offsets
-       (find_recurse / PRIV(find_bracket), ERR53). DEFERRED (M5,
-       docs/ocaml-engine/05-conditionals-recursion.md): parse_regex defers
-       every recursion construct, so cb.had_recurse cannot be true yet;
-       fail loudly rather than silently emitting unfixed offsets. *)
-    if Int.equal !errorcode 0 && cb.had_recurse then
-      errorcode := Parse.err_deferred;
+       subroutine calls and convert the group numbers into offsets.
+       Maintain a small cache so that repeated groups containing
+       recursions are efficiently handled. RSCAN_CACHE_SIZE = 8
+       (pcre2_compile.c:10731). The C's rcode/rgroup/search_from pointers
+       become offsets into re.code, with -1 for NULL; codestart is offset
+       0; the recurse_cache struct array becomes two int arrays. *)
+    (if Int.equal !errorcode 0 && cb.had_recurse then
+       let rscan_cache_size = 8 in
+       let ccount = ref 0 in
+       let start = ref rscan_cache_size in
+       let rc_groupnumber = Array.make rscan_cache_size 0 in
+       let rc_group = Array.make rscan_cache_size 0 in
+       let rcode = ref (find_recurse re.code 0 ~utf) in
+       let broke = ref false in
+       while (not !broke) && not (Int.equal !rcode (-1)) do
+         let groupnumber = get re.code (!rcode + 1) in
+         let rgroup = ref 0 (* groupnumber == 0 => rgroup = codestart *) in
+         if not (Int.equal groupnumber 0) then (
+           let search_from = ref 0 in
+           rgroup := -1;
+           (let i = ref 0 in
+            let p = ref !start in
+            let cache_hit = ref false in
+            while (not !cache_hit) && !i < !ccount do
+              if Int.equal groupnumber rc_groupnumber.(!p) then (
+                rgroup := rc_group.(!p);
+                cache_hit := true)
+              else (
+                (* pcre2_compile.c:10760-10764 — group n+1 must always
+                   start to the right of group n, so we can save search
+                   time below when the new group number is greater than
+                   any of the previously found groups. *)
+                if groupnumber > rc_groupnumber.(!p) then
+                  search_from := rc_group.(!p);
+                incr i;
+                p := (!p + 1) land 7)
+            done);
+           if Int.equal !rgroup (-1) then (
+             rgroup := find_bracket re.code !search_from ~utf groupnumber;
+             if Int.equal !rgroup (-1) then (
+               errorcode := Errors.err53;
+               broke := true)
+             else (
+               decr start;
+               if !start < 0 then start := rscan_cache_size - 1;
+               rc_groupnumber.(!start) <- groupnumber;
+               rc_group.(!start) <- !rgroup;
+               if !ccount < rscan_cache_size then incr ccount)));
+         if not !broke then (
+           put re.code (!rcode + 1) !rgroup;
+           rcode := find_recurse re.code (!rcode + 1 + Limits.link_size) ~utf)
+       done);
 
     (* pcre2_compile.c:10794-10805 — unless PCRE2_NO_AUTO_POSSESS, check
        whether any single character iterators can be auto-possessified
@@ -7580,3 +8087,267 @@ let () =
   assert (Int.equal (get2 re.code 7) 2);
   assert (Int.equal (get2 re.code 9) 5);
   assert (Int.equal re.max_lookbehind 5)
+
+(* Conditional groups and recursion (M4 compile chunks,
+   pcre2_compile.c:6590-6745, 6861-6913, 8061-8087, 8905-9049,
+   10727-10784 and pcre2_find_bracket.c,
+   docs/ocaml-engine/05-conditionals-recursion.md): bytecode and error
+   numbers/offsets pinned with `pcre2test -q` + fullbincode/-I on the real
+   10.44 library. *)
+let () =
+  let ok ?(options = 0) pat =
+    match pcre2_compile pat ~options with
+    | Ok re -> re
+    | Error (e, o) ->
+        failwith
+          (Printf.sprintf "pcre2_compile %S: error %d at offset %d" pat e o)
+  in
+  let expect_err pat options e o =
+    match pcre2_compile pat ~options with
+    | Ok _ -> assert false
+    | Error (e', o') ->
+        assert (Int.equal e e');
+        assert (Int.equal o o')
+  in
+  let assert_code (re : re) (expected : int list) =
+    assert (Int.equal (Bytes.length re.code) (List.length expected));
+    List.iteri
+      (fun i v -> assert (Int.equal (Char.code (Bytes.get re.code i)) v))
+      expected
+  in
+  let byte (re : re) i = Char.code (Bytes.get re.code i) in
+  (* /(?(1)a|b)(x)/: [COND 8][CREF 1] a [ALT 5] b [KET 13][CBRA 1] x. *)
+  let re = ok "(?(1)a|b)(x)" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      29;
+      Opcodes.op_cond;
+      0;
+      8;
+      Opcodes.op_cref;
+      0;
+      1;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_alt;
+      0;
+      5;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_ket;
+      0;
+      13;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x78;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_ket;
+      0;
+      29;
+      Opcodes.op_end;
+    ];
+  assert (Int.equal re.top_backref 1);
+  (* A named condition on a non-duplicated name compiles identically
+     (OP_CREF with the group number). *)
+  let re = ok "(?(<n>)a|b)(?<n>x)" in
+  assert (Int.equal (byte re 3) Opcodes.op_cond);
+  assert (Int.equal (byte re 6) Opcodes.op_cref);
+  assert (Int.equal (get2 re.code 7) 1);
+  assert (Int.equal re.top_backref 1);
+  (* (?(+1) and (?(-1) relative forms resolve at parse time. *)
+  let re = ok "(?(+1)a|b)(x)" in
+  assert (Int.equal (byte re 6) Opcodes.op_cref);
+  assert (Int.equal (get2 re.code 7) 1);
+  (* /(?(R)a|b)/: overall recursion test = OP_RREF with RREF_ANY. *)
+  let re = ok "(?(R)a|b)" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      19;
+      Opcodes.op_cond;
+      0;
+      8;
+      Opcodes.op_rref;
+      0xff;
+      0xff;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_alt;
+      0;
+      5;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_ket;
+      0;
+      13;
+      Opcodes.op_ket;
+      0;
+      19;
+      Opcodes.op_end;
+    ];
+  (* (?(R2) with group 2 defined: OP_RREF 2; (?(R&name): OP_RREF with the
+     named group's number, which also updates Max back reference. *)
+  let re = ok "(?(R2)a|b)(x)(y)" in
+  assert (Int.equal (byte re 6) Opcodes.op_rref);
+  assert (Int.equal (get2 re.code 7) 2);
+  let re = ok "(?(R&f)a|b)(?<f>x)" in
+  assert (Int.equal (byte re 6) Opcodes.op_rref);
+  assert (Int.equal (get2 re.code 7) 1);
+  assert (Int.equal re.top_backref 1);
+  (* Duplicate names: (?(d) = OP_DNCREF, (?(R&d) = OP_DNRREF, both with
+     name-table index 0 and count 2 (pcre2test: "Cond ref <d>2" /
+     "Cond recurse <d>2"). *)
+  let re = ok "(?J)(?<d>a)(?<d>b)(?(d)c)" in
+  assert (Int.equal (byte re 23) Opcodes.op_cond);
+  assert (Int.equal (byte re 26) Opcodes.op_dncref);
+  assert (Int.equal (get2 re.code 27) 0 (* index *));
+  assert (Int.equal (get2 re.code 29) 2 (* count *));
+  let re = ok "(?J)(?<d>a)(?<d>b)(?(R&d)c)" in
+  assert (Int.equal (byte re 26) Opcodes.op_dnrref);
+  assert (Int.equal (get2 re.code 27) 0);
+  assert (Int.equal (get2 re.code 29) 2);
+  (* /(?(DEFINE)(?<f>x))(?&f)/: OP_DEFINE is rewritten to OP_FALSE; the
+     named subroutine call becomes OP_RECURSE with the offset of CBra 1
+     (7) after the driver fixup pass. *)
+  let re = ok "(?(DEFINE)(?<f>x))(?&f)" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      23;
+      Opcodes.op_cond;
+      0;
+      14;
+      Opcodes.op_false;
+      Opcodes.op_cbra;
+      0;
+      7;
+      0;
+      1;
+      Opcodes.op_char;
+      0x78;
+      Opcodes.op_ket;
+      0;
+      7;
+      Opcodes.op_ket;
+      0;
+      14;
+      Opcodes.op_recurse;
+      0;
+      7;
+      Opcodes.op_ket;
+      0;
+      23;
+      Opcodes.op_end;
+    ];
+  (* Repeating a DEFINE group is pointless but allowed; the repeat is
+     ignored (pcre2_compile.c:7450-7456 reads the OP_FALSE written
+     above). *)
+  let re = ok "(?(DEFINE)a)*b" in
+  assert (Int.equal (byte re 3) Opcodes.op_cond);
+  assert (Int.equal (byte re 6) Opcodes.op_false);
+  assert (Int.equal (byte re 12) Opcodes.op_char);
+  assert (Int.equal (byte re 17) Opcodes.op_end);
+  (* VERSION conditions compile to OP_TRUE / OP_FALSE against 10.44. *)
+  let re = ok "(?(VERSION>=10.4)yes|no)" in
+  assert (Int.equal (byte re 6) Opcodes.op_true);
+  let re = ok "(?(VERSION=10.44)yes|no)" in
+  assert (Int.equal (byte re 6) Opcodes.op_true);
+  let re = ok "(?(VERSION>=10.45)yes|no)" in
+  assert (Int.equal (byte re 6) Opcodes.op_false);
+  let re = ok "(?(VERSION=10.4)yes|no)" in
+  assert (Int.equal (byte re 6) Opcodes.op_false);
+  (* /(?(?=x)a|b)/: assertion condition — no condition opcode
+     (skipunits = 0); the assertion is the first item in the group. *)
+  let re = ok "(?(?=x)a|b)" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      24;
+      Opcodes.op_cond;
+      0;
+      13;
+      Opcodes.op_assert;
+      0;
+      5;
+      Opcodes.op_char;
+      0x78;
+      Opcodes.op_ket;
+      0;
+      5;
+      Opcodes.op_char;
+      0x61;
+      Opcodes.op_alt;
+      0;
+      5;
+      Opcodes.op_char;
+      0x62;
+      Opcodes.op_ket;
+      0;
+      18;
+      Opcodes.op_ket;
+      0;
+      24;
+      Opcodes.op_end;
+    ];
+  (* /(?R)/: whole-pattern recursion — OP_RECURSE with offset 0. *)
+  let re = ok "(?R)" in
+  assert_code re
+    [
+      Opcodes.op_bra;
+      0;
+      6;
+      Opcodes.op_recurse;
+      0;
+      0;
+      Opcodes.op_ket;
+      0;
+      6;
+      Opcodes.op_end;
+    ];
+  (* Backward and forward numerical subroutine calls: the fixup pass
+     replaces group numbers with offsets. *)
+  let re = ok "a(x)(?1)b" in
+  assert (Int.equal (byte re 15) Opcodes.op_recurse);
+  assert (Int.equal (get re.code 16) 5 (* offset of CBra 1 *));
+  let re = ok "(?+1)(x)" in
+  assert (Int.equal (byte re 3) Opcodes.op_recurse);
+  assert (Int.equal (get re.code 4) 6 (* forward reference to CBra 1 *));
+  (* Repeated recursions to the same group exercise the fixup cache. *)
+  let re = ok "(?2)(?2)(x)(y)" in
+  assert (Int.equal (byte re 3) Opcodes.op_recurse);
+  assert (Int.equal (get re.code 4) 19);
+  assert (Int.equal (byte re 6) Opcodes.op_recurse);
+  assert (Int.equal (get re.code 7) 19);
+  (* Named recursion resolves to the first group with the name. *)
+  let re = ok "(?&f)(?<f>x)" in
+  assert (Int.equal (byte re 3) Opcodes.op_recurse);
+  assert (Int.equal (get re.code 4) 6);
+  (* Error numbers and offsets. ERR27 for an assertion condition reports
+     the offset stored by the last GETPLUSOFFSET (the C's function-level
+     `offset`, stale for META_COND_ASSERT). *)
+  expect_err "(?(1)a|b|c)(x)" 0 Errors.err27 0;
+  expect_err "(?<n>x)\\k<n>(?(?=y)a|b|c)" 0 Errors.err27 10;
+  expect_err "(?(DEFINE)a|b)" 0 Errors.err54 3;
+  expect_err "(?(x)a|b)" 0 Errors.err15 3;
+  expect_err "(?(R&x)a|b)" 0 Errors.err15 5;
+  expect_err "(?(R12)a|b)" 0 Errors.err15 3;
+  expect_err "(?(R999999999999)a|b)" 0 Errors.err61 8;
+  expect_err "(?(1)a|b)" 0 Errors.err15 2;
+  expect_err "(?(1 )a|b)" 0 Errors.err24 4;
+  expect_err "(?(0)a|b)" 0 Errors.err15 4;
+  expect_err "a(?1)b" 0 Errors.err15 4;
+  expect_err "(?-1)(x)" 0 Errors.err15 4;
+  expect_err "(?R" 0 Errors.err58 3;
+  expect_err "(?+)" 0 Errors.err29 2;
+  expect_err "(?(?z)a)" 0 Errors.err28 2

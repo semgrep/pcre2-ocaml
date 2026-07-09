@@ -11,15 +11,18 @@ recursion sections.
 
 ## Chunks
 
-- [ ] parse: `(?(...)` condition forms → META_COND_* (NUMBER/NAME/RNUMBER/DEFINE/VERSION/
+- [x] parse: `(?(...)` condition forms → META_COND_* (NUMBER/NAME/RNUMBER/DEFINE/VERSION/
   assertion), `(?n)/(?&name)/(?+n)` → META_RECURSE (pcre2_compile.c: parse_regex condition
   + recursion arms within 4400-5530)
-- [ ] compile: OP_COND/OP_SCOND emission — group-number and name conditions (OP_CREF/
+- [x] compile: OP_COND/OP_SCOND emission — group-number and name conditions (OP_CREF/
   OP_DNCREF), OP_RREF/OP_DNRREF, OP_FALSE/OP_TRUE for DEFINE/VERSION, assertion-condition
   wiring (pcre2_compile.c: compile_branch conditional arms within 6812-8370)
-- [ ] compile: OP_RECURSE emission + forward-recursion fixups, must-be-closed checks,
+- [x] compile: OP_RECURSE emission + forward-recursion fixups, must-be-closed checks,
   ERR15/ERR29/ERR40 paths (pcre2_compile.c: recursion arms 8050-8370 + driver fixup pass
-  in 10126-11001)
+  in 10126-11001) — note: ERR40 is the verb-name arm's error (pcre2_compile.c:3034),
+  which rides the M5 verbs chunk; the quantified-recursion repeat case
+  (pcre2_compile.c:7354-7422, OP_RECURSE in the repeat arm) still defers loudly and
+  belongs with the match-side recursion chunk
 - [ ] match: OP_COND/OP_SCOND — condition evaluation incl. assertion conditions
   (pcre2_match.c: OP_COND arms within 5511-5900)
 - [ ] match: OP_RECURSE — recursion frame push/pop, ovector save/restore semantics, capture
