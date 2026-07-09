@@ -1,0 +1,29 @@
+# Proves the published `pcre2` package is pure OCaml: builds on a bare runner
+# with NO libpcre2 installed and no dune-configurator, via plain opam.
+name: build-pure
+
+on:
+  push:
+    branches: [develop, "austin/pcre-ocaml-rewrite"]
+  pull_request:
+
+jobs:
+  build-pure:
+    strategy:
+      fail-fast: false
+      matrix:
+        ocaml-compiler: ["4.14", "5.2"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ matrix.ocaml-compiler }}
+      - name: Install pcre2 package deps only (no C libraries)
+        run: opam install . --deps-only --with-test --ignore-pin-depends
+      - name: Build the published package
+        run: opam exec -- dune build -p pcre2
+      # NOTE: the pure OUnit suite lives on @pure-tests and is re-enabled at
+      # gate G1 (docs/ocaml-engine/02-core-compile-match.md). Until then the
+      # engine skeleton intentionally fails every compile.
+      # - run: opam exec -- dune build @pure-tests

@@ -1,0 +1,28 @@
+# Conformance + differential jobs: everything that needs the dev shell
+# (OCaml 4.14.2 + the C oracle pinned at PCRE2 10.44 by flake.nix).
+name: conformance
+
+on:
+  push:
+    branches: [develop, "austin/pcre-ocaml-rewrite"]
+  pull_request:
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v14
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - name: Build everything (pure lib, engine, oracle, harness, runner)
+        run: nix develop -c dune build @all
+      - name: Generated tables in sync with vendored sources
+        run: nix develop -c dune build @gen-check
+      - name: OUnit suites (oracle + harness unit tests)
+        run: nix develop -c dune runtest --force
+      - name: Conformance vs baselines (regressions or stale skips fail)
+        run: nix develop -c dune exec test/conformance/runner.exe
+      # Differential fuzz smoke lands with the fuzzer (per-milestone feature
+      # masks; see docs/ocaml-engine plan docs):
+      # - run: nix develop -c dune exec fuzz/fuzz_diff.exe -- --cases 10000
+      # Bench gate (geomean <= 2.0 vs oracle) is a nightly job from M9 on.

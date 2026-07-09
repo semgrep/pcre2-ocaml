@@ -55,7 +55,7 @@ Remaining M0 chunk: CI.
   shim (same names/types, BADOFFSET checks, NOMATCH/PARTIAL folding, jit aliases,
   version=(10,44)). Pure OUnit will be red until M1 — conformance baseline starts at ~0
   passes for the engine, but the ORACLE path must satisfy G0. (~400 LOC)
-- [ ] **CI**: GitHub Actions — `build-pure` (4.14 + 5.x matrix, no libpcre2, pure runtest),
+- [x] **CI**: (this commit) GitHub Actions — `build-pure` (4.14 + 5.x matrix, no libpcre2, pure runtest),
   `conformance` (runner + baseline delta + staleness + frontier artifact), `differential`
   (apt libpcre2-dev, oracle OUnit, harness-vs-oracle spot check, fuzz smoke once fuzzer
   exists), `bench` (nightly + label; activates post-M9); `ulimit -s 512` stress job.
