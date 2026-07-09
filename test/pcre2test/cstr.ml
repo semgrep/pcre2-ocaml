@@ -6,25 +6,25 @@
    with a non-"C" LC_CTYPE except for the out-of-scope locale modifier). *)
 
 let at ?limit s i =
-  let n = match limit with Some l -> min l (String.length s) | None -> String.length s in
+  let n =
+    match limit with
+    | Some l -> min l (String.length s)
+    | None -> String.length s
+  in
   if i < 0 || i >= n then '\000' else s.[i]
 
 let isspace c =
   match c with ' ' | '\t' | '\n' | '\011' | '\012' | '\r' -> true | _ -> false
 
 let isdigit c = c >= '0' && c <= '9'
-
-let isxdigit c =
-  isdigit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
-
-let isalnum c =
-  isdigit c || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-
+let isxdigit c = isdigit c || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+let isalnum c = isdigit c || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 let tolower c = if c >= 'A' && c <= 'Z' then Char.chr (Char.code c + 32) else c
 
 let hexval c =
   let c = tolower c in
-  if isdigit c then Char.code c - Char.code '0' else Char.code c - Char.code 'a' + 10
+  if isdigit c then Char.code c - Char.code '0'
+  else Char.code c - Char.code 'a' + 10
 
 (* Case-independent comparison like pcre2test's strncmpic (pcre2test.c). *)
 let strncmpic s i t n =

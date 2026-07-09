@@ -119,7 +119,7 @@ let show_controls ~control ~control2 before =
   Buffer.add_string b before;
   List.iter
     (fun (c1, c2, name) ->
-      if (control land c1) lor (control2 land c2) <> 0 then (
+      if control land c1 lor (control2 land c2) <> 0 then (
         Buffer.add_char b ' ';
         Buffer.add_string b name))
     control_names;

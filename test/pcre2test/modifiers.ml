@@ -251,11 +251,10 @@ let check_modifier (m : entry) ~ctx ~(pctl : Ctl.patctl option)
   if
     restrict_perl
     && not (match m.which with PNDP | PATP | DATP | PDP -> true | _ -> false)
-  then begin
+  then (
     emit
       (Printf.sprintf "** '%s' is not allowed in a Perl-compatible test" m.name);
-    None
-  end
+    None)
   else
     match m.which with
     | CTC -> (
@@ -342,18 +341,17 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
         incr p
       done;
       if at !p = '\000' then continue_scan := false
-      else begin
+      else
         (* Find the end of the item; lose trailing whitespace at end of line. *)
         let ep = ref !p in
         while at !ep <> '\000' && at !ep <> ',' do
           incr ep
         done;
-        if at !ep = '\000' then begin
+        if at !ep = '\000' then (
           while !ep > !p && Cstr.isspace (Cstr.at s (!ep - 1)) do
             decr ep
           done;
-          limit := !ep (* the C writes *ep = 0 *)
-        end;
+          limit := !ep (* the C writes *ep = 0 *));
         let off = at !p = '-' in
         if off then incr p;
         (* Length of a full-length modifier name. *)
@@ -365,12 +363,11 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
         | None ->
             (* Single-character abbreviated modifiers (first item only);
                pcre2test.c:3813-3878. *)
-            if not !first then begin
+            if not !first then (
               emit (Printf.sprintf "** Unrecognized modifier '%s'" (sub !p !ep));
               if !ep - !p = 1 then
                 emit "** Single-character modifiers must come first";
-              raise Fail
-            end;
+              raise Fail);
             let mp = !p in
             while at !p <> ',' && at !p <> '\n' && at !p <> '\000' do
               let cc = at !p in
@@ -426,24 +423,22 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
               | IndT _ -> at !pp = '='
               | _ -> true
             in
-            if needs_data then begin
-              if at !pp <> '=' then begin
+            if needs_data then (
+              if at !pp <> '=' then (
                 emit (Printf.sprintf "** '=' expected after '%s'" m.name);
-                raise Fail
-              end;
+                raise Fail);
               incr pp;
-              if off then begin
+              if off then (
                 emit (Printf.sprintf "** '-' is not valid for '%s'" m.name);
-                raise Fail
-              end
-            end
+                raise Fail))
             else if
-              at !pp <> ',' && at !pp <> '\n' && at !pp <> ' '
+              at !pp <> ','
+              && at !pp <> '\n'
+              && at !pp <> ' '
               && at !pp <> '\000'
-            then begin
+            then (
               emit (Printf.sprintf "** Unrecognized modifier '%s'" (sub !p !ep));
-              raise Fail
-            end;
+              raise Fail);
             let len = !ep - !pp in
             match
               check_modifier m ~ctx ~pctl ~dctl ~restrict_perl ~emit
@@ -477,13 +472,13 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
                     | _ -> apply_bit target m.mtype ~off)
                 | BsrT ->
                     (* pcre2test.c:3936-3962 *)
-                    (if len = 7 && Cstr.strncmpic s !pp "default" 7 then (
+                    (if len = 7 && Cstr.strncmpic s !pp "default" 7 then
                        match target with
                        | Tpctx pc ->
                            pc.Ctl.ctx_bsr <- 0;
                            pc.Ctl.control2 <-
                              pc.Ctl.control2 land lnot Ctl.ctl2_bsr_set
-                       | _ -> ())
+                       | _ -> ()
                      else
                        let v =
                          if len = 7 && Cstr.strncmpic s !pp "anycrlf" 7 then
@@ -517,15 +512,13 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
                     if !found < 0 then invalid_value ();
                     (match target with
                     | Tpctx pc ->
-                        if !found = 0 then begin
+                        if !found = 0 then (
                           pc.Ctl.ctx_newline <- 0;
                           pc.Ctl.control2 <-
-                            pc.Ctl.control2 land lnot Ctl.ctl2_nl_set
-                        end
-                        else begin
+                            pc.Ctl.control2 land lnot Ctl.ctl2_nl_set)
+                        else (
                           pc.Ctl.ctx_newline <- !found;
-                          pc.Ctl.control2 <- pc.Ctl.control2 lor Ctl.ctl2_nl_set
-                        end
+                          pc.Ctl.control2 <- pc.Ctl.control2 lor Ctl.ctl2_nl_set)
                     | _ -> ());
                     pp := !ep
                 | ChrT ->
@@ -540,15 +533,15 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
                     if not (Cstr.isdigit (at !pp)) then invalid_value ();
                     match parse_u32 at !pp with
                     | None -> invalid_value ()
-                    | Some (_, j) -> (
+                    | Some (_, j) ->
                         note_skip ();
                         if at j = ':' then
                           match parse_u32 at (j + 1) with
                           | None -> invalid_value ()
                           | Some (_, j2) -> pp := j2
-                        else pp := j))
+                        else pp := j)
                 | InsT -> (
-                    if not (Cstr.isdigit (at !pp)) && at !pp <> '-' then
+                    if (not (Cstr.isdigit (at !pp))) && at !pp <> '-' then
                       invalid_value ();
                     match parse_s32 at !pp with
                     | None -> invalid_value ()
@@ -574,7 +567,7 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
                         | Skip, _ -> skip ("modifier:" ^ m.name)
                         | _ -> ());
                         pp := j)
-                | NnT -> (
+                | NnT ->
                     (* pcre2test.c:4048-4098 — number or name, several may
                        occur. *)
                     let too_many () =
@@ -583,7 +576,7 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
                            m.name);
                       raise Fail
                     in
-                    if Cstr.isdigit (at !pp) || at !pp = '-' then
+                    if Cstr.isdigit (at !pp) || at !pp = '-' then (
                       match parse_s32 at !pp with
                       | None -> invalid_value ()
                       | Some (v, j) ->
@@ -598,30 +591,29 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
                               if v < 0 then d.Ctl.get_numbers <- []
                               else if List.length d.Ctl.get_numbers >= 9 then
                                 too_many ()
-                              else d.Ctl.get_numbers <- d.Ctl.get_numbers @ [ v ]
+                              else
+                                d.Ctl.get_numbers <- d.Ctl.get_numbers @ [ v ]
                           | _ -> ());
-                          pp := j
-                    else begin
+                          pp := j)
+                    else
                       let nm = sub !pp !ep in
-                      if String.length nm > 128 then begin
+                      if String.length nm > 128 then (
                         emit
                           (Printf.sprintf "** Group name in '%s' is too long"
                              m.name);
-                        raise Fail
-                      end;
+                        raise Fail);
                       let check_room names =
                         let used =
                           List.fold_left
                             (fun a x -> a + String.length x + 1)
                             0 names
                         in
-                        if used + String.length nm + 2 > 64 then begin
+                        if used + String.length nm + 2 > 64 then (
                           emit
                             (Printf.sprintf
                                "** Too many characters in named '%s' modifiers"
                                m.name);
-                          raise Fail
-                        end
+                          raise Fail)
                       in
                       (match (m.act, target) with
                       | Nn_copy, Tdat d ->
@@ -632,30 +624,28 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
                           d.Ctl.get_names <- d.Ctl.get_names @ [ nm ]
                       | _ -> ());
                       pp := !ep
-                    end)
                 | StrT maxsz ->
-                    if len + 1 > maxsz then begin
+                    if len + 1 > maxsz then (
                       emit
                         (Printf.sprintf
                            "** Overlong value for '%s' (max %d code units)"
                            m.name (maxsz - 1));
-                      raise Fail
-                    end;
+                      raise Fail);
                     note_skip ();
                     pp := !ep);
                 (* pcre2test.c:4101-4109 *)
                 if
-                  at !pp <> ',' && at !pp <> '\n' && at !pp <> ' '
+                  at !pp <> ','
+                  && at !pp <> '\n'
+                  && at !pp <> ' '
                   && at !pp <> '\000'
-                then begin
+                then (
                   emit
                     (Printf.sprintf "** Comma expected after modifier item '%s'"
                        m.name);
-                  raise Fail
-                end;
+                  raise Fail);
                 p := !pp;
                 first := false)
-      end
     done;
     true
   with Fail -> false

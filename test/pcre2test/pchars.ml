@@ -13,28 +13,34 @@ let utf82ord ?limit s pos =
   let c = byte pos in
   let i =
     (* number of additional bytes: count leading 1 bits - 1 *)
-    let rec count d k = if k >= 6 then 6 else if d land 0x80 = 0 then k else count (d lsl 1) (k + 1) in
+    let rec count d k =
+      if k >= 6 then 6
+      else if d land 0x80 = 0 then k
+      else count (d lsl 1) (k + 1)
+    in
     count c (-1)
   in
   if i = -1 then (1, c)
   else if i = 0 || i = 6 then (0, 0) (* invalid UTF-8 *)
-  else begin
-    let lim = match limit with Some l -> min l (String.length s) | None -> String.length s in
+  else
+    let lim =
+      match limit with
+      | Some l -> min l (String.length s)
+      | None -> String.length s
+    in
     let s6 = 6 * i in
     let mask = [| 0xff; 0x1f; 0x0f; 0x07; 0x03; 0x01 |].(i) in
     let d = ref ((c land mask) lsl s6) in
     let rc = ref (i + 1) in
     (try
        for j = 0 to i - 1 do
-         if pos + 1 + j >= lim then begin
+         if pos + 1 + j >= lim then (
            rc := 0;
-           raise Exit
-         end;
+           raise Exit);
          let cc = byte (pos + 1 + j) in
-         if cc land 0xc0 <> 0x80 then begin
+         if cc land 0xc0 <> 0x80 then (
            rc := -(j + 1);
-           raise Exit
-         end;
+           raise Exit);
          d := !d lor ((cc land 0x3f) lsl (s6 - 6 - (6 * j)))
        done;
        (* check unique encoding *)
@@ -45,12 +51,11 @@ let utf82ord ?limit s pos =
        if !j <> i then rc := -(i + 1)
      with Exit -> ());
     if !rc > 0 then (!rc, !d) else (!rc, 0)
-  end
 
 (* pcre2test.c:3185-3217 ord2utf8 *)
 let ord2utf8 c =
   if c > 0x7fffffff then invalid_arg "ord2utf8"
-  else begin
+  else
     let i = ref 0 in
     while c > utf8_table1.(!i) do
       incr i
@@ -65,31 +70,26 @@ let ord2utf8 c =
     let table2 = [| 0; 0xc0; 0xe0; 0xf0; 0xf8; 0xfc |] in
     Bytes.set b 0 (Char.chr (table2.(n) lor !v));
     Bytes.to_string b
-  end
 
 (* pcre2test.c:249-254 PRINTABLE/PRINTOK (non-EBCDIC, no locale tables) *)
 let printok c = c >= 32 && c < 127
 
 (* pcre2test.c:3021-3051 pchar. Appends to [b], returns chars written. *)
 let pchar b c ~utf =
-  if printok c then begin
+  if printok c then (
     Buffer.add_char b (Char.chr c);
-    1
-  end
+    1)
   else if c < 0x100 then
-    if utf then begin
+    if utf then (
       Buffer.add_string b (Printf.sprintf "\\x{%02x}" c);
-      6
-    end
-    else begin
+      6)
+    else (
       Buffer.add_string b (Printf.sprintf "\\x%02x" c);
-      4
-    end
-  else begin
+      4)
+  else
     let t = Printf.sprintf "\\x{%02x}" c in
     Buffer.add_string b t;
     String.length t
-  end
 
 (* pcre2test.c:3094-3119 pchars8. Renders [len] bytes of [s] from [pos];
    in UTF mode decodes UTF-8 sequences that fit within the range. Returns
@@ -103,14 +103,12 @@ let pchars ~utf s pos len =
   while !remaining > 0 do
     let consumed = ref 1 in
     let c = ref (Char.code (Cstr.at s !p)) in
-    if utf then begin
-      let rc, v = utf82ord ~limit:endpos s !p in
-      (* pcre2test.c:3106 — mustn't run over the end *)
-      if rc > 0 && rc <= !remaining then begin
-        consumed := rc;
-        c := v
-      end
-    end;
+    (if utf then
+       let rc, v = utf82ord ~limit:endpos s !p in
+       (* pcre2test.c:3106 — mustn't run over the end *)
+       if rc > 0 && rc <= !remaining then (
+         consumed := rc;
+         c := v));
     p := !p + !consumed;
     remaining := !remaining - !consumed;
     yield := !yield + pchar b !c ~utf

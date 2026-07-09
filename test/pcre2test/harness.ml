@@ -61,7 +61,6 @@ module Make (D : Driver.S) = struct
 
   (* Unit-skip accessors used by the conformance runner. *)
   let reset_unit_skips t = t.unit_skips <- []
-
   let unit_skips t = List.rev t.default_skips @ List.rev t.unit_skips
 
   let build_default_newline t =
@@ -110,19 +109,18 @@ module Make (D : Driver.S) = struct
        switch; for unknown commands the C's cmdname is the last list entry. *)
     if
       t.restrict_perl
-      && not (match cmd with Some ("pattern" | "subject") -> true | _ -> false)
-    then begin
+      && not
+           (match cmd with Some ("pattern" | "subject") -> true | _ -> false)
+    then (
       emit t
         (Printf.sprintf "** #%s is not allowed after #perltest"
            (match cmd with Some c -> c | None -> "subject"));
       emit t "** pcre2test run abandoned";
-      t.aborted <- true
-    end
+      t.aborted <- true)
     else
       match cmd with
       | None -> emit t ("** Unknown command: " ^ chomp line)
-      | Some "forbid_utf" ->
-          t.forbid_utf <- Flags.never_utf lor Flags.never_ucp
+      | Some "forbid_utf" -> t.forbid_utf <- Flags.never_utf lor Flags.never_ucp
       | Some "perltest" -> t.restrict_perl <- true
       | Some "pattern" ->
           (* argptr = buffer + cmdlen + 1 (pcre2test.c:5024) *)
@@ -149,25 +147,23 @@ module Make (D : Driver.S) = struct
           while not !fin do
             argp := Cstr.skip_space line !argp;
             if Cstr.at line !argp = '\000' then fin := true
-            else begin
+            else (
               for i = 1 to Array.length Flags.newline_names - 1 do
                 let nm = Flags.newline_names.(i) in
                 let nlen = String.length nm in
                 if
                   Cstr.strncmpic line !argp nm nlen
                   && Cstr.isspace (Cstr.at line (!argp + nlen))
-                then begin
+                then (
                   if i = build_default_newline t then default_ok := true;
-                  if !first_listed = 0 then first_listed := i
-                end
+                  if !first_listed = 0 then first_listed := i)
               done;
               while
                 Cstr.at line !argp <> '\000'
                 && not (Cstr.isspace (Cstr.at line !argp))
               do
                 incr argp
-              done
-            end
+              done)
           done;
           if not !default_ok then t.local_newline_default <- !first_listed
       | Some other ->
@@ -210,63 +206,53 @@ module Make (D : Driver.S) = struct
     let ok = ref true in
     while !ok && at !pp <> '\000' do
       if Cstr.isspace (at !pp) then incr pp
-      else begin
+      else
         let c = at !pp in
         incr pp;
-        if c = '\'' || c = '"' then begin
+        if c = '\'' || c = '"' then
           (* literal substring *)
           let pq = !pp in
           let fin = ref false in
           while not !fin do
             let d = at !pp in
-            if d = '\000' then begin
+            if d = '\000' then (
               emit t
                 (Printf.sprintf
                    "** Missing closing quote in hex pattern: opening quote is \
                     at offset %d."
                    (pq - 1));
               ok := false;
-              fin := true
-            end
-            else if d = c then begin
+              fin := true)
+            else if d = c then (
               incr pp;
-              fin := true
-            end
-            else begin
+              fin := true)
+            else (
               Buffer.add_char out d;
-              incr pp
-            end
+              incr pp)
           done
-        end
-        else if not (Cstr.isxdigit c) then begin
+        else if not (Cstr.isxdigit c) then (
           emit t
             (Printf.sprintf
                "** Unexpected non-hex-digit '%c' at offset %d in hex pattern: \
                 quote missing?"
                c (!pp - 1));
-          ok := false
-        end
-        else if at !pp = '\000' then begin
+          ok := false)
+        else if at !pp = '\000' then (
           emit t "** Odd number of digits in hex pattern";
-          ok := false
-        end
-        else begin
+          ok := false)
+        else
           let d = at !pp in
-          if not (Cstr.isxdigit d) then begin
+          if not (Cstr.isxdigit d) then (
             emit t
               (Printf.sprintf
                  "** Unexpected non-hex-digit '%c' at offset %d in hex \
                   pattern: quote missing?"
                  d !pp);
-            ok := false
-          end
-          else begin
+            ok := false)
+          else (
             Buffer.add_char out
               (Char.chr ((Cstr.hexval c * 16) + Cstr.hexval d));
-            incr pp
-          end
-        end
-      end
+            incr pp)
     done;
     if !ok then Some (Buffer.contents out) else None
 
@@ -281,11 +267,11 @@ module Make (D : Driver.S) = struct
       let pc = ref !pp in
       let count = ref 1 in
       let length = ref 1 in
-      if at !pp = '\\' && at (!pp + 1) = '[' then begin
-        let pe = ref (!pp + 2) in
-        (try
+      (if at !pp = '\\' && at (!pp + 1) = '[' then
+         let pe = ref (!pp + 2) in
+         try
            while at !pe <> '\000' do
-             if at !pe = ']' && at (!pe + 1) = '{' then begin
+             if at !pe = ']' && at (!pe + 1) = '{' then
                let clen = !pe - !pc - 2 in
                let pe2 = !pe + 2 in
                match Modifiers.parse_u32 at pe2 with
@@ -294,33 +280,28 @@ module Make (D : Driver.S) = struct
                    ok := false;
                    raise Exit
                | Some (i, j) ->
-                   if at j = '}' then begin
-                     if i = 0 then begin
+                   if at j = '}' then (
+                     if i = 0 then (
                        emit t "** Zero repeat not allowed";
                        ok := false;
-                       raise Exit
-                     end;
+                       raise Exit);
                      pc := !pc + 2;
                      count := i;
                      length := clen;
                      pp := j;
-                     raise Exit
-                   end
+                     raise Exit)
                    else pe := j + 1 (* C continues scanning from endptr *)
-             end
              else incr pe
            done
-         with Exit -> ())
-      end;
-      if !ok then begin
+         with Exit -> ());
+      if !ok then (
         let chunk =
           if !pc + !length <= n then String.sub src !pc !length else ""
         in
         for _k = 1 to !count do
           Buffer.add_string out chunk
         done;
-        incr pp
-      end
+        incr pp)
     done;
     if !ok then Some (Buffer.contents out) else None
 
@@ -340,18 +321,18 @@ module Make (D : Driver.S) = struct
            ~restrict_perl:t.restrict_perl ~emit:(emit t) ~skip:(note_skip t)
            mods)
     then t.skipping <- true
-    else if pat.Ctl.control land Ctl.ctl_utf8_input <> 0 then begin
+    else if pat.Ctl.control land Ctl.ctl_utf8_input <> 0 then (
       emit t "** The utf8_input modifier is not allowed in 8-bit mode";
-      t.skipping <- true
-    end
-    else begin
+      t.skipping <- true)
+    else
       (* Mutually exclusive pattern controls we track
          (pcre2test.c:832-839, 5366-5376): expand vs hex. *)
       let excl = pat.Ctl.control land (Ctl.ctl_expand lor Ctl.ctl_hexpat) in
-      if excl <> 0 && excl <> excl land (-excl) then begin
-        emit t (Ctl.show_controls ~control:excl ~control2:0 "** Not allowed together:");
-        t.skipping <- true
-      end
+      if excl <> 0 && excl <> excl land -excl then (
+        emit t
+          (Ctl.show_controls ~control:excl ~control2:0
+             "** Not allowed together:");
+        t.skipping <- true)
       else
         let text =
           if pat.Ctl.control land Ctl.ctl_hexpat <> 0 then hex_decode t raw
@@ -366,8 +347,7 @@ module Make (D : Driver.S) = struct
             let nl_ctx =
               if pat.Ctl.control2 land Ctl.ctl2_nl_set <> 0 then
                 pat.Ctl.ctx_newline
-              else if t.local_newline_default <> 0 then
-                t.local_newline_default
+              else if t.local_newline_default <> 0 then t.local_newline_default
               else 0
             in
             (* pcre2test.c:5967-5970 — PCRE2_LITERAL disables forbid_utf *)
@@ -399,22 +379,19 @@ module Make (D : Driver.S) = struct
                       maxcapcount = inf.D.capture_count;
                     };
                 (* pcre2test.c:6094-6104 *)
-                if t.forbid_utf <> 0 && has_bkporx text then begin
+                if t.forbid_utf <> 0 && has_bkporx text then (
                   emit t
                     "** \\P, \\p, and \\X are not allowed after the \
                      #forbid_utf command";
-                  t.skipping <- true
-                end)
-    end
+                  t.skipping <- true))
 
   let start_pattern t line =
-    if t.restrict_perl && line.[0] <> '/' then begin
+    if t.restrict_perl && line.[0] <> '/' then (
       (* pcre2test.c:5287-5292 *)
       emit t "** The only allowed delimiter after #perltest is '/'";
       emit t "** pcre2test run abandoned";
-      t.aborted <- true
-    end
-    else begin
+      t.aborted <- true)
+    else
       let delim = line.[0] in
       match Scan.find_close ~delim line with
       | Some d -> finish_pattern t line d
@@ -422,7 +399,6 @@ module Make (D : Driver.S) = struct
           let buf = Buffer.create 128 in
           Buffer.add_string buf line;
           t.pending <- Some (delim, buf)
-    end
 
   let continue_pattern t delim buf line =
     Buffer.add_string buf line;
@@ -483,8 +459,7 @@ module Make (D : Driver.S) = struct
                 (Printf.sprintf "Copy substring %d failed (%d): %s" n
                    Flags.error_nomemory
                    (errmsg Flags.error_nomemory))
-            else
-              emit t (Printf.sprintf "%2dC %s (%d)" n (text_of n len) len))
+            else emit t (Printf.sprintf "%2dC %s (%d)" n (text_of n len) len))
       dat.Ctl.copy_numbers;
     (* copy by name *)
     List.iter
@@ -524,8 +499,7 @@ module Make (D : Driver.S) = struct
               else " (non-unique)"
             in
             emit t
-              (Printf.sprintf "  C %s (%d) %s%s" (text_of n len) len name
-                 suffix))
+              (Printf.sprintf "  C %s (%d) %s%s" (text_of n len) len name suffix))
       dat.Ctl.copy_names;
     (* get by number *)
     List.iter
@@ -576,16 +550,15 @@ module Make (D : Driver.S) = struct
               else " (non-unique)"
             in
             emit t
-              (Printf.sprintf "  G %s (%d) %s%s" (text_of n len) len name
-                 suffix))
+              (Printf.sprintf "  G %s (%d) %s%s" (text_of n len) len name suffix))
       dat.Ctl.get_names;
     (* getall — pcre2test.c:6787-6812 with pcre2_substring_list_get *)
-    if dat.Ctl.d_control land Ctl.ctl_getall <> 0 then begin
+    if dat.Ctl.d_control land Ctl.ctl_getall <> 0 then
       if md_rc < 0 then
         emit t
           (Printf.sprintf "get substring list failed (%d): %s" md_rc
              (errmsg md_rc))
-      else begin
+      else
         let count = if md_rc = 0 then oveccount else md_rc in
         let show = min capcount count in
         for i = 0 to show - 1 do
@@ -598,8 +571,6 @@ module Make (D : Driver.S) = struct
           in
           emit t (Printf.sprintf "%2dL %s" i txt)
         done
-      end
-    end
 
   (* The global matching loop — pcre2test.c:7761-8443. *)
   let run_match t (cp : compiled) (dat : Ctl.datctl) subject0 =
@@ -629,67 +600,59 @@ module Make (D : Driver.S) = struct
       let rc = if res.D.rc > emu_ovec then 0 else res.D.rc in
       (* advance decision carried to the loop bottom: None = break *)
       let advance = ref None in
-      if rc >= 0 then begin
+      if rc >= 0 then (
         let capcount = ref (if rc = 0 then emu_ovec else rc) in
         if rc = 0 then emit t "Matched, but too many substrings";
         (* pcre2test.c:7958-7980 — repeat-detection for global loops *)
         let skip_print = ref false in
-        if !gmatched > 0 && ovecsave.(0) = ov.(0) && ovecsave.(1) = ov.(1)
-        then begin
-          if ov.(0) = ov.(1) && ovecsave.(2) <> !offset then begin
+        if !gmatched > 0 && ovecsave.(0) = ov.(0) && ovecsave.(1) = ov.(1) then
+          if ov.(0) = ov.(1) && ovecsave.(2) <> !offset then (
             g_notempty := Flags.notempty_atstart lor Flags.anchored;
             ovecsave.(2) <- !offset;
-            skip_print := true (* continue: back to the top of the loop *)
-          end
-          else begin
+            skip_print := true (* continue: back to the top of the loop *))
+          else (
             emit t
               "** PCRE2 error: global repeat returned the same string as \
                previous";
             emit t "** Global loop abandoned";
-            dat.Ctl.d_control <- dat.Ctl.d_control land lnot Ctl.ctl_anyglob
-          end
-        end;
+            dat.Ctl.d_control <- dat.Ctl.d_control land lnot Ctl.ctl_anyglob);
         if !skip_print then advance := Some `Continue
-        else begin
+        else (
           (* pcre2test.c:7986-7991 allcaptures *)
-          if dat.Ctl.d_control land Ctl.ctl_allcaptures <> 0 then begin
+          if dat.Ctl.d_control land Ctl.ctl_allcaptures <> 0 then (
             capcount := cp.maxcapcount + 1;
-            if !capcount > emu_ovec then capcount := emu_ovec
-          end;
+            if !capcount > emu_ovec then capcount := emu_ovec);
           (* pcre2test.c:7999-8126 — output captured substrings *)
           for i = 0 to !capcount - 1 do
             let st0 = if 2 * i < 2 * dpairs then ov.(2 * i) else -1 in
             let en0 = if 2 * i < 2 * dpairs then ov.((2 * i) + 1) else -1 in
             let st, en =
-              if st0 <> -1 && en0 <> -1 && st0 > en0 then begin
+              if st0 <> -1 && en0 <> -1 && st0 > en0 then (
                 emit t
-                  "Start of matched string is beyond its end - displaying \
-                   from end to start.";
-                (en0, st0)
-              end
+                  "Start of matched string is beyond its end - displaying from \
+                   end to start.";
+                (en0, st0))
               else (st0, en0)
             in
             let prefix = Printf.sprintf "%2d: " i in
             if st = -1 && en = -1 then emit t (prefix ^ "<unset>")
-            else begin
+            else
               let line = Buffer.create 64 in
               Buffer.add_string line prefix;
               let caret = ref 0 in
-              (if i = 0 && dat.Ctl.d_control land Ctl.ctl_startchar <> 0 then begin
-                 (* pcre2test.c:8079-8094 startchar display *)
-                 let sc = res.D.startchar in
-                 let lstr, lcnt = Pchars.pchars ~utf !subj sc (st - sc) in
-                 Buffer.add_string line lstr;
-                 Buffer.add_string line
-                   (Pchars.pchars_str ~utf !subj st (en - st));
-                 if sc <> st then caret := lcnt
-               end
-               else
-                 Buffer.add_string line
-                   (Pchars.pchars_str ~utf !subj st (en - st)));
+              if i = 0 && dat.Ctl.d_control land Ctl.ctl_startchar <> 0 then (
+                (* pcre2test.c:8079-8094 startchar display *)
+                let sc = res.D.startchar in
+                let lstr, lcnt = Pchars.pchars ~utf !subj sc (st - sc) in
+                Buffer.add_string line lstr;
+                Buffer.add_string line
+                  (Pchars.pchars_str ~utf !subj st (en - st));
+                if sc <> st then caret := lcnt)
+              else
+                Buffer.add_string line
+                  (Pchars.pchars_str ~utf !subj st (en - st));
               emit t (Buffer.contents line);
-              if !caret > 0 then
-                emit t ("    " ^ String.make !caret '^');
+              if !caret > 0 then emit t ("    " ^ String.make !caret '^');
               (* pcre2test.c:8117-8125 aftertext *)
               if
                 dat.Ctl.d_control land Ctl.ctl_allaftertext <> 0
@@ -698,7 +661,6 @@ module Make (D : Driver.S) = struct
                 emit t
                   (Printf.sprintf "%2d+ %s" i
                      (Pchars.pchars_str ~utf !subj en0 (!ulen - en0)))
-            end
           done;
           (* pcre2test.c:8128-8136 MK: *)
           (if dat.Ctl.d_control land Ctl.ctl_mark <> 0 then
@@ -709,10 +671,8 @@ module Make (D : Driver.S) = struct
           copy_and_get t ~dat ~utf ~md_rc:rc ~oveccount:emu_ovec
             ~top_bracket:cp.maxcapcount ~ov ~subj:!subj ~ulen:!ulen
             ~nt:(Lazy.force nt) ~capcount:!capcount;
-          advance := Some (`Match (ov.(0), ov.(1), res.D.startchar))
-        end
-      end
-      else if rc = Flags.error_partial then begin
+          advance := Some (`Match (ov.(0), ov.(1), res.D.startchar))))
+      else if rc = Flags.error_partial then (
         (* pcre2test.c:8143-8198 *)
         let line = Buffer.create 64 in
         Buffer.add_string line "Partial match";
@@ -735,9 +695,8 @@ module Make (D : Driver.S) = struct
         copy_and_get t ~dat ~utf ~md_rc:Flags.error_partial ~oveccount:emu_ovec
           ~top_bracket:cp.maxcapcount ~ov ~subj:!subj ~ulen:!ulen
           ~nt:(Lazy.force nt) ~capcount:1;
-        advance := None
-      end
-      else if !g_notempty <> 0 then begin
+        advance := None)
+      else if !g_notempty <> 0 then (
         (* pcre2test.c:8200-8241 — failed retry after a null match: fake a
            one-character match, CRLF- and UTF-aware *)
         let start_offset = !offset in
@@ -745,7 +704,7 @@ module Make (D : Driver.S) = struct
         let nl = cp.nl in
         if
           (nl = Flags.newline_crlf || nl = Flags.newline_any
-          || nl = Flags.newline_anycrlf)
+         || nl = Flags.newline_anycrlf)
           && start_offset < !ulen - 1
           && Cstr.at !subj start_offset = '\r'
           && Cstr.at !subj !end_offset = '\n'
@@ -757,12 +716,11 @@ module Make (D : Driver.S) = struct
           do
             incr end_offset
           done;
-        advance := Some (`Match (start_offset, !end_offset, res.D.startchar))
-      end
-      else begin
+        advance := Some (`Match (start_offset, !end_offset, res.D.startchar)))
+      else (
         (* pcre2test.c:8246-8291 — normal match failure *)
-        (if rc = Flags.error_nomatch then begin
-           if !gmatched = 0 then begin
+        (if rc = Flags.error_nomatch then (
+           if !gmatched = 0 then (
              let line = Buffer.create 32 in
              Buffer.add_string line "No match";
              (if dat.Ctl.d_control land Ctl.ctl_mark <> 0 then
@@ -771,75 +729,62 @@ module Make (D : Driver.S) = struct
                     Buffer.add_string line ", mark = ";
                     Buffer.add_string line (Pchars.mark_str ~utf m)
                 | None -> ());
-             emit t (Buffer.contents line)
-           end
-         end
+             emit t (Buffer.contents line)))
          else if rc = Flags.error_badutfoffset then
            emit t (Printf.sprintf "Error %d (bad UTF-8 offset)" rc)
-         else begin
+         else
            let line = Buffer.create 64 in
            Buffer.add_string line
              (Printf.sprintf "Failed: error %d: %s" rc (D.error_message rc));
            if rc <= Flags.error_utf8_err1 && rc >= Flags.error_utf32_err2 then
              Buffer.add_string line
                (Printf.sprintf " at offset %d" res.D.startchar);
-           emit t (Buffer.contents line)
-         end);
-        advance := None
-      end;
+           emit t (Buffer.contents line));
+        advance := None);
       (* pcre2test.c:8293-8443 — bottom of the global loop *)
-      (match !advance with
+      match !advance with
       | None -> loop := false
       | Some `Continue -> incr gmatched
       | Some (`Match (mo, eo_orig, startchar)) ->
           if dat.Ctl.d_control land Ctl.ctl_anyglob = 0 then loop := false
-          else begin
+          else
             let eo = ref eo_orig in
             let brk = ref false in
-            if mo = !eo then begin
+            if mo = !eo then (
               if !eo = !ulen then brk := true
               else if mo <= !offset then
-                g_notempty := Flags.notempty_atstart lor Flags.anchored
-            end
-            else begin
+                g_notempty := Flags.notempty_atstart lor Flags.anchored)
+            else (
               g_notempty := 0;
               if dat.Ctl.d_control land Ctl.ctl_global <> 0 then
-                if !eo <= startchar then begin
+                if !eo <= startchar then
                   if startchar >= !ulen then brk := true
-                  else begin
+                  else (
                     eo := startchar + 1;
                     if utf then
                       while
-                        !eo < !ulen
-                        && Char.code !subj.[!eo] land 0xc0 = 0x80
+                        !eo < !ulen && Char.code !subj.[!eo] land 0xc0 = 0x80
                       do
                         incr eo
-                      done
-                  end
-                end
-            end;
+                      done));
             if !brk then loop := false
-            else begin
-              if dat.Ctl.d_control land Ctl.ctl_global <> 0 then begin
+            else (
+              if dat.Ctl.d_control land Ctl.ctl_global <> 0 then (
                 ovecsave.(0) <- mo;
                 ovecsave.(1) <- eo_orig;
                 ovecsave.(2) <- !offset;
-                offset := !eo
-              end
-              else begin
+                offset := !eo)
+              else (
                 (* altglobal: advance the subject pointer *)
                 subj := String.sub !subj !eo (!ulen - !eo);
-                ulen := !ulen - !eo
-              end;
-              incr gmatched
-            end
-          end)
+                ulen := !ulen - !eo);
+              incr gmatched)
     done
 
   let process_data t line =
     match t.compiled with
     | None -> ()
-    | Some cp ->
+    | Some cp -> (
         (* pcre2test.c:6893-6905 — data controls inherit from the pattern *)
         let dat = Ctl.copy_datctl t.def_dat in
         dat.Ctl.d_control <-
@@ -855,7 +800,7 @@ module Make (D : Driver.S) = struct
         (* pcre2test.c:6925-6940 — UTF-8 validity pre-check *)
         let valid =
           if not utf then true
-          else begin
+          else
             let ok = ref true in
             let i = ref start in
             while !ok && !i < len do
@@ -867,12 +812,10 @@ module Make (D : Driver.S) = struct
                 "** Failed: invalid UTF-8 string cannot be used as input in \
                  UTF mode";
             !ok
-          end
         in
         if valid then
           match
-            Subject.decode ~utf ~subject_literal ~emit:(emit t) line ~start
-              ~len
+            Subject.decode ~utf ~subject_literal ~emit:(emit t) line ~start ~len
           with
           | None -> ()
           | Some { Subject.subject; mods_from } ->
@@ -885,7 +828,7 @@ module Make (D : Driver.S) = struct
                       ~emit:(emit t) ~skip:(note_skip t)
                       (String.sub line idx (len - idx))
               in
-              if mods_ok then run_match t cp dat subject
+              if mods_ok then run_match t cp dat subject)
 
   (* ---------------- top-level line dispatch ---------------- *)
 
@@ -895,46 +838,41 @@ module Make (D : Driver.S) = struct
   let process_line t raw =
     t.out <- [];
     if t.aborted then []
-    else begin
+    else (
       emit t (chomp raw);
       (match t.pending with
       | Some (delim, buf) -> continue_pattern t delim buf raw
       | None ->
           let p = Cstr.skip_space raw 0 in
           let expectdata = t.compiled <> None in
-          if expectdata || t.skipping then begin
-            if Cstr.at raw p = '\000' then begin
+          if expectdata || t.skipping then (
+            if Cstr.at raw p = '\000' then (
               (* blank line terminates the test (pcre2test.c:9549-9568) *)
               t.compiled <- None;
-              t.skipping <- false
-            end
+              t.skipping <- false)
             else if (not t.skipping) && not (Scan.is_data_comment raw) then
-              process_data t raw
-          end
-          else if Cstr.at raw 0 = '#' then begin
+              process_data t raw)
+          else if Cstr.at raw 0 = '#' then
             if
               Cstr.isspace (Cstr.at raw 1)
               || Cstr.at raw 1 = '!'
               || Cstr.at raw 1 = '\000'
             then () (* comment *)
             else process_command t raw
-          end
           else if Scan.is_delimiter (Cstr.at raw 0) then start_pattern t raw
-          else if Cstr.at raw p <> '\000' then begin
+          else if Cstr.at raw p <> '\000' then (
             (* pcre2test.c:9598-9605 *)
             emit t
-              (Printf.sprintf "** Invalid pattern delimiter '%c' (x%x)."
-                 raw.[0] (Char.code raw.[0]));
-            t.skipping <- true
-          end);
-      List.rev t.out
-    end
+              (Printf.sprintf "** Invalid pattern delimiter '%c' (x%x)." raw.[0]
+                 (Char.code raw.[0]));
+            t.skipping <- true));
+      List.rev t.out)
 
   (* Signal end of input; reports an unterminated pattern like the C. *)
   let finish t =
     t.out <- [];
     if t.aborted then []
-    else begin
+    else (
       (match t.pending with
       | Some _ ->
           t.pending <- None;
@@ -942,6 +880,5 @@ module Make (D : Driver.S) = struct
           emit t "** pcre2test run abandoned";
           t.aborted <- true
       | None -> ());
-      List.rev t.out
-    end
+      List.rev t.out)
 end

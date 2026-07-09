@@ -5,8 +5,8 @@
 (* M1 adds the compiled program (OP_* bytecode in Bytes.t, LINK_SIZE=2) and
    study data; the skeleton carries only what the boundary functions touch. *)
 type t = {
-  name_table : (string * int) array;  (* PCRE2 name-table order *)
-  top_bracket : int;  (* capture group count *)
+  name_table : (string * int) array; (* PCRE2 name-table order *)
+  top_bracket : int; (* capture group count *)
 }
 
 type exec_result =
@@ -56,9 +56,7 @@ let info (re : t) : info =
    returns PCRE2_ERROR_BADDATA (unknown / 0..99 codes), the driver seam wants
    the empty string (mirrors oracle/pcre2test_stubs.c oracle_test_error_message). *)
 let error_message (code : int) : string =
-  match Errors.message code with
-  | s -> s
-  | exception Invalid_argument _ -> ""
+  match Errors.message code with s -> s | exception Invalid_argument _ -> ""
 
 let exec_full (_re : t) (_subject : string) (_offset : int) (_options : int32) :
     exec_result =
@@ -71,8 +69,8 @@ let exec (re : t) (subject : string) (offset : int) (options : int32) :
   | No_match | Partial _ -> Ok None (* pcre2_stubs.c: PARTIAL -> Ok None *)
   | Error e -> Error e
 
-let exec_captures (re : t) (subject : string) (offset : int) (options : int32)
-    : (((int * int) array * (string * int) array) option, int) result =
+let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
+    (((int * int) array * (string * int) array) option, int) result =
   match exec_full re subject offset options with
   | Match { ovector; _ } ->
       let n = re.top_bracket + 1 in

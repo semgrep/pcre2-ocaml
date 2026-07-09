@@ -1,11 +1,21 @@
 ; pcre2test-compatible harness (dev-only). The library is a functor over the
 ; DRIVER seam (driver.ml); engine_driver adapts the pure engine to that seam
 ; (the C oracle's driver lives in oracle/, package pcre2-dev).
+
 (library
  (name pcre2test_harness)
  (public_name pcre2-dev.pcre2test-harness)
- (modules flags ctl cstr pchars scan modifiers subject driver engine_driver
-   harness)
+ (modules
+  flags
+  ctl
+  cstr
+  pchars
+  scan
+  modifiers
+  subject
+  driver
+  engine_driver
+  harness)
  (libraries pcre2.engine))
 
 (executable

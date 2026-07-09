@@ -20,7 +20,12 @@ type exec_result =
 val compile : string -> int32 -> (t, int) result
 
 val compile_ctx :
-  ?newline:int -> ?bsr:int -> ?extra:int -> string -> int32 -> (t, int * int) result
+  ?newline:int ->
+  ?bsr:int ->
+  ?extra:int ->
+  string ->
+  int32 ->
+  (t, int * int) result
 (** [compile] plus the pcre2_compile_context knobs the pcre2test harness
     drives: [newline]/[bsr] take PCRE2_NEWLINE_* / PCRE2_BSR_* numeric
     values, [extra] the extra-options word; 0 = build default. On failure
@@ -42,7 +47,6 @@ val error_message : int -> string
     [""] for codes where the C returns PCRE2_ERROR_BADDATA. *)
 
 val exec_full : t -> string -> int -> int32 -> exec_result
-
 val exec : t -> string -> int -> int32 -> ((int * int) option, int) result
 
 val exec_captures :
@@ -53,7 +57,5 @@ val exec_captures :
   (((int * int) array * (string * int) array) option, int) result
 
 val capture_groups : t -> (string * int) array
-
 val version : int * int
-
 val print_code : Format.formatter -> t -> unit

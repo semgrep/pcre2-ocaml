@@ -1,6 +1,7 @@
 ; Dev-only C oracle: the original libpcre2-8 bindings, kept for differential
 ; testing and as the perf baseline. Never part of the published pcre2 package.
 ; C symbols are oracle_-prefixed so this can link alongside the pure engine.
+
 (library
  (name pcre2_c)
  (public_name pcre2-dev.oracle)
@@ -21,6 +22,7 @@
 
 ; Richer oracle access for the pcre2test harness: compile error offsets,
 ; compile contexts, full ovector, MARK, pattern info.
+
 (library
  (name pcre2_test_driver)
  (public_name pcre2-dev.test-driver)

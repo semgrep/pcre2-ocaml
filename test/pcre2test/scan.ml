@@ -2,7 +2,6 @@
 
 (* pcre2test.c:9591 — the set of valid pattern delimiters. *)
 let delimiters = "/!\"'`%&-=_:;,@~"
-
 let is_delimiter c = c <> '\000' && String.contains delimiters c
 
 (* pcre2test.c:5301-5311 — find the closing delimiter in the accumulated

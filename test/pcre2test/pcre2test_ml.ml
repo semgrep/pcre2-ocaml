@@ -8,7 +8,9 @@
    leading "PCRE2 version ..." banner (compare with `pcre2test -q`). *)
 
 module H_oracle = Pcre2test_harness.Harness.Make (Pcre2_test_driver.Test_driver)
-module H_engine = Pcre2test_harness.Harness.Make (Pcre2test_harness.Engine_driver)
+
+module H_engine =
+  Pcre2test_harness.Harness.Make (Pcre2test_harness.Engine_driver)
 
 let read_lines_with_newlines ic =
   (* Preserve exact line framing: keep '\n'; the final line may lack one. *)
@@ -23,10 +25,9 @@ let read_lines_with_newlines ic =
   let lines = ref [] in
   let start = ref 0 in
   for i = 0 to n - 1 do
-    if s.[i] = '\n' then begin
+    if s.[i] = '\n' then (
       lines := String.sub s !start (i - !start + 1) :: !lines;
-      start := i + 1
-    end
+      start := i + 1)
   done;
   if !start < n then lines := String.sub s !start (n - !start) :: !lines;
   List.rev !lines
@@ -49,10 +50,9 @@ let () =
     (fun a ->
       if a = "--driver=oracle" then driver := `Oracle
       else if a = "--driver=engine" then driver := `Engine
-      else if String.length a >= 9 && String.sub a 0 9 = "--driver=" then begin
+      else if String.length a >= 9 && String.sub a 0 9 = "--driver=" then (
         prerr_endline ("pcre2test_ml: unknown driver in '" ^ a ^ "'");
-        exit 2
-      end
+        exit 2)
       else file := a)
     args;
   let ic = if !file = "-" then stdin else open_in_bin !file in

@@ -5,7 +5,6 @@
    from M1 on. All ints are plain OCaml ints (option bits fit in 63 bits). *)
 
 type code
-
 type compile_error = { errcode : int; erroroffset : int }
 
 external compile_raw :
@@ -27,7 +26,8 @@ type exec_result = {
   startchar : int;
 }
 
-external exec_raw : code -> string -> int -> int -> int * int array * string option * int
+external exec_raw :
+  code -> string -> int -> int -> int * int array * string option * int
   = "oracle_test_exec"
 
 let exec ?(options = 0) ~subject ~offset code : exec_result =
@@ -50,5 +50,5 @@ let info code : info =
 
 external name_table : code -> (string * int) array = "oracle_test_name_table"
 
-(** Exactly [pcre2_get_error_message]; empty string for unknown codes. *)
 external error_message : int -> string = "oracle_test_error_message"
+(** Exactly [pcre2_get_error_message]; empty string for unknown codes. *)

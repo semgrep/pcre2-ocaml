@@ -11,10 +11,9 @@ module Ctl = Pcre2test_harness.Ctl
 let failures = ref 0
 
 let check name cond =
-  if not cond then begin
+  if not cond then (
     Printf.printf "FAIL: %s\n" name;
-    incr failures
-  end
+    incr failures)
 
 let decode_subject ?(utf = false) s =
   let msgs = ref [] in
@@ -68,9 +67,9 @@ let () =
         (String.equal m "** Unrecognized escape sequence \"\\y\"")
   | _ -> check "bad escape" false);
   (* escaped non-alnum char comes through *)
-  (match decode_subject "    \\$\\?" with
+  match decode_subject "    \\$\\?" with
   | Ok ("$?", None, []) -> ()
-  | _ -> check "escaped punctuation" false)
+  | _ -> check "escaped punctuation" false
 
 (* ---------------- modifier decoder ---------------- *)
 
@@ -170,17 +169,17 @@ let () =
   (match Units.align units expected with
   | Ok [ b1; b2 ] ->
       check "block1" (List.length b1 = 9);
-      check "block2 head" (match b2 with l :: _ -> String.equal l "/d(e)f/g" | [] -> false)
+      check "block2 head"
+        (match b2 with l :: _ -> String.equal l "/d(e)f/g" | [] -> false)
   | Ok _ -> check "align blocks" false
   | Error e -> check ("align error: " ^ e) false);
   (* misalignment must be detected *)
-  (match Units.align units [ "/different/\n" ] with
+  match Units.align units [ "/different/\n" ] with
   | Error _ -> ()
-  | Ok _ -> check "align must fail on mismatch" false)
+  | Ok _ -> check "align must fail on mismatch" false
 
 let () =
-  if !failures > 0 then begin
+  if !failures > 0 then (
     Printf.printf "%d harness unit test(s) failed\n" !failures;
-    exit 1
-  end
+    exit 1)
   else print_endline "harness unit tests passed"

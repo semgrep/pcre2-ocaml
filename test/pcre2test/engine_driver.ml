@@ -7,7 +7,6 @@
 module E = Pcre2_engine.Engine
 
 type code = E.t
-
 type compile_error = { errcode : int; erroroffset : int }
 
 let compile ?(options = 0) ?(newline = 0) ?(bsr = 0) ?(extra = 0) pattern :

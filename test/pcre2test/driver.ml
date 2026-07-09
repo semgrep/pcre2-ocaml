@@ -5,7 +5,6 @@
 
 module type S = sig
   type code
-
   type compile_error = { errcode : int; erroroffset : int }
 
   val compile :
@@ -19,7 +18,8 @@ module type S = sig
       default. *)
 
   type exec_result = {
-    rc : int;  (** pcre2_match return: >0 pairs, 0 ovector too small, <0 error *)
+    rc : int;
+        (** pcre2_match return: >0 pairs, 0 ovector too small, <0 error *)
     ovector : int array;  (** 2 * ovector-count entries; unset = -1 *)
     mark : string option;
     startchar : int;

@@ -53,18 +53,16 @@ let strip_comments ~what s =
   let n = String.length s in
   let i = ref 0 in
   while !i < n do
-    if !i + 1 < n && s.[!i] = '/' && s.[!i + 1] = '*' then begin
+    if !i + 1 < n && s.[!i] = '/' && s.[!i + 1] = '*' then (
       let close = find_from s (!i + 2) "*/" in
       if close < 0 then failf "%s: unterminated comment" what;
       for j = !i to close + 1 do
         if s.[j] = '\n' then Buffer.add_char b '\n'
       done;
-      i := close + 2
-    end
-    else begin
+      i := close + 2)
+    else (
       Buffer.add_char b s.[!i];
-      incr i
-    end
+      incr i)
   done;
   Buffer.contents b
 
@@ -84,25 +82,23 @@ let tokenize ~what s =
   while !i < n do
     let c = s.[!i] in
     if c = ' ' || c = '\t' || c = '\n' || c = '\r' || c = ',' then incr i
-    else if c = '{' || c = '}' then begin
+    else if c = '{' || c = '}' then (
       toks := String.make 1 c :: !toks;
-      incr i
-    end
-    else if c = '-' || is_ident_char c then begin
+      incr i)
+    else if c = '-' || is_ident_char c then (
       let j = ref (!i + 1) in
       while !j < n && is_ident_char s.[!j] do
         incr j
       done;
       toks := String.sub s !i (!j - !i) :: !toks;
-      i := !j
-    end
+      i := !j)
     else failf "%s: unexpected character %C" what c
   done;
   List.rev !toks
 
 let int_of_tok ~what t =
   if String.equal t "NOTACHAR" then 0xffffffff (* pcre2_internal.h:223 *)
-  else begin
+  else
     let l = String.length t in
     let t' =
       if l > 1 && (t.[l - 1] = 'u' || t.[l - 1] = 'U') then
@@ -112,7 +108,6 @@ let int_of_tok ~what t =
     match int_of_string_opt t' with
     | Some v -> v
     | None -> failf "%s: not an integer token: %S" what t
-  end
 
 (* 1-based inclusive line range in a vendored C source. *)
 type span = { l0 : int; l1 : int }
@@ -132,13 +127,13 @@ let extract_array text ~what ~after decl =
 let split_ws s =
   let parts = ref [] and b = Buffer.create 16 in
   let flush () =
-    if Buffer.length b > 0 then begin
+    if Buffer.length b > 0 then (
       parts := Buffer.contents b :: !parts;
-      Buffer.clear b
-    end
+      Buffer.clear b)
   in
   String.iter
-    (fun c -> if c = ' ' || c = '\t' || c = '\r' then flush () else Buffer.add_char b c)
+    (fun c ->
+      if c = ' ' || c = '\t' || c = '\r' then flush () else Buffer.add_char b c)
     s;
   flush ();
   List.rev !parts
@@ -148,7 +143,8 @@ let split_ws s =
 (* ------------------------------------------------------------------ *)
 
 type chartables = {
-  ct_data : int array; (* 1088 bytes: lcc @0, fcc @256, cbits @512, ctypes @832 *)
+  ct_data : int array;
+      (* 1088 bytes: lcc @0, fcc @256, cbits @512, ctypes @832 *)
   ct_all : span;
   ct_lcc : span;
   ct_fcc : span;
@@ -164,10 +160,12 @@ let parse_chartables path =
   in
   let vals = List.map (int_of_tok ~what) (tokenize ~what body) in
   let n = List.length vals in
-  if n <> 1088 then failf "%s: expected 1088 bytes in default_tables, got %d" what n;
+  if n <> 1088 then
+    failf "%s: expected 1088 bytes in default_tables, got %d" what n;
   let data = Array.of_list vals in
   Array.iteri
-    (fun i v -> if v < 0 || v > 255 then failf "%s: byte %d out of range: %d" what i v)
+    (fun i v ->
+      if v < 0 || v > 255 then failf "%s: byte %d out of range: %d" what i v)
     data;
   let marker pat =
     let idx = find_from text 0 pat in
@@ -231,11 +229,14 @@ let parse_ucd path =
   let caseless, cl_span = ints "const uint32_t PRIV(ucd_caseless_sets)[] =" in
   let digits, dg_span = ints "const uint32_t PRIV(ucd_digit_sets)[] =" in
   let script_sets, ss_span = ints "const uint32_t PRIV(ucd_script_sets)[] =" in
-  let boolprop_sets, bp_span = ints "const uint32_t PRIV(ucd_boolprop_sets)[] =" in
+  let boolprop_sets, bp_span =
+    ints "const uint32_t PRIV(ucd_boolprop_sets)[] ="
+  in
   let stage1, s1_span = ints "const uint16_t PRIV(ucd_stage1)[] =" in
   let stage2, s2_span = ints "const uint16_t PRIV(ucd_stage2)[] =" in
   let rbody, rec_span =
-    extract_array text ~what ~after:anchor "const ucd_record PRIV(ucd_records)[] ="
+    extract_array text ~what ~after:anchor
+      "const ucd_record PRIV(ucd_records)[] ="
   in
   let records =
     let rec go acc = function
@@ -270,15 +271,18 @@ let parse_ucd path =
     failf "%s: stage1 has %d entries, expected %d" what (Array.length stage1)
       (0x110000 / 128);
   if Array.length stage2 = 0 || Array.length stage2 mod 128 <> 0 then
-    failf "%s: stage2 length %d not a multiple of 128" what (Array.length stage2);
+    failf "%s: stage2 length %d not a multiple of 128" what
+      (Array.length stage2);
   let nblocks = Array.length stage2 / 128 in
   Array.iteri
     (fun i v ->
-      if v < 0 || v >= nblocks then failf "%s: stage1[%d] = %d out of range" what i v)
+      if v < 0 || v >= nblocks then
+        failf "%s: stage1[%d] = %d out of range" what i v)
     stage1;
   Array.iteri
     (fun i v ->
-      if v < 0 || v >= nrec then failf "%s: stage2[%d] = %d out of range" what i v)
+      if v < 0 || v >= nrec then
+        failf "%s: stage2[%d] = %d out of range" what i v)
     stage2;
   if Array.length caseless = 0 || caseless.(0) <> 0xffffffff then
     failf "%s: ucd_caseless_sets must start with NOTACHAR" what;
@@ -320,15 +324,14 @@ let strip_line_comment ~what line =
   let n = String.length line in
   let i = ref 0 in
   while !i < n do
-    if !i + 1 < n && line.[!i] = '/' && line.[!i + 1] = '*' then begin
+    if !i + 1 < n && line.[!i] = '/' && line.[!i + 1] = '*' then (
       let close = find_from line (!i + 2) "*/" in
-      if close < 0 then failf "%s: comment spans lines inside an enum: %S" what line;
-      i := close + 2
-    end
-    else begin
+      if close < 0 then
+        failf "%s: comment spans lines inside an enum: %S" what line;
+      i := close + 2)
+    else (
       Buffer.add_char b line.[!i];
-      incr i
-    end
+      incr i)
   done;
   Buffer.contents b
 
@@ -343,53 +346,55 @@ let parse_ucp path =
     let pat = "#define " ^ name in
     let rec find = function
       | [] -> failf "%s: %s not found" what pat
-      | l :: tl -> (
-          if String.length l >= String.length pat
-             && String.equal (String.sub l 0 (String.length pat)) pat
+      | l :: tl ->
+          if
+            String.length l >= String.length pat
+            && String.equal (String.sub l 0 (String.length pat)) pat
           then
             match split_ws (strip_line_comment ~what l) with
             | [ "#define"; _; v ] -> int_of_tok ~what v
             | _ -> failf "%s: cannot parse %S" what l
-          else find tl)
+          else find tl
     in
     find lines
   in
   List.iter
     (fun raw ->
       match !cur with
-      | None -> if String.equal (String.trim raw) "enum {" then cur := Some (ref [])
+      | None ->
+          if String.equal (String.trim raw) "enum {" then cur := Some (ref [])
       | Some members ->
           let t = String.trim (strip_line_comment ~what raw) in
-          if String.equal t "};" then begin
+          if String.equal t "};" then (
             let ms = List.rev !members in
             List.iteri
               (fun i name ->
-                if Hashtbl.mem map name then failf "%s: duplicate enum name %s" what name;
+                if Hashtbl.mem map name then
+                  failf "%s: duplicate enum name %s" what name;
                 Hashtbl.add map name i)
               ms;
             sizes := List.length ms :: !sizes;
-            cur := None
-          end
-          else if not (String.equal t "") then begin
+            cur := None)
+          else if not (String.equal t "") then
             let name =
               if t.[String.length t - 1] = ',' then
                 String.trim (String.sub t 0 (String.length t - 1))
               else t
             in
-            if not (String.equal name "") then begin
+            if not (String.equal name "") then (
               String.iter
                 (fun c ->
                   if not (is_ident_char c) then
                     failf "%s: unexpected enum member line %S" what raw)
                 name;
-              members := name :: !members
-            end
-          end)
+              members := name :: !members))
     lines;
   if !cur <> None then failf "%s: unterminated enum" what;
   let enum_sizes = Array.of_list (List.rev !sizes) in
   if Array.length enum_sizes <> 6 then
-    failf "%s: expected 6 enums (gentype, chartype, boolprop, bidi, gbprop, script), got %d"
+    failf
+      "%s: expected 6 enums (gentype, chartype, boolprop, bidi, gbprop, \
+       script), got %d"
       what (Array.length enum_sizes);
   {
     ucp_map = map;
@@ -410,7 +415,8 @@ let parse_pt path =
     (fun line ->
       match split_ws line with
       | "#define" :: name :: value :: _
-        when String.length name > 3 && String.equal (String.sub name 0 3) "PT_" -> (
+        when String.length name > 3 && String.equal (String.sub name 0 3) "PT_"
+        -> (
           match int_of_string_opt value with
           | Some v -> Hashtbl.replace map name v
           | None -> failf "%s: cannot parse value of %s: %S" what name value)
@@ -447,9 +453,10 @@ let parse_ucptables path ~ucp ~pt =
   List.iter
     (fun line ->
       let pfx = "#define STRING_" in
-      if String.length line > String.length pfx
-         && String.equal (String.sub line 0 (String.length pfx)) pfx
-      then begin
+      if
+        String.length line > String.length pfx
+        && String.equal (String.sub line 0 (String.length pfx)) pfx
+      then
         match split_ws line with
         | "#define" :: name :: body ->
             let b = Buffer.create 32 in
@@ -459,27 +466,31 @@ let parse_ucptables path ~ucp ~pt =
                 else if String.equal tok "STR_AMPERSAND" then
                   (* pcre2_internal.h:812; used by STRING_l_AMPERSAND0 ("l&") *)
                   Buffer.add_char b '&'
-                else if String.length tok = 5
-                        && String.equal (String.sub tok 0 4) "STR_"
-                        && is_ident_char tok.[4]
+                else if
+                  String.length tok = 5
+                  && String.equal (String.sub tok 0 4) "STR_"
+                  && is_ident_char tok.[4]
                 then Buffer.add_char b tok.[4]
                 else failf "%s: unexpected token %S in %s" what tok name)
               body;
             let s = Buffer.contents b in
             if String.length s = 0 || s.[String.length s - 1] <> '\000' then
               failf "%s: %s does not end with a NUL" what name;
-            if Hashtbl.mem macros name then failf "%s: duplicate macro %s" what name;
+            if Hashtbl.mem macros name then
+              failf "%s: duplicate macro %s" what name;
             Hashtbl.add macros name s
-        | _ -> failf "%s: cannot parse macro line %S" what line
-      end)
+        | _ -> failf "%s: cannot parse macro line %S" what line)
     lines;
   (* utt_names: a ';'-terminated concatenation of the STRING_ macros. *)
   let names_decl = "const char PRIV(utt_names)[] =" in
   let nd = find_from text 0 names_decl in
   if nd < 0 then failf "%s: %S not found" what names_decl;
   let semi = String.index_from text (nd + String.length names_decl) ';' in
-  let names_body = String.sub text (nd + String.length names_decl)
-      (semi - nd - String.length names_decl) in
+  let names_body =
+    String.sub text
+      (nd + String.length names_decl)
+      (semi - nd - String.length names_decl)
+  in
   let names =
     let b = Buffer.create 4096 in
     List.iter
@@ -509,7 +520,8 @@ let parse_ucptables path ~ucp ~pt =
         | None -> failf "%s: unknown property type %S" what ptok
       in
       let ue_pvalue =
-        if String.length vtok > 4 && String.equal (String.sub vtok 0 4) "ucp_" then
+        if String.length vtok > 4 && String.equal (String.sub vtok 0 4) "ucp_"
+        then
           match Hashtbl.find_opt ucp.ucp_map vtok with
           | Some v -> v
           | None -> failf "%s: unknown ucp value %S" what vtok
@@ -525,7 +537,8 @@ let parse_ucptables path ~ucp ~pt =
     in
     let rec go acc = function
       | [] -> List.rev acc
-      | "{" :: off :: ptok :: vtok :: "}" :: tl -> go (entry off ptok vtok :: acc) tl
+      | "{" :: off :: ptok :: vtok :: "}" :: tl ->
+          go (entry off ptok vtok :: acc) tl
       | t :: _ -> failf "%s: unexpected token %S in utt" what t
     in
     Array.of_list (go [] (tokenize ~what ubody))
@@ -534,8 +547,8 @@ let parse_ucptables path ~ucp ~pt =
   (* The table is binary-chopped: names must be strictly ascending. *)
   for i = 1 to Array.length entries - 1 do
     if String.compare entries.(i - 1).ue_name entries.(i).ue_name >= 0 then
-      failf "%s: utt not strictly sorted at %S / %S" what entries.(i - 1).ue_name
-        entries.(i).ue_name
+      failf "%s: utt not strictly sorted at %S / %S" what
+        entries.(i - 1).ue_name entries.(i).ue_name
   done;
   let size_decl = "const size_t PRIV(utt_size)" in
   let sd = find_from text 0 size_decl in
@@ -553,7 +566,8 @@ let parse_ucptables path ~ucp ~pt =
 
 let gen_header src =
   Printf.sprintf
-    "(* Generated by gen/gen_tables.exe from vendor/pcre2/src/%s (PCRE2 10.44). DO NOT EDIT. *)\n"
+    "(* Generated by gen/gen_tables.exe from vendor/pcre2/src/%s (PCRE2 \
+     10.44). DO NOT EDIT. *)\n"
     src
 
 (* let <name> =
@@ -584,12 +598,11 @@ let add_int_array buf ~name ~per_line ~pp (a : int array) =
   Array.iteri
     (fun i v ->
       Printf.bprintf line " %s;" (pp v);
-      if (i + 1) mod per_line = 0 || i = n - 1 then begin
+      if (i + 1) mod per_line = 0 || i = n - 1 then (
         Buffer.add_char buf ' ';
         Buffer.add_buffer buf line;
         Buffer.add_char buf '\n';
-        Buffer.clear line
-      end)
+        Buffer.clear line))
     a;
   Buffer.add_string buf "|]\n"
 
@@ -610,10 +623,12 @@ let emit_chartables ct =
     \   (pcre2_chartables.c.dist:%d-%d), C locale, split at the offsets given\n\
     \   by pcre2_internal.h:606-609. Used only for characters < 256. *)\n\n"
     ct.ct_all.l0 ct.ct_all.l1;
-  Printf.bprintf b "(* pcre2_chartables.c.dist:%d-%d - lower casing table (256 bytes). *)\n"
+  Printf.bprintf b
+    "(* pcre2_chartables.c.dist:%d-%d - lower casing table (256 bytes). *)\n"
     ct.ct_lcc.l0 ct.ct_lcc.l1;
   add_bytes_lit b ~name:"lcc_tab" (fun i -> ct.ct_data.(i)) 256;
-  Printf.bprintf b "\n(* pcre2_chartables.c.dist:%d-%d - case flipping table (256 bytes). *)\n"
+  Printf.bprintf b
+    "\n(* pcre2_chartables.c.dist:%d-%d - case flipping table (256 bytes). *)\n"
     ct.ct_fcc.l0 ct.ct_fcc.l1;
   add_bytes_lit b ~name:"fcc_tab" (fun i -> ct.ct_data.(256 + i)) 256;
   Printf.bprintf b
@@ -699,7 +714,8 @@ let emit_ucd u ~version_line =
     \   pcre2_internal.h:1852-1860). *)\n\n"
     version_line u.version nrec u.rec_span.l0 u.rec_span.l1 nrec;
   let field name f =
-    Printf.bprintf b "(* uint8 %s of each ucd_record, one byte per record. *)\n" name;
+    Printf.bprintf b "(* uint8 %s of each ucd_record, one byte per record. *)\n"
+      name;
     add_bytes_lit b ~name:(name ^ "_tab") (fun i -> u.records.(i).(f)) nrec;
     Printf.bprintf b
       "\n\
@@ -719,8 +735,11 @@ let emit_ucd u ~version_line =
     (Array.map (fun r -> r.(4)) u.records);
   let field16 name f =
     Printf.bprintf b
-      "\n(* uint16 %s of each ucd_record, 2 bytes little-endian per record. *)\n" name;
-    add_uint16_le_lit b ~name:(name ^ "_tab") (Array.map (fun r -> r.(f)) u.records);
+      "\n\
+       (* uint16 %s of each ucd_record, 2 bytes little-endian per record. *)\n"
+      name;
+    add_uint16_le_lit b ~name:(name ^ "_tab")
+      (Array.map (fun r -> r.(f)) u.records);
     Printf.bprintf b
       "\n\
        (* safe: i is a record number 0..nrecords-1 (a stage2 value; every\n\
@@ -815,11 +834,10 @@ let emit_ucptables t =
     t.utt_span.l0 t.utt_span.l1 t.names_span.l0 t.names_span.l1;
   Array.iter
     (fun e ->
-      Printf.bprintf b "  (%S, %d, %d); (* %s, %s *)\n" e.ue_name e.ue_ptype e.ue_pvalue
-        e.ue_ptype_c e.ue_pvalue_c)
+      Printf.bprintf b "  (%S, %d, %d); (* %s, %s *)\n" e.ue_name e.ue_ptype
+        e.ue_pvalue e.ue_ptype_c e.ue_pvalue_c)
     t.entries;
-  Printf.bprintf b
-    "|]\n\n(* pcre2_ucptables.c:%d *)\nlet utt_size = %d\n"
+  Printf.bprintf b "|]\n\n(* pcre2_ucptables.c:%d *)\nlet utt_size = %d\n"
     t.size_line (Array.length t.entries);
   Buffer.contents b
 
@@ -853,9 +871,11 @@ let run_sanity ct u t ucp pt =
   ok "ctypes 'A' has letter, not lcletter" (ctypes 0x41 land 0x06 = 0x02);
   ok "ctypes '5' has digit+word bits" (ctypes 0x35 land 0x18 = 0x18);
   ok "ctypes ' ' has space bit" (ctypes 0x20 land 0x01 <> 0);
-  ok "cbit_digit has '5'" (cbits (64 + (0x35 / 8)) land (1 lsl (0x35 mod 8)) <> 0);
+  ok "cbit_digit has '5'"
+    (cbits (64 + (0x35 / 8)) land (1 lsl (0x35 mod 8)) <> 0);
   ok "cbit_space has LF" (cbits (0 + (0x0a / 8)) land (1 lsl (0x0a mod 8)) <> 0);
-  ok "cbit_word has '_'" (cbits (160 + (0x5f / 8)) land (1 lsl (0x5f mod 8)) <> 0);
+  ok "cbit_word has '_'"
+    (cbits (160 + (0x5f / 8)) land (1 lsl (0x5f mod 8)) <> 0);
   (* ucp / PT spot values (pin the enum and #define parses) *)
   ok "ucp_Latin = 0" (ucp_v "ucp_Latin" = 0);
   ok "ucp_Greek = 1" (ucp_v "ucp_Greek" = 1);
@@ -882,7 +902,9 @@ let run_sanity ct u t ucp pt =
   ok "boolprop_sets multiple of item size (2)"
     (ucp.boolprop_item_size = 2 && Array.length u.boolprop_sets mod 2 = 0);
   (* two-stage GET_UCD lookups (pcre2_internal.h:1865-1867) *)
-  let get_ucd ch = u.records.(u.stage2.((u.stage1.(ch / 128) * 128) + (ch mod 128))) in
+  let get_ucd ch =
+    u.records.(u.stage2.((u.stage1.(ch / 128) * 128) + (ch mod 128)))
+  in
   let ra = get_ucd 0x41 in
   ok "U+0041 other_case -> U+0061" (0x41 + ra.(4) = 0x61);
   ok "U+0041 chartype = ucp_Lu" (ra.(1) = ucp_v "ucp_Lu");
@@ -926,19 +948,26 @@ let run_sanity ct u t ucp pt =
   (* utt *)
   let find name =
     let r = ref None in
-    Array.iter (fun x -> if String.equal x.ue_name name then r := Some x) t.entries;
-    match !r with Some x -> x | None -> failf "sanity: utt has no entry %S" name
+    Array.iter
+      (fun x -> if String.equal x.ue_name name then r := Some x)
+      t.entries;
+    match !r with
+    | Some x -> x
+    | None -> failf "sanity: utt has no entry %S" name
   in
   ok "utt_size = 489" (Array.length t.entries = 489);
   let greek = find "greek" in
   ok "utt \"greek\" is (PT_SCX, ucp_Greek)"
     (greek.ue_ptype = pt_v "PT_SCX" && greek.ue_pvalue = ucp_v "ucp_Greek");
   let any = find "any" in
-  ok "utt \"any\" is (PT_ANY, 0)" (any.ue_ptype = pt_v "PT_ANY" && any.ue_pvalue = 0);
+  ok "utt \"any\" is (PT_ANY, 0)"
+    (any.ue_ptype = pt_v "PT_ANY" && any.ue_pvalue = 0);
   let xan = find "xan" in
-  ok "utt \"xan\" is (PT_ALNUM, 0)" (xan.ue_ptype = pt_v "PT_ALNUM" && xan.ue_pvalue = 0);
+  ok "utt \"xan\" is (PT_ALNUM, 0)"
+    (xan.ue_ptype = pt_v "PT_ALNUM" && xan.ue_pvalue = 0);
   let lamp = find "l&" in
-  ok "utt \"l&\" is (PT_LAMP, 0)" (lamp.ue_ptype = pt_v "PT_LAMP" && lamp.ue_pvalue = 0);
+  ok "utt \"l&\" is (PT_LAMP, 0)"
+    (lamp.ue_ptype = pt_v "PT_LAMP" && lamp.ue_pvalue = 0);
   (* every pvalue is in range for its ptype *)
   Array.iter
     (fun x ->
@@ -954,7 +983,8 @@ let run_sanity ct u t ucp pt =
       match bound with
       | Some m ->
           if x.ue_pvalue < 0 || x.ue_pvalue >= m then
-            failf "sanity: utt %S pvalue %d out of range (< %d)" x.ue_name x.ue_pvalue m
+            failf "sanity: utt %S pvalue %d out of range (< %d)" x.ue_name
+              x.ue_pvalue m
       | None -> ())
     t.entries;
   print_endline "gen_tables: sanity checks passed"
@@ -998,10 +1028,12 @@ let () =
   (* structural cross-file checks (always on) *)
   if Array.length ucd.script_sets mod ucp.script_item_size <> 0 then
     failf "ucd_script_sets length %d not a multiple of item size %d"
-      (Array.length ucd.script_sets) ucp.script_item_size;
+      (Array.length ucd.script_sets)
+      ucp.script_item_size;
   if Array.length ucd.boolprop_sets mod ucp.boolprop_item_size <> 0 then
     failf "ucd_boolprop_sets length %d not a multiple of item size %d"
-      (Array.length ucd.boolprop_sets) ucp.boolprop_item_size;
+      (Array.length ucd.boolprop_sets)
+      ucp.boolprop_item_size;
   if !check then run_sanity ct ucd utt ucp pt;
   let version_line =
     let text = read_file (path "pcre2_ucd.c") in
@@ -1014,8 +1046,10 @@ let () =
   Printf.printf
     "gen_tables: chartables=1088 bytes; nrecords=%d stage1=%d stage2=%d \
      caseless=%d digit=%d script_sets=%d boolprop_sets=%d; utt_size=%d\n"
-    (Array.length ucd.records) (Array.length ucd.stage1) (Array.length ucd.stage2)
-    (Array.length ucd.caseless) (Array.length ucd.digits)
+    (Array.length ucd.records) (Array.length ucd.stage1)
+    (Array.length ucd.stage2)
+    (Array.length ucd.caseless)
+    (Array.length ucd.digits)
     (Array.length ucd.script_sets)
     (Array.length ucd.boolprop_sets)
     (Array.length utt.entries)

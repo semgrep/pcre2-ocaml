@@ -29,10 +29,70 @@ let utf8_table3 = [| 0xff; 0x1f; 0x0f; 0x07; 0x03; 0x01 |]
    masked with 0x3f (the highest valid UTF-8 first byte masks to 0x3d). *)
 let utf8_table4 =
   [|
-    1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1;
-    1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1; 1;
-    2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2; 2;
-    3; 3; 3; 3; 3; 3; 3; 3; 4; 4; 4; 4; 5; 5; 5; 5;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    3;
+    3;
+    3;
+    3;
+    3;
+    3;
+    3;
+    3;
+    4;
+    4;
+    4;
+    4;
+    5;
+    5;
+    5;
+    5;
   |]
 
 (* pcre2_tables.c:66 = HSPACE_LIST (pcre2_internal.h:400-404): horizontal
@@ -40,8 +100,25 @@ let utf8_table4 =
    0x20, CHAR_NBSP = 0xa0 (pcre2_internal.h:696,703,683). *)
 let hspace_list =
   [|
-    0x09; 0x20; 0xa0; 0x1680; 0x180e; 0x2000; 0x2001; 0x2002; 0x2003; 0x2004;
-    0x2005; 0x2006; 0x2007; 0x2008; 0x2009; 0x200a; 0x202f; 0x205f; 0x3000;
+    0x09;
+    0x20;
+    0xa0;
+    0x1680;
+    0x180e;
+    0x2000;
+    0x2001;
+    0x2002;
+    0x2003;
+    0x2004;
+    0x2005;
+    0x2006;
+    0x2007;
+    0x2008;
+    0x2009;
+    0x200a;
+    0x202f;
+    0x205f;
+    0x3000;
     notachar;
   |]
 
@@ -55,14 +132,44 @@ let vspace_list = [| 0x0a; 0x0b; 0x0c; 0x0d; 0x85; 0x2028; 0x2029; notachar |]
    (ucp_cc..ucp_zs) -> general category (ucp_c..ucp_z). *)
 let ucp_gentype =
   [|
-    Ucp.ucp_c; Ucp.ucp_c; Ucp.ucp_c; Ucp.ucp_c; Ucp.ucp_c; (* Cc, Cf, Cn, Co, Cs *)
-    Ucp.ucp_l; Ucp.ucp_l; Ucp.ucp_l; Ucp.ucp_l; Ucp.ucp_l; (* Ll, Lu, Lm, Lo, Lt *)
-    Ucp.ucp_m; Ucp.ucp_m; Ucp.ucp_m; (* Mc, Me, Mn *)
-    Ucp.ucp_n; Ucp.ucp_n; Ucp.ucp_n; (* Nd, Nl, No *)
-    Ucp.ucp_p; Ucp.ucp_p; Ucp.ucp_p; Ucp.ucp_p; Ucp.ucp_p; (* Pc, Pd, Pe, Pf, Pi *)
-    Ucp.ucp_p; Ucp.ucp_p; (* Ps, Po *)
-    Ucp.ucp_s; Ucp.ucp_s; Ucp.ucp_s; Ucp.ucp_s; (* Sc, Sk, Sm, So *)
-    Ucp.ucp_z; Ucp.ucp_z; Ucp.ucp_z; (* Zl, Zp, Zs *)
+    Ucp.ucp_c;
+    Ucp.ucp_c;
+    Ucp.ucp_c;
+    Ucp.ucp_c;
+    Ucp.ucp_c;
+    (* Cc, Cf, Cn, Co, Cs *)
+    Ucp.ucp_l;
+    Ucp.ucp_l;
+    Ucp.ucp_l;
+    Ucp.ucp_l;
+    Ucp.ucp_l;
+    (* Ll, Lu, Lm, Lo, Lt *)
+    Ucp.ucp_m;
+    Ucp.ucp_m;
+    Ucp.ucp_m;
+    (* Mc, Me, Mn *)
+    Ucp.ucp_n;
+    Ucp.ucp_n;
+    Ucp.ucp_n;
+    (* Nd, Nl, No *)
+    Ucp.ucp_p;
+    Ucp.ucp_p;
+    Ucp.ucp_p;
+    Ucp.ucp_p;
+    Ucp.ucp_p;
+    (* Pc, Pd, Pe, Pf, Pi *)
+    Ucp.ucp_p;
+    Ucp.ucp_p;
+    (* Ps, Po *)
+    Ucp.ucp_s;
+    Ucp.ucp_s;
+    Ucp.ucp_s;
+    Ucp.ucp_s;
+    (* Sc, Sk, Sm, So *)
+    Ucp.ucp_z;
+    Ucp.ucp_z;
+    Ucp.ucp_z;
+    (* Zl, Zp, Zs *)
   |]
 
 (* pcre2_tables.c:141-208 - PRIV(ucp_gbtable): the extended grapheme cluster
@@ -82,31 +189,37 @@ let ucp_gbtable =
     lor (1 lsl Ucp.ucp_gb_zwj)
   in
   [|
-    1 lsl Ucp.ucp_gb_lf; (*  0 CR *)
-    0; (*  1 LF *)
-    0; (*  2 Control *)
-    esz; (*  3 Extend *)
-    esz (*  4 Prepend *)
-    lor (1 lsl Ucp.ucp_gb_prepend)
-    lor (1 lsl Ucp.ucp_gb_l)
-    lor (1 lsl Ucp.ucp_gb_v)
-    lor (1 lsl Ucp.ucp_gb_t)
-    lor (1 lsl Ucp.ucp_gb_lv)
-    lor (1 lsl Ucp.ucp_gb_lvt)
+    1 lsl Ucp.ucp_gb_lf;
+    (*  0 CR *)
+    0;
+    (*  1 LF *)
+    0;
+    (*  2 Control *)
+    esz;
+    (*  3 Extend *)
+    esz (*  4 Prepend *) lor (1 lsl Ucp.ucp_gb_prepend)
+    lor (1 lsl Ucp.ucp_gb_l) lor (1 lsl Ucp.ucp_gb_v) lor (1 lsl Ucp.ucp_gb_t)
+    lor (1 lsl Ucp.ucp_gb_lv) lor (1 lsl Ucp.ucp_gb_lvt)
     lor (1 lsl Ucp.ucp_gb_other)
     lor (1 lsl Ucp.ucp_gb_regional_indicator);
-    esz; (*  5 SpacingMark *)
-    esz (*  6 L *)
-    lor (1 lsl Ucp.ucp_gb_l)
-    lor (1 lsl Ucp.ucp_gb_v)
-    lor (1 lsl Ucp.ucp_gb_lv)
-    lor (1 lsl Ucp.ucp_gb_lvt);
-    esz lor (1 lsl Ucp.ucp_gb_v) lor (1 lsl Ucp.ucp_gb_t); (*  7 V *)
-    esz lor (1 lsl Ucp.ucp_gb_t); (*  8 T *)
-    esz lor (1 lsl Ucp.ucp_gb_v) lor (1 lsl Ucp.ucp_gb_t); (*  9 LV *)
-    esz lor (1 lsl Ucp.ucp_gb_t); (* 10 LVT *)
-    1 lsl Ucp.ucp_gb_regional_indicator; (* 11 Regional Indicator *)
-    esz; (* 12 Other *)
-    esz lor (1 lsl Ucp.ucp_gb_extended_pictographic); (* 13 ZWJ *)
-    esz; (* 14 Extended Pictographic *)
+    esz;
+    (*  5 SpacingMark *)
+    esz (*  6 L *) lor (1 lsl Ucp.ucp_gb_l)
+    lor (1 lsl Ucp.ucp_gb_v) lor (1 lsl Ucp.ucp_gb_lv) lor (1 lsl Ucp.ucp_gb_lvt);
+    esz lor (1 lsl Ucp.ucp_gb_v) lor (1 lsl Ucp.ucp_gb_t);
+    (*  7 V *)
+    esz lor (1 lsl Ucp.ucp_gb_t);
+    (*  8 T *)
+    esz lor (1 lsl Ucp.ucp_gb_v) lor (1 lsl Ucp.ucp_gb_t);
+    (*  9 LV *)
+    esz lor (1 lsl Ucp.ucp_gb_t);
+    (* 10 LVT *)
+    1 lsl Ucp.ucp_gb_regional_indicator;
+    (* 11 Regional Indicator *)
+    esz;
+    (* 12 Other *)
+    esz lor (1 lsl Ucp.ucp_gb_extended_pictographic);
+    (* 13 ZWJ *)
+    esz;
+    (* 14 Extended Pictographic *)
   |]

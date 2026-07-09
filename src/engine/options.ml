@@ -109,10 +109,9 @@ let public_literal_compile_extra_options =
 (* pcre2_compile.c:786-792 — all public extra options for pcre2_compile(). *)
 let public_compile_extra_options =
   public_literal_compile_extra_options lor extra_allow_surrogate_escapes
-  lor extra_bad_escape_is_literal lor extra_escaped_cr_is_lf
-  lor extra_alt_bsux lor extra_allow_lookaround_bsk lor extra_ascii_bsd
-  lor extra_ascii_bss lor extra_ascii_bsw lor extra_ascii_posix
-  lor extra_ascii_digit
+  lor extra_bad_escape_is_literal lor extra_escaped_cr_is_lf lor extra_alt_bsux
+  lor extra_allow_lookaround_bsk lor extra_ascii_bsd lor extra_ascii_bss
+  lor extra_ascii_bsw lor extra_ascii_posix lor extra_ascii_digit
 
 (* pcre2_match.c:73-77 — public options permitted at match time; anything
    outside this mask is PCRE2_ERROR_BADOPTION (-34). *)

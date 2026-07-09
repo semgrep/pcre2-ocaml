@@ -36,6 +36,7 @@ end
 
 module Oracle_harness =
   Pcre2test_harness.Harness.Make (Pcre2_test_driver.Test_driver)
+
 module Engine_harness =
   Pcre2test_harness.Harness.Make (Pcre2test_harness.Engine_driver)
 
@@ -79,10 +80,9 @@ let read_raw_lines path =
   let lines = ref [] in
   let start = ref 0 in
   for i = 0 to n - 1 do
-    if s.[i] = '\n' then begin
+    if s.[i] = '\n' then (
       lines := String.sub s !start (i - !start + 1) :: !lines;
-      start := i + 1
-    end
+      start := i + 1)
   done;
   if !start < n then lines := String.sub s !start (n - !start) :: !lines;
   List.rev !lines
@@ -160,9 +160,7 @@ let load_baseline baseline_rel =
           (List.map
              (function
                | Sexp_lite.List
-                   [
-                     Sexp_lite.Atom f; Sexp_lite.Atom p; Sexp_lite.Atom tot;
-                   ] ->
+                   [ Sexp_lite.Atom f; Sexp_lite.Atom p; Sexp_lite.Atom tot ] ->
                    (f, int_of_string p, int_of_string tot)
                | _ ->
                    prerr_endline ("runner: malformed " ^ baseline_rel);
@@ -247,8 +245,7 @@ let run_file (module H : HARNESS) skiplist file : file_report =
     List.length (List.filter (fun o -> o.skip = None && o.passed) outcomes)
   in
   let n_fail =
-    List.length
-      (List.filter (fun o -> o.skip = None && not o.passed) outcomes)
+    List.length (List.filter (fun o -> o.skip = None && not o.passed) outcomes)
   in
   let cats = [ "out-of-scope"; "env"; "deferred"; "harness" ] in
   let n_skip_by_cat =
@@ -258,7 +255,9 @@ let run_file (module H : HARNESS) skiplist file : file_report =
           List.length
             (List.filter
                (fun o ->
-                 match o.skip with Some (c', _) -> String.equal c c' | None -> false)
+                 match o.skip with
+                 | Some (c', _) -> String.equal c c'
+                 | None -> false)
                outcomes) ))
       cats
   in
@@ -297,18 +296,15 @@ let () =
   let args =
     List.filter
       (fun a ->
-        if String.equal a "--driver=oracle" then begin
+        if String.equal a "--driver=oracle" then (
           driver := `Oracle;
-          false
-        end
-        else if String.equal a "--driver=engine" then begin
+          false)
+        else if String.equal a "--driver=engine" then (
           driver := `Engine;
-          false
-        end
-        else if String.length a >= 9 && String.sub a 0 9 = "--driver=" then begin
+          false)
+        else if String.length a >= 9 && String.sub a 0 9 = "--driver=" then (
           prerr_endline ("runner: unknown driver in '" ^ a ^ "'");
-          exit 2
-        end
+          exit 2)
         else true)
       args
   in
@@ -359,7 +355,7 @@ let () =
           Printf.eprintf "runner: %s has no unit %d (%d units)\n" file ord
             (List.length r.outcomes);
           exit 2
-      | Some o ->
+      | Some o -> (
           Printf.printf "%s:%d  pattern: %s\n" file ord o.pattern_line;
           (match o.skip with
           | Some (c, why) -> Printf.printf "skip: [%s] %s\n" c why
@@ -368,7 +364,7 @@ let () =
           List.iter (fun l -> Printf.printf "  %s\n" l) o.expected;
           Printf.printf "--- actual\n";
           List.iter (fun l -> Printf.printf "  %s\n" l) o.actual;
-          (match first_diff o.expected o.actual with
+          match first_diff o.expected o.actual with
           | None ->
               Printf.printf "--- no diff (unit passes)\n";
               exit 0
@@ -387,7 +383,7 @@ let () =
           let r = run_file skiplist file in
           List.iter
             (fun o ->
-              if o.skip = None && not o.passed then begin
+              if o.skip = None && not o.passed then (
                 any := true;
                 Printf.printf "%s:%d  pattern: %s\n" file o.ordinal
                   o.pattern_line;
@@ -398,8 +394,7 @@ let () =
                       (match e with Some l -> l | None -> "<end of output>");
                     Printf.printf "    actual:   %s\n"
                       (match a with Some l -> l | None -> "<end of output>")
-                | None -> ()
-              end)
+                | None -> ()))
             r.outcomes)
         files;
       exit (if !any then 1 else 0)
@@ -410,9 +405,7 @@ let () =
           if !frontier = None then
             let r = run_file skiplist file in
             match
-              List.find_opt
-                (fun o -> o.skip = None && not o.passed)
-                r.outcomes
+              List.find_opt (fun o -> o.skip = None && not o.passed) r.outcomes
             with
             | Some o -> frontier := Some (file, o)
             | None -> ())
@@ -443,8 +436,8 @@ let () =
             (fun o ->
               match o.skip with
               | Some (cat, why) ->
-                  Printf.printf "  skipped %s:%d [%s] %s\n" r.file o.ordinal
-                    cat why
+                  Printf.printf "  skipped %s:%d [%s] %s\n" r.file o.ordinal cat
+                    why
               | None -> ())
             r.outcomes)
         reports;
@@ -469,13 +462,10 @@ let () =
       | `Update ->
           let oc = open_out (path baseline_rel) in
           let regen_flag =
-            match !driver with
-            | `Oracle -> ""
-            | `Engine -> "--driver=engine "
+            match !driver with `Oracle -> "" | `Engine -> "--driver=engine "
           in
           Printf.fprintf oc
-            "; Conformance baseline: ((<file> <passed> <total-in-scope>) \
-             ...)\n\
+            "; Conformance baseline: ((<file> <passed> <total-in-scope>) ...)\n\
              ; Regenerate with: dune exec test/conformance/runner.exe -- \
              %s--update-baseline\n"
             regen_flag;
@@ -502,15 +492,12 @@ let () =
                     List.find_opt (fun r -> String.equal r.file f) reports
                   with
                   | None ->
-                      Printf.printf
-                        "REGRESSION: %s in baseline but not run\n" f;
+                      Printf.printf "REGRESSION: %s in baseline but not run\n" f;
                       regressed := true
                   | Some r ->
-                      if r.n_pass < bpass then begin
-                        Printf.printf
-                          "REGRESSION: %s passed %d < baseline %d\n" f r.n_pass
-                          bpass;
-                        regressed := true
-                      end)
+                      if r.n_pass < bpass then (
+                        Printf.printf "REGRESSION: %s passed %d < baseline %d\n"
+                          f r.n_pass bpass;
+                        regressed := true))
                 baseline;
               if !regressed then exit 1))

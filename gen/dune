@@ -15,6 +15,7 @@
 ; diff against the committed src/engine files. This rule must live here, not
 ; in src/ (src/ is a library with include_subdirs; the generated files are
 ; committed there as normal sources).
+
 (rule
  (targets chartables.ml ucd_tables.ml ucptables.ml)
  (deps

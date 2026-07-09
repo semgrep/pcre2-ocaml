@@ -153,7 +153,6 @@ let op_dnrefi = 116 (* Match a duplicate name backref, caselessly *)
 let op_recurse = 117 (* Match a numbered subpattern (possibly recursive) *)
 let op_callout = 118 (* Call out to external function if provided *)
 let op_callout_str = 119 (* Call out with string argument *)
-
 let op_alt = 120 (* Start of alternation *)
 let op_ket = 121 (* End of group that doesn't have an unbounded repeat *)
 let op_ketrmax = 122 (* These two must remain together and in this order; *)
@@ -197,7 +196,6 @@ let op_rref = 147 (* Used to hold a recursion number as condition *)
 let op_dnrref = 148 (* Used to point to duplicate names as a condition *)
 let op_false = 149 (* Always false (used by DEFINE and VERSION) *)
 let op_true = 150 (* Always true (used by VERSION) *)
-
 let op_brazero = 151 (* These two must remain together and in this order *)
 let op_braminzero = 152
 let op_braposzero = 153
@@ -251,46 +249,177 @@ let rref_any = 0xffff
    names in many cases). Indexed by opcode. *)
 let op_names =
   [|
-    "End"; "\\A"; "\\G"; "\\K"; "\\B"; "\\b"; "\\D"; "\\d";
-    "\\S"; "\\s"; "\\W"; "\\w"; "Any"; "AllAny"; "Anybyte";
-    "notprop"; "prop"; "\\R"; "\\H"; "\\h"; "\\V"; "\\v";
-    "extuni"; "\\Z"; "\\z";
-    "$"; "$"; "^"; "^"; "char"; "chari"; "not"; "noti";
-    "*"; "*?"; "+"; "+?"; "?"; "??";
-    "{"; "{"; "{";
-    "*+"; "++"; "?+"; "{";
-    "*"; "*?"; "+"; "+?"; "?"; "??";
-    "{"; "{"; "{";
-    "*+"; "++"; "?+"; "{";
-    "*"; "*?"; "+"; "+?"; "?"; "??";
-    "{"; "{"; "{";
-    "*+"; "++"; "?+"; "{";
-    "*"; "*?"; "+"; "+?"; "?"; "??";
-    "{"; "{"; "{";
-    "*+"; "++"; "?+"; "{";
-    "*"; "*?"; "+"; "+?"; "?"; "??"; "{"; "{"; "{";
-    "*+"; "++"; "?+"; "{";
-    "*"; "*?"; "+"; "+?"; "?"; "??"; "{"; "{";
-    "*+"; "++"; "?+"; "{";
-    "class"; "nclass"; "xclass"; "Ref"; "Refi"; "DnRef"; "DnRefi";
-    "Recurse"; "Callout"; "CalloutStr";
-    "Alt"; "Ket"; "KetRmax"; "KetRmin"; "KetRpos";
-    "Reverse"; "VReverse"; "Assert"; "Assert not";
-    "Assert back"; "Assert back not";
-    "Non-atomic assert"; "Non-atomic assert back";
+    "End";
+    "\\A";
+    "\\G";
+    "\\K";
+    "\\B";
+    "\\b";
+    "\\D";
+    "\\d";
+    "\\S";
+    "\\s";
+    "\\W";
+    "\\w";
+    "Any";
+    "AllAny";
+    "Anybyte";
+    "notprop";
+    "prop";
+    "\\R";
+    "\\H";
+    "\\h";
+    "\\V";
+    "\\v";
+    "extuni";
+    "\\Z";
+    "\\z";
+    "$";
+    "$";
+    "^";
+    "^";
+    "char";
+    "chari";
+    "not";
+    "noti";
+    "*";
+    "*?";
+    "+";
+    "+?";
+    "?";
+    "??";
+    "{";
+    "{";
+    "{";
+    "*+";
+    "++";
+    "?+";
+    "{";
+    "*";
+    "*?";
+    "+";
+    "+?";
+    "?";
+    "??";
+    "{";
+    "{";
+    "{";
+    "*+";
+    "++";
+    "?+";
+    "{";
+    "*";
+    "*?";
+    "+";
+    "+?";
+    "?";
+    "??";
+    "{";
+    "{";
+    "{";
+    "*+";
+    "++";
+    "?+";
+    "{";
+    "*";
+    "*?";
+    "+";
+    "+?";
+    "?";
+    "??";
+    "{";
+    "{";
+    "{";
+    "*+";
+    "++";
+    "?+";
+    "{";
+    "*";
+    "*?";
+    "+";
+    "+?";
+    "?";
+    "??";
+    "{";
+    "{";
+    "{";
+    "*+";
+    "++";
+    "?+";
+    "{";
+    "*";
+    "*?";
+    "+";
+    "+?";
+    "?";
+    "??";
+    "{";
+    "{";
+    "*+";
+    "++";
+    "?+";
+    "{";
+    "class";
+    "nclass";
+    "xclass";
+    "Ref";
+    "Refi";
+    "DnRef";
+    "DnRefi";
+    "Recurse";
+    "Callout";
+    "CalloutStr";
+    "Alt";
+    "Ket";
+    "KetRmax";
+    "KetRmin";
+    "KetRpos";
+    "Reverse";
+    "VReverse";
+    "Assert";
+    "Assert not";
+    "Assert back";
+    "Assert back not";
+    "Non-atomic assert";
+    "Non-atomic assert back";
     "Once";
     "Script run";
-    "Bra"; "BraPos"; "CBra"; "CBraPos";
+    "Bra";
+    "BraPos";
+    "CBra";
+    "CBraPos";
     "Cond";
-    "SBra"; "SBraPos"; "SCBra"; "SCBraPos";
+    "SBra";
+    "SBraPos";
+    "SCBra";
+    "SCBraPos";
     "SCond";
-    "Cond ref"; "Cond dnref"; "Cond rec"; "Cond dnrec";
-    "Cond false"; "Cond true";
-    "Brazero"; "Braminzero"; "Braposzero";
-    "*MARK"; "*PRUNE"; "*PRUNE"; "*SKIP"; "*SKIP";
-    "*THEN"; "*THEN"; "*COMMIT"; "*COMMIT"; "*FAIL";
-    "*ACCEPT"; "*ASSERT_ACCEPT";
-    "Close"; "Skip zero"; "Define"; "\\B (ucp)"; "\\b (ucp)";
+    "Cond ref";
+    "Cond dnref";
+    "Cond rec";
+    "Cond dnrec";
+    "Cond false";
+    "Cond true";
+    "Brazero";
+    "Braminzero";
+    "Braposzero";
+    "*MARK";
+    "*PRUNE";
+    "*PRUNE";
+    "*SKIP";
+    "*SKIP";
+    "*THEN";
+    "*THEN";
+    "*COMMIT";
+    "*COMMIT";
+    "*FAIL";
+    "*ACCEPT";
+    "*ASSERT_ACCEPT";
+    "Close";
+    "Skip zero";
+    "Define";
+    "\\B (ucp)";
+    "\\b (ucp)";
   |]
 
 (* pcre2_internal.h:1726-1812 — OP_LENGTHS: the length of fixed-length
@@ -301,92 +430,263 @@ let op_names =
    (config.h.generic:173), 32/sizeof(PCRE2_UCHAR) = 32. *)
 let op_lengths =
   [|
-    1;                    (* End                                    *)
-    1; 1; 1; 1; 1;        (* \A, \G, \K, \B, \b                     *)
-    1; 1; 1; 1; 1; 1;     (* \D, \d, \S, \s, \W, \w                 *)
-    1; 1; 1;              (* Any, AllAny, Anybyte                   *)
-    3; 3;                 (* \P, \p                                 *)
-    1; 1; 1; 1; 1;        (* \R, \H, \h, \V, \v                     *)
-    1;                    (* \X                                     *)
-    1; 1; 1; 1; 1; 1;     (* \Z, \z, $, $M ^, ^M                    *)
-    2;                    (* Char  - the minimum length             *)
-    2;                    (* Chari - the minimum length             *)
-    2;                    (* not                                    *)
-    2;                    (* noti                                   *)
+    1;
+    (* End                                    *)
+    1;
+    1;
+    1;
+    1;
+    1;
+    (* \A, \G, \K, \B, \b                     *)
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    (* \D, \d, \S, \s, \W, \w                 *)
+    1;
+    1;
+    1;
+    (* Any, AllAny, Anybyte                   *)
+    3;
+    3;
+    (* \P, \p                                 *)
+    1;
+    1;
+    1;
+    1;
+    1;
+    (* \R, \H, \h, \V, \v                     *)
+    1;
+    (* \X                                     *)
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    (* \Z, \z, $, $M ^, ^M                    *)
+    2;
+    (* Char  - the minimum length             *)
+    2;
+    (* Chari - the minimum length             *)
+    2;
+    (* not                                    *)
+    2;
+    (* noti                                   *)
     (* Positive single-char repeats; minima in UTF-8 mode *)
-    2; 2; 2; 2; 2; 2;     (* *, *?, +, +?, ?, ??                    *)
-    4; 4;                 (* upto, minupto            2+IMM2_SIZE   *)
-    4;                    (* exact                    2+IMM2_SIZE   *)
-    2; 2; 2; 4;           (* *+, ++, ?+, upto+                      *)
-    2; 2; 2; 2; 2; 2;     (* *I, *?I, +I, +?I, ?I, ??I              *)
-    4; 4;                 (* upto I, minupto I                      *)
-    4;                    (* exact I                                *)
-    2; 2; 2; 4;           (* *+I, ++I, ?+I, upto+I                  *)
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    (* *, *?, +, +?, ?, ??                    *)
+    4;
+    4;
+    (* upto, minupto            2+IMM2_SIZE   *)
+    4;
+    (* exact                    2+IMM2_SIZE   *)
+    2;
+    2;
+    2;
+    4;
+    (* *+, ++, ?+, upto+                      *)
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    (* *I, *?I, +I, +?I, ?I, ??I              *)
+    4;
+    4;
+    (* upto I, minupto I                      *)
+    4;
+    (* exact I                                *)
+    2;
+    2;
+    2;
+    4;
+    (* *+I, ++I, ?+I, upto+I                  *)
     (* Negative single-char repeats - only for chars < 256 *)
-    2; 2; 2; 2; 2; 2;     (* NOT *, *?, +, +?, ?, ??                *)
-    4; 4;                 (* NOT upto, minupto                      *)
-    4;                    (* NOT exact                              *)
-    2; 2; 2; 4;           (* Possessive NOT *, +, ?, upto           *)
-    2; 2; 2; 2; 2; 2;     (* NOT *I, *?I, +I, +?I, ?I, ??I          *)
-    4; 4;                 (* NOT upto I, minupto I                  *)
-    4;                    (* NOT exact I                            *)
-    2; 2; 2; 4;           (* Possessive NOT *I, +I, ?I, upto I      *)
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    (* NOT *, *?, +, +?, ?, ??                *)
+    4;
+    4;
+    (* NOT upto, minupto                      *)
+    4;
+    (* NOT exact                              *)
+    2;
+    2;
+    2;
+    4;
+    (* Possessive NOT *, +, ?, upto           *)
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    (* NOT *I, *?I, +I, +?I, ?I, ??I          *)
+    4;
+    4;
+    (* NOT upto I, minupto I                  *)
+    4;
+    (* NOT exact I                            *)
+    2;
+    2;
+    2;
+    4;
+    (* Possessive NOT *I, +I, ?I, upto I      *)
     (* Positive type repeats *)
-    2; 2; 2; 2; 2; 2;     (* Type *, *?, +, +?, ?, ??               *)
-    4; 4;                 (* Type upto, minupto                     *)
-    4;                    (* Type exact                             *)
-    2; 2; 2; 4;           (* Possessive *+, ++, ?+, upto+           *)
+    2;
+    2;
+    2;
+    2;
+    2;
+    2;
+    (* Type *, *?, +, +?, ?, ??               *)
+    4;
+    4;
+    (* Type upto, minupto                     *)
+    4;
+    (* Type exact                             *)
+    2;
+    2;
+    2;
+    4;
+    (* Possessive *+, ++, ?+, upto+           *)
     (* Character class & ref repeats *)
-    1; 1; 1; 1; 1; 1;     (* *, *?, +, +?, ?, ??                    *)
-    5; 5;                 (* CRRANGE, CRMINRANGE      1+2*IMM2_SIZE *)
-    1; 1; 1; 5;           (* Possessive *+, ++, ?+, CRPOSRANGE      *)
-    33;                   (* CLASS                    1+(32/1)      *)
-    33;                   (* NCLASS                                 *)
-    0;                    (* XCLASS - variable length               *)
-    3;                    (* REF                      1+IMM2_SIZE   *)
-    3;                    (* REFI                                   *)
-    5;                    (* DNREF                    1+2*IMM2_SIZE *)
-    5;                    (* DNREFI                                 *)
-    3;                    (* RECURSE                  1+LINK_SIZE   *)
-    6;                    (* CALLOUT                  1+2*LINK_SIZE+1 *)
-    0;                    (* CALLOUT_STR - variable length          *)
-    3;                    (* Alt                      1+LINK_SIZE   *)
-    3;                    (* Ket                                    *)
-    3;                    (* KetRmax                                *)
-    3;                    (* KetRmin                                *)
-    3;                    (* KetRpos                                *)
-    3;                    (* Reverse                  1+IMM2_SIZE   *)
-    5;                    (* VReverse                 1+2*IMM2_SIZE *)
-    3;                    (* Assert                   1+LINK_SIZE   *)
-    3;                    (* Assert not                             *)
-    3;                    (* Assert behind                          *)
-    3;                    (* Assert behind not                      *)
-    3;                    (* NA Assert                              *)
-    3;                    (* NA Assert behind                       *)
-    3;                    (* ONCE                                   *)
-    3;                    (* SCRIPT_RUN                             *)
-    3;                    (* BRA                                    *)
-    3;                    (* BRAPOS                                 *)
-    5;                    (* CBRA                     1+LINK_SIZE+IMM2_SIZE *)
-    5;                    (* CBRAPOS                                *)
-    3;                    (* COND                                   *)
-    3;                    (* SBRA                                   *)
-    3;                    (* SBRAPOS                                *)
-    5;                    (* SCBRA                                  *)
-    5;                    (* SCBRAPOS                               *)
-    3;                    (* SCOND                                  *)
-    3; 5;                 (* CREF, DNCREF                           *)
-    3; 5;                 (* RREF, DNRREF                           *)
-    1; 1;                 (* FALSE, TRUE                            *)
-    1; 1; 1;              (* BRAZERO, BRAMINZERO, BRAPOSZERO        *)
-    3; 1; 3;              (* MARK, PRUNE, PRUNE_ARG                 *)
-    1; 3;                 (* SKIP, SKIP_ARG                         *)
-    1; 3;                 (* THEN, THEN_ARG                         *)
-    1; 3;                 (* COMMIT, COMMIT_ARG                     *)
-    1; 1; 1;              (* FAIL, ACCEPT, ASSERT_ACCEPT            *)
-    3; 1;                 (* CLOSE, SKIPZERO                        *)
-    1;                    (* DEFINE                                 *)
-    1; 1;                 (* \B and \b in UCP mode                  *)
+    1;
+    1;
+    1;
+    1;
+    1;
+    1;
+    (* *, *?, +, +?, ?, ??                    *)
+    5;
+    5;
+    (* CRRANGE, CRMINRANGE      1+2*IMM2_SIZE *)
+    1;
+    1;
+    1;
+    5;
+    (* Possessive *+, ++, ?+, CRPOSRANGE      *)
+    33;
+    (* CLASS                    1+(32/1)      *)
+    33;
+    (* NCLASS                                 *)
+    0;
+    (* XCLASS - variable length               *)
+    3;
+    (* REF                      1+IMM2_SIZE   *)
+    3;
+    (* REFI                                   *)
+    5;
+    (* DNREF                    1+2*IMM2_SIZE *)
+    5;
+    (* DNREFI                                 *)
+    3;
+    (* RECURSE                  1+LINK_SIZE   *)
+    6;
+    (* CALLOUT                  1+2*LINK_SIZE+1 *)
+    0;
+    (* CALLOUT_STR - variable length          *)
+    3;
+    (* Alt                      1+LINK_SIZE   *)
+    3;
+    (* Ket                                    *)
+    3;
+    (* KetRmax                                *)
+    3;
+    (* KetRmin                                *)
+    3;
+    (* KetRpos                                *)
+    3;
+    (* Reverse                  1+IMM2_SIZE   *)
+    5;
+    (* VReverse                 1+2*IMM2_SIZE *)
+    3;
+    (* Assert                   1+LINK_SIZE   *)
+    3;
+    (* Assert not                             *)
+    3;
+    (* Assert behind                          *)
+    3;
+    (* Assert behind not                      *)
+    3;
+    (* NA Assert                              *)
+    3;
+    (* NA Assert behind                       *)
+    3;
+    (* ONCE                                   *)
+    3;
+    (* SCRIPT_RUN                             *)
+    3;
+    (* BRA                                    *)
+    3;
+    (* BRAPOS                                 *)
+    5;
+    (* CBRA                     1+LINK_SIZE+IMM2_SIZE *)
+    5;
+    (* CBRAPOS                                *)
+    3;
+    (* COND                                   *)
+    3;
+    (* SBRA                                   *)
+    3;
+    (* SBRAPOS                                *)
+    5;
+    (* SCBRA                                  *)
+    5;
+    (* SCBRAPOS                               *)
+    3;
+    (* SCOND                                  *)
+    3;
+    5;
+    (* CREF, DNCREF                           *)
+    3;
+    5;
+    (* RREF, DNRREF                           *)
+    1;
+    1;
+    (* FALSE, TRUE                            *)
+    1;
+    1;
+    1;
+    (* BRAZERO, BRAMINZERO, BRAPOSZERO        *)
+    3;
+    1;
+    3;
+    (* MARK, PRUNE, PRUNE_ARG                 *)
+    1;
+    3;
+    (* SKIP, SKIP_ARG                         *)
+    1;
+    3;
+    (* THEN, THEN_ARG                         *)
+    1;
+    3;
+    (* COMMIT, COMMIT_ARG                     *)
+    1;
+    1;
+    1;
+    (* FAIL, ACCEPT, ASSERT_ACCEPT            *)
+    3;
+    1;
+    (* CLOSE, SKIPZERO                        *)
+    1;
+    (* DEFINE                                 *)
+    1;
+    1;
+    (* \B and \b in UCP mode                  *)
   |]
 
 (* Consistency checks mirroring the C's use of OP_TABLE_LENGTH to catch

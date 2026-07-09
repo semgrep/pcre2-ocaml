@@ -36,7 +36,8 @@ external pcre2_jit_match :
   string ->
   (int[@untagged]) ->
   (int32[@unboxed]) ->
-  ((int * int) option, int) Result.t = "oracle_jit_match" "oracle_jit_match_unboxed"
+  ((int * int) option, int) Result.t
+  = "oracle_jit_match" "oracle_jit_match_unboxed"
 
 external pcre2_jit_capture :
   jit regex ->

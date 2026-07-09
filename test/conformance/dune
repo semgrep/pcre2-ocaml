@@ -23,6 +23,7 @@
 
 ; `dune build @conformance` = default runner mode (report + baseline check +
 ; skiplist staleness). Deliberately NOT attached to @runtest yet.
+
 (rule
  (alias conformance)
  (deps

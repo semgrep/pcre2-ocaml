@@ -14,10 +14,9 @@ let ( >>= ) x f =
   | Error e -> Error e
 
 module MakeTests
-    (M :
-      Pcre2.Matcher
-        with type compile_error = compile_error
-         and type match_error = match_error) : sig
+    (M : Pcre2.Matcher
+           with type compile_error = compile_error
+            and type match_error = match_error) : sig
   val tests : test list
 end = struct
   open M

@@ -52,17 +52,16 @@ let split (lines : string list) : unit_t list =
             mode := `Subject
       | `Subject ->
           current := raw :: !current;
-          if Scan.is_blank raw then begin
+          if Scan.is_blank raw then (
             finish_unit ();
-            mode := `Top
-          end
+            mode := `Top)
       | `Top ->
           if
             String.length raw > 0
             && raw.[0] <> '#'
             && Scan.is_delimiter raw.[0]
             && not (Scan.is_blank raw)
-          then begin
+          then (
             (* [current] is stored reversed; preamble is reversed too, so
                consing the pattern line onto it keeps file order *)
             current := raw :: !preamble;
@@ -74,8 +73,7 @@ let split (lines : string list) : unit_t list =
             | None ->
                 let buf = Buffer.create 128 in
                 Buffer.add_string buf raw;
-                mode := `Pat (delim, buf)
-          end
+                mode := `Pat (delim, buf))
           else preamble := raw :: !preamble)
     lines;
   (* flush *)
@@ -89,8 +87,7 @@ let split (lines : string list) : unit_t list =
   match (units, trailing) with
   | [], _ ->
       if trailing = [] then []
-      else
-        [ { ordinal = 1; lines = trailing; pattern_line = "" } ]
+      else [ { ordinal = 1; lines = trailing; pattern_line = "" } ]
         (* degenerate: no patterns at all *)
   | _, [] -> units
   | _, _ ->
@@ -138,13 +135,12 @@ let align (units : unit_t list) (expected_lines : string list) :
                     error :=
                       Some
                         (Printf.sprintf
-                           "alignment failed at unit %d, input line %d: %S \
-                            not found in expected output after line %d"
+                           "alignment failed at unit %d, input line %d: %S not \
+                            found in expected output after line %d"
                            u.ordinal (li + 1) want !cursor)
-                  else begin
+                  else (
                     if li = 0 then unit_starts := !j :: !unit_starts;
-                    cursor := !j + 1
-                  end)
+                    cursor := !j + 1))
             u.lines;
           ignore ui)
     units;
