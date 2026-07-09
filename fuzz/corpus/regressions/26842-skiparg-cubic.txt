@@ -1,0 +1,27 @@
+# fuzz-diff repro (differential: pure engine vs C oracle)
+# seed=4242 case=26842 kind=exec (behavior pin — no divergence; both sides agree)
+# reason: campaign stall, not an engine bug. The (*SKIP:name)-with-unmatched-mark
+#         re-run saga is Theta(limit^3) on BOTH implementations: pcre2_match.c
+#         7536-7539 re-runs the attempt at the SAME start with ignore_skip_arg
+#         bumped, 7506 RESETS match_call_count per re-run, 6407-6424 OP_SKIP_ARG;
+#         with (?0) + PCRE2_DISABLE_RECURSELOOP_CHECK the re-run count is
+#         unbounded by the match limit. At the fuzzer's old imposed
+#         LIMIT_MATCH=80000 the mopts=0x20040000 draw below measured 2350 s
+#         (C 10.44 pcre2test, rc=-47) / ~3.2 h extrapolated (engine, same cubic
+#         exponent, same rc). Pinned here at LIMIT_MATCH=1600 (~0.2 s replay):
+#         the -47 saga draw, two -52 recurse-loop-check draws, and three match
+#         draws replay byte-identical engine-vs-oracle.
+# pattern (ascii): (*LIMIT_MATCH=1600)\H9??|[\P{Sc}\p{sc:Latin}][_[:alpha:]0](?*A\NA*(?<!Z?+))|\ |(?0)(*SKIP:z)
+# compile: options=0x04810000 extra=0x00000050 newline=0 bsr=0
+# exec: subject="jR1/1{x" offset=0 mopts=0x20040000 (saga draw; 7 more below)
+# engine: rc=-47 (match limit exceeded) on the saga draw
+# oracle: rc=-47 (match limit exceeded) on the saga draw
+/28 2a 4c 49 4d 49 54 5f 4d 41 54 43 48 3d 31 36 30 30 29 5c 48 39 3f 3f 7c 5b 5c 50 7b 53 63 7d 5c 70 7b 73 63 3a 4c 61 74 69 6e 7d 5d 5b 5f 5b 3a 61 6c 70 68 61 3a 5d 30 5d 28 3f 2a 41 5c 4e 41 2a 28 3f 3c 21 5a 3f 2b 29 29 7c 5c 20 7c 28 3f 30 29 28 2a 53 4b 49 50 3a 7a 29/hex,no_start_optimize,use_offset_limit,match_invalid_utf,escaped_cr_is_lf,allow_lookaround_bsk
+    \=offset=0,mark,startchar
+    \x6a\x52\x31\x2f\x31\x7b\x78\=offset=0,mark,startchar,endanchored,disable_recurseloop_check
+    \x6a\x52\x31\x2f\x31\x7b\x78\=offset=2,mark,startchar,anchored,copy_matched_subject
+    \x41\x41\x41\=offset=0,mark,startchar,noteol
+    \x5f\x30\x5f\x41\x5a\=offset=0,mark,startchar,copy_matched_subject,disable_recurseloop_check
+    \x5f\x30\x5f\x41\x5a\=offset=5,mark,startchar
+    \x41\x5a\x20\x5f\x41\x5f\x5f\x5a\x41\x5f\x41\x41\=offset=0,mark,startchar,notbol,partial_hard
+    \x41\x5a\x20\x5f\x41\x5f\x5f\x5a\x41\x5f\x41\x41\=offset=0,mark,startchar,copy_matched_subject

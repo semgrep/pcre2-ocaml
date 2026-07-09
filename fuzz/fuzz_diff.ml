@@ -1216,9 +1216,26 @@ let () =
     (* base case for compile-level checks; subject/exec filled per draw.
        A default LIMIT_MATCH bounds catastrophic backtracking / deep recursion
        during the sweep (dropped by the shrinker when the repro doesn't need
-       it). *)
+       it).
+
+       The imposed limit bounds each match ATTEMPT, not a whole exec: when a
+       ( *SKIP:name) fails with no matching mark, pcre2_match re-runs the
+       attempt at the SAME start with mb->ignore_skip_arg bumped
+       (pcre2_match.c:6407-6424, 7536-7539) and mb->match_call_count RESET
+       (pcre2_match.c:7506) — the re-run count is unbounded by the limit, so
+       worst-case total work is Theta(limit^3) on BOTH implementations.  At
+       the old limit of 80000, seed 4242 case 26842
+       ("(?0)( *SKIP:z)" + PCRE2_DISABLE_RECURSELOOP_CHECK) measured 39 min
+       (C oracle) / ~3.2 h (engine) for ONE exec draw — an apparent campaign
+       hang.  2000 caps that saga at ~0.04 s (C) / ~0.2 s (engine), measured
+       via the same case's cubic scaling (time x8 per limit doubling, both
+       sides).  Divergence coverage lost to the lower cap is limited to
+       cases needing > 2000 frame ticks to demonstrate a diff: one-sided
+       -47/-53 results are already suppressed as limit-confounded by
+       is_limit_rc above (see its definition and the `confounded` check in
+       diff_case). *)
     let base =
-      { pat; copts; newline; bsr; extra; limit = 80000; subj = ""; off = 0;
+      { pat; copts; newline; bsr; extra; limit = 2000; subj = ""; off = 0;
         mopts = 0 }
     in
     if !dump_case = !ci then (
