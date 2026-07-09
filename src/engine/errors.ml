@@ -35,6 +35,7 @@ let err7 =
   compile_error_base + 7 (* escape sequence is invalid in character class *)
 
 let err8 = compile_error_base + 8 (* range out of order in character class *)
+let err9 = compile_error_base + 9 (* quantifier does not follow repeatable *)
 let err11 = compile_error_base + 11 (* unrecognized character after (? or (?- *)
 
 let err12 =
@@ -56,9 +57,15 @@ let err34 = compile_error_base + 34 (* code point in \x{} or \o{} too large *)
 let err37 =
   compile_error_base + 37 (* \F, \L, \l, \N{name}, \U, \u unsupported *)
 
+let err41 = compile_error_base + 41 (* unrecognized character after (?P *)
 let err42 = compile_error_base + 42 (* syntax error in subpattern name *)
+
+let err43 =
+  compile_error_base + 43 (* two named subpatterns have the same name *)
+
 let err44 = compile_error_base + 44 (* name must start with a non-digit *)
 let err48 = compile_error_base + 48 (* subpattern name is too long *)
+let err49 = compile_error_base + 49 (* too many named subpatterns *)
 let err50 = compile_error_base + 50 (* invalid range in character class *)
 
 let err51 =
@@ -74,6 +81,9 @@ let err63 =
   compile_error_base + 63 (* internal error: parsed pattern overflow *)
 
 let err64 = compile_error_base + 64 (* non-octal character in \o{} *)
+
+let err65 =
+  compile_error_base + 65 (* different names for subpatterns of same number *)
 let err67 = compile_error_base + 67 (* non-hex character in \x{} *)
 let err68 = compile_error_base + 68 (* \c must be followed by printable ASCII *)
 

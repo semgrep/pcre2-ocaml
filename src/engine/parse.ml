@@ -5,8 +5,8 @@
    meta_extra_lengths), the parse-phase helpers (read_number,
    read_repeat_counts, check_posix_syntax, check_posix_name, read_name,
    check_escape, handle_escdsw, manage_callouts), parse_context, and
-   parse_regex itself (quantifier/group/assertion/verb arms still deferred
-   per docs/ocaml-engine/02-core-compile-match.md).
+   parse_regex itself (assertion/conditional/recursion/verb/callout and
+   \p arms still deferred per docs/ocaml-engine/02-core-compile-match.md).
 
    The pattern is a `string` of 8-bit code units (this port is the 8-bit
    library); pointers become int indices into that string. *)
@@ -766,6 +766,21 @@ let posix_substitutes =
 
 (* ---------- Parse context ---------- *)
 
+(* pcre2_intmodedep.h:709-717 — structure for building a list of named
+   groups during the first pass of compiling. The C's PCRE2_SPTR name
+   pointer becomes a pattern offset. *)
+type named_group = {
+  name : int; (* Offset of the name in the pattern *)
+  number : int; (* uint32_t: group number *)
+  length : int; (* uint16_t: length of the name *)
+  mutable isdup : bool; (* uint16_t: TRUE if a duplicate *)
+}
+
+(* pcre2_compile.c:187 — the initial number of entries in the named-group
+   list (a stack vector in the C pcre2_compile(), grown on the heap when it
+   fills up; see the DEFINE_NAME code in parse_regex). *)
+let named_group_list_size = 20
+
 (* pcre2_internal.h:490-492 — newline-convention types. NLTYPE_ANY/ANYCRLF
    dispatch to PRIV(is_newline) (pcre2_newline.c), which is the newline.ml
    chunk; the constants live here until that module lands. *)
@@ -817,6 +832,16 @@ type parse_context = {
   (* cb->small_ref_offset — first-occurrence pattern offsets of \1..\9
      (pcre2_compile.c:10280-10290, initialized to PCRE2_UNSET). *)
   small_ref_offset : int array;
+  (* The named-group list built by parse_regex's DEFINE_NAME code and
+     consumed by the compile phase: cb->names_found / name_entry_size
+     (pcre2_intmodedep.h:736-737, both uint16_t), cb->named_groups /
+     named_group_list_size (pcre2_intmodedep.h:740-741), and cb->dupnames
+     (pcre2_intmodedep.h:762). *)
+  mutable names_found : int;
+  mutable name_entry_size : int;
+  mutable named_groups : named_group array;
+  mutable named_group_list_size : int;
+  mutable dupnames : bool;
   (* cb->parsed_pattern / cb->parsed_pattern_end: the parsed-pattern vector
      and its end. C pointers become the int array plus an index limit;
      allocate_parsed_pattern (below) sizes them as pcre2_compile() does. *)
@@ -841,6 +866,17 @@ let make_context (pattern : string) : parse_context =
     nl0 = 0x0a (* CHAR_LF *);
     nl1 = 0;
     small_ref_offset = Array.make 10 pcre2_unset (* pcre2_compile.c:10290 *);
+    names_found = 0 (* pcre2_compile.c:10264 *);
+    name_entry_size = 0 (* pcre2_compile.c:10260 *);
+    (* pcre2_compile.c:10168,10262 — the initial NAMED_GROUP_LIST_SIZE
+       entries. Sharing one dummy record across the fresh slots is safe:
+       only entries below names_found are ever read or mutated, and each is
+       replaced with a fresh record when it is added. *)
+    named_groups =
+      Array.make named_group_list_size
+        { name = 0; number = 0; length = 0; isdup = false };
+    named_group_list_size (* pcre2_compile.c:10263 *);
+    dupnames = false (* pcre2_compile.c:10250 *);
     parsed_pattern = [||];
     parsed_pattern_end = 0;
   }
@@ -1788,6 +1824,19 @@ let strncmp_c8_eq (pattern : string) (ptr : int) (name : string) (len : int) :
   in
   loop 0
 
+(* pcre2_string_utils.c:150-167 — PRIV(strncmp), specialized to the == 0
+   (equality) test that is its only use in this module
+   (pcre2_compile.c:4874). Compares len code units of the pattern starting
+   at p1 with the len code units starting at p2. *)
+let strncmp_eq (pattern : string) (p1 : int) (p2 : int) (len : int) : bool =
+  let rec loop i =
+    if i >= len then true
+    else if Char.equal pattern.[p1 + i] pattern.[p2 + i] then
+      (loop [@tailcall]) (i + 1)
+    else false
+  in
+  loop 0
+
 (* pcre2_compile.c:2403-2430 — check_posix_name. Checks the name given in a
    POSIX-style class entry such as [:alnum:].
 
@@ -2115,10 +2164,9 @@ let parse_tracked_extra_options =
   lor Options.extra_ascii_digit lor Options.extra_ascii_posix
 
 (* DEVIATION: distinctive placeholder error code for parse_regex arms that
-   are deferred to later chunks (quantifiers, groups and named-group
-   definitions -> parse_regex C; named references -> M3; lookarounds/atomic
-   groups -> M4; conditionals, recursion, verbs and callouts -> M5; \p and
-   \P -> M7). PCRE2 compile
+   are deferred to later chunks (lookarounds/atomic groups -> M4;
+   conditionals, recursion, subroutine calls, verbs and callouts -> M5;
+   \p and \P -> M7). PCRE2 compile
    errors occupy 100..201, so 299 can never collide with a real result;
    deferred constructs fail loudly instead of misparsing. Every use site
    below carries a comment naming its chunk. *)
@@ -2140,15 +2188,18 @@ exception Goto_failed
 
    Ported so far: the main-loop skeleton (literals, \Q..\E, extended-mode
    white space and # comments, (?# comments, the escape dispatch (numeric
-   backrefs included), inline option settings (?imnrsxJUa..) / (?^) / (?|,
-   bare capturing/non-capturing parentheses, alternation, group close, and
-   the end-of-pattern epilogue) and character classes (parse_regex B:
+   backrefs and the \k / \g{} named references included), inline option
+   settings (?imnrsxJUa..) / (?^) / (?|, bare capturing/non-capturing
+   parentheses, quantifiers * + ? {n,m} with their lazy/possessive
+   modifiers, named-group definitions (?<name> (?'name' (?P<name> with the
+   named-group list, (?P=name) named references, alternation, group close,
+   and the end-of-pattern epilogue) and character classes (parse_regex B:
    POSIX class items with their UCP substitutions, literals, ranges and
    in-class escapes). Arms marked "deferred" fail loudly with
-   err_deferred until their chunks land; the named-group table, verb-name
-   locals (verblengthptr/verbstartptr/verbnamestart, add_after_mark) and
-   the inverbname accumulator block (pcre2_compile.c:2941-3039) are
-   deferred with those arms.
+   err_deferred until their chunks land; the verb-name locals
+   (verblengthptr/verbnamestart, add_after_mark) and the inverbname
+   accumulator block (pcre2_compile.c:2941-3039) are deferred with those
+   arms.
 
    Arguments:
      cx              compile block; parsing starts at cx.ptr and the parsed
@@ -2169,6 +2220,12 @@ let parse_regex (cx : parse_context) ~(options : int)
      locals belong to deferred arms). *)
   let previous_callout = ref (-1) in
   (* uint32_t *previous_callout = NULL *)
+  (* pcre2_compile.c:2780 — uint32_t *verbstartptr = NULL, as an index into
+     the parsed pattern with -1 for NULL. It is set only by the ( *VERB) arm
+     (M5); until that chunk lands its one reader (the META_ACCEPT block in
+     CHECK_QUANTIFIER) is unreachable, because META_ACCEPT is never
+     emitted. *)
+  let verbstartptr = ref (-1) in
   let pp = ref 0 in
   (* parsed_pattern = cb->parsed_pattern, as an index *)
   let this_parsed_item = ref (-1) in
@@ -2220,6 +2277,96 @@ let parse_regex (cx : parse_context) ~(options : int)
   let failed_back () =
     decr ptr;
     raise_notrace Goto_failed
+  in
+
+  (* pcre2_compile.c:4824-4923 — the DEFINE_NAME label: define a named
+     group. A forward goto target reached from (?'name' (with the
+     terminator set to the apostrophe, pcre2_compile.c:4830-4831) and from
+     the (?< (pcre2_compile.c:4783-4784) and (?P< (pcre2_compile.c:
+     4364-4365) disambiguations with the terminator set to '>'. On entry
+     ptr points at the delimiter character that precedes the name. *)
+  let define_name ~terminator =
+    let offset = ref 0 in
+    let name = ref 0 in
+    let namelen = ref 0 in
+    if not (read_name cx ptr ~utf ~terminator offset name namelen) then
+      raise_notrace Goto_failed;
+
+    (* We have a name for this capturing group. It is also assigned a
+       number, which is its primary means of identification
+       (pcre2_compile.c:4837-4847). *)
+    if cx.bracount >= Limits.max_group_number then (
+      cx.errorcode <- Errors.err97;
+      raise_notrace Goto_failed);
+    cx.bracount <- cx.bracount + 1;
+    buf.(!pp) <- meta_capture lor cx.bracount;
+    incr pp;
+    nest_depth := !nest_depth + 1;
+
+    (* Check not too many names (pcre2_compile.c:4849-4855). *)
+    if cx.names_found >= Limits.max_name_count then (
+      cx.errorcode <- Errors.err49;
+      raise_notrace Goto_failed);
+
+    (* Adjust the entry size to accommodate the longest name found
+       (pcre2_compile.c:4857-4860). *)
+    if !namelen + Limits.imm2_size + 1 > cx.name_entry_size then
+      cx.name_entry_size <- !namelen + Limits.imm2_size + 1;
+
+    (* pcre2_compile.c:4862-4890 — scan the list to check for duplicates.
+       For duplicate names, if the number is the same, break the loop,
+       which causes the name to be discarded; otherwise, if DUPNAMES is not
+       set, give an error. If it is set, allow the name with a different
+       number, but continue scanning in case this is a duplicate with the
+       same number. For non-duplicate names, give an error if the number is
+       duplicated. *)
+    let isdupname = ref false in
+    let broke = ref false in
+    let i = ref 0 in
+    while (not !broke) && !i < cx.names_found do
+      let ng = cx.named_groups.(!i) in
+      (if
+         Int.equal !namelen ng.length && strncmp_eq pat !name ng.name !namelen
+       then (
+         if Int.equal ng.number cx.bracount then broke := true
+         else if Int.equal (!options land Options.dupnames) 0 then (
+           cx.errorcode <- Errors.err43;
+           raise_notrace Goto_failed)
+         else (
+           ng.isdup <- true;
+           isdupname := true (* Mark as a duplicate *);
+           cx.dupnames <- true (* Duplicate names exist *)))
+       else if Int.equal ng.number cx.bracount then (
+         cx.errorcode <- Errors.err65;
+         raise_notrace Goto_failed));
+      if not !broke then incr i
+    done;
+
+    (* Ignore a duplicate with the same number: the C's
+       `if (i < cb->names_found) break` (pcre2_compile.c:4892). *)
+    if not !broke then (
+      (* Increase the list size if necessary (pcre2_compile.c:4894-4915).
+         DEVIATION: the C reports malloc failure as ERR21; Array.make has no
+         recoverable failure (Out_of_memory is fatal), so that error path
+         has no OCaml equivalent. *)
+      if cx.names_found >= cx.named_group_list_size then (
+        let newsize = cx.named_group_list_size * 2 in
+        let newspace =
+          Array.make newsize { name = 0; number = 0; length = 0; isdup = false }
+        in
+        Array.blit cx.named_groups 0 newspace 0 cx.named_group_list_size;
+        cx.named_groups <- newspace;
+        cx.named_group_list_size <- newsize);
+
+      (* Add this name to the list (pcre2_compile.c:4917-4923). *)
+      cx.named_groups.(cx.names_found) <-
+        {
+          name = !name;
+          number = cx.bracount;
+          length = !namelen;
+          isdup = !isdupname;
+        };
+      cx.names_found <- cx.names_found + 1)
   in
 
   try
@@ -2478,12 +2625,12 @@ let parse_regex (cx : parse_context) ~(options : int)
            (* pcre2_compile.c:3165-3177 — remember whether we are expecting
               a conditional assertion and the quantification status of the
               previous significant item, then set the defaults for this
-              item. prev_expect_cond_assert and prev_okquantifier are
-              consumed by the deferred alpha-assertion and CHECK_QUANTIFIER
-              code (their underscores go away with those chunks). *)
+              item. prev_expect_cond_assert is consumed by the deferred
+              alpha-assertion and lookaround code (its underscore goes away
+              with those chunks, M4). *)
            let _prev_expect_cond_assert = !expect_cond_assert in
            expect_cond_assert := 0;
-           let _prev_okquantifier = !okquantifier in
+           let prev_okquantifier = !okquantifier in
            let prev_meta_quantifier = !meta_quantifier in
            okquantifier := false;
            meta_quantifier := 0;
@@ -2509,6 +2656,51 @@ let parse_regex (cx : parse_context) ~(options : int)
                if Int.equal !c (Char.code '?') then 0x0002_0000 else 0x0001_0000
                );
              raise_notrace Loop_continue (* Next character in pattern *));
+
+           (* pcre2_compile.c:3452-3490 — the CHECK_QUANTIFIER label: shared
+              quantifier post-processing, a forward goto target for the
+              * + ? arms and the {n,m} fall-through below. Check that a
+              quantifier is allowed after the previous item. This
+              guarantees that there is a previous item. *)
+           let check_quantifier ~min_repeat ~max_repeat =
+             if not prev_okquantifier then (
+               cx.errorcode <- Errors.err9;
+               failed_back () (* goto FAILED_BACK *));
+
+             (* pcre2_compile.c:3464-3477 — most ( *VERB)s are not allowed
+                to be quantified, but an ungreedy quantifier can be useful
+                for ( *ACCEPT) - meaning "succeed on backtrack", a sort of
+                negated ( *COMMIT). We therefore allow ( *ACCEPT) to be
+                quantified by wrapping it in non-capturing brackets, but we
+                have to allow for a preceding ( *MARK) for when ( *ACCEPT)
+                has an argument. META_ACCEPT is emitted (and verbstartptr
+                set) only by the ( *VERB) arm, so this block is unreachable
+                until that chunk lands (M5). *)
+             (* safe: prev_okquantifier guarantees a previous item
+                (pcre2_compile.c:3454-3455), so prev_parsed_item >= 0. *)
+             if Int.equal buf.(!prev_parsed_item) meta_accept then (
+               let p = ref (!pp - 1) in
+               while !p >= !verbstartptr do
+                 buf.(!p + 1) <- buf.(!p);
+                 decr p
+               done;
+               buf.(!verbstartptr) <- meta_nocapture;
+               buf.(!pp + 1) <- meta_ket;
+               pp := !pp + 2);
+
+             (* pcre2_compile.c:3479-3490 — now we can put the quantifier
+                into the parsed pattern vector. At this stage, we have only
+                the basic quantifier. The check for a following + or ?
+                modifier happens at the top of the loop, after any
+                intervening comments have been removed. *)
+             buf.(!pp) <- !meta_quantifier;
+             incr pp;
+             if Int.equal !c (Char.code '{') then (
+               buf.(!pp) <- min_repeat;
+               incr pp;
+               buf.(!pp) <- max_repeat;
+               incr pp)
+           in
 
            (* pcre2_compile.c:3193-3195 — process the next item in the main
               part of a pattern. The C switch's default case (non-special
@@ -2640,10 +2832,8 @@ let parse_regex (cx : parse_context) ~(options : int)
                         numerical or named subroutine call; with brace
                         delimiters it is a numerical back reference and does
                         not come here because check_escape() returns it
-                        directly. \k is always a named back reference. The
-                        validation and its error paths are ported; the
-                        accepted cases are deferred (named references M3,
-                        subroutine calls M5). *)
+                        directly. \k is always a named back reference.
+                        Subroutine calls are deferred (M5). *)
                      !ptr >= cx.ptrend
                      || (not (Char.equal pat.[!ptr] '{'))
                         && (not (Char.equal pat.[!ptr] '<'))
@@ -2707,11 +2897,24 @@ let parse_regex (cx : parse_context) ~(options : int)
                        then (
                          escape_failed () (* goto ESCAPE_FAILED *);
                          process_escape ())
+                       else if
+                         (* pcre2_compile.c:3392-3402 — \k and \g when used
+                            with braces are back references, whereas \g
+                            used with quotes or angle brackets is a
+                            recursion. *)
+                         Int.equal !escape esc_k
+                         || Int.equal terminator (Char.code '}')
+                       then (
+                         buf.(!pp) <- meta_backref_byname;
+                         incr pp;
+                         buf.(!pp) <- !namelen;
+                         incr pp;
+                         putoffset buf pp !offset;
+                         okquantifier := true)
                        else (
-                         (* pcre2_compile.c:3392-3402 — emission of
-                            META_BACKREF_BYNAME / META_RECURSE_BYNAME:
-                            deferred (named references M3, subroutine calls
-                            M5). *)
+                         (* META_RECURSE_BYNAME emission (pcre2_compile.c:
+                            3396-3398): subroutine calls are the M5
+                            chunk. *)
                          cx.errorcode <- err_deferred;
                          raise_notrace Goto_failed))
                  else (
@@ -2737,16 +2940,25 @@ let parse_regex (cx : parse_context) ~(options : int)
                buf.(!pp) <- meta_dot;
                incr pp;
                okquantifier := true
-           | '*' | '+' | '?' ->
-               (* pcre2_compile.c:3423-3435 — single-character quantifiers,
-                  and 3452-3490 (CHECK_QUANTIFIER shared post-processing):
-                  deferred to the quantifiers/groups chunk (parse_regex
-                  C). *)
-               cx.errorcode <- err_deferred;
-               raise_notrace Goto_failed
+           (* ---- Single-character quantifiers ---- *)
+           | '*' ->
+               (* pcre2_compile.c:3425-3427 *)
+               meta_quantifier := meta_asterisk;
+               check_quantifier ~min_repeat:0 ~max_repeat:0
+               (* goto CHECK_QUANTIFIER *)
+           | '+' ->
+               (* pcre2_compile.c:3429-3431 *)
+               meta_quantifier := meta_plus;
+               check_quantifier ~min_repeat:0 ~max_repeat:0
+               (* goto CHECK_QUANTIFIER *)
+           | '?' ->
+               (* pcre2_compile.c:3433-3435 *)
+               meta_quantifier := meta_query;
+               check_quantifier ~min_repeat:0 ~max_repeat:0
+               (* goto CHECK_QUANTIFIER *)
            | '{' ->
                (* ---- Potential {n,m} quantifier ----
-                  pcre2_compile.c:3438-3447 *)
+                  pcre2_compile.c:3440-3449 *)
                let min_repeat = ref 0 in
                let max_repeat = ref 0 in
                if
@@ -2756,14 +2968,13 @@ let parse_regex (cx : parse_context) ~(options : int)
                then (
                  if not (Int.equal cx.errorcode 0) then
                    raise_notrace Goto_failed (* Error in quantifier *);
-                 parsed_literal !c (* Not a quantifier *))
+                 parsed_literal !c
+                 (* Not a quantifier; no more quantifier processing *))
                else (
-                 (* pcre2_compile.c:3448-3490 — META_MINMAX and the shared
-                    CHECK_QUANTIFIER post-processing consume min_repeat and
-                    max_repeat: deferred to the quantifiers/groups chunk
-                    (parse_regex C). *)
-                 cx.errorcode <- err_deferred;
-                 raise_notrace Goto_failed)
+                 meta_quantifier := meta_minmax;
+                 (* Fall through *)
+                 check_quantifier ~min_repeat:!min_repeat
+                   ~max_repeat:!max_repeat)
            | '[' ->
                (* ---- Character class ---- pcre2_compile.c:3493-3496 *)
                okquantifier := true;
@@ -3255,12 +3466,45 @@ let parse_regex (cx : parse_context) ~(options : int)
                  if !ptr >= cx.ptrend then unclosed_parenthesis ();
                  match pat.[!ptr] with
                  | 'P' ->
-                     (* pcre2_compile.c:4355-4387 — Python syntax support:
-                        (?P<name> named-group definition (parse_regex C),
-                        (?P>name) subroutine call (M5), (?P=name) named back
-                        reference (M3). Deferred. *)
-                     cx.errorcode <- err_deferred;
-                     raise_notrace Goto_failed
+                     (* ---- Python syntax support ----
+                        pcre2_compile.c:4355-4387 *)
+                     incr ptr;
+                     if !ptr >= cx.ptrend then unclosed_parenthesis ();
+                     (* (?P<name> is the same as (?<name>, which defines a
+                        named group (pcre2_compile.c:4360-4366). *)
+                     if Char.equal pat.[!ptr] '<' then
+                       define_name ~terminator:(Char.code '>')
+                       (* goto DEFINE_NAME *)
+                     else if Char.equal pat.[!ptr] '>' then (
+                       (* (?P>name) is the same as (?&name), which is a
+                          recursion or subroutine call: goto RECURSE_BY_NAME
+                          (pcre2_compile.c:4368-4371,4440-4448), deferred
+                          (M5). *)
+                       cx.errorcode <- err_deferred;
+                       raise_notrace Goto_failed)
+                     else if not (Char.equal pat.[!ptr] '=') then (
+                       (* (?P=name) is the same as \k<name>, a back
+                          reference by name. Anything else after (?P is an
+                          error (pcre2_compile.c:4373-4380). *)
+                       cx.errorcode <- Errors.err41;
+                       raise_notrace Goto_failed)
+                     else (
+                       (* pcre2_compile.c:4381-4387 *)
+                       let offset = ref 0 in
+                       let name = ref 0 in
+                       let namelen = ref 0 in
+                       if
+                         not
+                           (read_name cx ptr ~utf ~terminator:(Char.code ')')
+                              offset name namelen)
+                       then raise_notrace Goto_failed;
+                       buf.(!pp) <- meta_backref_byname;
+                       incr pp;
+                       buf.(!pp) <- !namelen;
+                       incr pp;
+                       putoffset buf pp !offset;
+                       okquantifier := true)
+                     (* End of (?P processing *)
                  | 'R' | '+' | '0' .. '9' ->
                      (* pcre2_compile.c:4390-4436 — recursion/subroutine
                         calls by number (RECURSION_BYNUMBER): deferred
@@ -3295,16 +3539,28 @@ let parse_regex (cx : parse_context) ~(options : int)
                      cx.errorcode <- err_deferred;
                      raise_notrace Goto_failed
                  | '<' ->
-                     (* pcre2_compile.c:4773-4802 — lookbehind assertions
-                        (M4) or, when not followed by = ! *, a named-group
-                        definition (parse_regex C): deferred. *)
-                     cx.errorcode <- err_deferred;
-                     raise_notrace Goto_failed
+                     (* ---- Lookbehind assertions ----
+                        pcre2_compile.c:4774-4785 — (?< followed by = or !
+                        or * is a lookbehind assertion. Otherwise (?< is the
+                        start of the name of a capturing group. *)
+                     if
+                       cx.ptrend - !ptr <= 1
+                       || (not (Char.equal pat.[!ptr + 1] '='))
+                          && (not (Char.equal pat.[!ptr + 1] '!'))
+                          && not (Char.equal pat.[!ptr + 1] '*')
+                     then define_name ~terminator:(Char.code '>')
+                       (* goto DEFINE_NAME *)
+                     else (
+                       (* pcre2_compile.c:4786-4820 — lookbehind assertions:
+                          deferred (M4). *)
+                       cx.errorcode <- err_deferred;
+                       raise_notrace Goto_failed)
                  | '\'' ->
-                     (* pcre2_compile.c:4828-4926 — named-group definition
-                        (DEFINE_NAME): deferred (parse_regex C). *)
-                     cx.errorcode <- err_deferred;
-                     raise_notrace Goto_failed
+                     (* ---- Define a named group ----
+                        pcre2_compile.c:4824-4831 — a named group may be
+                        defined as (?'name') or (?<name>); DEFINE_NAME with
+                        the terminator set to the apostrophe. *)
+                     define_name ~terminator:(Char.code '\'')
                  | _ ->
                      (* pcre2_compile.c:4169-4352 — the C switch's default
                         case (first in the source): (?-digit relative
@@ -4079,8 +4335,41 @@ let () =
   expect_err ")" Errors.err22 0;
   expect_err (String.make 252 '(') Errors.err19 251;
 
-  (* Quantifier errors detected by this chunk ({n,m} syntax); a
-     non-quantifier brace is a literal. *)
+  (* Quantifiers (parse_regex C): * + ? {n,m} plus the lazy/possessive
+     modifier adjustment at the top of the loop. Each stream was traced
+     against pcre2_compile.c:3425-3449, 3452-3490 and 3179-3191. *)
+  expect "a*" [| 0x61; meta_asterisk; meta_end |];
+  expect "a+" [| 0x61; meta_plus; meta_end |];
+  expect "a?" [| 0x61; meta_query; meta_end |];
+  expect "a*?" [| 0x61; meta_asterisk_query; meta_end |];
+  expect "a+?" [| 0x61; meta_plus_query; meta_end |];
+  expect "a*+" [| 0x61; meta_asterisk_plus; meta_end |];
+  expect "a?+" [| 0x61; meta_query_plus; meta_end |];
+  expect "a{2,5}" [| 0x61; meta_minmax; 2; 5; meta_end |];
+  expect "a{2}?" [| 0x61; meta_minmax_query; 2; 2; meta_end |];
+  expect "a{2,}+"
+    [| 0x61; meta_minmax_plus; 2; Limits.repeat_unlimited; meta_end |];
+  (* {,m} is a quantifier meaning {0,m} (pcre2_compile.c:1461-1465). *)
+  expect "a{,5}" [| 0x61; meta_minmax; 0; 5; meta_end |];
+  (* Comments and /x white space between a quantifier and its + or ?
+     modifier are ignored (pcre2_compile.c:3179-3191). *)
+  expect "a*(?#c)?" [| 0x61; meta_asterisk_query; meta_end |];
+  expect "ab|c*" [| 0x61; 0x62; meta_alt; 0x63; meta_asterisk; meta_end |];
+  expect "(a)*"
+    [| meta_capture lor 1; 0x61; meta_ket; meta_asterisk; meta_end |];
+  expect "[ab]+"
+    [| meta_class; 0x61; 0x62; meta_class_end; meta_plus; meta_end |];
+  (* ERR9 "quantifier does not follow a repeatable item"; FAILED_BACK makes
+     the offset point at the quantifier character (at its final code unit,
+     for {n,m}). *)
+  expect_err "*" Errors.err9 0;
+  expect_err "+a" Errors.err9 0;
+  expect_err "a**" Errors.err9 2;
+  expect_err "(?i)*" Errors.err9 4;
+  expect_err "\\b*" Errors.err9 2;
+  expect_err "a{2}{3}" Errors.err9 6;
+  (* Quantifier errors from the {n,m} syntax; a non-quantifier brace is a
+     literal. *)
   expect_err "a{2,1}" Errors.err4 5;
   expect "a{,}b" [| 0x61; 0x7b; 0x2c; 0x7d; 0x62; meta_end |];
 
@@ -4233,17 +4522,72 @@ let () =
        meta_end;
      |]);
 
+  (* Named-group definitions (DEFINE_NAME, pcre2_compile.c:4824-4923) via
+     (?<name>, (?'name', and (?P<name>. *)
+  let check_named pat_str =
+    let cx, rc = run_parse pat_str in
+    assert (Int.equal rc 0);
+    Array.iteri
+      (fun i v -> assert (Int.equal cx.parsed_pattern.(i) v))
+      [| meta_capture lor 1; 0x78; meta_ket; meta_end |];
+    assert (Int.equal cx.bracount 1);
+    assert (Int.equal cx.names_found 1);
+    assert (Int.equal cx.name_entry_size (1 + Limits.imm2_size + 1));
+    let ng = cx.named_groups.(0) in
+    assert (Char.equal cx.pattern.[ng.name] 'n');
+    assert (Int.equal ng.number 1);
+    assert (Int.equal ng.length 1);
+    assert (not ng.isdup)
+  in
+  check_named "(?<n>x)";
+  check_named "(?'n'x)";
+  check_named "(?P<n>x)";
+  (* Duplicate names: ERR43 without PCRE2_DUPNAMES; with it, both entries
+     are marked isdup and cb->dupnames is set. *)
+  expect_err "(?<a>x)(?<a>y)" Errors.err43 12;
+  (let cx, rc = run_parse ~options:Options.dupnames "(?<a>x)(?<a>y)" in
+   assert (Int.equal rc 0);
+   assert (Int.equal cx.names_found 2);
+   assert cx.named_groups.(0).isdup;
+   assert cx.named_groups.(1).isdup;
+   assert (Int.equal cx.named_groups.(1).number 2);
+   assert cx.dupnames);
+  (* In a (?| group, a duplicate name with the same number is discarded
+     (pcre2_compile.c:4878,4892); a different name for the same number is
+     ERR65. *)
+  (let cx, rc = run_parse "(?|(?<a>x)|(?<a>y))" in
+   assert (Int.equal rc 0);
+   assert (Int.equal cx.names_found 1);
+   assert (not cx.named_groups.(0).isdup));
+  expect_err "(?|(?<a>x)|(?<b>y))" Errors.err65 16;
+  (* Malformed names and (?P errors. *)
+  expect_err "(?<>x)" Errors.err62 3;
+  expect_err "(?<9>x)" Errors.err44 3;
+  expect_err "(?Pz)" Errors.err41 3;
+  expect_err "(?P" Errors.err14 3;
+  expect_err "(?<n>x" Errors.err14 6;
+
+  (* Named back references: \k<n> \k'n' \k{n} \g{n} (pcre2_compile.c:
+     3392-3402) and (?P=n) (pcre2_compile.c:4381-4387), ported with this
+     chunk because the emission is name length + offset words only. *)
+  expect "\\k<n>" [| meta_backref_byname; 1; 3; meta_end |];
+  expect "\\k'n'" [| meta_backref_byname; 1; 3; meta_end |];
+  expect "\\k{n}" [| meta_backref_byname; 1; 3; meta_end |];
+  expect "\\g{n}" [| meta_backref_byname; 1; 3; meta_end |];
+  expect "(?P=n)" [| meta_backref_byname; 1; 4; meta_end |];
+  (* Named references are quantifiable. *)
+  expect "(?P=n)?" [| meta_backref_byname; 1; 4; meta_query; meta_end |];
+
   (* Deferred arms fail loudly with the placeholder code (never a real
      PCRE2 error number). *)
   assert (err_deferred > 201);
-  expect_err "a*" err_deferred 2 (* quantifiers: parse_regex C *);
-  expect_err "a{2,3}" err_deferred 6 (* quantifiers: parse_regex C *);
-  expect_err "(?<n>a)" err_deferred 2 (* named groups: parse_regex C *);
   expect_err "(?=a)" err_deferred 2 (* lookaheads: M4 *);
+  expect_err "(?<=a)" err_deferred 2 (* lookbehinds: M4 *);
   expect_err "(?>a)" err_deferred 2 (* atomic groups: M4 *);
   expect_err "(?(1)a)" err_deferred 2 (* conditionals: M5 *);
   expect_err "(?R)" err_deferred 2 (* recursion: M5 *);
+  expect_err "(?P>n)" err_deferred 3 (* subroutine calls: M5 *);
   expect_err "(*FAIL)" err_deferred 1 (* verbs: M5 *);
   expect_err "\\p{L}" err_deferred 2 (* properties: M7 *);
-  expect_err "\\k<n>" err_deferred 5 (* named references: M3 *);
-  expect_err "\\g<1>" err_deferred 4 (* subroutine calls: M5 *)
+  expect_err "\\g<1>" err_deferred 4 (* subroutine calls: M5 *);
+  expect_err "\\g'n'" err_deferred 5 (* subroutine calls: M5 *)

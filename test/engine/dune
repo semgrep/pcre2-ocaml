@@ -1,0 +1,8 @@
+; Force-links the engine modules that carry module-init assert suites
+; (parse.ml etc.) so `dune runtest` and CI actually execute them — dune does
+; not -linkall libraries, and nothing else references Parse until the
+; compile-phase chunks wire Engine.compile.
+(test
+ (name engine_init_tests)
+ (package pcre2-dev)
+ (libraries pcre2.engine))

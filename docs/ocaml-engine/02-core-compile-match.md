@@ -25,9 +25,9 @@ Parse phase (`parse.ml` ← pcre2_compile.c front half):
   loop (pcre2_compile.c:10305-10381), i.e. the "pcre2_compile top-level" chunk below;
   parse_regex's share — IS_NEWLINE in # comment skipping — is ported with an
   NLTYPE_FIXED-only deferral to newline.ml)
-- [ ] parse_regex B — character classes incl. POSIX names, ranges, negation
+- [x] parse_regex B — (48720f6) character classes incl. POSIX names, ranges, negation
   (pcre2_compile.c:3800-4400 + handle_escdsw 2642-2770)
-- [ ] parse_regex C — quantifiers {n,m} +?*, groups (capturing/non/named), alternation,
+- [x] parse_regex C — (this commit) quantifiers {n,m} +?*, groups (capturing/non/named), alternation,
   meta_extra_lengths bookkeeping (pcre2_compile.c:4400-5530; verb/lookaround/conditional
   arms parse-error or defer to M3–M5)
 
