@@ -106,7 +106,8 @@ end = struct
 
   let bad_pattern () =
     match compile "ab(" with
-    | Error MISSING_CLOSING_PARENTHESIS -> ()
+    | Error { code = MISSING_CLOSING_PARENTHESIS; offset; _ } ->
+        check_eq string_of_int "error offset" 3 offset
     | Error e ->
         Alcotest.fail ("Incorrectly error for pattern: " ^ show_compile_error e)
     | Ok _ -> Alcotest.fail "Incorrectly compiled invalid pattern"
@@ -662,7 +663,7 @@ let alloc_per_exec_minor () =
   let re =
     match Pcre2_engine.Engine.compile "(q)z" 0l with
     | Ok r -> r
-    | Error code ->
+    | Error (code, _offset) ->
         Alcotest.fail ("failed to compile: error " ^ string_of_int code)
   in
   let subject = "qqqq" in

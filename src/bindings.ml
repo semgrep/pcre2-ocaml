@@ -1,5 +1,7 @@
 (* Pure-OCaml implementation of the former C-stub boundary (pcre2_stubs.c).
-   Names and types are frozen: src/pcre2.ml{,i} must never need a diff.
+   Names and types track the boundary the Pcre2 module compiles against; the
+   compile path carries pcre2_compile's &erroroffset out-parameter alongside
+   the error code so callers can report the failing position, like the C stub.
    The C originals live on as the dev-only oracle (oracle/, package pcre2-dev).
 
    The jit/interp phantom mirrors the C library, where pcre2_jit_compile
@@ -17,7 +19,7 @@ let unset = (-1, -1)
 let pcre2_ocaml_init : unit -> unit = fun () -> ()
 
 let pcre2_compile (pattern : string) (options : int32) :
-    (interp regex, int) Result.t =
+    (interp regex, int * int) Result.t =
   Pcre2_engine.Engine.compile pattern options
 
 let pcre2_match (re : _ regex) (subject : string) (offset : int)

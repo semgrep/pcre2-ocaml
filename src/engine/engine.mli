@@ -30,7 +30,9 @@ type exec_result =
           invalid code unit there (pcre2_match.c:6899-6903), and
           pcre2test prints it as " at offset N". 0 otherwise. *)
 
-val compile : string -> int32 -> (t, int) result
+val compile : string -> int32 -> (t, int * int) result
+(** On failure returns [(errcode, erroroffset)] — the byte offset in the
+    pattern where compilation failed (pcre2_compile's &erroroffset). *)
 
 val compile_ctx :
   ?newline:int ->

@@ -4,8 +4,8 @@ type match_ [@@deriving show, eq]
 type captures [@@deriving show, eq]
 (** A set comprising an entire match alongside any matches for capture groups *)
 
-(** Errors which may occur during compilation of the pattern *)
-type compile_error =
+(** The kinds of error which may occur during compilation of the pattern *)
+type compile_error_code =
   | END_BACKSLASH  (** A pattern string ends in a backslash *)
   | END_BACKSLASH_C
       (** A pattern string ends in \c, which should require an additional
@@ -151,6 +151,17 @@ type compile_error =
       (** Atomic assertion expected after (?( or (?(?C) *)
   | BACKSLASH_K_IN_LOOKAROUND
       (** \K is not allowed in lookarounds (cf.  EXTRA_ALLOW_LOOKAROUND_BSK) *)
+[@@deriving show, eq]
+
+(** An error which may occur during compilation of the pattern *)
+type compile_error = {
+  code : compile_error_code;  (** what went wrong *)
+  message : string;
+      (** human-readable description of [code] (pcre2_get_error_message) *)
+  offset : int;
+      (** byte offset in the pattern where compilation failed, or [-1] if
+          unknown *)
+}
 [@@deriving show, eq]
 
 (** Errors which may occur during matching of a pattern *)

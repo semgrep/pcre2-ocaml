@@ -16,11 +16,10 @@ type exec_result =
 (* pcre2_compile.c:10096-10993 via Compile.pcre2_compile. Option bits cross
    the boundary as int32 and are widened exactly once here
    (port-conventions §3); unknown bits yield error 117 inside the driver
-   (§5). This entry point drops the error offset (pcre2_stubs.c shape). *)
-let compile (pattern : string) (options : int32) : (t, int) result =
-  match Compile.pcre2_compile pattern ~options:(Options.of_int32 options) with
-  | Ok re -> Ok re
-  | Result.Error (errorcode, _erroroffset) -> Result.Error errorcode
+   (§5). On failure returns [(errcode, erroroffset)] like [compile_ctx];
+   callers surface the offset (pcre2_compile's &erroroffset out-parameter). *)
+let compile (pattern : string) (options : int32) : (t, int * int) result =
+  Compile.pcre2_compile pattern ~options:(Options.of_int32 options)
 
 (* [compile] plus the pcre2_compile_context knobs the pcre2test harness
    drives (pcre2test.c: pcre2_set_newline / pcre2_set_bsr /

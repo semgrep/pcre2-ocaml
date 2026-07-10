@@ -247,8 +247,10 @@ module Engine_driver : DRIVER = struct
        (port-conventions.md par. 3). *)
     match E.compile pattern (Int32.of_int options) with
     | Ok c -> Ok c
-    | Error code ->
-        Error (Printf.sprintf "compile error %d (%s)" code (E.error_message code))
+    | Error (code, erroroffset) ->
+        Error
+          (Printf.sprintf "compile error %d at offset %d (%s)" code erroroffset
+             (E.error_message code))
 
   let exec code subject offset options =
     match E.exec code subject offset (Int32.of_int options) with
