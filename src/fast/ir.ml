@@ -75,6 +75,37 @@ let t_wordbound = 29 (* [t_wordbound; want] — \b (want=1) / \B (want=0) *)
 let t_type_rep = 30 (* [t_type_rep; reptype; lmin; lmax; type_op] *)
 let t_class_rep = 31 (* [t_class_rep; reptype; lmin; lmax; map_off] *)
 
+(* Chunk F additions (fast-design.md §2/§3) — backreferences.
+
+   A numbered backref [t_ref] / repeated numbered backref [t_ref_rep]; a
+   duplicate-named backref [t_dnref] / repeated dup-named [t_dnref_rep]
+   (scan the name-table group list for the first SET group,
+   pcre2_match.c:5002-5007). [ovbase] = 2N (fast public ovector convention,
+   group N at [2N,2N+1]); [caseless] = 1 for OP_REFI/OP_DNREFI. A DNREF
+   stores the name-table byte offset [slot_base] of its first list entry and
+   the [count] of entries; the runner resolves the offset at run time
+   ([mb.name_table], mirroring dnref_scan). The repeat forms carry the
+   pre-decoded [reptype]/[lmin]/[lmax] (only the OP_CRSTAR..OP_CRMINQUERY /
+   OP_CRRANGE / OP_CRMINRANGE forms — a possessive ref repeat compiles to an
+   atomic group, out of subset, pcre2_match.c:5024-5043).
+
+   Referenced captures use the JIT's non-optimized-cbracket protocol
+   (pcre2_jit_compile.c:1145, 11055-11061, 10692-10702): the in-progress
+   start is kept in [mb.cap_start] (NOT the ovector slot, which must stay
+   UNSET until the group CLOSES so a mid-match backref sees only closed
+   values), so [t_cap_start_ref] records the group entry (private-scratch
+   save, KIND_CAPSTART) and [t_cap_end_ref] writes BOTH ovector slots at
+   close (ovector save, KIND_CAP). *)
+let t_ref = 32 (* [t_ref; ovbase; caseless]                          *)
+let t_ref_rep = 33 (* [t_ref_rep; reptype; lmin; lmax; ovbase; caseless] *)
+let t_dnref = 34 (* [t_dnref; slot_base; count; caseless]              *)
+
+let t_dnref_rep = 35
+(* [t_dnref_rep; reptype; lmin; lmax; slot_base; count; caseless] *)
+
+let t_cap_start_ref = 36 (* [t_cap_start_ref; ovbase] — referenced capture entry *)
+let t_cap_end_ref = 37 (* [t_cap_end_ref; ovbase]   — referenced capture close *)
+
 (* Sentinel [g] for a repeated group whose bracket is OP_BRA (bra_loop, C's
    P == NULL): NO empty-string check (the C short-circuits it, and OP_BRA can
    never match empty), so no [t_group_start] and no [mb.group_start] slot. *)
@@ -90,7 +121,7 @@ let reptype_pos = 2
 let rep_inf = 0xFFFFFFFF
 
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 31
+let max_tag = 37
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -129,6 +160,12 @@ let arity =
     2 (* t_wordbound: want *);
     5 (* t_type_rep: reptype, lmin, lmax, type_op *);
     5 (* t_class_rep: reptype, lmin, lmax, map_off *);
+    3 (* t_ref: ovbase, caseless *);
+    6 (* t_ref_rep: reptype, lmin, lmax, ovbase, caseless *);
+    4 (* t_dnref: slot_base, count, caseless *);
+    7 (* t_dnref_rep: reptype, lmin, lmax, slot_base, count, caseless *);
+    2 (* t_cap_start_ref: ovbase *);
+    2 (* t_cap_end_ref: ovbase *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -167,6 +204,12 @@ let tag_name =
     "WORDBOUND";
     "TYPE_REP";
     "CLASS_REP";
+    "REF";
+    "REF_REP";
+    "DNREF";
+    "DNREF_REP";
+    "CAP_START_REF";
+    "CAP_END_REF";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -242,6 +285,22 @@ let wordbound_want (ir : t) (pc : int) : int = ir.code.(pc + 1)
 let rep_type_op (ir : t) (pc : int) : int = ir.code.(pc + 4)
 let rep_map_off (ir : t) (pc : int) : int = ir.code.(pc + 4)
 
+(* Chunk F operands (fast-design.md §2/§3). [t_ref] carries [ovbase; caseless]
+   at pc+1/pc+2; [t_ref_rep] the reptype/lmin/lmax triple (rep_reptype/rep_lmin/
+   rep_lmax above) then [ovbase; caseless] at pc+4/pc+5; [t_dnref] the
+   name-table [slot_base; count; caseless] at pc+1..pc+3; [t_dnref_rep] the
+   reptype triple then [slot_base; count; caseless] at pc+4..pc+6. *)
+let ref_ovbase (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let ref_caseless (ir : t) (pc : int) : int = ir.code.(pc + 2)
+let ref_rep_ovbase (ir : t) (pc : int) : int = ir.code.(pc + 4)
+let ref_rep_caseless (ir : t) (pc : int) : int = ir.code.(pc + 5)
+let dnref_slot_base (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let dnref_count (ir : t) (pc : int) : int = ir.code.(pc + 2)
+let dnref_caseless (ir : t) (pc : int) : int = ir.code.(pc + 3)
+let dnref_rep_slot_base (ir : t) (pc : int) : int = ir.code.(pc + 4)
+let dnref_rep_count (ir : t) (pc : int) : int = ir.code.(pc + 5)
+let dnref_rep_caseless (ir : t) (pc : int) : int = ir.code.(pc + 6)
+
 (* ---------- Text dump (fast-design.md §2) ----------
    Stable, debug_printer.ml-style listing for golden tests: one line per
    instruction, [%3d TAG operands]. Printf/Format here is a debug path
@@ -279,6 +338,38 @@ let render (ir : t) (pc : int) (t : int) : string =
     Printf.sprintf "CAP_START ovbase=%d" (cap_ovbase ir pc)
   else if Int.equal t t_cap_end then
     Printf.sprintf "CAP_END ovbase=%d" (cap_ovbase ir pc)
+  else if Int.equal t t_cap_start_ref then
+    Printf.sprintf "CAP_START_REF ovbase=%d" (cap_ovbase ir pc)
+  else if Int.equal t t_cap_end_ref then
+    Printf.sprintf "CAP_END_REF ovbase=%d" (cap_ovbase ir pc)
+  else if Int.equal t t_ref then
+    Printf.sprintf "REF ovbase=%d ci=%d" (ref_ovbase ir pc) (ref_caseless ir pc)
+  else if Int.equal t t_dnref then
+    Printf.sprintf "DNREF slot=%d count=%d ci=%d" (dnref_slot_base ir pc)
+      (dnref_count ir pc) (dnref_caseless ir pc)
+  else if Int.equal t t_ref_rep then (
+    let ty = rep_reptype ir pc in
+    let tystr =
+      if Int.equal ty reptype_min then "min"
+      else if Int.equal ty reptype_max then "max"
+      else "pos"
+    in
+    let lmax = rep_lmax ir pc in
+    let lmaxstr = if Int.equal lmax rep_inf then "inf" else string_of_int lmax in
+    Printf.sprintf "REF_REP %s {%d,%s} ovbase=%d ci=%d" tystr (rep_lmin ir pc)
+      lmaxstr (ref_rep_ovbase ir pc) (ref_rep_caseless ir pc))
+  else if Int.equal t t_dnref_rep then (
+    let ty = rep_reptype ir pc in
+    let tystr =
+      if Int.equal ty reptype_min then "min"
+      else if Int.equal ty reptype_max then "max"
+      else "pos"
+    in
+    let lmax = rep_lmax ir pc in
+    let lmaxstr = if Int.equal lmax rep_inf then "inf" else string_of_int lmax in
+    Printf.sprintf "DNREF_REP %s {%d,%s} slot=%d count=%d ci=%d" tystr
+      (rep_lmin ir pc) lmaxstr (dnref_rep_slot_base ir pc)
+      (dnref_rep_count ir pc) (dnref_rep_caseless ir pc))
   else if Int.equal t t_group_start then
     Printf.sprintf "GROUP_START g=%d" (group_start_id ir pc)
   else if Int.equal t t_brazero then

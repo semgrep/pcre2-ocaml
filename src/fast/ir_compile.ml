@@ -199,6 +199,16 @@ let cr_bounds (src : Bytes.t) (q : int) : int * int * int * int =
 
 let is_cr_op (op : int) : bool = op >= Op.op_crstar && op <= Op.op_crposrange
 
+(* A CR quantifier that can follow a backreference (pcre2_match.c:5024-5043):
+   the greedy/lazy STAR/PLUS/QUERY (OP_CRSTAR..OP_CRMINQUERY) and the two range
+   forms (OP_CRRANGE/OP_CRMINRANGE). No OP_CRPOS* form follows a ref — a
+   possessive ref repeat is compiled as an atomic group (interpreter.ml:6089-
+   6092), which is out of subset (chunk G). *)
+let is_ref_repeat_cr (op : int) : bool =
+  (op >= Op.op_crstar && op <= Op.op_crminquery)
+  || Int.equal op Op.op_crrange
+  || Int.equal op Op.op_crminrange
+
 (* A character-type opcode the fast engine matches in the non-UTF subset:
    \D \d \S \s \W \w (ctypes), . (OP_ANY), OP_ALLANY/OP_ANYBYTE, \R (OP_ANYNL),
    \h \H \v \V. OP_PROP/OP_NOTPROP/OP_EXTUNI need the property machinery (chunk
@@ -369,17 +379,23 @@ let compile (re : C.re) : (Ir.t, string) result =
          (capturing) and OP_SBRA (empty-checking non-capturing); OP_BRA keeps
          bra_loop lowering (interpreter.ml:2416-2452). *)
       let grouploop = is_capture || is_sbra in
-      let ovbase =
+      (* optimized_cbracket gate (pcre2_jit_compile.c:404,1145-1184): a capture
+         whose optimized bit is CLEAR is reached by a reference — OP_REF/OP_REFI
+         (chunk F), OP_CREF/OP_DNCREF (conditionals, chunk J), OP_DNREF/OP_DNREFI
+         (chunk F), or is a possessive capture OP_CBRAPOS/OP_SCBRAPOS (chunk G).
+         Such a capture cannot use its ovector slot as the in-progress start
+         scratch (a mid-match backref must see only CLOSED values), so it uses
+         the referenced protocol (t_cap_start_ref/t_cap_end_ref, fast-design.md
+         §3): the in-progress start lives in mb.cap_start, and both ovector
+         slots are written only at CLOSE. This is behaviour-correct for ANY
+         referencing construct; the out-of-subset ones (CREF → OP_COND, CBRAPOS,
+         RECURSE-adjacent) still decline elsewhere, so the lowered IR is never
+         executed for them. *)
+      let ovbase, referenced =
         if is_capture then (
           let num = C.get2 src (bra_off + 1 + Limits.link_size) in
-          (* optimized_cbracket gate: a referenced capture would need its
-             ovector slot to survive as a completed value mid-match, so the
-             direct-slot scratch used by CAP_START/CAP_END is invalid —
-             decline (the referencing opcode is itself out of subset). *)
-          if not opt_cbracket.(num) then
-            raise (Unsupported "fast: referenced capture (chunk F/J/K)");
-          2 * num)
-        else -1
+          (2 * num, not opt_cbracket.(num)))
+        else (-1, false)
       in
       (* Collect branch-body start offsets by following the BRA/ALT link
          chain, and the trailing KET offset (mirrors the interpreter's
@@ -417,7 +433,7 @@ let compile (re : C.re) : (Ir.t, string) result =
         push Ir.t_group_start;
         push group_id);
       if is_capture then (
-        push Ir.t_cap_start;
+        push (if referenced then Ir.t_cap_start_ref else Ir.t_cap_start);
         push ovbase);
       push Ir.t_bra;
       let nbr = List.length branch_offs in
@@ -466,7 +482,7 @@ let compile (re : C.re) : (Ir.t, string) result =
          (the CAP_END for captures, else the first ket instruction). *)
       let ket_ir = here () in
       if is_capture then (
-        push Ir.t_cap_end;
+        push (if referenced then Ir.t_cap_end_ref else Ir.t_cap_end);
         push ovbase);
       if repeating then (
         push (if is_max then Ir.t_ket_rmax else Ir.t_ket_rmin);
@@ -650,6 +666,56 @@ let compile (re : C.re) : (Ir.t, string) result =
           push Ir.t_wordbound;
           push (if Int.equal op Op.op_word_boundary then 1 else 0);
           p := !p + Op.op_lengths.(op))
+        else if
+          Int.equal op Op.op_ref || Int.equal op Op.op_refi
+          || Int.equal op Op.op_dnref || Int.equal op Op.op_dnrefi
+        then (
+          (* OP_REF/OP_REFI (numbered) / OP_DNREF/OP_DNREFI (duplicate-named)
+             backreferences (pcre2_match.c:4994-5015). The item is followed by
+             optional CR* / CRRANGE repeat info (REF_REPEAT, 5021-5043); when
+             present the ref repeats (t_ref_rep / t_dnref_rep), else it matches
+             once (t_ref / t_dnref). ovbase = 2N (fast public ovector); a DNREF
+             stores the name-table byte offset of its first list entry and the
+             entry count (resolved at run time by dnref_scan). *)
+          let caseless =
+            Int.equal op Op.op_refi || Int.equal op Op.op_dnrefi
+          in
+          let is_dn = Int.equal op Op.op_dnref || Int.equal op Op.op_dnrefi in
+          let ci = if caseless then 1 else 0 in
+          (* REF: GET2(code, p+1) = group number; DNREF: GET2(code, p+1) = name
+             index (× name_entry_size = byte offset), GET2(code, p+1+IMM2) =
+             count. *)
+          let after = !p + Op.op_lengths.(op) in
+          let nx = byte after in
+          if is_ref_repeat_cr nx then (
+            let reptype, lmin, lmax, crlen = cr_bounds src after in
+            if is_dn then (
+              push Ir.t_dnref_rep;
+              push reptype;
+              push lmin;
+              push lmax;
+              push (C.get2 src (!p + 1) * re.C.name_entry_size);
+              push (C.get2 src (!p + 1 + Limits.imm2_size));
+              push ci)
+            else (
+              push Ir.t_ref_rep;
+              push reptype;
+              push lmin;
+              push lmax;
+              push (2 * C.get2 src (!p + 1));
+              push ci);
+            p := after + crlen)
+          else (
+            if is_dn then (
+              push Ir.t_dnref;
+              push (C.get2 src (!p + 1) * re.C.name_entry_size);
+              push (C.get2 src (!p + 1 + Limits.imm2_size));
+              push ci)
+            else (
+              push Ir.t_ref;
+              push (2 * C.get2 src (!p + 1));
+              push ci);
+            p := after))
         else
           match anchor_tag op with
           | Some tag ->

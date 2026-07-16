@@ -24,6 +24,13 @@ let check (ir : Ir.t) : (unit, string) result =
   let top_bracket = ir.Ir.re.Pcre2_engine.Compile.top_bracket in
   let codelen = Bytes.length ir.Ir.re.Pcre2_engine.Compile.code in
   let n_groups = ir.Ir.n_groups in
+  let nt_len = Bytes.length ir.Ir.re.Pcre2_engine.Compile.name_table in
+  let name_entry_size = ir.Ir.re.Pcre2_engine.Compile.name_entry_size in
+  (* An ovbase names a capture pair 2N (fast public convention), 1 <= N <=
+     top_bracket, so it indexes the ovector / cap_start (sized 2*(top+1)). *)
+  let ovbase_ok (ovb : int) : bool =
+    ovb >= 2 && Int.equal (ovb land 1) 0 && ovb / 2 <= top_bracket
+  in
   (* A class bitmap reference (t_class / t_class_rep) must name a 32-byte map
      wholly inside re.code. A character-type operand must be a supported
      single-type opcode (not \p/\P/\X — those decline at compile). *)
@@ -125,18 +132,91 @@ let check (ir : Ir.t) : (unit, string) result =
                           [%d,%d) outside pool of %d"
                          pc off (off + l) litlen)
                   else Ok ())
-                else if Int.equal t Ir.t_cap_start || Int.equal t Ir.t_cap_end
+                else if
+                  Int.equal t Ir.t_cap_start || Int.equal t Ir.t_cap_end
+                  || Int.equal t Ir.t_cap_start_ref
+                  || Int.equal t Ir.t_cap_end_ref
                 then (
                   (* ovbase = 2N, 1 <= N <= top_bracket. *)
                   let ovb = code.(pc + 1) in
-                  if ovb < 2 || not (Int.equal (ovb land 1) 0)
-                     || ovb / 2 > top_bracket
-                  then
+                  if not (ovbase_ok ovb) then
                     Error
                       (Printf.sprintf
                          "fast-verify: %s at pc %d ovbase %d out of range (top \
                           bracket %d)"
                          Ir.tag_name.(t) pc ovb top_bracket)
+                  else Ok ())
+                else if Int.equal t Ir.t_ref then (
+                  (* [ovbase; caseless]. *)
+                  let ovb = code.(pc + 1) and ci = code.(pc + 2) in
+                  if not (ovbase_ok ovb) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: REF at pc %d ovbase %d out of range (top \
+                          bracket %d)"
+                         pc ovb top_bracket)
+                  else if not (Int.equal ci 0 || Int.equal ci 1) then
+                    Error
+                      (Printf.sprintf "fast-verify: REF at pc %d bad caseless %d"
+                         pc ci)
+                  else Ok ())
+                else if Int.equal t Ir.t_ref_rep then (
+                  (* [reptype; lmin; lmax; ovbase; caseless]. *)
+                  let reptype = code.(pc + 1) in
+                  let lmin = code.(pc + 2) and lmax = code.(pc + 3) in
+                  let ovb = code.(pc + 4) and ci = code.(pc + 5) in
+                  if reptype < 0 || reptype > 2 || lmin < 0 || lmax < lmin then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: REF_REP at pc %d bad operands \
+                          (reptype=%d min=%d max=%d)"
+                         pc reptype lmin lmax)
+                  else if not (ovbase_ok ovb) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: REF_REP at pc %d ovbase %d out of range"
+                         pc ovb)
+                  else if not (Int.equal ci 0 || Int.equal ci 1) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: REF_REP at pc %d bad caseless %d" pc ci)
+                  else Ok ())
+                else if Int.equal t Ir.t_dnref || Int.equal t Ir.t_dnref_rep then (
+                  (* DNREF [slot_base; count; caseless]; DNREF_REP prefixes the
+                     reptype triple. The run-time dnref_scan reads GET2 (2 safe
+                     bytes) at slot_base + k*name_entry_size for k in
+                     [0, count) — validate the widest access is inside the name
+                     table so no read raises across the runner loop. *)
+                  let rep = Int.equal t Ir.t_dnref_rep in
+                  let base = if rep then pc + 4 else pc + 1 in
+                  let slot_base = code.(base) in
+                  let count = code.(base + 1) in
+                  let ci = code.(base + 2) in
+                  let rep_ok =
+                    (not rep)
+                    ||
+                    let reptype = code.(pc + 1) in
+                    let lmin = code.(pc + 2) and lmax = code.(pc + 3) in
+                    reptype >= 0 && reptype <= 2 && lmin >= 0 && lmax >= lmin
+                  in
+                  let last_byte =
+                    slot_base + ((count - 1) * name_entry_size) + 1
+                  in
+                  if not rep_ok then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: DNREF_REP at pc %d bad repeat operands" pc)
+                  else if count < 1 || slot_base < 0 || last_byte >= nt_len then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: %s at pc %d name-table span [%d..%d) \
+                          outside table of %d bytes (entry_size %d)"
+                         Ir.tag_name.(t) pc slot_base (last_byte + 1) nt_len
+                         name_entry_size)
+                  else if not (Int.equal ci 0 || Int.equal ci 1) then
+                    Error
+                      (Printf.sprintf "fast-verify: %s at pc %d bad caseless %d"
+                         Ir.tag_name.(t) pc ci)
                   else Ok ())
                 else if
                   Int.equal t Ir.t_rep || Int.equal t Ir.t_repi

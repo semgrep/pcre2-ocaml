@@ -115,7 +115,22 @@ interpreter is its differential oracle. Approved plan:
   non-matching positions ticks FEWER times than the interpreter (which RMATCHes
   every give-back position, incl. failures), breaking §4 LIMIT_MATCH tick
   parity. The per-position give-back is tick-identical without it.
-- [ ] **F — Backreferences** — REF/REFI/DNREF/DNREFI + ref repeats.
+- [x] **F — Backreferences** — REF/REFI (numbered) + DNREF/DNREFI
+  (duplicate-named, first-set-wins name-table scan) singles and their OP_CR*
+  repeats (minimize RM20 / maximize-samelengths RM21; non-UTF is always
+  samelengths so the RM22 rescan never fires; possessive ref repeats compile to
+  atomic groups → chunk G). New IR tags REF/REF_REP/DNREF/DNREF_REP +
+  CAP_START_REF/CAP_END_REF (32-37); `match_ref`/`dnref_scan`/`setup_ref_rep` +
+  ref_min/ref_max helpers. Referenced captures (optimized_cbracket = 0) now
+  LOWER with the JIT non-optimized-cbracket protocol: the in-progress start
+  lives in mb.cap_start (new KIND_CAPSTART save), both ovector slots written
+  only at CLOSE (KIND_CAP at CAP_END_REF), so a mid-match backref sees only
+  CLOSED values — the chunk-D decline is replaced. MATCH_UNSET_BACKREF (unset
+  ref matches empty) exact both ways. New save kinds KIND_CAPSTART/KIND_REF_MIN/
+  KIND_REF_MAX (fast-design.md §2/§3/§4). Ratchet 656/470 → 727/503
+  (testinput1/2); fuzz fast-vs-interp clean over 260k+ cases.
+  **Declined (unchanged reason):** possessive ref repeat `\1++` (OP_ONCE →
+  chunk G); a capture referenced by a conditional (OP_COND → chunk J).
 - [ ] **G — Lookaround/atomic** — ASSERT* families, REVERSE/VREVERSE, ONCE.
 - [ ] **H — Verbs** — MARK/PRUNE/SKIP/THEN/COMMIT (+_ARG), ACCEPT/FAIL; SKIP_ARG rerun
   protocol (interpreter.ml:9336-9377 semantics).

@@ -62,15 +62,41 @@ let kind_rep_max = 2
 let kind_rep_min = 3
 let kind_cont = 4
 let kind_gstart = 5
+
+(* Chunk F additions (fast-design.md §3) — backreferences.
+     KIND_CAPSTART (width 3): [ovbase; old_cap_start; KIND_CAPSTART]
+        a referenced capture's ENTRY private-scratch save (the JIT's
+        non-optimized-cbracket 1-slot save, pcre2_jit_compile.c:11055-11061 /
+        13454-13459): on backtrack restore [mb.cap_start.(ovbase)] to the
+        enclosing value, then keep popping. The ovector slots are NOT touched
+        at entry (they stay UNSET until CLOSE, so a mid-match backref sees only
+        closed values); the enclosing group's exhaustion still rolls back the
+        ovector via the KIND_CAP pushed at CLOSE.
+     KIND_REF_MIN (width 5): [rep_pc; count; eptr; rdepth; KIND_REF_MIN]
+        a minimizing ref repeat (RM20, pcre2_match.c:5097-5113): on backtrack
+        match one more copy at [eptr] ([count] up to Lmax) and retry the
+        continuation; rep_pc re-derives ovbase/caseless/Lmax/cont.
+     KIND_REF_MAX (width 6): [cont; try_eptr; flength; lstart; rdepth;
+        KIND_REF_MAX] a maximizing ref repeat, samelengths (RM21,
+        pcre2_match.c:5154-5162; non-UTF lengths are always equal so the rare
+        RM22 rescan never occurs): on backtrack give back one copy
+        ([try_eptr] -= [flength], down to and INCLUDING [lstart]) and retry
+        the continuation. *)
+let kind_capstart = 6
+let kind_ref_min = 7
+let kind_ref_max = 8
 let width_alt = 4
 let width_cap = 4
 let width_rep_max = 5
 let width_rep_min = 5
 let width_cont = 4
 let width_gstart = 3
+let width_capstart = 3
+let width_ref_min = 5
+let width_ref_max = 6
 
 (* Widest record — the runner reserves this much headroom on a push. *)
-let max_record_width = 5
+let max_record_width = 6
 
 (* Initial capacity in ints (~85 records); grows geometrically. *)
 let initial_ints = 256

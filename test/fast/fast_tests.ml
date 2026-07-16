@@ -452,6 +452,98 @@ let goldens : (string * string) list =
           "  9 KET";
           " 10 END";
         ] );
+    (* --- Chunk F: backreferences --- *)
+    (* A referenced capture lowers with the referenced protocol
+       (CAP_START_REF / CAP_END_REF): the in-progress start lives in
+       mb.cap_start, both ovector slots written only at close. The reference
+       itself is REF (numbered, ci=0). *)
+    ( "(a)\\1",
+      g
+        [
+          "  0 BRA";
+          "  1 CAP_START_REF ovbase=2";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 12";
+          " 11 FAIL";
+          " 12 CAP_END_REF ovbase=2";
+          " 14 REF ovbase=2 ci=0";
+          " 17 KET";
+          " 18 END";
+        ] );
+    (* Caseless reference -> REF ci=1 (the referenced group's 'a' is CHARI). *)
+    ( "(?i)(a)\\1",
+      g
+        [
+          "  0 BRA";
+          "  1 CAP_START_REF ovbase=2";
+          "  3 BRA";
+          "  4 ALT next=10";
+          "  6 CHARI \"a\"";
+          "  8 JMP 11";
+          " 10 FAIL";
+          " 11 CAP_END_REF ovbase=2";
+          " 13 REF ovbase=2 ci=1";
+          " 16 KET";
+          " 17 END";
+        ] );
+    (* Greedy ref repeat (\1+) -> REF_REP; the group is still referenced. *)
+    ( "(a)\\1+",
+      g
+        [
+          "  0 BRA";
+          "  1 CAP_START_REF ovbase=2";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 12";
+          " 11 FAIL";
+          " 12 CAP_END_REF ovbase=2";
+          " 14 REF_REP max {1,inf} ovbase=2 ci=0";
+          " 20 KET";
+          " 21 END";
+        ] );
+    (* Bounded ref repeat \1{2,4}. *)
+    ( "(a)\\1{2,4}",
+      g
+        [
+          "  0 BRA";
+          "  1 CAP_START_REF ovbase=2";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 12";
+          " 11 FAIL";
+          " 12 CAP_END_REF ovbase=2";
+          " 14 REF_REP max {2,4} ovbase=2 ci=0";
+          " 20 KET";
+          " 21 END";
+        ] );
+    (* A named non-duplicate reference is a numbered REF; only the referenced
+       group (n) is CAP_START_REF, the unreferenced one (m) stays CAP_START. *)
+    ( "(?<n>a)(?<m>b)\\k<n>",
+      g
+        [
+          "  0 BRA";
+          "  1 CAP_START_REF ovbase=2";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 12";
+          " 11 FAIL";
+          " 12 CAP_END_REF ovbase=2";
+          " 14 CAP_START ovbase=4";
+          " 16 BRA";
+          " 17 ALT next=24";
+          " 19 CHAR_RUN \"b\"";
+          " 22 JMP 25";
+          " 24 FAIL";
+          " 25 CAP_END ovbase=4";
+          " 27 REF ovbase=2 ci=0";
+          " 30 KET";
+          " 31 END";
+        ] );
   ]
 
 let golden_tests =
@@ -466,6 +558,56 @@ let golden_tests =
             expected (dump_of pat)))
     goldens
 
+(* Chunk F: a DNREF golden needs DUPNAMES (duplicate group names), so it
+   compiles with that option rather than through the plain [dump_of]. Both
+   alternatives are referenced captures; the reference scans the name-table
+   list (slot=0, count=2) for the first set group. *)
+let dupnames = 0x00000040l
+
+let dnref_golden_test =
+  Alcotest.test_case "dump DNREF (dupnames)" `Quick (fun () ->
+      let ir =
+        match
+          C.pcre2_compile "(?:(?<n>a)|(?<n>b))\\k<n>"
+            ~options:(Pcre2_engine.Options.of_int32 dupnames)
+        with
+        | Ok re -> (
+            match Ir_compile.compile re with
+            | Ok ir -> ir
+            | Error r -> Alcotest.failf "unexpectedly Unsupported: %s" r)
+        | Error (c, o) -> Alcotest.failf "compile err %d @ %d" c o
+      in
+      let expected =
+        g
+          [
+            "  0 BRA";
+            "  1 BRA";
+            "  2 ALT next=19";
+            "  4 CAP_START_REF ovbase=2";
+            "  6 BRA";
+            "  7 ALT next=14";
+            "  9 CHAR_RUN \"a\"";
+            " 12 JMP 15";
+            " 14 FAIL";
+            " 15 CAP_END_REF ovbase=2";
+            " 17 JMP 32";
+            " 19 CAP_START_REF ovbase=4";
+            " 21 BRA";
+            " 22 ALT next=29";
+            " 24 CHAR_RUN \"b\"";
+            " 27 JMP 30";
+            " 29 FAIL";
+            " 30 CAP_END_REF ovbase=4";
+            " 32 KET";
+            " 33 DNREF slot=0 count=2 ci=0";
+            " 37 KET";
+            " 38 END";
+          ]
+      in
+      Alcotest.(check string)
+        "DNREF dump" expected
+        (Format.asprintf "%a" Ir.dump ir))
+
 (* ---------- 2. unsupported reasons ---------- *)
 
 let unsupported_reason (pat : string) : string =
@@ -476,10 +618,14 @@ let unsupported_reason (pat : string) : string =
 let unsupported_cases : (string * string * string) list =
   [
     (* (label, pattern, expected reason) *)
-    (* A back-referenced capture is declined at CAP_START by the
-       optimized_cbracket gate (chunk F/J/K): its ovector slot cannot be used
-       as the in-progress start scratch. *)
-    ("referenced capture", "(a)\\1", "fast: referenced capture (chunk F/J/K)");
+    (* Chunk F: a back-referenced capture is now LOWERED (referenced protocol),
+       so (a)\1 is accepted — no unsupported entry. A capture referenced by a
+       CONDITIONAL still declines, but at the OP_COND (chunk J), not the
+       referenced cbracket: the referenced-capture lowering is generic. *)
+    ("conditional ref", "(a)(?(1)b|c)", "fast: OP_COND (chunk J)");
+    (* A possessive ref repeat compiles to an atomic group (OP_ONCE), which is
+       out of subset (chunk G). *)
+    ("possessive ref repeat", "(a)\\1++", "fast: OP_ONCE (chunk G)");
     (* Chunk D2: possessive group repeats stay declined (their KETRPOS
        frame-juggling protocol resists the minimal-save design → chunk G). *)
     ("possessive group", "(a)++", "fast: possessive group (CBRAPOS) (chunk G)");
@@ -592,6 +738,24 @@ let supported_patterns =
     "\\R+";
     "(?:\\d|[a-f])+";
     "a\\bc\\d[e-h]";
+    (* Chunk F: backreferences (numbered; DNREF needs dupnames, covered
+       separately). *)
+    "(a)\\1";
+    "(?i)(a)\\1";
+    "(abc)\\1";
+    "(a|b)\\1";
+    "(.)\\1";
+    "(a)\\1+";
+    "(a)\\1*";
+    "(a)\\1?";
+    "(ab)\\1{2,3}";
+    "(a)\\1+?";
+    "(a)(b)\\2\\1";
+    "((a|b))\\1";
+    "(\\1a|b)+";
+    "((a)\\2)+";
+    "(a*)\\1";
+    "\\1(a)";
   ]
 
 let verify_ok = function
@@ -770,8 +934,23 @@ let sweep_patterns =
     "(\\w+)\\s+(\\w+)";
     "^\\d+$";
     "a[bc]d[^e]f";
-    (* unsupported (declined; verify not invoked) *)
+    (* Chunk F: backreferences (accepted; verify passes). *)
     "(a)\\1";
+    "(?i)(a)\\1";
+    "(abc)\\1";
+    "(a|b)\\1";
+    "(.)\\1+";
+    "(ab)\\1{2,3}";
+    "(a)\\1*b";
+    "(a)\\1+?";
+    "(a)(b)\\2\\1";
+    "((a|b))\\1";
+    "(\\1a|b)+";
+    "((a)\\2)+";
+    "(a*)\\1";
+    "\\1(a)";
+    "(a+)\\1";
+    (* unsupported (declined; verify not invoked) *)
     "(?=x)";
     "(?!x)";
     "(?<=x)";
@@ -1155,6 +1334,57 @@ let parity_cases : (string * string * int * int32) list =
     ("\\d+", "12ab", 0, o_endanchored);
     ("\\d+", "12", 0, o_endanchored);
     ("[a-z]", "5a", 0, o_anchored);
+    (* --- Chunk F: backreferences --- *)
+    (* basic numbered ref (match / miss) *)
+    ("(a)\\1", "aa", 0, 0l);
+    ("(a)\\1", "ab", 0, 0l);
+    ("(abc)\\1", "abcabc", 0, 0l);
+    ("(a|b)\\1", "aa", 0, 0l);
+    ("(a|b)\\1", "ab", 0, 0l);
+    ("(.)\\1", "xx", 0, 0l);
+    (* caseless ref *)
+    ("(?i)(a)\\1", "aA", 0, 0l);
+    ("(?i)(abc)\\1", "abcABC", 0, 0l);
+    ("(?i)(a)\\1", "ab", 0, 0l);
+    (* unset ref: default NM (forward ref, group not yet defined) *)
+    ("\\1(a)", "a", 0, 0l);
+    ("(a)?\\1b", "b", 0, 0l); (* optional group unset -> \1 empty -> "b" *)
+    (* zero-length group ref *)
+    ("(a*)\\1", "aaaa", 0, 0l);
+    ("(a*)\\1", "", 0, 0l);
+    ("(a?)b\\1", "b", 0, 0l);
+    (* nested / sibling referenced captures *)
+    ("((a|b))\\1", "aa", 0, 0l);
+    ("((a|b))\\1", "ab", 0, 0l);
+    ("(a)(b)\\2\\1", "abba", 0, 0l);
+    ("(a)(b)\\2\\1", "abab", 0, 0l);
+    (* ref repeats: greedy / lazy / bounded, with give-back *)
+    ("(ab)\\1*c", "ababc", 0, 0l);
+    ("(ab)\\1*?c", "ababc", 0, 0l);
+    ("(ab)\\1{2}", "ababab", 0, 0l);
+    ("(ab)\\1{2,3}", "abababab", 0, 0l);
+    ("(a)\\1+", "aaaa", 0, 0l);
+    ("(a)\\1+", "a", 0, 0l);
+    ("(.)\\1+", "aabbb", 0, 0l);
+    (* self-referential loops (the interpreter is the oracle) *)
+    ("(\\1a|b)", "ba", 0, 0l);
+    ("(\\1a|b)+", "baa", 0, 0l);
+    ("(a\\1?)", "a", 0, 0l);
+    ("((a)\\2)+", "aa", 0, 0l);
+    (* referenced group inside a repeat, re-entered on backtrack *)
+    ("((?:a|ab))+\\1", "abab", 0, 0l);
+    ("((a|ab))\\1", "abab", 0, 0l);
+    ("(a+)\\1", "aaaa", 0, 0l);
+    ("(a+)\\1", "aaaaa", 0, 0l);
+    (* PARTIAL x ref *)
+    ("(a)\\1", "a", 0, o_partial_soft);
+    ("(abc)\\1", "abcab", 0, o_partial_soft);
+    ("(abc)\\1", "abcab", 0, o_partial_hard);
+    ("(a)\\1+", "aa", 0, o_partial_soft);
+    (* anchored / endanchored x ref *)
+    ("(a)\\1", "xaa", 0, o_anchored);
+    ("(a)\\1", "aa", 0, o_endanchored);
+    ("(a)\\1b", "aab", 0, o_endanchored);
   ]
 
 let parity_tests =
@@ -1269,7 +1499,83 @@ let limit_match_boundary_test =
             ("\\w+\\d", "abc1"); (* type-repeat over a mixed run *)
             ("\\R+x", "\r\n\nx"); (* \R repeat give-back over CRLF *)
           ]);
+    (* Chunk F: ref-repeat tick parity. A greedy ref repeat over-eats then gives
+       back one COPY per RMATCH (RM21) down to and including the floor
+       (pcre2_match.c:5154-5162); a lazy one extends by one copy per RMATCH
+       (RM20). The two engines must trip -47 at the SAME N. Sweep across the
+       boundary; include self-referential loops and captured group repeats. *)
+    Alcotest.test_case "LIMIT_MATCH sweep, ref repeat (fast == interp)" `Quick
+      (fun () ->
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 40 do
+              let f, e = run_both body n subj in
+              Alcotest.(check string)
+                (Printf.sprintf "fast == interp for /%s/ on %S at N=%d" body subj
+                   n)
+                e f
+            done)
+          [
+            ("(a)\\1*b", "aaaaab"); (* greedy ref give-back *)
+            ("(a)\\1*?b", "aaaaab"); (* lazy ref extend *)
+            ("(a)\\1{2,4}b", "aaaaaab"); (* bounded ref give-back *)
+            ("(ab)\\1+c", "ababababc"); (* multi-unit ref repeat *)
+            ("(\\1a|b)+", "baaa"); (* self-referential loop *)
+            ("((a)\\2)+", "aaaa"); (* nested captured ref repeat *)
+            ("(a+)\\1", "aaaaaa"); (* variable-length ref *)
+          ]);
   ]
+
+(* ---------- 6b. backref compile-option parity vs the interpreter ----------
+
+   MATCH_UNSET_BACKREF (0x200, compile option) and DUPNAMES (0x40, needed for
+   OP_DNREF) are compile options, so [parity_tests] (which compiles with 0
+   options) cannot exercise them; these compile with the option and compare
+   exec_full to the interpreter over each subject. *)
+let munset = 0x00000200l
+
+let ref_options_cases : (string * int32 * string) list =
+  [
+    (* MATCH_UNSET_BACKREF: an unset reference matches empty rather than failing
+       (compare with the default in parity_cases: "\\1(a)" NM there). *)
+    ("\\1(a)", munset, "a");
+    ("(a\\1)", munset, "a"); (* self-ref, group in progress -> unset -> empty *)
+    ("(a)?\\1b", munset, "b"); (* optional group skipped: \1 empty *)
+    ("(a)?\\1b", munset, "ab"); (* group set: \1 = "a" *)
+    ("(a)\\1{2}", munset, "aaa"); (* set group: MUB has no effect *)
+    ("(a)?\\1{2,4}c", munset, "c"); (* unset repeated ref -> empty, then 'c' *)
+    (* DUPNAMES + \k<n> => OP_DNREF: first-set-wins scan across the name list. *)
+    ("(?:(?<n>a)|(?<n>b))\\k<n>", dupnames, "aa");
+    ("(?:(?<n>a)|(?<n>b))\\k<n>", dupnames, "bb");
+    ("(?:(?<n>a)|(?<n>b))\\k<n>", dupnames, "ab");
+    ("(?:(?<n>a)|(?<n>ab))\\k<n>", dupnames, "abab");
+    ("(?:(?<n>a)|(?<n>b))\\k<n>+", dupnames, "baaa");
+    ("(?:(?<n>a)|(?<n>b))\\k<n>*c", dupnames, "aaac");
+    (* DUPNAMES with MATCH_UNSET_BACKREF: an unmatched-name-alternative ref. *)
+    ( "(?:(?<n>a)(?<n>b)|(?<n>c))\\k<n>",
+      Int32.logor dupnames munset,
+      "cc" );
+  ]
+
+let ref_options_tests =
+  dnref_golden_test
+  :: List.map
+       (fun (pat, copts, subj) ->
+         Alcotest.test_case
+           (Printf.sprintf "ref-opts %S copt=0x%lx on %S" pat copts subj)
+           `Quick
+           (fun () ->
+             match (F.compile pat copts, E.compile pat copts) with
+             | Ok fre, Ok ere ->
+                 let f = norm (F.exec_full fre subj 0 0l) in
+                 let e = norm (E.exec_full ere subj 0 0l) in
+                 Alcotest.(check string)
+                   (Printf.sprintf "fast vs interp for %S/%S" pat subj)
+                   e f
+             | Error (F.Unsupported _), _ -> ()
+             | Error _, _ | _, Error _ ->
+                 Alcotest.failf "compile mismatch for %S" pat))
+       ref_options_cases
 
 (* ---------- 7. alloc pins ----------
 
@@ -1411,6 +1717,7 @@ let () =
       ("verifier", verifier_tests);
       ("sweep", sweep_tests);
       ("runner parity", parity_tests);
+      ("backref option parity", ref_options_tests);
       ("limit-match boundary", limit_match_boundary_test);
       ("alloc pins", alloc_tests);
       ("stack safety", stack_safety_tests);

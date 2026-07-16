@@ -160,6 +160,34 @@ type mb = {
      bitmap reads (t_class / t_class_rep); the 32-byte map stays in place. *)
   mutable bytecode : Bytes.t;
   mutable bsr_anycrlf : bool; (* bsr_convention = BSR_ANYCRLF (\R) *)
+  (* Chunk F — backreferences. [match_unset_backref] is the compile option
+     PCRE2_MATCH_UNSET_BACKREF (mb.poptions & ..., interpreter.ml:913/6156):
+     an unset reference matches empty rather than failing. [name_table] /
+     [name_entry_size] back the OP_DNREF group-list scan (dnref_scan). *)
+  mutable match_unset_backref : bool;
+  mutable name_table : Bytes.t;
+  mutable name_entry_size : int;
+  (* [ref_length] is match_ref's out-parameter (the C's *lengthptr): the number
+     of subject code units the last successful reference match consumed (= the
+     reference length, non-UTF). Written by [match_ref], read at each ref site.
+     [cap_start] holds the in-progress start OFFSET of each referenced capture
+     group (the JIT's private_data slot for a non-optimized cbracket), indexed
+     by ovbase; written by t_cap_start_ref, read by t_cap_end_ref, saved/
+     restored by KIND_CAPSTART. Sized 2*oveccount, reused/grown across execs;
+     written before any read (like group_start), so no per-attempt reset. *)
+  mutable ref_length : int;
+  mutable cap_start : int array;
+  (* Ref-repeat scratch (t_ref_rep / t_dnref_rep): the invariant parameters of
+     the ref repeat currently being run, decoded by [setup_ref_rep] on the
+     forward path and re-derived on the RM20 backtrack (a nested repeat may
+     clobber them). *)
+  mutable ref_pc : int; (* the ref-repeat instruction head (RM20 re-derive) *)
+  mutable ref_ovbase : int;
+  mutable ref_caseless : bool;
+  mutable ref_reptype : int;
+  mutable ref_lmin : int;
+  mutable ref_lmax : int;
+  mutable ref_cont : int; (* continuation pc past the ref-repeat instruction *)
   (* the backtracking save stack *)
   ss : Save_stack.t;
 }
@@ -228,6 +256,18 @@ let make_mb (ss : Save_stack.t) : mb =
     rep_map_off = 0;
     bytecode = Bytes.empty;
     bsr_anycrlf = false;
+    match_unset_backref = false;
+    name_table = Bytes.empty;
+    name_entry_size = 0;
+    ref_length = 0;
+    cap_start = [||];
+    ref_pc = 0;
+    ref_ovbase = 0;
+    ref_caseless = false;
+    ref_reptype = 0;
+    ref_lmin = 0;
+    ref_lmax = 0;
+    ref_cont = 0;
     ss;
   }
 
@@ -552,6 +592,134 @@ let push_cont (mb : mb) (sp : int) (target : int) (eptr : int) (rdepth : int) :
   Array.unsafe_set d (sp + 2) rdepth;
   Array.unsafe_set d (sp + 3) Save_stack.kind_cont
 
+(* ---------- Backreferences (chunk F, §2/§3) ---------- *)
+
+(* pcre2_match.c:438-451 — match_ref()'s caseless compare loop, not in UTF or
+   UCP mode: fold both code units through the lcc table (interpreter.ml
+   match_ref_ci :815-826). Returns 0 all matched / -1 no match / 1 partial. *)
+let rec ref_cmp_ci (mb : mb) (p : int) (eptr : int) (length : int) : int =
+  if length <= 0 then 0
+  else if eptr >= mb.end_subject then 1 (* partial match, 443 *)
+  else
+    (* safe: eptr < mb.end_subject <= String.length subject (checked above);
+       p in the captured substring [start, end) with end <= end_subject. *)
+    let cc = Char.code (String.unsafe_get mb.subject eptr) in
+    let cp = Char.code (String.unsafe_get mb.subject p) in
+    if not (Int.equal (Chartables.lcc cp) (Chartables.lcc cc)) then -1
+    else (ref_cmp_ci [@tailcall]) mb (p + 1) (eptr + 1) (length - 1)
+
+(* pcre2_match.c:460-467 — match_ref()'s caseful compare loop for partial
+   matching: unit by unit, checking the subject end before each unit
+   (interpreter.ml match_ref_cs_partial :831-844). *)
+let rec ref_cmp_cs_partial (mb : mb) (p : int) (eptr : int) (length : int) : int =
+  if length <= 0 then 0
+  else if eptr >= mb.end_subject then 1 (* partial match, 464 *)
+  else if
+    (* safe: as ref_cmp_ci. *)
+    not
+      (Int.equal
+         (Char.code (String.unsafe_get mb.subject p))
+         (Char.code (String.unsafe_get mb.subject eptr)))
+  then -1 (* no match, 465 *)
+  else (ref_cmp_cs_partial [@tailcall]) mb (p + 1) (eptr + 1) (length - 1)
+
+(* pcre2_match.c:474 — memcmp(p, eptr, CU2BYTES(length)) != 0 as an equality
+   scan (interpreter.ml match_ref_memcmp :849-858). Caller checked
+   end_subject - eptr >= length. *)
+let rec ref_memcmp (mb : mb) (p : int) (eptr : int) (length : int) : bool =
+  length <= 0
+  || Int.equal
+       (* safe: eptr + length <= end_subject (caller's 473 check); p in the
+          captured substring. *)
+       (Char.code (String.unsafe_get mb.subject p))
+       (Char.code (String.unsafe_get mb.subject eptr))
+     && (ref_memcmp [@tailcall]) mb (p + 1) (eptr + 1) (length - 1)
+
+(* pcre2_match.c:360-481 — match_ref() for the non-UTF, non-UCP subset
+   (interpreter.ml match_ref :899-957). Match the reference at group [ovbase]
+   (fast public convention, group N at [2N,2N+1]) against the subject at
+   [eptr]. A referenced group's ovector slots are written ONLY at its close
+   (t_cap_end_ref) and restored on backtrack, so [ovector.(ovbase) = UNSET]
+   captures exactly the C's `offset >= Foffset_top || Fovector[offset] ==
+   PCRE2_UNSET` (unset on the current path, §3). Returns 0 = match (with the
+   consumed length in [mb.ref_length]); -1 = no match; 1 = partial. *)
+let match_ref (mb : mb) (ovbase : int) (caseless : bool) (eptr : int) : int =
+  let ov = mb.ovector in
+  (* safe (every ov.() below): ovbase = 2N, 1 <= N <= top_bracket — a REF
+     operand (Ir_verify ovbase_ok) or a dnref_scan result (a compiler-generated
+     name-table group number), so ovbase, ovbase+1 < 2*oveccount =
+     Array.length ov. *)
+  (* pcre2_match.c:372-380 — unset group: no match, unless MATCH_UNSET_BACKREF
+     (then an empty match). *)
+  if Int.equal (Array.unsafe_get ov ovbase) Frames.unset then
+    if mb.match_unset_backref then (
+      mb.ref_length <- 0;
+      0)
+    else -1
+  else
+    (* pcre2_match.c:384-386 — p = start_subject + Fovector[offset]; length =
+       Fovector[offset+1] - Fovector[offset]. *)
+    let p = mb.start_subject + Array.unsafe_get ov ovbase in
+    let length = Array.unsafe_get ov (ovbase + 1) - Array.unsafe_get ov ovbase in
+    if caseless then (
+      (* pcre2_match.c:438-451 (non-UTF/UCP). *)
+      let rc = ref_cmp_ci mb p eptr length in
+      if Int.equal rc 0 then mb.ref_length <- length;
+      rc)
+    else if mb.partial <> 0 then (
+      (* pcre2_match.c:460-467 — caseful, partial: unit by unit. *)
+      let rc = ref_cmp_cs_partial mb p eptr length in
+      if Int.equal rc 0 then mb.ref_length <- length;
+      rc)
+    else if mb.end_subject - eptr < length then 1 (* partial, 473 *)
+    else if not (ref_memcmp mb p eptr length) then -1 (* no match, 474 *)
+    else (
+      mb.ref_length <- length;
+      0)
+
+(* pcre2_match.c:5002-5007 — the OP_DNREF group-list walk (interpreter.ml
+   dnref_scan :6060-6073): return the ovbase of the first group in the list
+   that is SET, or the last examined entry when none is set (the caller then
+   applies the unset-reference logic). [slot_base] is the name-table byte
+   offset of the first entry; each entry begins with the group NUMBER (GET2).
+   count >= 1 in a compiled program. *)
+let rec dnref_scan (mb : mb) (remaining : int) (slot : int) : int =
+  (* Compile.get2 (safe Bytes.get) reads a 2-byte group number; Ir_verify proved
+     the whole list span [slot_base, slot_base+(count-1)*entry_size] is inside
+     name_table, so no read raises across the loop. *)
+  let ovbase = Compile.get2 mb.name_table slot lsl 1 (* 2N, fast convention *) in
+  if remaining <= 1 then ovbase (* last entry (C: count == 1) *)
+  else if
+    (* safe: ovbase = 2N, 1 <= N <= top_bracket (compiler-generated name-table
+       group number), so ovbase < 2*oveccount = Array.length mb.ovector. *)
+    not (Int.equal (Array.unsafe_get mb.ovector ovbase) Frames.unset)
+  then ovbase (* first set group *)
+  else (dnref_scan [@tailcall]) mb (remaining - 1) (slot + mb.name_entry_size)
+
+(* [setup_ref_rep] decodes the ref-repeat instruction at [pc] into mb.ref_*
+   (fast-design.md §2/§3). Called on the forward path (op_ref_repeat) and
+   re-called on the RM20 backtrack (KIND_REF_MIN) to restore the fields a
+   nested ref may have clobbered — it writes only mb.ref_*, so it is
+   idempotent. For a DNREF the ovbase is re-resolved by dnref_scan (the
+   referenced group precedes the ref, so its ovector is stable across the
+   repeat's backtracking, §3). *)
+let setup_ref_rep (mb : mb) (pc : int) : unit =
+  let code = mb.code in
+  let tag = code.(pc) in
+  mb.ref_pc <- pc;
+  mb.ref_reptype <- code.(pc + 1);
+  mb.ref_lmin <- code.(pc + 2);
+  mb.ref_lmax <- code.(pc + 3);
+  if Int.equal tag 33 (* t_ref_rep *) then (
+    mb.ref_ovbase <- code.(pc + 4);
+    mb.ref_caseless <- Int.equal code.(pc + 5) 1;
+    mb.ref_cont <- pc + 6)
+  else (
+    (* tag 35 t_dnref_rep. *)
+    mb.ref_ovbase <- dnref_scan mb code.(pc + 5) code.(pc + 4);
+    mb.ref_caseless <- Int.equal code.(pc + 6) 1;
+    mb.ref_cont <- pc + 7)
+
 (* ---------- The fused loop (§3) ---------- *)
 
 let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
@@ -835,6 +1003,68 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
           push_cont mb sp code.(pc + 1) eptr rdepth;
           (run [@tailcall]) mb (pc + 3) eptr (sp + Save_stack.width_cont)
             (rdepth + 1) mcc')
+  | 32 ->
+      (* REF (fast-design.md §2/§3; OP_REF single, pcre2_match.c:5045-5056) —
+         match a numbered backref once, then continue. No choice point, no
+         tick; on failure/partial: CHECK_PARTIAL then NOMATCH. *)
+      (op_single_ref [@tailcall]) mb (pc + 3) code.(pc + 1)
+        (Int.equal code.(pc + 2) 1)
+        eptr sp rdepth mcc
+  | 34 ->
+      (* DNREF (fast-design.md §2/§3; OP_DNREF single, pcre2_match.c:4994-5009 +
+         5045-5056) — resolve the duplicate-named group list to the first set
+         group (dnref_scan), then as REF. *)
+      let ovb = dnref_scan mb code.(pc + 2) code.(pc + 1) in
+      (op_single_ref [@tailcall]) mb (pc + 4) ovb
+        (Int.equal code.(pc + 3) 1)
+        eptr sp rdepth mcc
+  | 33 | 35 ->
+      (* REF_REP / DNREF_REP (fast-design.md §2/§3/§4; the OP_CR* ref repeat
+         forms, pcre2_match.c:5017-5162). *)
+      (op_ref_repeat [@tailcall]) mb pc eptr sp rdepth mcc
+  | 36 ->
+      (* CAP_START_REF (fast-design.md §3; the JIT non-optimized cbracket entry
+         pcre2_jit_compile.c:11055-11061) — open a REFERENCED capture group N.
+         Keep the start OFFSET in mb.cap_start (private scratch, NOT the ovector
+         slot, which must stay UNSET until CLOSE so a mid-match backref sees
+         only closed values); push a KIND_CAPSTART saving the enclosing
+         cap_start value. No ovector write, no tick. *)
+      let ovb = code.(pc + 1) in
+      let ss = mb.ss in
+      let need = sp + Save_stack.width_capstart in
+      if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+      let d = ss.Save_stack.data in
+      (* safe: [grow] ensured length >= sp + width_capstart; ovb in [2, 2*top]
+         (Ir_verify) < 2*oveccount = Array.length mb.cap_start. *)
+      Array.unsafe_set d sp ovb;
+      Array.unsafe_set d (sp + 1) (Array.unsafe_get mb.cap_start ovb);
+      Array.unsafe_set d (sp + 2) Save_stack.kind_capstart;
+      Array.unsafe_set mb.cap_start ovb (eptr - mb.start_subject);
+      (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_capstart) rdepth
+        mcc
+  | 37 ->
+      (* CAP_END_REF (fast-design.md §3; the JIT non-optimized cbracket close
+         pcre2_jit_compile.c:10692-10702 / the C ket write pcre2_match.c:
+         6081-6082) — close a REFERENCED capture: push a KIND_CAP saving the OLD
+         ovector pair, then set ovector[ovb] = cap_start (the private start) and
+         ovector[ovb+1] = current position. On backtrack past this point the
+         KIND_CAP restores the pair (so a re-entered earlier iteration sees the
+         group unset until it re-closes). No tick. *)
+      let ovb = code.(pc + 1) in
+      let ss = mb.ss in
+      let need = sp + Save_stack.width_cap in
+      if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+      let d = ss.Save_stack.data in
+      let ov = mb.ovector in
+      (* safe: [grow] ensured length >= sp + width_cap; ovb, ovb+1 < 2*oveccount
+         and ovb < Array.length mb.cap_start. *)
+      Array.unsafe_set d sp ovb;
+      Array.unsafe_set d (sp + 1) (Array.unsafe_get ov ovb);
+      Array.unsafe_set d (sp + 2) (Array.unsafe_get ov (ovb + 1));
+      Array.unsafe_set d (sp + 3) Save_stack.kind_cap;
+      Array.unsafe_set ov ovb (Array.unsafe_get mb.cap_start ovb);
+      Array.unsafe_set ov (ovb + 1) (eptr - mb.start_subject);
+      (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_cap) rdepth mcc
   | 0 ->
       (* END (fast-design.md §2; op_end_tail interpreter.ml:3416-3492 /
          pcre2_match.c:876-940) — accept, subject to the empty-match and
@@ -934,6 +1164,25 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
       (* safe: g written by GROUP_START, in [0, n_groups). *)
       Array.unsafe_set mb.group_start g (Array.unsafe_get d (base + 1));
       (backtrack [@tailcall]) mb base mcc)
+    else if Int.equal kind Save_stack.kind_capstart then (
+      (* KIND_CAPSTART [ovbase; old_cap_start; kind] (fast-design.md §3; the JIT
+         non-optimized cbracket entry restore, pcre2_jit_compile.c:13454-13459)
+         — restore a referenced capture's private in-progress start to the
+         enclosing value, then keep popping. The ovector was already rolled back
+         by the KIND_CAP pushed at CLOSE (popped earlier in this unwind). *)
+      let base = sp - Save_stack.width_capstart in
+      let ovb = Array.unsafe_get d base in
+      (* safe: ovb written by CAP_START_REF, < Array.length mb.cap_start. *)
+      Array.unsafe_set mb.cap_start ovb (Array.unsafe_get d (base + 1));
+      (backtrack [@tailcall]) mb base mcc)
+    else if Int.equal kind Save_stack.kind_ref_min then
+      (* KIND_REF_MIN [rep_pc; count; eptr; rdepth; kind] — minimizing ref
+         repeat give-one-more (RM20, pcre2_match.c:5097-5113). *)
+      (backtrack_ref_min [@tailcall]) mb sp mcc
+    else if Int.equal kind Save_stack.kind_ref_max then
+      (* KIND_REF_MAX [cont; try_eptr; flength; lstart; rdepth; kind] —
+         maximizing ref repeat give-back (RM21, pcre2_match.c:5154-5162). *)
+      (backtrack_ref_max [@tailcall]) mb sp mcc
     else
       (* KIND_CONT [target; eptr; rdepth; kind] (fast-design.md §3) — a
          chunk-D2 group choice point: resume at [target] with [eptr]/[rdepth]
@@ -1093,6 +1342,184 @@ and rep_bt_min_anynl_step (mb : mb) (base : int) (count : int) (e' : int)
     (run [@tailcall]) mb mb.rep_cont e'
       (base + Save_stack.width_rep_min)
       (dd + 1) mcc')
+
+(* ---------- Backreference execution (chunk F, §2/§3/§4) ---------- *)
+
+(* pcre2_match.c:5045-5056 — a single (non-repeated) backreference: match_ref
+   once, then continue; on rrc != 0 do the partial handling then NOMATCH. No
+   choice point, no tick (the C's `continue`). Shared by t_ref (numbered) and
+   t_dnref (dup-named, after dnref_scan resolves the ovbase). *)
+and op_single_ref (mb : mb) (cont : int) (ovbase : int) (caseless : bool)
+    (eptr : int) (sp : int) (rdepth : int) (mcc : int) : int =
+  let rrc = match_ref mb ovbase caseless eptr in
+  if not (Int.equal rrc 0) then
+    (* pcre2_match.c:5050-5052 — if rrc > 0 (partial): Feptr = end_subject;
+       then CHECK_PARTIAL; then NOMATCH. *)
+    let feptr = if rrc > 0 then mb.end_subject else eptr in
+    let rc = if feptr >= mb.end_subject then scheck_partial mb feptr else 0 in
+    if rc < 0 then rc else (backtrack [@tailcall]) mb sp mcc
+  else (run [@tailcall]) mb cont (eptr + mb.ref_length) sp rdepth mcc
+
+(* pcre2_match.c:5021-5074 — REF_REPEAT + the ref_repeat_head decision
+   (interpreter.ml ref_repeat/ref_repeat_head :6081-6158). [setup_ref_rep]
+   decodes the repeat; then: a SET zero-length group matches any number of
+   times (continue); an unset group with Lmin = 0 or MATCH_UNSET_BACKREF
+   continues (empty); otherwise ensure the minimum via [ref_min]. *)
+and op_ref_repeat (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  setup_ref_rep mb pc;
+  let ov = mb.ovector in
+  let ovbase = mb.ref_ovbase in
+  if not (Int.equal (Array.unsafe_get ov ovbase) Frames.unset) then
+    (* pcre2_match.c:5066-5069 — group is set. *)
+    if
+      Int.equal (Array.unsafe_get ov ovbase) (Array.unsafe_get ov (ovbase + 1))
+    then (run [@tailcall]) mb mb.ref_cont eptr sp rdepth mcc (* zero length, 5068 *)
+    else (ref_min [@tailcall]) mb 1 eptr sp rdepth mcc
+  else if Int.equal mb.ref_lmin 0 || mb.match_unset_backref then
+    (* pcre2_match.c:5070-5074 — group not set: Lmin = 0 or MATCH_UNSET_BACKREF
+       makes it a zero-length match; continue. *)
+    (run [@tailcall]) mb mb.ref_cont eptr sp rdepth mcc
+  else (ref_min [@tailcall]) mb 1 eptr sp rdepth mcc
+
+(* pcre2_match.c:5076-5124 — ensure the minimum number of matches, then
+   dispatch on the repeat strategy (interpreter.ml ref_min :6163-6211). Reads
+   the repeat invariants from mb.ref_* (set by [setup_ref_rep]; not clobbered
+   until an RMATCH, which happens only after this loop). *)
+and ref_min (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  if i <= mb.ref_lmin then
+    let rrc = match_ref mb mb.ref_ovbase mb.ref_caseless eptr in
+    if not (Int.equal rrc 0) then
+      (* pcre2_match.c:5082-5087 — partial handling then NOMATCH. *)
+      let feptr = if rrc > 0 then mb.end_subject else eptr in
+      let rc = if feptr >= mb.end_subject then scheck_partial mb feptr else 0 in
+      if rc < 0 then rc else (backtrack [@tailcall]) mb sp mcc
+    else (ref_min [@tailcall]) mb (i + 1) (eptr + mb.ref_length) sp rdepth mcc
+  else if Int.equal mb.ref_lmin mb.ref_lmax then
+    (* pcre2_match.c:5093 — min == max: done, continue. *)
+    (run [@tailcall]) mb mb.ref_cont eptr sp rdepth mcc
+  else if Int.equal mb.ref_reptype Ir.reptype_min then (
+    (* pcre2_match.c:5097-5102 — minimize: RMATCH(cont, RM20) — tick, push
+       KIND_REF_MIN with count = Lmin, run the continuation at rdepth+1. *)
+    let mcc' = tick_child mb mcc (rdepth + 1) in
+    if mcc' < 0 then mcc'
+    else (
+      let ss = mb.ss in
+      let need = sp + Save_stack.width_ref_min in
+      if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+      let d = ss.Save_stack.data in
+      Array.unsafe_set d sp mb.ref_pc;
+      Array.unsafe_set d (sp + 1) mb.ref_lmin (* count so far *);
+      Array.unsafe_set d (sp + 2) eptr;
+      Array.unsafe_set d (sp + 3) rdepth;
+      Array.unsafe_set d (sp + 4) Save_stack.kind_ref_min;
+      (run [@tailcall]) mb mb.ref_cont eptr need (rdepth + 1) mcc'))
+  else
+    (* pcre2_match.c:5120-5124 — maximize: Lstart = eptr (position after Lmin
+       copies); Flength = ref length (> 0 here — a set, non-zero group). In
+       non-UTF every iteration matches exactly Flength units (samelengths
+       always TRUE), so the rare RM22 rescan never occurs. *)
+    let ov = mb.ovector in
+    let flength =
+      Array.unsafe_get ov (mb.ref_ovbase + 1) - Array.unsafe_get ov mb.ref_ovbase
+    in
+    (ref_max_scan [@tailcall]) mb mb.ref_lmin flength eptr eptr sp rdepth mcc
+
+(* pcre2_match.c:5126-5146 — the maximize greedy scan (interpreter.ml
+   ref_max_scan :6217-6252): match up to Lmax copies, each consuming Flength.
+   [lstart] is the position after Lmin copies (constant); [eptr] the running
+   end. A failing/partial copy breaks the scan WITHOUT advancing eptr (the C's
+   "can't use CHECK_PARTIAL because we don't want to update Feptr in the soft
+   partial case", 5132-5142). *)
+and ref_max_scan (mb : mb) (i : int) (flength : int) (lstart : int) (eptr : int)
+    (sp : int) (rdepth : int) (mcc : int) : int =
+  if i < mb.ref_lmax then
+    let rrc = match_ref mb mb.ref_ovbase mb.ref_caseless eptr in
+    if not (Int.equal rrc 0) then (
+      (* pcre2_match.c:5130-5142 — partial handling (no eptr update), break. *)
+      if
+        rrc > 0 && mb.partial <> 0 && mb.end_subject > mb.start_used_ptr
+      then (
+        mb.hitend <- true;
+        if mb.partial > 1 then Errors.error_partial
+        else (ref_max_end [@tailcall]) mb flength lstart eptr sp rdepth mcc)
+      else (ref_max_end [@tailcall]) mb flength lstart eptr sp rdepth mcc)
+    else
+      (ref_max_scan [@tailcall]) mb (i + 1) flength lstart (eptr + mb.ref_length)
+        sp rdepth mcc
+  else (ref_max_end [@tailcall]) mb flength lstart eptr sp rdepth mcc
+
+(* pcre2_match.c:5154-5162 — the samelengths give-back while head: [eptr] is the
+   greedy end (>= lstart, so the first RMATCH(RM21) always fires). Tick, push
+   KIND_REF_MAX; the RM21 backtrack gives back Flength per failure down to and
+   INCLUDING lstart, then NOMATCH (5186). *)
+and ref_max_end (mb : mb) (flength : int) (lstart : int) (eptr : int) (sp : int)
+    (rdepth : int) (mcc : int) : int =
+  let mcc' = tick_child mb mcc (rdepth + 1) in
+  if mcc' < 0 then mcc'
+  else (
+    let ss = mb.ss in
+    let need = sp + Save_stack.width_ref_max in
+    if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+    let d = ss.Save_stack.data in
+    Array.unsafe_set d sp mb.ref_cont;
+    Array.unsafe_set d (sp + 1) eptr;
+    Array.unsafe_set d (sp + 2) flength;
+    Array.unsafe_set d (sp + 3) lstart;
+    Array.unsafe_set d (sp + 4) rdepth;
+    Array.unsafe_set d (sp + 5) Save_stack.kind_ref_max;
+    (run [@tailcall]) mb mb.ref_cont eptr need (rdepth + 1) mcc')
+
+(* KIND_REF_MIN backtrack (RM20, pcre2_match.c:5102-5113 / interpreter.ml
+   :7573-7604): the continuation failed; if Lmin < Lmax match one more copy and
+   retry. Re-derives the repeat invariants from the IR via [setup_ref_rep] (a
+   nested ref may have clobbered the mb.ref fields). *)
+and backtrack_ref_min (mb : mb) (sp : int) (mcc : int) : int =
+  let d = mb.ss.Save_stack.data in
+  let base = sp - Save_stack.width_ref_min in
+  let rep_pc = Array.unsafe_get d base in
+  let count = Array.unsafe_get d (base + 1) in
+  let eptr = Array.unsafe_get d (base + 2) in
+  let dd = Array.unsafe_get d (base + 3) in
+  setup_ref_rep mb rep_pc;
+  if count >= mb.ref_lmax then (backtrack [@tailcall]) mb base mcc
+    (* pcre2_match.c:5104 — Lmin++ >= Lmax: NOMATCH. *)
+  else
+    let rrc = match_ref mb mb.ref_ovbase mb.ref_caseless eptr in
+    if not (Int.equal rrc 0) then
+      (* pcre2_match.c:5106-5111 — partial handling then NOMATCH. *)
+      let feptr = if rrc > 0 then mb.end_subject else eptr in
+      let rc = if feptr >= mb.end_subject then scheck_partial mb feptr else 0 in
+      if rc < 0 then rc else (backtrack [@tailcall]) mb base mcc
+    else
+      let mcc' = tick_child mb mcc (dd + 1) in
+      if mcc' < 0 then mcc'
+      else (
+        let eptr' = eptr + mb.ref_length in
+        Array.unsafe_set d (base + 1) (count + 1);
+        Array.unsafe_set d (base + 2) eptr';
+        (run [@tailcall]) mb mb.ref_cont eptr' sp (dd + 1) mcc')
+
+(* KIND_REF_MAX backtrack (RM21, pcre2_match.c:5158-5161 / interpreter.ml
+   :7605-7614): give back one copy (Feptr -= Flength); while still >= lstart,
+   retry the continuation (tick); below lstart -> NOMATCH. *)
+and backtrack_ref_max (mb : mb) (sp : int) (mcc : int) : int =
+  let d = mb.ss.Save_stack.data in
+  let base = sp - Save_stack.width_ref_max in
+  let cont = Array.unsafe_get d base in
+  let try_eptr = Array.unsafe_get d (base + 1) in
+  let flength = Array.unsafe_get d (base + 2) in
+  let lstart = Array.unsafe_get d (base + 3) in
+  let dd = Array.unsafe_get d (base + 4) in
+  let new_eptr = try_eptr - flength in
+  if new_eptr >= lstart then (
+    let mcc' = tick_child mb mcc (dd + 1) in
+    if mcc' < 0 then mcc'
+    else (
+      Array.unsafe_set d (base + 1) new_eptr;
+      (run [@tailcall]) mb cont new_eptr sp (dd + 1) mcc'))
+  else (backtrack [@tailcall]) mb base mcc (* Feptr < Lstart: NOMATCH, 5186 *)
 
 (* ---------- Repeat superinstructions (§2/§4) ----------
 
@@ -1853,6 +2280,13 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
         mb.bytecode <- re.Compile.code;
         mb.bsr_anycrlf <-
           Int.equal re.Compile.bsr_convention Options.bsr_anycrlf;
+        (* Chunk F — backreferences. MATCH_UNSET_BACKREF is a compile option
+           (mb.poptions = re.overall_options, interpreter.ml:9910/913). The name
+           table + entry size back the OP_DNREF group-list scan. *)
+        mb.match_unset_backref <-
+          not (Int.equal (re.Compile.overall_options land Options.match_unset_backref) 0);
+        mb.name_table <- re.Compile.name_table;
+        mb.name_entry_size <- re.Compile.name_entry_size;
         mb.subject <- subject;
         mb.end_subject <- length;
         mb.start_subject <- 0;
@@ -1879,6 +2313,11 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
         mb.oveccount <- oveccount;
         if Array.length mb.ovector < 2 * oveccount then
           mb.ovector <- Array.make (2 * oveccount) Frames.unset;
+        (* Chunk F: referenced-capture in-progress starts (t_cap_start_ref),
+           indexed by ovbase; sized like the ovector, reused/grown across execs.
+           Written before any read (like group_start), so no per-attempt reset. *)
+        if Array.length mb.cap_start < 2 * oveccount then
+          mb.cap_start <- Array.make (2 * oveccount) 0;
         (* Repeated-group iteration-start scratch (chunk D2): one int per
            empty-check-tracked group; reused/grown across execs. Contents are
            written by t_group_start before any read, so no reset is needed. *)
@@ -2039,11 +2478,20 @@ let () =
   assert (Int.equal Ir.t_wordbound 29);
   assert (Int.equal Ir.t_type_rep 30);
   assert (Int.equal Ir.t_class_rep 31);
-  assert (Int.equal Ir.max_tag 31);
+  assert (Int.equal Ir.t_ref 32);
+  assert (Int.equal Ir.t_ref_rep 33);
+  assert (Int.equal Ir.t_dnref 34);
+  assert (Int.equal Ir.t_dnref_rep 35);
+  assert (Int.equal Ir.t_cap_start_ref 36);
+  assert (Int.equal Ir.t_cap_end_ref 37);
+  assert (Int.equal Ir.max_tag 37);
   (* Save-record KIND / width constants the runner inlines as literals. *)
   assert (Int.equal Save_stack.kind_alt 0);
   assert (Int.equal Save_stack.kind_cap 1);
   assert (Int.equal Save_stack.kind_rep_max 2);
   assert (Int.equal Save_stack.kind_rep_min 3);
   assert (Int.equal Save_stack.kind_cont 4);
-  assert (Int.equal Save_stack.kind_gstart 5)
+  assert (Int.equal Save_stack.kind_gstart 5);
+  assert (Int.equal Save_stack.kind_capstart 6);
+  assert (Int.equal Save_stack.kind_ref_min 7);
+  assert (Int.equal Save_stack.kind_ref_max 8)

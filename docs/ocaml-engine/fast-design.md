@@ -84,6 +84,12 @@ following the tag. Widths are `Ir.arity`:
 | 29 | `WORDBOUND` | `want` | 2 | `\b` (`want=1`, `OP_WORD_BOUNDARY`) / `\B` (`want=0`, `OP_NOT_WORD_BOUNDARY`), non-UCP. The prev-char read lowers `mb.start_used_ptr` (the SCHECK_PARTIAL floor, pcre2_match.c:6280) |
 | 30 | `TYPE_REP` | `reptype; lmin; lmax; type_op` | 5 | character-type repeat (`OP_TYPESTAR`..`OP_TYPEPOSUPTO`) |
 | 31 | `CLASS_REP` | `reptype; lmin; lmax; map_off` | 5 | class repeat (`OP_CLASS`/`OP_NCLASS` + an `OP_CR*` quantifier) |
+| 32 | `REF` | `ovbase; caseless` | 3 | numbered backref (`OP_REF`/`OP_REFI`), no repeat: `match_ref` once (`ovbase = 2N`, fast public ovector), then continue |
+| 33 | `REF_REP` | `reptype; lmin; lmax; ovbase; caseless` | 6 | numbered backref + `OP_CR*` repeat |
+| 34 | `DNREF` | `slot_base; count; caseless` | 4 | duplicate-named backref (`OP_DNREF`/`OP_DNREFI`), no repeat: scan the name-table list (`slot_base` = byte offset, `count` entries) for the first SET group (`dnref_scan`), then `match_ref` |
+| 35 | `DNREF_REP` | `reptype; lmin; lmax; slot_base; count; caseless` | 7 | dup-named backref + `OP_CR*` repeat |
+| 36 | `CAP_START_REF` | `ovbase` | 2 | open a REFERENCED capture N (`ovbase = 2N`): push a `KIND_CAPSTART` (private-scratch save), set `mb.cap_start[ovbase]` to the current position — the ovector slot stays UNSET until CLOSE |
+| 37 | `CAP_END_REF` | `ovbase` | 2 | close a REFERENCED capture: push a `KIND_CAP` (ovector save), write `ovector[ovbase] = cap_start[ovbase]` and `ovector[ovbase+1]` = current position |
 
 **Chunk D additions.** `CIRCM`/`DOLLM` are the multiline anchors (their arms
 carry no operands; runtime semantics only). `CAP_START`/`CAP_END` bracket a
@@ -205,6 +211,57 @@ tags (27-31, above). Design notes:
   is not a valid \R boundary). `giveback_pos` reproduces this on the stored
   give-back position for a `t_type_rep` whose type is `OP_ANYNL`.
 
+**Chunk F additions — backreferences.** Six new tags (32-37, above). Design
+notes:
+
+- **`match_ref` (non-UTF/non-UCP)** ports `pcre2_match.c:360-481`
+  (interpreter.ml:899-957): unset-group check, the caseless (`lcc`-fold), the
+  caseful-partial (unit-by-unit) and the caseful-non-partial (`memcmp`) compare
+  loops. The consumed length goes through `mb.ref_length` (the C's
+  `*lengthptr`); non-UTF it always equals the reference length. A group is
+  "set" iff `ovector[ovbase] != UNSET` — which for a REFERENCED group (written
+  only at CLOSE, restored on backtrack) captures exactly the C's
+  `offset >= Foffset_top || Fovector[offset] == PCRE2_UNSET`.
+- **`OP_REF`/`OP_REFI` single** (no `OP_CR*`) is the C default case
+  (`:5045-5056`): `match_ref` once, advance, continue — **no choice point, no
+  tick**. Unset-ref semantics (`-1` NOMATCH, or an empty match under
+  `PCRE2_MATCH_UNSET_BACKREF`) and zero-length-set-group (empty match) fall out
+  of `match_ref` directly.
+- **`OP_DNREF`/`OP_DNREFI`** (duplicate-named, needs `PCRE2_DUPNAMES`) first
+  scans the name-table list for the first SET group, or the LAST entry when none
+  is set (`dnref_scan`, `:5002-5007`); then it is a `REF`. The scan reads
+  `mb.name_table` via `Compile.get2` (safe `Bytes.get`) — the verifier proves
+  the whole list span lies inside the table so no read raises across the loop.
+- **Ref repeats** (`REF_REP`/`DNREF_REP`, the `OP_CR*` forms `:5017-5162`)
+  mirror `ref_repeat_head` → `ref_min` → minimize (RM20) / maximize samelengths
+  (RM21). In non-UTF every iteration matches exactly `Flength` units, so
+  `samelengths` is ALWAYS true and the rare RM22 rescan (`:5164-5184`) never
+  occurs. A possessive ref repeat compiles to an atomic group (`OP_ONCE`, out of
+  subset → chunk G), so only `OP_CRSTAR`..`OP_CRMINQUERY` / `OP_CRRANGE` /
+  `OP_CRMINRANGE` follow a ref. The invariants are decoded by `setup_ref_rep`
+  into `mb.ref_*` on the forward path and re-derived on the RM20 backtrack (a
+  nested ref may clobber them).
+- **Referenced-capture protocol (`optimized_cbracket` = 0).** A capture reached
+  by `OP_REF*`/`OP_DNREF*` (or `OP_CREF`/`OP_DNCREF`, or a possessive capture)
+  clears its `optimized_cbracket` bit; chunk D ported the analysis and DECLINED
+  such captures. Chunk F LOWERS them with the JIT's non-optimized cbracket
+  protocol (`pcre2_jit_compile.c:1145`, `11055-11061`, `10692-10702`): the
+  in-progress start lives in `mb.cap_start` (NOT the ovector slot — a mid-match
+  backref must see only CLOSED values), and both ovector slots are written only
+  at CLOSE. `CAP_START_REF` pushes `KIND_CAPSTART` (saving the enclosing
+  `cap_start`), `CAP_END_REF` pushes `KIND_CAP` (saving the OLD ovector pair).
+  The D design's single entry-save `KIND_CAP` is INSUFFICIENT for referenced
+  groups (it writes the ovector start at ENTRY, so an in-progress group would
+  read as "set" to a self-reference like `(\1a|b)`, and the ovector would not be
+  rolled back when backtracking INTO the group body past a completed CLOSE); the
+  split entry-private + close-ovector protocol fixes both. It is
+  behaviour-correct for ANY referencing construct, so the gate is generic: an
+  out-of-subset referencer (`OP_COND`/`OP_CBRAPOS`) declines ELSEWHERE and the
+  lowered IR is never executed. Verified against the interpreter on `(a\1)`,
+  `(\1a|b)+`, `((a)\2)+`, `((?:a|ab))+\1` (a re-entered earlier iteration whose
+  re-run `CAP_END_REF` must read the restored `cap_start`, which `KIND_CAPSTART`
+  provides) and 260k+ fuzz cases.
+
 **charpos (`pcre2_jit_compile.c:11831-12130`) — DECLINED PERMANENTLY (not a
 coverage gap), same class of decision as detect_repeat.** charpos optimises a
 GREEDY single-char/type repeat immediately followed by a fixed literal char
@@ -305,6 +362,9 @@ first:
 | `KIND_REP_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REP_MIN` | minimizing char / type / class repeat with `lmin<lmax` | match one more unit at `eptr`, retry the continuation |
 | `KIND_CONT` | 4 | `target; eptr; rdepth; KIND_CONT` | BRAZERO / BRAMINZERO / greedy KETRMAX / lazy KETRMIN | resume at IR index `target` (restore `eptr`/`rdepth`), NO tick |
 | `KIND_GSTART` | 3 | `g; old_start; KIND_GSTART` | each `GROUP_START` (tracked repeated group) | restore `mb.group_start.(g)`, then keep popping |
+| `KIND_CAPSTART` | 3 | `ovbase; old_cap_start; KIND_CAPSTART` | each `CAP_START_REF` (referenced capture entry) | restore `mb.cap_start.(ovbase)` to the enclosing value, then keep popping (the ovector was already rolled back by the CLOSE's `KIND_CAP`) |
+| `KIND_REF_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REF_MIN` | minimizing ref repeat with `lmin<lmax` (RM20) | match one more copy at `eptr` (`count` up to Lmax), retry the continuation; `rep_pc` re-derives ovbase/caseless/Lmax/cont |
+| `KIND_REF_MAX` | 6 | `cont; try_pos; flength; lstart; rdepth; KIND_REF_MAX` | maximizing ref repeat, samelengths (RM21) | give back one copy (`try_pos` −= `flength`, down to and INCLUDING `lstart`), retry the continuation; below `lstart` → NOMATCH |
 
 `match_call_count`, `hitend`, `start_used_ptr` are NOT saved (monotonic /
 constant per attempt). `sp` is a runner tail-call parameter; push/pop are
@@ -379,13 +439,16 @@ does) UNLESS reached by `OP_REF`/`OP_REFI` (`:1145`), `OP_CREF` (`:1173`),
 `OP_DNREF`/`OP_DNREFI`/`OP_DNCREF` (`:1180-1186`), or `OP_CBRAPOS`/
 `OP_SCBRAPOS` (`:1159`). A linear analysis walk over `re.code` (with a
 byte-length helper covering the variable-length opcodes — XCLASS, CALLOUT_STR,
-arg-verbs, and type-repeat-of-`\p`) clears the bit for referenced groups; a
-non-optimized capture is declined at `CAP_START` (`"fast: referenced capture
-(chunk F/J/K)"`). In this chunk's subset every referencing opcode is itself
-out of scope, so ALL captures come out optimized — chunks F/J/K widen the
-referencing lowering and add the private-scratch path, flipping bits off
-without changing this gate. The walk is written to never index out of bounds
-(a conservative early stop only leaves captures optimized).
+arg-verbs, and type-repeat-of-`\p`) clears the bit for referenced groups. A
+non-optimized capture uses the private-scratch path (`CAP_START_REF`/
+`CAP_END_REF`, chunk F): the in-progress start lives in `mb.cap_start` and both
+ovector slots are written only at CLOSE, so a mid-match backref sees only CLOSED
+values. Chunk D declined all non-optimized captures (its subset had no
+referencing opcode in scope); chunk F flips the gate to the referenced lowering
+(behaviour-correct for any referencer) — an out-of-subset referencer
+(`OP_COND`/`OP_CBRAPOS`, chunks J/G) still declines at ITS opcode, so the
+lowered IR is never executed for it. The walk is written to never index out of
+bounds (a conservative early stop only leaves captures optimized).
 
 **Scratch policy (chunk C2).** `save_stack.ml` retains ONE module-level `int array` across
 execs, guarded by its OWN `Atomic.t busy` flag (NOT Frames' scratch slot); a concurrent exec
@@ -451,6 +514,15 @@ child frame. `grouploop`'s single/last branch ticks (the top level "can't optimi
 | maximize repeat, greedy end `= floor`: continuation in place | 0 | `d` | none |
 | backtrack pop `KIND_REP_MAX`: `try_pos > floor` (give back one) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
 | backtrack pop `KIND_REP_MAX`: `try_pos = floor` (min position, in place) | 0 | `d` | none (pop) |
+| `REF`/`DNREF` single, `CAP_START_REF`, `CAP_END_REF` | 0 | unchanged | none |
+| ref repeat min-loop / greedy scan (per copy `match_ref`) | 0 | unchanged | none |
+| ref repeat, `lmin=lmax` (EXACT) or continue (zero-length / unset+MUB) | 0 | unchanged | none |
+| minimize ref repeat, `lmin<lmax`: first continuation try (push `KIND_REF_MIN`, RM20) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| backtrack pop `KIND_REF_MIN`: match one more copy + retry (`count<lmax`) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| backtrack pop `KIND_REF_MIN`: `count>=lmax` / mismatch | 0 | — | none (pop, propagate) |
+| maximize ref repeat: first give-back try at greedy end (push `KIND_REF_MAX`, RM21) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| backtrack pop `KIND_REF_MAX`: `try_pos−flength >= lstart` (give back one copy) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| backtrack pop `KIND_REF_MAX`: `try_pos−flength < lstart` (below floor) | 0 | — | none (pop) |
 
 The whole-pattern outer `BRA` (dispatched at rdepth 0) is `grouploop` at the
 top level; nested `OP_BRA` is `bra_loop` (rdepth `>= 1`, no THEN in chunk D).
@@ -487,6 +559,21 @@ reproduced by `rep_greedy_done_class`. The single `t_type` / `t_class` /
 Verified by the fuzz `--mode fast-vs-interp` `LIMIT_MATCH=2000` differential (0
 divergences over 310k+ cases with classes/types/\R/\b) and the type/class-repeat
 `LIMIT_MATCH` N-sweep test.
+
+**Backreferences (chunk F) tick like the C's REF_REPEAT.** A single `REF`/
+`DNREF` and the `CAP_START_REF`/`CAP_END_REF` bracket never tick (the C's
+`continue` / ket at the same level). A ref repeat's min-loop and greedy scan run
+`match_ref` tick-free; the minimize continuation (RM20) and every extend-one-
+copy tick a child frame; the maximize give-back (RM21) ticks a child frame per
+copy given back — and, unlike char/type repeats but LIKE the class maxbt, it
+tries the FLOOR position (`lstart`, the Lmin-copies position) via a ticked
+`RMATCH` too (the C's `while (Feptr >= Lstart) RMATCH(RM21)`,
+pcre2_match.c:5156), so a greedy ref repeat ticks once at the floor before
+NOMATCH. In non-UTF every copy is exactly `Flength` units (`samelengths` always
+true), so the rare RM22 rescan never fires and there is no tick divergence from
+it. Verified by the fuzz `--mode fast-vs-interp` `LIMIT_MATCH=2000` differential
+(0 divergences over 260k+ cases with backrefs) and the ref-repeat `LIMIT_MATCH`
+N-sweep test.
 
 **Capturing groups (chunk D) are `grouploop`, so their LAST branch ticks too.**
 `OP_CBRA`/`OP_SCBRA` (interpreter.ml:2434-2444 → `grouploop`) record a
