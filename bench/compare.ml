@@ -71,32 +71,47 @@ let () =
   if String.equal mode "quick" then
     Printf.printf
       "** advisory: quick-mode (smoke) inputs — not the full gate corpus **\n";
-  Printf.printf "\n%-16s %12s %12s %7s %11s %8s  %s\n" "benchmark"
-    "engine(ms)" "oracle(ms)" "ratio" "raw-C(ms)" "eng/raw" "gate";
-  Printf.printf "%s\n" (String.make 92 '-');
+  Printf.printf "\n%-16s %12s %12s %7s %11s %8s %10s %7s  %s\n" "benchmark"
+    "engine(ms)" "oracle(ms)" "ratio" "raw-C(ms)" "eng/raw" "fast(ms)" "fratio"
+    "gate";
+  Printf.printf "%s\n" (String.make 110 '-');
   let invalids = ref [] in
   let rows = ref [] (* (name, ratio) for valid benchmarks, in order *) in
+  (* M11 chunk L — fast engine ratios are INFORMATIONAL (chunk N gates them). *)
+  let fast_rows = ref [] in
   List.iter
     (fun b ->
       let name = get_string ~default:"?" (member "name" b) in
       if not (get_bool ~default:false (member "valid" b)) then (
         let reason = get_string ~default:"?" (member "invalid_reason" b) in
         invalids := (name, reason) :: !invalids;
-        Printf.printf "%-16s %12s %12s %7s %11s %8s  INVALID: %s\n" name "-"
-          "-" "-" "-" "-" reason)
+        Printf.printf "%-16s %12s %12s %7s %11s %8s %10s %7s  INVALID: %s\n"
+          name "-" "-" "-" "-" "-" "-" "-" reason)
       else
         let eng = get_float ~default:0. (member "engine_median_ms" b) in
         let orc = get_float ~default:0. (member "oracle_median_ms" b) in
         let raw = get_float ~default:0. (member "raw_c_median_ms" b) in
         let ratio = eng /. Float.max orc 1e-6 in
         let raw_ratio = eng /. Float.max raw 1e-6 in
+        let fast_agrees = get_bool ~default:false (member "fast_agrees" b) in
+        let fast_ratio =
+          if fast_agrees then get_float ~default:0. (member "fast_ratio" b)
+          else 0.
+        in
         rows := (name, ratio) :: !rows;
-        Printf.printf "%-16s %12.1f %12.1f %7.2f %11.1f %8.2f  %s\n" name eng
-          orc ratio raw raw_ratio
+        if fast_agrees then fast_rows := (name, fast_ratio) :: !fast_rows;
+        Printf.printf "%-16s %12.1f %12.1f %7.2f %11.1f %8.2f %10s %7s  %s\n"
+          name eng orc ratio raw raw_ratio
+          (if fast_agrees then
+             Printf.sprintf "%.1f" (get_float ~default:0.
+               (member "fast_median_ms" b))
+           else "-")
+          (if fast_agrees then Printf.sprintf "%.2f" fast_ratio else "-")
           (if ratio <= !max_ratio then "pass" else "FAIL"))
     benches;
-  Printf.printf "%s\n" (String.make 92 '-');
+  Printf.printf "%s\n" (String.make 110 '-');
   let rows = List.rev !rows in
+  let fast_rows = List.rev !fast_rows in
   let invalids = List.rev !invalids in
   let violations = List.filter (fun (_, r) -> r > !max_ratio) rows in
   let gm =
@@ -110,6 +125,20 @@ let () =
   let gm_ok = (not (Float.is_nan gm)) && gm <= !max_ratio in
   Printf.printf "geomean ratio: %.3f (max allowed %.2f) — %s\n" gm !max_ratio
     (if gm_ok then "pass" else "FAIL");
+  (* M11 chunk L — informational fast/oracle geomean over the in-subset
+     benchmarks (NOT gated until chunk N). *)
+  (match fast_rows with
+  | [] -> Printf.printf "fast/oracle geomean: n/a (no in-subset benchmarks)\n"
+  | l ->
+      let fgm =
+        exp
+          (List.fold_left (fun acc (_, x) -> acc +. log x) 0. l
+          /. float_of_int (List.length l))
+      in
+      Printf.printf
+        "fast/oracle geomean: %.3f over %d/%d benchmarks (informational — \
+         chunk N gate)\n"
+        fgm (List.length l) (List.length rows));
   (match
      List.fold_left
        (fun acc (n, r) ->

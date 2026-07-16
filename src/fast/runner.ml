@@ -187,10 +187,23 @@ type mb = {
   mutable use_start_bits : bool;
   mutable start_bitmap : Bytes.t;
   mutable startline : bool;
+  (* Chunk L — PCRE2_FIRSTLINE (pcre2_match.c:6942): the match must start
+     at or before the first newline following the start. Like the C local,
+     it is [(not anchored) && (overall_options & FIRSTLINE)]; the start-of-
+     match scans run against a temporarily-shortened end_subject (7164-7186)
+     and bump_bottom stops at a failed newline start (7584-7588). *)
+  mutable firstline : bool;
   mutable has_req_cu : bool;
   mutable req_cu : int;
   mutable req_cu2 : int;
   mutable minlength : int;
+  (* Chunk L — the 8-bit memchr result caches (pcre2_match.c:7246-7273 /
+     interpreter.ml:8687-8688): the last found position of first_cu / first_cu2
+     (or the shortened end_subject as a "not found" sentinel; -1 = NULL/unset).
+     Reset per fragment in [fragment_restart]. Result-identical to the uncached
+     scan — same attempt positions, so tick-neutral (§4). *)
+  mutable memchr_found_first_cu : int;
+  mutable memchr_found_first_cu2 : int;
   (* newline convention *)
   mutable nltype : int;
   mutable nllen : int;
@@ -386,10 +399,13 @@ let make_mb (ss : Save_stack.t) : mb =
     use_start_bits = false;
     start_bitmap = Bytes.empty;
     startline = false;
+    firstline = false;
     has_req_cu = false;
     req_cu = 0;
     req_cu2 = 0;
     minlength = 0;
+    memchr_found_first_cu = -1;
+    memchr_found_first_cu2 = -1;
     nltype = Newline.nltype_fixed;
     nllen = 1;
     nl0 = Newline.char_lf;
@@ -4727,18 +4743,21 @@ and assert_nl_or_eos (mb : mb) (pc : int) (eptr : int) (sp : int)
     else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc)
   else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
 
-(* ---------- The bump-along driver (pcre2_match.c:7151-7617 + 7637-7766) ----------
+(* ---------- The bump-along driver (pcre2_match.c:7139-7617 + 7637-7766) ----------
 
-   A faithful port of the interpreter's driver (interpreter.ml:9004-9569) for
-   the non-UTF subset, MINUS UTF fragments (none here) and firstline (rejected
-   at compile). The start-of-match scans (first_cu / start_bits / startline)
-   and the minlength / req_cu tail optimizations ARE ported, WITHOUT the
-   memchr result-caching (result-identical: same attempt positions). This is
-   required for LIMIT tick parity (§4): a skipped attempt does zero ticks, so
-   naive bump-along would trip a LIMIT_MATCH cap where the interpreter does not.
-   The perf-optimized (cached) versions are chunk L; these scalar ones exist
-   for correctness. Module-level + [mb]-only so the loop builds no closure and
-   allocates nothing per attempt (§8). *)
+   A faithful port of the interpreter's driver (interpreter.ml:8889-9569),
+   COMPLETE as of chunk L: the start-of-match scans (first_cu — with the
+   8-bit memchr result caches, 7246-7273 — start_bits, startline), the
+   PCRE2_FIRSTLINE end-shortening for those scans (7164-7186) and its
+   bump_bottom newline break (7584-7588), the minlength / req_cu tail
+   optimizations (7378-7481), the rc switch, and the invalid-UTF fragment
+   carry-on (chunk I2). Every scan yields the interpreter's EXACT attempt
+   position set — required for LIMIT tick parity (§4): a skipped attempt does
+   zero ticks, so any attempt-set divergence would trip a LIMIT_MATCH cap at
+   a different point than the interpreter. Module-level + [mb]-only so the
+   loop builds no closure and allocates nothing per attempt (§8; the UTF scan
+   steps allocate a ref per char like the interpreter's own — cold pre-match
+   paths outside the frame loop). *)
 
 let req_cu_max = 5000 (* pcre2_internal.h:566-575 / interpreter.ml:8622 *)
 
@@ -4793,85 +4812,185 @@ let across_char (mb : mb) (pos : int) : int =
     !p)
   else pos
 
+(* Chunk L — the PCRE2_FIRSTLINE scans (pcre2_match.c:7170-7186 /
+   interpreter.ml:8792-8825). Return the position of the first newline at or
+   after [t] (or [limit] = mb.end_subject if none): the temporarily-shortened
+   end_subject used by the start-of-match scans in [bump_top]. The
+   IS_NEWLINE/NLTYPE fork is hoisted out of the loop (mb.nltype is loop-
+   invariant, matching the interpreter's DEVIATION note); NLTYPE_FIXED runs the
+   inlined arm below, ANY/ANYCRLF keeps the per-position [is_newline_at] call
+   at the [bump_top] site. [limit] is the arm's PSEND (mb.end_subject). *)
+
+(* pcre2_match.c:7184 — fixed newline convention, not UTF. *)
+let rec scan_firstline_fixed (subject : string) (limit : int) (nllen : int)
+    (nl0 : int) (nl1 : int) (t : int) : int =
+  if
+    t < limit
+    && not
+         (t <= limit - nllen
+         && Int.equal (Char.code subject.[t]) nl0
+         && (Int.equal nllen 1 || Int.equal (Char.code subject.[t + 1]) nl1))
+  then (scan_firstline_fixed [@tailcall]) subject limit nllen nl0 nl1 (t + 1)
+  else t
+
+(* pcre2_match.c:7176-7180 — fixed newline convention, UTF: as above plus
+   ACROSSCHAR(t < end_subject, t, t++) (7179) after each advance. *)
+let rec scan_firstline_fixed_utf (subject : string) (limit : int) (nllen : int)
+    (nl0 : int) (nl1 : int) (t : int) : int =
+  if
+    t < limit
+    && not
+         (t <= limit - nllen
+         && Int.equal (Char.code subject.[t]) nl0
+         && (Int.equal nllen 1 || Int.equal (Char.code subject.[t + 1]) nl1))
+  then (
+    let t = ref (t + 1) in
+    while !t < limit && Int.equal (Char.code subject.[!t] land 0xc0) 0x80 do
+      incr t
+    done;
+    (scan_firstline_fixed_utf [@tailcall]) subject limit nllen nl0 nl1 !t)
+  else t
+
+(* pcre2_match.c:7176-7184 — ANY/ANYCRLF newline convention (variable): keep
+   the per-position IS_NEWLINE call (mb.nltype's NLTYPE_ANY/ANYCRLF arm), one
+   CHARACTER step (ACROSSCHAR in UTF via [across_char]; identity otherwise).
+   Module-level + tail-recursive: the non-UTF path allocates nothing per
+   attempt (§8 named hazard, alloc-pinned); in UTF [across_char] allocates a
+   ref per char stepped, like the interpreter's own UTF scans
+   (interpreter.ml:8820) — a cold pre-match path outside the frame loop.
+   [limit] = mb.end_subject (the IS_NEWLINE PSEND). *)
+let rec scan_firstline_var (mb : mb) (limit : int) (t : int) : int =
+  if t < limit && not (is_newline_at mb t) then
+    (scan_firstline_var [@tailcall]) mb limit (across_char mb (t + 1))
+  else t
+
 let rec bump_top (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
   (* pcre2_match.c:7155-7375 (interpreter.ml:9018-9217) — the loop head:
-     start-of-match optimizations (firstline rejected at compile). *)
+     start-of-match optimizations. *)
   if mb.no_start_optimize then (run_attempt [@tailcall]) mb start_match req_cu_ptr
-  else if mb.anchored then
-    (* pcre2_match.c:7188-7215 — anchored: gate the single attempt on the
-       first code unit / start bitmap. Unlike first_cu_tail, this branch has
-       NO partial exception (it breaks unconditionally). *)
-    if mb.has_first_cu || mb.use_start_bits then
-      let ok =
-        start_match < mb.end_subject
-        &&
-        (* safe: start_match < end_subject <= String.length subject. *)
-        let c = Char.code (String.unsafe_get mb.subject start_match) in
-        (mb.has_first_cu
-        && (Int.equal c mb.first_cu || Int.equal c mb.first_cu2))
-        || mb.use_start_bits
-           && not
-                (Int.equal
-                   (* safe: c <= 255, so c lsr 3 <= 31 < 32 = |start_bitmap|. *)
-                   (Char.code (Bytes.unsafe_get mb.start_bitmap (c lsr 3))
-                   land (1 lsl (c land 7)))
-                   0)
-      in
-      if not ok then (endloop [@tailcall]) mb match_nomatch req_cu_ptr
-      else (tail_opts [@tailcall]) mb start_match req_cu_ptr
-    else (tail_opts [@tailcall]) mb start_match req_cu_ptr
-  else if mb.has_first_cu then
-    (* pcre2_match.c:7217-7298 — advance to a unique first code unit. *)
-    let sm =
-      if not (Int.equal mb.first_cu mb.first_cu2) then (
-        (* caseless: earliest occurrence of either case. *)
-        let e = mb.end_subject in
-        let p1 = memchr_sub mb.subject mb.first_cu e start_match in
-        let p2 = memchr_sub mb.subject mb.first_cu2 e start_match in
-        if p1 < 0 then if p2 < 0 then e else p2
-        else if p2 < 0 || p1 < p2 then p1
-        else p2)
-      else
-        let r = memchr_sub mb.subject mb.first_cu mb.end_subject start_match in
-        if r < 0 then mb.end_subject else r
+  else
+    (* pcre2_match.c:7164-7186 (interpreter.ml:8923-8957) — if firstline is
+       TRUE the start of the match is constrained to the first line: shorten
+       [end_subject] LOCALLY so the first-code-unit / start-bitmap / startline
+       scans below stop at the first newline. [first_cu_tail] and [tail_opts]
+       re-read mb.end_subject (the C's "restore fudged end_subject", 7378-7380),
+       so firstline only affects the scans here. firstline implies (not
+       anchored), so the anchored branch's [es] = mb.end_subject. *)
+    let es =
+      if mb.firstline then
+        if Int.equal mb.nltype Newline.nltype_fixed then
+          if mb.utf then
+            scan_firstline_fixed_utf mb.subject mb.end_subject mb.nllen mb.nl0
+              mb.nl1 start_match
+          else
+            scan_firstline_fixed mb.subject mb.end_subject mb.nllen mb.nl0 mb.nl1
+              start_match
+        else scan_firstline_var mb mb.end_subject start_match
+      else mb.end_subject
     in
-    (first_cu_tail [@tailcall]) mb sm req_cu_ptr
-  else if mb.startline then (
-    (* pcre2_match.c:7318-7349 — advance to just after a line break. *)
-    let sm = ref start_match in
-    if !sm > mb.start_subject + mb.start_offset then (
-      (* pcre2_match.c:7326-7332 — step by CHARACTERS (ACROSSCHAR in UTF). *)
-      while !sm < mb.end_subject && not (was_newline_at mb !sm) do
-        sm := across_char mb (!sm + 1)
+    if mb.anchored then
+      (* pcre2_match.c:7188-7215 — anchored: gate the single attempt on the
+         first code unit / start bitmap. Unlike first_cu_tail, this branch has
+         NO partial exception (it breaks unconditionally). firstline is false
+         when anchored, so [es] = mb.end_subject here. *)
+      (if mb.has_first_cu || mb.use_start_bits then
+         let ok =
+           start_match < es
+           &&
+           (* safe: start_match < es <= end_subject <= String.length subject. *)
+           let c = Char.code (String.unsafe_get mb.subject start_match) in
+           (mb.has_first_cu
+           && (Int.equal c mb.first_cu || Int.equal c mb.first_cu2))
+           || mb.use_start_bits
+              && not
+                   (Int.equal
+                      (* safe: c <= 255, so c lsr 3 <= 31 < 32 = |start_bitmap|. *)
+                      (Char.code (Bytes.unsafe_get mb.start_bitmap (c lsr 3))
+                      land (1 lsl (c land 7)))
+                      0)
+         in
+         if not ok then (endloop [@tailcall]) mb match_nomatch req_cu_ptr
+         else (tail_opts [@tailcall]) mb start_match req_cu_ptr
+       else (tail_opts [@tailcall]) mb start_match req_cu_ptr)
+    else if mb.has_first_cu then
+      (* pcre2_match.c:7217-7298 — advance to a unique first code unit, over
+         [start_match, es). *)
+      let sm =
+        if not (Int.equal mb.first_cu mb.first_cu2) then (
+          (* pcre2_match.c:7223-7284 — caseless: memchr twice (earliest
+             occurrence of either case), with the 8-bit result caches (chunk
+             L): if we have no cached position, or the start has passed it, do
+             a fresh search (a miss is cached as [es]); else reuse the cached
+             position (-1 if that prior search failed). *)
+          let pp1 =
+            if
+              mb.memchr_found_first_cu < 0
+              || start_match > mb.memchr_found_first_cu
+            then (
+              let r = memchr_sub mb.subject mb.first_cu es start_match in
+              mb.memchr_found_first_cu <- (if r < 0 then es else r);
+              r)
+            else if Int.equal mb.memchr_found_first_cu es then -1
+            else mb.memchr_found_first_cu
+          in
+          let pp2 =
+            if
+              mb.memchr_found_first_cu2 < 0
+              || start_match > mb.memchr_found_first_cu2
+            then (
+              let r = memchr_sub mb.subject mb.first_cu2 es start_match in
+              mb.memchr_found_first_cu2 <- (if r < 0 then es else r);
+              r)
+            else if Int.equal mb.memchr_found_first_cu2 es then -1
+            else mb.memchr_found_first_cu2
+          in
+          (* pcre2_match.c:7275-7281 — [es] if neither case found, else the
+             earlier found point. *)
+          if pp1 < 0 then if pp2 < 0 then es else pp2
+          else if pp2 < 0 || pp1 < pp2 then pp1
+          else pp2)
+        else
+          (* pcre2_match.c:7286-7298 — the caseful case (no caching needed). *)
+          let r = memchr_sub mb.subject mb.first_cu es start_match in
+          if r < 0 then es else r
+      in
+      (first_cu_tail [@tailcall]) mb sm req_cu_ptr
+    else if mb.startline then (
+      (* pcre2_match.c:7318-7349 — advance to just after a line break. *)
+      let sm = ref start_match in
+      if !sm > mb.start_subject + mb.start_offset then (
+        (* pcre2_match.c:7326-7332 — step by CHARACTERS (ACROSSCHAR in UTF). *)
+        while !sm < es && not (was_newline_at mb !sm) do
+          sm := across_char mb (!sm + 1)
+        done;
+        (* pcre2_match.c:7339-7347 — CR then LF under ANY/ANYCRLF: advance one
+           more. safe: !sm - 1 >= start_offset >= 0; !sm < es guards subject[!sm]. *)
+        if
+          Int.equal (Char.code (String.unsafe_get mb.subject (!sm - 1))) Newline.char_cr
+          && (Int.equal mb.nltype Newline.nltype_any
+             || Int.equal mb.nltype Newline.nltype_anycrlf)
+          && !sm < es
+          && Int.equal (Char.code (String.unsafe_get mb.subject !sm)) Newline.char_lf
+        then incr sm);
+      (tail_opts [@tailcall]) mb !sm req_cu_ptr)
+    else if mb.use_start_bits then (
+      (* pcre2_match.c:7351-7375 — advance to a non-unique first code unit. *)
+      let sm = ref start_match in
+      let brk = ref false in
+      while (not !brk) && !sm < es do
+        (* safe: !sm < es <= end_subject <= String.length subject; c <= 255. *)
+        let c = Char.code (String.unsafe_get mb.subject !sm) in
+        if
+          not
+            (Int.equal
+               (Char.code (Bytes.unsafe_get mb.start_bitmap (c lsr 3))
+               land (1 lsl (c land 7)))
+               0)
+        then brk := true
+        else incr sm
       done;
-      (* pcre2_match.c:7339-7347 — CR then LF under ANY/ANYCRLF: advance one
-         more. safe: !sm - 1 >= start_offset >= 0; !sm < end guards subject[!sm]. *)
-      if
-        Int.equal (Char.code (String.unsafe_get mb.subject (!sm - 1))) Newline.char_cr
-        && (Int.equal mb.nltype Newline.nltype_any
-           || Int.equal mb.nltype Newline.nltype_anycrlf)
-        && !sm < mb.end_subject
-        && Int.equal (Char.code (String.unsafe_get mb.subject !sm)) Newline.char_lf
-      then incr sm);
-    (tail_opts [@tailcall]) mb !sm req_cu_ptr)
-  else if mb.use_start_bits then (
-    (* pcre2_match.c:7351-7375 — advance to a non-unique first code unit. *)
-    let sm = ref start_match in
-    let brk = ref false in
-    while (not !brk) && !sm < mb.end_subject do
-      (* safe: !sm < end_subject <= String.length subject; c <= 255. *)
-      let c = Char.code (String.unsafe_get mb.subject !sm) in
-      if
-        not
-          (Int.equal
-             (Char.code (Bytes.unsafe_get mb.start_bitmap (c lsr 3))
-             land (1 lsl (c land 7)))
-             0)
-      then brk := true
-      else incr sm
-    done;
-    (first_cu_tail [@tailcall]) mb !sm req_cu_ptr)
-  else (tail_opts [@tailcall]) mb start_match req_cu_ptr
+      (first_cu_tail [@tailcall]) mb !sm req_cu_ptr)
+    else (tail_opts [@tailcall]) mb start_match req_cu_ptr
 
 and first_cu_tail (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
   (* pcre2_match.c:7300-7315 (interpreter.ml:9219-9233) — break on failure to
@@ -4967,11 +5086,11 @@ and run_attempt (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
          re-run at the SAME start position with ignore_skip_arg = skip_arg_count
          (SKIP_ARGs up to that count become no-ops). *)
       mb.ignore_skip_arg <- mb.skip_arg_count;
-      (bump_bottom [@tailcall]) mb start_match req_cu_ptr)
+      (bump_bottom [@tailcall]) mb start_match start_match req_cu_ptr)
     else if Int.equal rc match_skip && mb.verb_skip_ptr > start_match then
       (* pcre2_match.c:7541-7549 — SKIP passes back a target > the current start:
          advance directly to it. *)
-      (bump_bottom [@tailcall]) mb mb.verb_skip_ptr req_cu_ptr
+      (bump_bottom [@tailcall]) mb start_match mb.verb_skip_ptr req_cu_ptr
     else if
       Int.equal rc match_nomatch || Int.equal rc match_prune
       || Int.equal rc match_then
@@ -4981,7 +5100,9 @@ and run_attempt (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
          SKIP) advance by one CHARACTER (ACROSSCHAR in UTF). Unset
          ignore_skip_arg. *)
       mb.ignore_skip_arg <- 0;
-      (bump_bottom [@tailcall]) mb (across_char mb (start_match + 1)) req_cu_ptr)
+      (bump_bottom [@tailcall]) mb start_match
+        (across_char mb (start_match + 1))
+        req_cu_ptr)
     else if Int.equal rc match_commit then
       (* pcre2_match.c:7567-7571 — COMMIT disables bumpalong: rc = NOMATCH,
          goto ENDLOOP. *)
@@ -4991,12 +5112,20 @@ and run_attempt (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
          ENDLOOP, which passes it through. *)
       (endloop [@tailcall]) mb rc req_cu_ptr)
 
-and bump_bottom (mb : mb) (new_start_match : int) (req_cu_ptr : int) : int =
+and bump_bottom (mb : mb) (start_match : int) (new_start_match : int)
+    (req_cu_ptr : int) : int =
   (* pcre2_match.c:7579-7616 (interpreter.ml:9376-9430) — advance to
      [new_start_match] (set by the NOMATCH/verb rc switch), stop if anchored or
-     past the end, apply the CRLF skip, reset the per-attempt mark. Firstline is
-     declined at compile. *)
-  if mb.anchored || new_start_match > mb.end_subject then
+     past the end, apply the CRLF skip, reset the per-attempt mark. [start_match]
+     is the position we just attempted (the C's un-advanced local, needed for
+     the firstline newline check). *)
+  (* pcre2_match.c:7584-7588 (interpreter.ml:9285-9286) — if PCRE2_FIRSTLINE is
+     set, the match must happen before or at the first newline in the subject
+     (though it may continue over the newline). Therefore, if we have just
+     failed to match, starting AT a newline, do not continue. (chunk L) *)
+  if mb.firstline && is_newline_at mb start_match then
+    (endloop [@tailcall]) mb match_nomatch req_cu_ptr
+  else if mb.anchored || new_start_match > mb.end_subject then
     (endloop [@tailcall]) mb match_nomatch req_cu_ptr
   else
     let sm =
@@ -5023,9 +5152,12 @@ and fragment_restart (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
   (* pcre2_match.c:7139-7148 (interpreter.ml fragment_restart) —
      FRAGMENT_RESTART: (re)set the per-fragment loop state, then enter the
      bump-along loop. Also the initial entry point (the C falls through the
-     label; the 8-bit memchr caches are chunk L, absent here). *)
+     label). *)
   mb.match_partial <- -1 (* start_partial = match_partial = NULL, 7141 *);
   mb.hitend <- false (* 7144 *);
+  (* pcre2_match.c:7146-7147 — reset the 8-bit memchr caches (chunk L). *)
+  mb.memchr_found_first_cu <- -1;
+  mb.memchr_found_first_cu2 <- -1;
   (bump_top [@tailcall]) mb start_match req_cu_ptr
 
 and endloop (mb : mb) (rc : int) (req_cu_ptr : int) : int =
@@ -5463,6 +5595,12 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
            else first_cu);
         mb.startline <-
           not (Int.equal (re.Compile.flags land Compile.startline) 0);
+        (* pcre2_match.c:6942 — firstline = (not anchored) && FIRSTLINE (chunk
+           L). Must follow mb.anchored above. *)
+        mb.firstline <-
+          (not mb.anchored)
+          && not
+               (Int.equal (re.Compile.overall_options land Options.firstline) 0);
         mb.use_start_bits <-
           (not has_first_cu) && (not mb.startline)
           && not (Int.equal (re.Compile.flags land Compile.firstmapset) 0);

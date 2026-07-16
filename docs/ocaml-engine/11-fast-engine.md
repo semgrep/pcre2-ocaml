@@ -334,10 +334,29 @@ interpreter is its differential oracle. Approved plan:
   testinput5 +3), zero failures; fuzz fast-vs-interp clean over 2.8M+ comparisons
   (7 seeds x 100k) + the battery's fresh-seed stages. **After K2 the decline list
   reads exactly {PCRE2_FIRSTLINE (chunk L)}.**
-- [ ] **L — JIT start-opts** — scan_prefix + range skip table (`:5592,6159-6330`),
-  first_cu/req_cu scalar ports, startline/start_bits/minlength.
-- [ ] **M — Early-fail + tuning** — detect_early_fail watermarks (`:1292`, types `:232`);
-  CHAR_RUN word-compare (`String.get_int64_ne`) verification.
+- [x] **L — FIRSTLINE + memchr caching + bench plumbing** — PCRE2_FIRSTLINE lowered at
+  MATCH time (runner `bump_top` shortens end_subject for the start-scans,
+  pcre2_match.c:7164-7186; `bump_bottom` stops at a failed newline start, 7584-7588),
+  mirroring the interpreter EXACTLY so the attempt set is identical (tick-/result-neutral,
+  §5.1). Closes the decline list ENTIRELY: `Unsupported` is now unreachable for in-scope
+  patterns (zero-Unsupported white-box sweep + `--driver=fast` 0 `fast:` skips; conformance
+  3112 = FULL PARITY, +11 units testinput2/5/10). memchr result caching
+  (`memchr_found_first_cu`/`_cu2`, pcre2_match.c:7246-7273, result-identical). Bench Fast
+  driver column landed (bench.ml `Fast_driver`/`fast_ratio`, warm-up fast-vs-engine
+  cross-check; compare.ml prints fast columns, informational — NOT gated until N).
+  **DECLINED PERMANENTLY (not a coverage gap):** the JIT `scan_prefix` + range skip table
+  (`:5592,6159-6330`) — the same differential-contract class as detect_repeat
+  (fast-design.md §2/§5.2): it skips start positions the interpreter attempts-and-ticks,
+  with UNBOUNDED per-attempt tick counts (scan_prefix descends into ticking alternations/
+  repeats and skips over assertions the interpreter executes), so no JIT-mirrored form can
+  be tick-safe against the interpreter oracle; no static LIMIT_MATCH gate is sound without
+  disabling the fuzz `fast-vs-interp` differential.
+- [ ] **M — Early-fail assessment + tuning** — CHAR_RUN word-compare
+  (`String.get_int64_ne`) verification (in-attempt acceleration, cannot change the attempt
+  set); detect_early_fail watermarks (`:1292`, types `:232`) ASSESSMENT against the §5.2
+  tick-parity test — early_fail skips bump-along start positions the interpreter
+  attempts-and-ticks, so it likely hits the SAME obstacle and is likely a documented
+  decline, not a port.
 - [ ] **N — Perf close** — bench Fast column + compare gates; meet G11.2.
 - [ ] **O — Gate close** — G11.1 + fuzz long run + plan-update marks the gate.
 

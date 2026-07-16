@@ -1471,9 +1471,12 @@ which breaks unconditionally with no partial exception (pcre2_match.c:7188-7215,
 first_cu_tail:7300-7315) — would surface a PARTIAL the interpreter suppresses when
 `allowemptypartial` holds (e.g. `\A0` on `""` under `PARTIAL_SOFT`: `\A` gives
 `max_lookbehind = 1`). runner.ml therefore ports the scalar (uncached, result-identical)
-bump_top + first_cu_tail + tail_opts scans; only the memchr result-caching and the
-JIT range-skip table are left to chunk L. `PCRE2_FIRSTLINE` is declined at compile
-(`Ir_compile`) — its enforcement is entangled with those scans' shortened `end_subject`.
+bump_top + first_cu_tail + tail_opts scans. Chunk L added the memchr result-caching
+(§5.1, result-identical → tick-neutral) and PCRE2_FIRSTLINE (the shortened-`end_subject`
+scans + the `bump_bottom` newline break, mirroring the interpreter so the attempt set is
+identical → tick-neutral). The JIT range-skip table is DECLINED PERMANENTLY (§5.2: it
+skips positions the interpreter attempts-and-ticks with unbounded per-attempt tick counts,
+so no JIT-mirrored form can be tick-safe against the oracle — the detect_repeat class).
 
 - Continuous check: fuzz `--mode fast-vs-interp` with the imposed `LIMIT_MATCH=2000`
   differential — any `-47`/`-2`/ovector divergence fast-vs-interp is a bug (0 over 150k+
@@ -1486,18 +1489,83 @@ Aho–Corasick, no mid-pattern prefix entry. Exactly the JIT's menu, scalar:
 `fast_forward_first_n_chars`/`scan_prefix` + the range skip table
 (pcre2_jit_compile.c:5592,6159-6330), single/pair char scan, startline, start_bits, req_cu
 (`search_requested_char:6655`), minlength, and `detect_early_fail` watermarks
-(`:1292`, types `:232`). Until chunk L the driver uses a naive bump-along (correctness
-first; the conformance diff does not depend on scan strategy).
+(`:1292`, types `:232`). The scalar first_cu/start_bits/startline/minlength/req_cu
+scans landed in chunk C2 (required for LIMIT tick parity + the anchored-gate partial
+correctness, §4).
+
+### §5.1 Chunk L — FIRSTLINE + memchr caching (LANDED)
+
+- **PCRE2_FIRSTLINE** (`runner.ml` `bump_top`/`bump_bottom`, pcre2_match.c:7164-7186 +
+  7584-7588 / interpreter.ml:8923-8957 + 9285). `firstline = (not anchored) && FIRSTLINE`
+  (6942). `bump_top` computes a LOCAL `es` = the first newline at/after `start_match`
+  (`scan_firstline_fixed`/`_fixed_utf`/`_var`, module-level + tail-recursive; the NON-UTF
+  paths are allocation-free and alloc-pinned — §8 named hazard — while the UTF scans
+  allocate one ref per character stepped, faithfully mirroring the interpreter's own UTF
+  scan (interpreter.ml:8820); these are cold pre-match scans OUTSIDE the frame loop, so
+  §8's zero-alloc rule does not bind them) and runs the
+  first_cu/start_bits/startline scans against `es`; `first_cu_tail`/`tail_opts` re-read
+  the TRUE `mb.end_subject` (the C's "restore fudged end_subject", 7378-7380).
+  `bump_bottom` takes the OLD `start_match` (the just-attempted position) and breaks the
+  bump loop when `firstline && is_newline_at start_match`. This mirrors the interpreter
+  EXACTLY, so the fast engine attempts the interpreter's identical position set → tick-
+  and result-neutral by construction. Closes the decline list (§6): after chunk L the IR
+  compiler declines NOTHING in subset (zero-Unsupported, pinned by a white-box sweep + the
+  `--driver=fast` conformance run's 0 `fast:` skips).
+- **memchr result caching** (`mb.memchr_found_first_cu`/`_cu2`, pcre2_match.c:7246-7273,
+  reset per fragment 7146-7148). The caseless first_cu branch caches each case's last
+  found position (or `es` as the "not found" sentinel) so repeated bump-along scans don't
+  rescan. RESULT-IDENTICAL (same attempt positions as the uncached scan) → tick-neutral.
+
+### §5.2 Range skip table + `fast_forward_first_n_chars` — DECLINED PERMANENTLY (not a coverage gap)
+
+`scan_prefix` (pcre2_jit_compile.c:5592-5818) + the 256-byte Horspool `update_table`
+(:6159-6330) is DECLINED PERMANENTLY — the same differential-contract class as
+`detect_repeat` (§2): a JIT-only optimization whose faithful port CANNOT be tick-safe
+against the interpreter oracle for all in-subset patterns, because the JIT never had a
+tick-parity obligation and the fast engine DOES:
+
+- It is a strictly MORE powerful start filter than the interpreter's own: first_cu/
+  start_bits look only at match offset 0, while `scan_prefix` collects candidate char
+  sets at offsets `0..max-1` and the range table's shift skips a candidate start `P` on a
+  mismatch at a LATER offset — a position the interpreter ATTEMPTS.
+- Skipping such `P` is tick-safe only if the interpreter's attempt at `P` accumulates
+  `< match_limit` ticks before NOMATCH (a skipped attempt is invisible, since
+  `match_call_count` resets per attempt; only a per-attempt `-47` trip is observable).
+  For a pure literal prefix the tick floor is 1 (frame 0), so it would be safe for
+  `match_limit >= 1` (diverging only at `match_limit = 0`, gateable).
+- But `scan_prefix` DESCENDS into ticking constructs (alternations :5699-5720, class/type
+  repeats :5844-5868/OP_PLUS :5661) and SKIPS OVER zero-width assertions (:5647-5654) that
+  the interpreter still executes-and-ticks. So `T(P)` is UNBOUNDED (a prefix assertion like
+  `(?=(?:.)*x)abcd` ticks `O(line length)` at a skipped `P` before the char mismatch is
+  reached). No static `match_limit > K` gate is sound: a high `K` DISABLES the scan for the
+  fuzz `--mode fast-vs-interp LIMIT_MATCH=2000` differential (killing the very oracle that
+  would catch a divergence) and the conformance `(*LIMIT_MATCH=n)` cases; a low `K` leaves a
+  divergence window. A "tick-free-prefix-only" restriction would be safe but is a
+  substantial DEVIATION from the JIT's `scan_prefix` (violating the "JIT-mirrored ONLY"
+  constraint) — i.e. no proven-safe JIT-MIRRORED form exists. The single/pair-char fallback
+  (`fast_forward_first_char2`, :6295/6390) is exactly the already-ported first_cu scan — no
+  new capability.
+
+Like `detect_repeat`, this is NOT ported BY DESIGN; the marginal gain over the already-
+ported first_cu memchr (the Horspool multi-unit shift) is pursued instead through chunk M's
+CHAR_RUN word-compare, which accelerates work INSIDE an attempt and cannot change the
+attempt set. **Chunk M scope note:** `detect_early_fail` (pcre2_jit_compile.c:1292, types
+:232) likely hits the SAME obstacle — its watermarks skip bump-along start positions that
+the interpreter attempts-and-ticks — so chunk M must ASSESS it against this same
+tick-parity test and likely decline it too (documented, not ported).
 
 ## §6 Unsupported taxonomy
 
 `Unsupported of string` — the string names the construct (stable prefix for skip-report
-grouping), e.g. `"fast: IR compiler not yet implemented (chunk C, 11-fast-engine.md)"`,
-`"fast: PCRE2_FIRSTLINE (chunk L)"`. Coverage only widens (baseline ratchet
-`fast_baseline_counts.sexp`); chunk K2 lowered the last construct-level declines
-(\K, ( \*ACCEPT)-in-assertion, ( \*THEN)+NA, OP_RECURSE into a possessive
-capture), so `PCRE2_FIRSTLINE` (a compile-option gate, chunk L) is the SOLE
-remaining `Unsupported` reason.
+grouping), e.g. `"fast: IR compiler not yet implemented (chunk C, 11-fast-engine.md)"`.
+Coverage only widens (baseline ratchet `fast_baseline_counts.sexp`); chunk K2 lowered the
+last construct-level declines (\K, ( \*ACCEPT)-in-assertion, ( \*THEN)+NA, OP_RECURSE into
+a possessive capture), and chunk L lowered the last compile-option gate (PCRE2_FIRSTLINE,
+handled at match time in the runner). After chunk L `Unsupported` is UNREACHABLE for every
+in-scope pattern — the fast IR compiler declines NOTHING in subset (asserted by the
+white-box zero-Unsupported sweep and the `--driver=fast` conformance run's 0 `fast:` skips).
+The range skip table (§5.2) is DECLINED PERMANENTLY (differential-contract class, like
+detect_repeat §2), not a coverage gap.
 
 ## §7 Testing hooks
 

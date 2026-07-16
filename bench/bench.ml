@@ -25,6 +25,7 @@
    if any benchmark is INVALID (correctness failure), 0 otherwise. *)
 
 module E = Pcre2_engine.Engine
+module F = Pcre2_fast
 module O = Pcre2_engine.Options
 module T = Pcre2_test_driver.Test_driver
 
@@ -262,6 +263,40 @@ module Engine_driver : DRIVER = struct
     | Error rc -> rc
 end
 
+(* M11 chunk L — the fast engine (pure-OCaml JIT-mirrored matcher), same seam
+   shape as Engine_driver. [code] is exposed as F.t so [run_bench] can compile
+   via F.compile directly and DISTINGUISH a genuine Unsupported (no fast
+   column, "-") from a Compile_error on a pattern the engine accepted (a
+   fast-engine bug -> INVALID row, like the exec cross-check). On an accepted
+   pattern its exec is observably identical to the engine (fast-design.md §1)
+   and is cross-checked against it in the warm-up. Chunk N gates the fast
+   column; chunk L only lands the plumbing (informational numbers). *)
+module Fast_driver : DRIVER with type code = F.t = struct
+  type code = F.t
+
+  let id = "fast"
+  let last_start = ref 0
+  let last_end = ref 0
+
+  let compile pattern options =
+    match F.compile pattern (Int32.of_int options) with
+    | Ok c -> Ok c
+    | Error (F.Unsupported r) -> Error ("unsupported: " ^ r)
+    | Error (F.Compile_error { errcode; erroroffset }) ->
+        Error
+          (Printf.sprintf "compile error %d at offset %d (%s)" errcode
+             erroroffset (F.error_message errcode))
+
+  let exec code subject offset options =
+    match F.exec code subject offset (Int32.of_int options) with
+    | Ok (Some (s, e)) ->
+        last_start := s;
+        last_end := e;
+        1
+    | Ok None -> 0
+    | Error rc -> rc
+end
+
 module Oracle_driver : DRIVER = struct
   type code = T.code
 
@@ -413,6 +448,7 @@ end
 
 module ER = Runner (Engine_driver)
 module OR = Runner (Oracle_driver)
+module FR = Runner (Fast_driver)
 
 let outcome_of_raw r =
   if r < 0 then { count = 0; extracted = 0; error = r }
@@ -577,11 +613,19 @@ type bench_result = {
   eng_ms : float array;
   orc_ms : float array;
   raw_ms : float array;
+  fast_ms : float array;
   eng_med : float;
   orc_med : float;
   raw_med : float;
+  fast_med : float;
   ratio : float;
   raw_ratio : float;
+  (* M11 chunk L — fast engine vs oracle (fast_ratio) and whether the pattern
+     is in the fast subset (fast_supported); [fast_agrees] pins the fast-vs-
+     engine correctness cross-check. Not gated until chunk N. *)
+  fast_ratio : float;
+  fast_supported : bool;
+  fast_agrees : bool;
   raw_agrees : bool;
   eng_minor_words : float; (* median minor words allocated per engine rep *)
 }
@@ -603,11 +647,16 @@ let run_bench ~reps corpus (b : bench) : bench_result =
       eng_ms = [||];
       orc_ms = [||];
       raw_ms = [||];
+      fast_ms = [||];
       eng_med = 0.;
       orc_med = 0.;
       raw_med = 0.;
+      fast_med = 0.;
       ratio = 0.;
       raw_ratio = 0.;
+      fast_ratio = 0.;
+      fast_supported = false;
+      fast_agrees = false;
       raw_agrees = false;
       eng_minor_words = 0.;
     }
@@ -655,6 +704,32 @@ let run_bench ~reps corpus (b : bench) : bench_result =
                 outcome_of_raw
                   (Raw_c.run rcode subject raw_mode (if b.utf then 1 else 0))
               in
+              (* M11 chunk L — the fast engine is OPTIONAL for OUT-OF-SUBSET
+                 patterns: a genuine Unsupported simply has no fast column
+                 ("-"), never an INVALID bench. But a REAL Compile_error on a
+                 pattern the engine just compiled is a fast-engine bug and
+                 must fail LOUDLY (INVALID), exactly like the exec warm-up
+                 cross-check below. *)
+              let fast_code, fast_compile_error =
+                match F.compile b.pattern (Int32.of_int b.copts) with
+                | Ok c -> (Some c, None)
+                | Error (F.Unsupported _) -> (None, None)
+                | Error (F.Compile_error { errcode; erroroffset }) ->
+                    ( None,
+                      Some
+                        (Printf.sprintf
+                           "fast: compile error %d at offset %d (%s) but \
+                            engine compiled"
+                           errcode erroroffset (F.error_message errcode)) )
+              in
+              let fast_run fcode () =
+                match b.mode with
+                | M_count -> FR.count_all fcode subject ~utf:b.utf ~extract:false
+                | M_extract ->
+                    FR.count_all fcode subject ~utf:b.utf ~extract:true
+                | M_lines -> FR.per_line fcode corpus.lines
+                | M_single -> FR.single fcode subject
+              in
               (* warm-up + correctness cross-check *)
               let e0 = eng_run () in
               let o0 = orc_run () in
@@ -664,60 +739,103 @@ let run_bench ~reps corpus (b : bench) : bench_result =
                   (Printf.sprintf "COUNT MISMATCH engine %s vs oracle %s"
                      (show_outcome e0) (show_outcome o0))
               else
-                let raw_agrees =
-                  Int.equal r0.count e0.count && Int.equal r0.error e0.error
+                (* fast-vs-engine cross-check (fast-design.md §1: identical
+                   observable behavior on accepted patterns). A divergence here
+                   — or the engine-Ok + fast-Compile_error mismatch above —
+                   is a fast-engine bug, so it INVALIDATES the bench row. *)
+                let fast_agrees, fast_mismatch =
+                  match fast_code with
+                  | None -> (false, fast_compile_error)
+                  | Some fcode ->
+                      let f0 = fast_run fcode () in
+                      if outcome_equal f0 e0 then (true, None)
+                      else
+                        ( false,
+                          Some
+                            (Printf.sprintf "COUNT MISMATCH fast %s vs engine %s"
+                               (show_outcome f0) (show_outcome e0)) )
                 in
-                let eng_ms = Array.make reps 0. in
-                let orc_ms = Array.make reps 0. in
-                let raw_ms = Array.make reps 0. in
-                let eng_mw = Array.make reps 0. in
-                let drift = ref "" in
-                for i = 0 to reps - 1 do
-                  let mw0 = Gc.minor_words () in
-                  let t, oc = time_ms eng_run in
-                  eng_mw.(i) <- Gc.minor_words () -. mw0;
-                  eng_ms.(i) <- t;
-                  if not (outcome_equal oc e0) then
-                    drift := "engine result drifted across reps";
-                  let t, oc = time_ms orc_run in
-                  orc_ms.(i) <- t;
-                  if not (outcome_equal oc o0) then
-                    drift := "oracle result drifted across reps";
-                  let t, _ = time_ms raw_run in
-                  raw_ms.(i) <- t
-                done;
-                if String.length !drift > 0 then invalid !drift
-                else
-                  let eng_med = median eng_ms in
-                  let orc_med = median orc_ms in
-                  let raw_med = median raw_ms in
-                  let ratio = eng_med /. Float.max orc_med 1e-6 in
-                  let raw_ratio = eng_med /. Float.max raw_med 1e-6 in
-                  Printf.printf
-                    "count=%-8d engine=%8.1fms  oracle=%8.1fms  ratio=%5.2f  \
-                     raw-C=%8.1fms%s\n\
-                     %!"
-                    e0.count eng_med orc_med ratio raw_med
-                    (if raw_agrees then ""
-                     else
-                       Printf.sprintf "  ** raw-C DISAGREES: %s"
-                         (show_outcome r0));
-                  {
-                    b;
-                    valid = true;
-                    reason = "";
-                    out = e0;
-                    eng_ms;
-                    orc_ms;
-                    raw_ms;
-                    eng_med;
-                    orc_med;
-                    raw_med;
-                    ratio;
-                    raw_ratio;
-                    raw_agrees;
-                    eng_minor_words = median eng_mw;
-                  }))
+                match fast_mismatch with
+                | Some msg -> invalid msg
+                | None ->
+                    let raw_agrees =
+                      Int.equal r0.count e0.count && Int.equal r0.error e0.error
+                    in
+                    let eng_ms = Array.make reps 0. in
+                    let orc_ms = Array.make reps 0. in
+                    let raw_ms = Array.make reps 0. in
+                    let fast_ms = Array.make reps 0. in
+                    let eng_mw = Array.make reps 0. in
+                    let drift = ref "" in
+                    for i = 0 to reps - 1 do
+                      let mw0 = Gc.minor_words () in
+                      let t, oc = time_ms eng_run in
+                      eng_mw.(i) <- Gc.minor_words () -. mw0;
+                      eng_ms.(i) <- t;
+                      if not (outcome_equal oc e0) then
+                        drift := "engine result drifted across reps";
+                      let t, oc = time_ms orc_run in
+                      orc_ms.(i) <- t;
+                      if not (outcome_equal oc o0) then
+                        drift := "oracle result drifted across reps";
+                      let t, _ = time_ms raw_run in
+                      raw_ms.(i) <- t;
+                      match fast_code with
+                      | None -> ()
+                      | Some fcode ->
+                          let t, oc = time_ms (fast_run fcode) in
+                          fast_ms.(i) <- t;
+                          if not (outcome_equal oc e0) then
+                            drift := "fast result drifted across reps"
+                    done;
+                    if String.length !drift > 0 then invalid !drift
+                    else
+                      let eng_med = median eng_ms in
+                      let orc_med = median orc_ms in
+                      let raw_med = median raw_ms in
+                      let fast_med =
+                        if fast_agrees then median fast_ms else 0.
+                      in
+                      let ratio = eng_med /. Float.max orc_med 1e-6 in
+                      let raw_ratio = eng_med /. Float.max raw_med 1e-6 in
+                      let fast_ratio =
+                        if fast_agrees then fast_med /. Float.max orc_med 1e-6
+                        else 0.
+                      in
+                      Printf.printf
+                        "count=%-8d engine=%8.1fms  oracle=%8.1fms  \
+                         ratio=%5.2f  raw-C=%8.1fms  %s%s\n\
+                         %!"
+                        e0.count eng_med orc_med ratio raw_med
+                        (if fast_agrees then
+                           Printf.sprintf "fast=%8.1fms fratio=%5.2f" fast_med
+                             fast_ratio
+                         else "fast=  (unsupported)")
+                        (if raw_agrees then ""
+                         else
+                           Printf.sprintf "  ** raw-C DISAGREES: %s"
+                             (show_outcome r0));
+                      {
+                        b;
+                        valid = true;
+                        reason = "";
+                        out = e0;
+                        eng_ms;
+                        orc_ms;
+                        raw_ms;
+                        fast_ms;
+                        eng_med;
+                        orc_med;
+                        raw_med;
+                        fast_med;
+                        ratio;
+                        raw_ratio;
+                        fast_ratio;
+                        fast_supported = Option.is_some fast_code;
+                        fast_agrees;
+                        raw_agrees;
+                        eng_minor_words = median eng_mw;
+                      }))
 
 (* ------------------------------------------------------------------ *)
 (* Reporting                                                            *)
@@ -730,19 +848,22 @@ let geomean = function
         /. float_of_int (List.length l))
 
 let print_table results =
-  Printf.printf "\n%-16s %10s %12s %12s %7s %11s %8s  %s\n" "benchmark"
-    "count" "engine(ms)" "oracle(ms)" "ratio" "raw-C(ms)" "eng/raw" "status";
-  Printf.printf "%s\n" (String.make 100 '-');
+  Printf.printf "\n%-16s %10s %12s %12s %7s %11s %8s %10s %7s  %s\n" "benchmark"
+    "count" "engine(ms)" "oracle(ms)" "ratio" "raw-C(ms)" "eng/raw" "fast(ms)"
+    "fratio" "status";
+  Printf.printf "%s\n" (String.make 118 '-');
   List.iter
     (fun r ->
       if r.valid then
-        Printf.printf "%-16s %10d %12.1f %12.1f %7.2f %11.1f %8.2f  %s\n"
-          r.b.name r.out.count r.eng_med r.orc_med r.ratio r.raw_med
-          r.raw_ratio
+        Printf.printf
+          "%-16s %10d %12.1f %12.1f %7.2f %11.1f %8.2f %10s %7s  %s\n" r.b.name
+          r.out.count r.eng_med r.orc_med r.ratio r.raw_med r.raw_ratio
+          (if r.fast_agrees then Printf.sprintf "%.1f" r.fast_med else "-")
+          (if r.fast_agrees then Printf.sprintf "%.2f" r.fast_ratio else "-")
           (if r.raw_agrees then "ok" else "ok (raw-C count mismatch!)")
       else Printf.printf "%-16s %10s INVALID: %s\n" r.b.name "-" r.reason)
     results;
-  Printf.printf "%s\n" (String.make 100 '-')
+  Printf.printf "%s\n" (String.make 118 '-')
 
 let iso_now () =
   let t = Unix.gmtime (Unix.time ()) in
@@ -788,6 +909,8 @@ let json_of_result (r : bench_result) : Bench_json.t =
        ("extracted_bytes", Num (float_of_int r.out.extracted));
        ("error_rc", Num (float_of_int r.out.error));
        ("raw_c_agrees", Bool r.raw_agrees);
+       ("fast_supported", Bool r.fast_supported);
+       ("fast_agrees", Bool r.fast_agrees);
      ]
     @
     if not r.valid then []
@@ -802,7 +925,17 @@ let json_of_result (r : bench_result) : Bench_json.t =
         ("ratio", Num r.ratio);
         ("engine_vs_raw_c", Num r.raw_ratio);
         ("engine_minor_words_per_rep", Num r.eng_minor_words);
-      ])
+      ]
+    @
+    (* M11 chunk L — fast engine numbers only when the pattern is in subset AND
+       the fast-vs-engine cross-check passed (chunk N gates the ratio). *)
+    if r.valid && r.fast_agrees then
+      [
+        ("fast_ms", floats r.fast_ms);
+        ("fast_median_ms", Num r.fast_med);
+        ("fast_ratio", Num r.fast_ratio);
+      ]
+    else [])
 
 let contains hay needle =
   let hl = String.length hay and nl = String.length needle in

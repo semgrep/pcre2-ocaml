@@ -1010,10 +1010,12 @@ let unsupported_cases : (string * string * string) list =
        patterns, a MANUAL callout before a condition assertion "(?(?C1)(?=a)b|c)",
        "(*sr:\\d+)" and "(*asr:\\d+)" are now ACCEPTED (parity in parity_cases). *)
     (* Chunk K2 lowered \K (OP_SET_SOM), ( *ACCEPT)-in-assertion, ( *THEN)+NA and
-       OP_RECURSE-into-possessive-capture — the whole engine now declines ONLY
-       PCRE2_FIRSTLINE (chunk L), a compile-level OPTION gate (not a pattern
-       construct, so it has no per-pattern unsupported_reason entry here). The
-       list is intentionally empty: every construct-level pattern now compiles. *)
+       OP_RECURSE-into-possessive-capture. Chunk L lowered PCRE2_FIRSTLINE (the
+       last compile-level OPTION gate) at match time (runner bump_top /
+       bump_bottom), so the compiler now declines NOTHING in subset: [Unsupported]
+       is unreachable for every in-scope pattern (asserted by [zero_unsupported_test]
+       below, which compiles a sweep over all previously-declined constructs). The
+       list is intentionally empty. *)
   ]
 
 let unsupported_tests =
@@ -1613,6 +1615,12 @@ let parity_cases : (string * string * int * int32) list =
     ("(?i)abc", "ABC", 0, 0l);
     ("(?i)abc", "aBc", 0, 0l);
     ("(?i)abc", "abd", 0, 0l);
+    (* Chunk L — the caseless first_cu memchr CACHE across many bump iterations
+       (both cases present, only the last start matches; the cache must find the
+       SAME positions as the uncached scan). *)
+    ("(?i)abz", "aBxAbyaBz", 0, 0l);
+    ("(?i)abz", "AbAbAbAbAB", 0, 0l) (* no z: NM after scanning all starts *);
+    ("(?i)qz", "QqQqQqQz", 0, 0l);
     (* anchors *)
     ("^abc", "abc", 0, 0l);
     ("^abc", "xabc", 1, 0l);
@@ -2368,6 +2376,221 @@ let parity_tests =
           | Error _, _ | _, Error _ ->
               Alcotest.failf "compile mismatch for %S" pat))
     parity_cases
+
+(* ---------- 5a1. Chunk L — PCRE2_FIRSTLINE parity ----------
+
+   FIRSTLINE (a COMPILE option, 0x100) constrains the match to START at or
+   before the first newline following the start offset (it MAY continue over
+   the newline). The runner mirrors the interpreter exactly: [bump_top] shortens
+   end_subject to the first newline for the start-of-match scans
+   (pcre2_match.c:7164-7186), and [bump_bottom] stops when an attempt STARTING
+   at a newline failed (7584-7588). firstline is FALSE when anchored (6942), so
+   \A / ( *ANCHORED) disables it. These cases cross the newline conventions ×
+   first_cu / startline / start_bits / no-scan × the "continue over the newline"
+   (DOTALL) × anchored interplay; the interpreter is the oracle (fast == interp
+   is the assertion; the interpreter's FIRSTLINE is already conformance-tested). *)
+let firstline_opt = 0x00000100l (* PCRE2_FIRSTLINE compile option *)
+let nl_cr = Pcre2_engine.Options.newline_cr
+let nl_lf = Pcre2_engine.Options.newline_lf
+let nl_crlf = Pcre2_engine.Options.newline_crlf
+let nl_any = Pcre2_engine.Options.newline_any
+let nl_anycrlf = Pcre2_engine.Options.newline_anycrlf
+
+let firstline_parity_tests =
+  let run_both ~newline ~copts pat subj off opts =
+    match
+      (F.compile_ctx ~newline pat copts, E.compile_ctx ~newline pat copts)
+    with
+    | Ok fre, Ok ere ->
+        ( norm (F.exec_full fre subj off opts),
+          norm (E.exec_full ere subj off opts) )
+    | Error _, Error _ -> ("CE", "CE") (* both reject: agree *)
+    | _ -> Alcotest.failf "compile mismatch for %S" pat
+  in
+  (* (label, pattern, subject, offset, newline, copts, match_opts) *)
+  let cases : (string * string * string * int * int * int32 * int32) list =
+    [
+      (* has_first_cu, default (LF) convention *)
+      ("fc match line1", "a", "xa\nya", 0, nl_lf, firstline_opt, 0l);
+      ("fc line2 -> NM", "a", "x\nya", 0, nl_lf, firstline_opt, 0l);
+      ("fc newline@start", "a", "\na", 0, nl_lf, firstline_opt, 0l);
+      ("fc no newline", "a", "xya", 0, nl_lf, firstline_opt, 0l);
+      ("fc at first nl pos", "a", "ab\na", 0, nl_lf, firstline_opt, 0l);
+      (* offset into the subject: firstline is relative to the start offset *)
+      ("fc offset", "a", "z\nxa\nb", 2, nl_lf, firstline_opt, 0l);
+      (* match STARTS on line1 but CONTINUES over the newline (DOTALL) *)
+      ("continue over nl", "(?s)a.b", "a\nb", 0, nl_lf, firstline_opt, 0l);
+      ("continue, line2 start -> NM", "(?s)a.b", "x\na\nb", 0, nl_lf,
+        firstline_opt, 0l );
+      (* caseless first_cu + the memchr cache under firstline shortening *)
+      ("caseless fc line1", "(?i)a", "XA\nB", 0, nl_lf, firstline_opt, 0l);
+      ("caseless fc line2 -> NM", "(?i)a", "X\nA", 0, nl_lf, firstline_opt, 0l);
+      (* start_bits (class, no unique first cu) *)
+      ("start_bits line1", "[ab]", "xb\ny", 0, nl_lf, firstline_opt, 0l);
+      ("start_bits line2 -> NM", "[ab]", "x\nb", 0, nl_lf, firstline_opt, 0l);
+      (* startline (multiline ^) + firstline *)
+      ("startline ^ line1", "(?m)^a", "a\nb", 0, nl_lf, firstline_opt, 0l);
+      ("startline ^ line2 -> NM", "(?m)^x", "a\nx", 0, nl_lf, firstline_opt, 0l);
+      (* no-scan plain path (NO_START_OPTIMIZE forces run_attempt directly) *)
+      ("no_start_opt", "(*NO_START_OPT)a", "x\nya", 0, nl_lf, firstline_opt, 0l);
+      ("no_start_opt line1", "(*NO_START_OPT)a", "xa\ny", 0, nl_lf,
+        firstline_opt, 0l );
+      (* CR convention *)
+      ("cr line1", "a", "xa\ry", 0, nl_cr, firstline_opt, 0l);
+      ("cr line2 -> NM", "a", "x\rya", 0, nl_cr, firstline_opt, 0l);
+      (* CRLF convention (the CR-then-LF bump interplay) *)
+      ("crlf line1", "a", "xa\r\ny", 0, nl_crlf, firstline_opt, 0l);
+      ("crlf line2 -> NM", "a", "x\r\nya", 0, nl_crlf, firstline_opt, 0l);
+      ("crlf class line2 -> NM", "[ab]", "x\r\nb", 0, nl_crlf, firstline_opt, 0l);
+      (* ANY convention (the variable is_newline path: scan_firstline_var) *)
+      ("any cr line2 -> NM", "a", "x\rya", 0, nl_any, firstline_opt, 0l);
+      ("any lf line1", "a", "xa\ny", 0, nl_any, firstline_opt, 0l);
+      ("any startline", "(?m)^b", "a\rb", 0, nl_any, firstline_opt, 0l);
+      (* ANYCRLF convention *)
+      ("anycrlf crlf line2 -> NM", "a", "x\r\nya", 0, nl_anycrlf, firstline_opt,
+        0l );
+      ("anycrlf lf line1", "a", "za\nb", 0, nl_anycrlf, firstline_opt, 0l);
+      (* anchored disables firstline (firstline = !anchored && FIRSTLINE) *)
+      ("anchored \\A", "\\Aab", "ab\ncd", 0, nl_lf, firstline_opt, 0l);
+      ("match-time ANCHORED", "a", "x\nya", 0, nl_lf, firstline_opt,
+        0x80000000l );
+      (* partial matching keeps every attempt (minlength/req_cu disabled), but
+         firstline still stops the bump at a failed newline start *)
+      ("partial soft", "abc", "ab\nx", 0, nl_lf, firstline_opt, 0x10l);
+      ("partial line2 -> NM", "abc", "x\nabc", 0, nl_lf, firstline_opt, 0x10l);
+      (* NOTBOL interplay *)
+      ("notbol", "^a", "a\nb", 0, nl_lf, firstline_opt, 0x1l);
+      (* firstline + req_cu (last code unit) tail optimization *)
+      ("reqcu line1", "a.*z", "az\nq", 0, nl_lf, firstline_opt, 0l);
+      ("reqcu line2 -> NM", "a.*z", "q\naz", 0, nl_lf, firstline_opt, 0l);
+      (* firstline is TICK-NEUTRAL (the runner attempts the interpreter's exact
+         position set, §5.1), so ( *LIMIT_MATCH=N) trips at the SAME N in both
+         engines. A ticking alternation prefix over several failing first-line
+         starts exercises the per-attempt -47 point under firstline. *)
+      ("limit_match 1", "(*LIMIT_MATCH=1)a(b|c)d", "xaXdaXe\nz", 0, nl_lf,
+        firstline_opt, 0l );
+      ("limit_match 2", "(*LIMIT_MATCH=2)a(b|c)d", "xaXdaXe\nz", 0, nl_lf,
+        firstline_opt, 0l );
+      ("limit_match 3", "(*LIMIT_MATCH=3)a(b|c)d", "xaXdaXe\nz", 0, nl_lf,
+        firstline_opt, 0l );
+      ("limit_match 6", "(*LIMIT_MATCH=6)a(b|c)d", "xaXdaXe\nz", 0, nl_lf,
+        firstline_opt, 0l );
+    ]
+  in
+  List.map
+    (fun (label, pat, subj, off, nl, copts, opts) ->
+      Alcotest.test_case
+        (Printf.sprintf "firstline %s: %S %S off=%d nl=%d" label pat subj off nl)
+        `Quick
+        (fun () ->
+          let f, e = run_both ~newline:nl ~copts pat subj off opts in
+          Alcotest.(check string)
+            (Printf.sprintf "fast vs interp for %S/%S (nl=%d)" pat subj nl)
+            e f))
+    cases
+
+(* ---------- 5a2. Chunk L — zero-Unsupported invariant ----------
+
+   After chunk L the fast IR compiler declines NOTHING in subset: [Unsupported]
+   is unreachable for every in-scope pattern (fast-design.md §5/§6). The
+   conformance run (--driver=fast) is the full witness — 0 [fast:] skips across
+   all testinput files — but this white-box test pins the invariant directly by
+   compiling a sweep over every construct family that was declined in an earlier
+   chunk (B..K2) AND PCRE2_FIRSTLINE (chunk L, compiled with the option), and
+   asserting each yields [Ok] (never [Unsupported]). Re-introducing any decline
+   fails here immediately, without waiting for the conformance diff. *)
+let zero_unsupported_tests =
+  let must_compile ?(copts = 0l) ?(newline = 0) pat =
+    match F.compile_ctx ~newline pat copts with
+    | Ok _ -> ()
+    | Error (F.Unsupported r) ->
+        Alcotest.failf "pattern %S unexpectedly Unsupported: %s" pat r
+    | Error (F.Compile_error { errcode; erroroffset }) ->
+        Alcotest.failf "pattern %S failed to compile: error %d at offset %d" pat
+          errcode erroroffset
+  in
+  (* One construct per previously-declined family (labels track the chunk that
+     lowered it). The point is coverage of every family, not exhaustiveness. *)
+  let construct_patterns =
+    [
+      (* D/D2 — captures, repeats, groups, multiline anchors *)
+      "(a)(b)(c)";
+      "(a)+";
+      "(?:ab)*c";
+      "(?m)^a$";
+      (* E — types, classes, their repeats *)
+      "\\d+\\w*[a-z]{2,4}";
+      "[^a]*b";
+      (* F — backreferences *)
+      "(a)\\1";
+      "(?<n>a)(?<m>b)\\k<n>";
+      "(a)\\1{2,4}";
+      (* G — lookaround, atomic, possessive *)
+      "a(?=b)c";
+      "a(?!b)";
+      "(?<=ab)c";
+      "(?>a|b)c";
+      "(?:ab)++c";
+      "(a)*+";
+      (* H — verbs *)
+      "(*MARK:x)a(*PRUNE)b";
+      "a(*COMMIT)b|c";
+      "a(*THEN)b|c";
+      "a(*SKIP)b|c";
+      "a(*ACCEPT)b";
+      (* I/I2 — UTF, XCLASS, \p, \X, UCP *)
+      "[\\p{L}]+";
+      "(*UTF)caf\\x{e9}";
+      "\\p{Lu}+";
+      "\\X{2,}";
+      "(*UCP)\\bx\\B";
+      (* J — conditionals *)
+      "(a)(?(1)b|c)";
+      "(?(?=a)b|c)";
+      "(?(DEFINE)(?<x>y))z";
+      (* K — script runs, callouts, repeated atomic *)
+      "(*sr:\\d+)";
+      "a(?C1)b";
+      "(?>a)+";
+      (* K1b/K2 — recursion (all forms), \K, ( *ACCEPT)/( *THEN) edge cases *)
+      "(?R)?z";
+      "(a(?1)?b)";
+      "(?(R)a|b)";
+      "\\((?:[^()]|(?R))*\\)";
+      "(a)++(?1)b";
+      "a\\Kb";
+      "(?=a(*ACCEPT))a" (* ( *ACCEPT) inside a positive assertion (K2) *);
+      "(*napla:a(*THEN)b|c)d";
+    ]
+  in
+  let construct_tests =
+    List.map
+      (fun pat ->
+        Alcotest.test_case
+          (Printf.sprintf "compiles (no Unsupported): %S" pat)
+          `Quick
+          (fun () -> must_compile pat))
+      construct_patterns
+  in
+  (* L — PCRE2_FIRSTLINE itself, across the newline conventions, over a mix of
+     patterns that hit first_cu / startline / start_bits / no-scan. *)
+  let firstline_compile_test =
+    Alcotest.test_case "compiles with PCRE2_FIRSTLINE (all conventions)" `Quick
+      (fun () ->
+        let pats =
+          [
+            "a"; "(?i)a"; "[ab]"; "(?m)^a"; "(?s)a.b"; "(*NO_START_OPT)a";
+            "abc"; "\\d+"; "(a)(b)"; "a(?=b)c"; "(?R)?z";
+          ]
+        in
+        List.iter
+          (fun pat ->
+            List.iter
+              (fun nl -> must_compile ~copts:firstline_opt ~newline:nl pat)
+              [ 0; nl_cr; nl_lf; nl_crlf; nl_any; nl_anycrlf ])
+          pats)
+  in
+  construct_tests @ [ firstline_compile_test ]
 
 (* ---------- 5b. K2 \K-in-assertion ( *ACCEPT) witnesses ----------
 
@@ -3262,6 +3485,37 @@ let alloc_tests =
                   ~1000 copies, measured %.0f words"
                  delta)
               true (delta < 1000.));
+    (* Chunk L — the PCRE2_FIRSTLINE scan runs once per bump attempt. The
+       NON-UTF scan paths are module-level + tail-recursive and allocation-free
+       (§8 named hazard); the UTF scans allocate a ref per character stepped,
+       faithfully mirroring the interpreter's own (interpreter.ml:8820) —
+       cold pre-match scans outside the frame loop, NOT covered by this pin.
+       ANY convention (non-UTF) exercises the VARIABLE [scan_firstline_var]
+       path (the one a ref regression would hit); ~2000 'q' on the first line
+       = ~2000 failing 'qz' attempts, each re-running the firstline scan.
+       Reverting [scan_firstline_var] to an inline `let t = ref …` allocates a
+       ref per attempt (~6k words) and trips this pin. *)
+    Alcotest.test_case "alloc: O(1) FIRSTLINE scan over ~2000 attempts" `Slow
+      (fun () ->
+        match F.compile_ctx ~newline:nl_any "qz" firstline_opt with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            let subject = String.make 2000 'q' ^ "\rz" in
+            (match F.exec re subject 0 0l with
+            | Ok None -> ()
+            | _ -> Alcotest.fail "expected no match (warm-up)");
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            (match r with
+            | Ok None -> ()
+            | _ -> Alcotest.fail "expected no match");
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for the FIRSTLINE scan over \
+                  ~2000 attempts, measured %.0f words"
+                 delta)
+              true (delta < 1000.));
   ]
 
 (* ---------- 8. ulimit-free stack-safety smoke ----------
@@ -3561,6 +3815,8 @@ let () =
       ("verifier", verifier_tests);
       ("sweep", sweep_tests);
       ("runner parity", parity_tests);
+      ("firstline parity", firstline_parity_tests);
+      ("zero unsupported", zero_unsupported_tests);
       ("K2 bsk/accept witnesses", k2_bsk_accept_tests);
       ("backref option parity", ref_options_tests);
       ("invalid-utf fragment parity", invalid_utf_tests);

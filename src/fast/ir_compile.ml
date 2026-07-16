@@ -370,17 +370,12 @@ let compile (re : C.re) : (Ir.t, string) result =
      pcre2_match.c:7650-7699, landed in runner [exec]/[next_fragment]). *)
   let utf = not (Int.equal (re.C.overall_options land Opt.utf) 0) in
   let ucp = not (Int.equal (re.C.overall_options land Opt.ucp) 0) in
-  (* Compile-level gates BEFORE the walk (fast-design.md §6, task spec). *)
-  if not (Int.equal (re.C.overall_options land Opt.firstline) 0) then
-    (* PCRE2_FIRSTLINE constrains an unanchored match to the first line. The
-       C enforces this partly through the start-of-match scans' shortened
-       end_subject (pcre2_match.c:7164-7186), which the naive chunk-C2 driver
-       does not replicate; a bump_bottom-only stop (pcre2_match.c:7584-7588)
-       diverges at the newline position for patterns with a first code unit.
-       Declined until the JIT start-opts land (chunk L, fast-design.md §5). *)
-    Error "fast: PCRE2_FIRSTLINE (chunk L)"
-  else
-    let src = re.C.code in
+  (* Chunk L — PCRE2_FIRSTLINE is now handled at match time (runner [bump_top]
+     shortens end_subject for the start-scans, pcre2_match.c:7164-7186;
+     [bump_bottom] stops at a failed newline start, 7584-7588). No compile gate
+     remains: after chunk L the compiler declines NOTHING in subset (the
+     zero-Unsupported invariant, fast-design.md §5/§6). *)
+  let src = re.C.code in
     let byte (p : int) : int = Char.code (Bytes.get src p) in
     (* GET(code, p+1): a LINK_SIZE = 2 big-endian offset relative to the
        opcode at [p] (pcre2_intmodedep.h:108-109; debug_printer.ml uses the
