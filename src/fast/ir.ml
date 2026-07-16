@@ -11,6 +11,7 @@
    left in [re.code] and referenced by offset, so [t] pins [Compile.re]. *)
 
 module C = Pcre2_engine.Compile
+module Op = Pcre2_engine.Opcodes
 
 (* fast-design.md §2 — the dense instruction tags. Values are contiguous
    from 0 and never change meaning across chunks (coverage only widens); the
@@ -57,6 +58,23 @@ let t_braminzero = 24 (* [t_braminzero; skip] — lazy optional: skip, enter on 
 let t_ket_rmax = 25 (* [t_ket_rmax; entry; g] — greedy repeating ket (OP_KETRMAX) *)
 let t_ket_rmin = 26 (* [t_ket_rmin; entry; g] — lazy repeating ket (OP_KETRMIN) *)
 
+(* Chunk E additions (fast-design.md §2/§4) — character types and classes.
+   [t_type] is a single character-type test whose operand is the C type
+   opcode (OP_NOT_DIGIT..OP_VSPACE / OP_ANY / OP_ALLANY / OP_ANYBYTE /
+   OP_ANYNL); OP_PROP/OP_NOTPROP/OP_EXTUNI stay declined (chunk I). [t_class]
+   is a single 32-byte-bitmap class test (OP_CLASS/OP_NCLASS, identical in
+   non-UTF where every code unit is 0..255); its operand is the byte offset of
+   the bitmap in [re.code] (like the JIT / XCLASS, no copy). [t_wordbound] is
+   \b / \B (non-UCP); its operand is 1 for OP_WORD_BOUNDARY (\b) and 0 for
+   OP_NOT_WORD_BOUNDARY (\B). The type/class repeats reuse the REP superinstr
+   machinery: [t_type_rep] / [t_class_rep] carry [reptype; lmin; lmax] then the
+   type opcode / bitmap offset. *)
+let t_type = 27 (* [t_type; type_op]  — one char-type test *)
+let t_class = 28 (* [t_class; map_off] — one bitmap-class test *)
+let t_wordbound = 29 (* [t_wordbound; want] — \b (want=1) / \B (want=0) *)
+let t_type_rep = 30 (* [t_type_rep; reptype; lmin; lmax; type_op] *)
+let t_class_rep = 31 (* [t_class_rep; reptype; lmin; lmax; map_off] *)
+
 (* Sentinel [g] for a repeated group whose bracket is OP_BRA (bra_loop, C's
    P == NULL): NO empty-string check (the C short-circuits it, and OP_BRA can
    never match empty), so no [t_group_start] and no [mb.group_start] slot. *)
@@ -72,7 +90,7 @@ let reptype_pos = 2
 let rep_inf = 0xFFFFFFFF
 
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 26
+let max_tag = 31
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -106,6 +124,11 @@ let arity =
     2 (* t_braminzero: skip *);
     3 (* t_ket_rmax: entry, g *);
     3 (* t_ket_rmin: entry, g *);
+    2 (* t_type: type_op *);
+    2 (* t_class: map_off *);
+    2 (* t_wordbound: want *);
+    5 (* t_type_rep: reptype, lmin, lmax, type_op *);
+    5 (* t_class_rep: reptype, lmin, lmax, map_off *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -139,6 +162,11 @@ let tag_name =
     "BRAMINZERO";
     "KET_RMAX";
     "KET_RMIN";
+    "TYPE";
+    "CLASS";
+    "WORDBOUND";
+    "TYPE_REP";
+    "CLASS_REP";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -204,6 +232,16 @@ let braz_skip (ir : t) (pc : int) : int = ir.code.(pc + 1)
 let ket_entry (ir : t) (pc : int) : int = ir.code.(pc + 1)
 let ket_group (ir : t) (pc : int) : int = ir.code.(pc + 2)
 
+(* Chunk E operands. [t_type] / [t_wordbound] carry one operand at pc+1;
+   [t_class] carries the bitmap byte offset at pc+1; the type / class repeats
+   carry the type opcode / bitmap offset at pc+4 (after reptype/lmin/lmax,
+   read by rep_reptype/rep_lmin/rep_lmax above). *)
+let type_op (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let class_map_off (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let wordbound_want (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let rep_type_op (ir : t) (pc : int) : int = ir.code.(pc + 4)
+let rep_map_off (ir : t) (pc : int) : int = ir.code.(pc + 4)
+
 (* ---------- Text dump (fast-design.md §2) ----------
    Stable, debug_printer.ml-style listing for golden tests: one line per
    instruction, [%3d TAG operands]. Printf/Format here is a debug path
@@ -251,6 +289,35 @@ let render (ir : t) (pc : int) (t : int) : string =
     Printf.sprintf "KET_RMAX entry=%d g=%d" (ket_entry ir pc) (ket_group ir pc)
   else if Int.equal t t_ket_rmin then
     Printf.sprintf "KET_RMIN entry=%d g=%d" (ket_entry ir pc) (ket_group ir pc)
+  else if Int.equal t t_type then
+    Printf.sprintf "TYPE %s" Op.op_names.(type_op ir pc)
+  else if Int.equal t t_class then
+    Printf.sprintf "CLASS map=%d" (class_map_off ir pc)
+  else if Int.equal t t_wordbound then
+    Printf.sprintf "WORDBOUND %s"
+      (if Int.equal (wordbound_want ir pc) 1 then "\\b" else "\\B")
+  else if Int.equal t t_type_rep then (
+    let ty = rep_reptype ir pc in
+    let tystr =
+      if Int.equal ty reptype_min then "min"
+      else if Int.equal ty reptype_max then "max"
+      else "pos"
+    in
+    let lmax = rep_lmax ir pc in
+    let lmaxstr = if Int.equal lmax rep_inf then "inf" else string_of_int lmax in
+    Printf.sprintf "TYPE_REP %s {%d,%s} %s" tystr (rep_lmin ir pc) lmaxstr
+      Op.op_names.(rep_type_op ir pc))
+  else if Int.equal t t_class_rep then (
+    let ty = rep_reptype ir pc in
+    let tystr =
+      if Int.equal ty reptype_min then "min"
+      else if Int.equal ty reptype_max then "max"
+      else "pos"
+    in
+    let lmax = rep_lmax ir pc in
+    let lmaxstr = if Int.equal lmax rep_inf then "inf" else string_of_int lmax in
+    Printf.sprintf "CLASS_REP %s {%d,%s} map=%d" tystr (rep_lmin ir pc) lmaxstr
+      (rep_map_off ir pc))
   else if
     Int.equal t t_rep || Int.equal t t_repi || Int.equal t t_notrep
     || Int.equal t t_notrepi

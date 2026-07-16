@@ -79,6 +79,11 @@ following the tag. Widths are `Ir.arity`:
 | 24 | `BRAMINZERO` | `skip` | 2 | lazy zero-repeat (`OP_BRAMINZERO`): jump to `skip` (the continuation) first (tick, child frame), enter the group (`pc+2`) on backtrack |
 | 25 | `KET_RMAX` | `entry; g` | 3 | greedy repeating ket (`OP_KETRMAX`): empty-check `g` (`no_group` = none) then loop back to `entry` (tick), give back the continuation (`pc+3`) on backtrack |
 | 26 | `KET_RMIN` | `entry; g` | 3 | lazy repeating ket (`OP_KETRMIN`): empty-check `g` then try the continuation (`pc+3`, tick), reiterate at `entry` on backtrack |
+| 27 | `TYPE` | `type_op` | 2 | one character-type test; `type_op` is the C opcode (`OP_NOT_DIGIT`..`OP_VSPACE` / `OP_ANY` / `OP_ALLANY` / `OP_ANYBYTE` / `OP_ANYNL`). `OP_ANY` (newline-sensitive + CRLF-partial) and `OP_ANYNL` (\R, variable length) get special arms; the rest are one code unit via `simple_type_match` |
+| 28 | `CLASS` | `map_off` | 2 | one 32-byte-bitmap class test (`OP_CLASS`/`OP_NCLASS` — identical in non-UTF where every code unit is 0..255). `map_off` = byte offset of the bitmap in `re.code` (like the JIT / XCLASS, no copy) |
+| 29 | `WORDBOUND` | `want` | 2 | `\b` (`want=1`, `OP_WORD_BOUNDARY`) / `\B` (`want=0`, `OP_NOT_WORD_BOUNDARY`), non-UCP. The prev-char read lowers `mb.start_used_ptr` (the SCHECK_PARTIAL floor, pcre2_match.c:6280) |
+| 30 | `TYPE_REP` | `reptype; lmin; lmax; type_op` | 5 | character-type repeat (`OP_TYPESTAR`..`OP_TYPEPOSUPTO`) |
+| 31 | `CLASS_REP` | `reptype; lmin; lmax; map_off` | 5 | class repeat (`OP_CLASS`/`OP_NCLASS` + an `OP_CR*` quantifier) |
 
 **Chunk D additions.** `CIRCM`/`DOLLM` are the multiline anchors (their arms
 carry no operands; runtime semantics only). `CAP_START`/`CAP_END` bracket a
@@ -151,6 +156,75 @@ engine tick FEWER times than the interpreter for an unrolled repeat, so a
 violation and a fuzz `--mode fast-vs-interp` divergence. It is therefore NOT
 ported, by design; the unrolled copies are lowered individually (correct,
 tick-identical) instead.
+
+**Chunk E additions — character types, classes, and their repeats.** Five new
+tags (27-31, above). Design notes:
+
+- **CLASS / NCLASS (non-UTF are the same).** In non-UTF every code unit is
+  0..255, and both `OP_CLASS` and `OP_NCLASS` reduce to the same 32-byte bitmap
+  probe (`class_bit`, interpreter.ml:721 / `scan_class_min`): the compiler has
+  already baked the negation into the bitmap for the 0..255 range. So a class
+  is one tag, `t_class` (or `t_class_rep` with an `OP_CR*` quantifier); the
+  bitmap is left in place in `re.code` and referenced by byte offset (`Ir.t`
+  already pins `Compile.re`; `mb.bytecode` holds `re.code`). A lone class is
+  `class_min` with `lmin=lmax=1` in the C — one code unit, no choice point, no
+  tick — so `t_class` neither ticks nor records.
+- **OP_XCLASS is declined to chunk I, not ported.** In non-UTF/non-UCP the
+  shared compiler only emits `OP_XCLASS` for a class that contains a Unicode
+  property (`\p`/`\P`) — `compile.ml:2199-2281`, where `xclass = true` implies
+  `xclass_has_prop = true` (wide chars > 255 cannot occur non-UTF, and
+  `\h`/`\v` etc. stay in the bitmap). Matching it needs the property machinery
+  (chunk I), so it is declined (`"fast: OP_XCLASS (\p in class) (chunk I)"`)
+  rather than routed through `Xclass.xclass`.
+- **Single negated char `OP_NOT`/`OP_NOTI` (`[^a]`).** Lowered as a NOT-char
+  repeat with `lmin=lmax=1` (the C's `repeatnotchar` with `Lmin==Lmax` is a
+  bare one-char test — no choice point, no tick), reusing `NOTREP`/`NOTREPI`.
+- **Type / class repeats reuse the four `REP*` records + `KIND_REP_MIN/MAX`.**
+  `setup_rep` decodes any REP superinstruction (char / type / class) into
+  `mb.rep_*` including a `rep_kind` discriminator; the forward min/greedy loops
+  and the REP_MIN/REP_MAX backtracks dispatch on it. Char / ctype (`\d`..`\W`) /
+  class / `\h`\`\v` are "one code unit, predicate" (shared `rep_min_loop` /
+  `rep_greedy` via `rep_unit_matches`); `OP_ALLANY`/`OP_ANYBYTE` use a bulk min
+  loop + bulk greedy (one bound check — the C's `SCHECK_PARTIAL` at the
+  ORIGINAL eptr, not a per-char eptr); `OP_ANY` and `OP_ANYNL` (\R) get
+  dedicated loops (newline stop + CRLF-partial for ANY; variable-length CR/LF
+  absorption for \R). No new record kinds — a nested repeat clobbers `mb.rep_*`
+  freely, so the REP_MIN/REP_MAX backtracks re-run `setup_rep` from the IR at
+  `rep_pc` before extending / giving back.
+- **CLASS-repeat maxbt ticks the floor; char/type do not.** The C's char/type
+  greedy backtrack (`pcre2_match.c:1451/4960`) tries the floor position
+  (`Lstart_eptr`) IN PLACE (`if Feptr == Lstart_eptr break`, no RMATCH); the
+  CLASS one (`:2143`) tries it via a ticked `RMATCH` (`while Feptr >= Lstart`)
+  before failing. `rep_greedy_done_dispatch` therefore routes a class repeat to
+  `rep_greedy_done_class` (always push + tick, give back down to and INCLUDING
+  floor) and every other kind to `rep_greedy_done` (floor in place, no tick) —
+  a §4 tick-parity requirement, not cosmetic.
+- **\R greedy give-back skips mid-CRLF (`giveback_pos`).** The C's RM34
+  (`:4966-4967`) decrements `Feptr` by one, then — for `OP_ANYNL` only — by one
+  MORE if it landed between a CR and its LF (backing into the middle of a CRLF
+  is not a valid \R boundary). `giveback_pos` reproduces this on the stored
+  give-back position for a `t_type_rep` whose type is `OP_ANYNL`.
+
+**charpos (`pcre2_jit_compile.c:11831-12130`) — DECLINED PERMANENTLY (not a
+coverage gap), same class of decision as detect_repeat.** charpos optimises a
+GREEDY single-char/type repeat immediately followed by a fixed literal char
+(`X*Y` / `X{0,n}Y`, `type != OP_CHAR/CHARI`, `*end == OP_CHAR/CHARI` — e.g.
+`.*;`, `[a-z]*=`, `\w*:`): instead of over-eating `X` and trying `Y` at EVERY
+give-back position, it scans (memchr-like) for the first/last occurrence of
+`Y`'s char and only attempts the continuation where `Y` can match. Those
+bytecode shapes DO occur in this chunk's subset (the type/class greedy repeats
+are now lowered). But the interpreter — the fast engine's differential oracle —
+does the greedy give-back one code unit at a time, and RMATCHes the
+continuation (a `match_call_count` tick) at EVERY position from the greedy end
+down to the floor, INCLUDING positions where the trailing char does not match
+(the `OP_CHAR` fails there, but the RMATCH still ticked). charpos skips exactly
+those non-matching positions, so porting it would make the fast engine tick
+FEWER times than the interpreter for `.*x`-shaped patterns — a `(*LIMIT_MATCH=N)`
+cap (`-47`) would trip at a different N (a §4 tick-parity violation) and a fuzz
+`--mode fast-vs-interp` divergence. It is therefore NOT ported; the per-position
+give-back (`rep_greedy_done` / `backtrack_rep_max`) is tick-identical to the
+interpreter. (The JIT never had a tick-parity obligation; this is the same
+differential-contract decision recorded for detect_repeat.)
 
 `Ir.dump : Format.formatter -> Ir.t -> unit` prints one `%3d TAG operands` line per head
 (debug_printer.ml style); `CHAR_RUN`/`CHARI` show the escaped literal, `ALT` shows
@@ -227,8 +301,8 @@ first:
 |---|---|---|---|---|
 | `KIND_ALT` | 4 | `handler; eptr; rdepth; KIND_ALT` | each `ALT` | resume the next alternative at `handler` (restore `eptr`/`rdepth`) |
 | `KIND_CAP` | 4 | `ovbase; old_start; old_end; KIND_CAP` | each `CAP_START` | restore `ovector[ovbase]`/`[ovbase+1]`, then keep popping |
-| `KIND_REP_MAX` | 5 | `rep_pc; try_pos; floor; rdepth; KIND_REP_MAX` | greedy repeat with extra chars | retry the continuation at `try_pos` (decrement to `floor`) |
-| `KIND_REP_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REP_MIN` | minimizing repeat with `lmin<lmax` | match one more char at `eptr`, retry the continuation |
+| `KIND_REP_MAX` | 5 | `rep_pc; try_pos; floor; rdepth; KIND_REP_MAX` | greedy char / type / class repeat with extra units | retry the continuation at `try_pos` (decrement to `floor`; \R skips mid-CRLF; class also tries floor) |
+| `KIND_REP_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REP_MIN` | minimizing char / type / class repeat with `lmin<lmax` | match one more unit at `eptr`, retry the continuation |
 | `KIND_CONT` | 4 | `target; eptr; rdepth; KIND_CONT` | BRAZERO / BRAMINZERO / greedy KETRMAX / lazy KETRMIN | resume at IR index `target` (restore `eptr`/`rdepth`), NO tick |
 | `KIND_GSTART` | 3 | `g; old_start; KIND_GSTART` | each `GROUP_START` (tracked repeated group) | restore `mb.group_start.(g)`, then keep popping |
 
@@ -396,6 +470,23 @@ the group's own entry tick the same way (the C's RM9/RM10 frame wraps the
 bracket dispatch). Verified continuously by the fuzz `--mode fast-vs-interp`
 `LIMIT_MATCH=2000` differential (0 divergences over 200k+ cases including
 group repeats) and the group-repeat `LIMIT_MATCH` N-sweep test.
+
+**Type / class repeats (chunk E) reuse the char-repeat tick rows** — a
+`t_type_rep` / `t_class_rep` ticks exactly like `REP`/`REPI` (min-loop and
+greedy scan tick-free; the minimize continuation, the greedy-end continuation,
+and every give-back / extend a child-frame tick) because they share
+`rep_min_loop` / `rep_after_min` / `rep_greedy` / `backtrack_rep_min` /
+`backtrack_rep_max`, mirroring the C's RM25/RM26/RM27/RM28 (char) ≡
+RM33/RM34 (type) frame counts. The ONE difference is the CLASS maxbt: the C
+tries the floor position via a ticked `RMATCH` (`:2143`, `while Feptr >=
+Lstart`) whereas char/type try it in place (`:1451/4960`, `if == break`), so a
+class greedy repeat ticks ONE more time (at the floor) than a char/type one —
+reproduced by `rep_greedy_done_class`. The single `t_type` / `t_class` /
+`t_wordbound` arms never tick (one code unit, no choice point — the C's
+`class_min` with `lmin=lmax=1` and the single-type arms dispatch in place).
+Verified by the fuzz `--mode fast-vs-interp` `LIMIT_MATCH=2000` differential (0
+divergences over 310k+ cases with classes/types/\R/\b) and the type/class-repeat
+`LIMIT_MATCH` N-sweep test.
 
 **Capturing groups (chunk D) are `grouploop`, so their LAST branch ticks too.**
 `OP_CBRA`/`OP_SCBRA` (interpreter.ml:2434-2444 → `grouploop`) record a

@@ -22,7 +22,18 @@ let check (ir : Ir.t) : (unit, string) result =
   let len = Array.length code in
   let litlen = String.length ir.Ir.lit in
   let top_bracket = ir.Ir.re.Pcre2_engine.Compile.top_bracket in
+  let codelen = Bytes.length ir.Ir.re.Pcre2_engine.Compile.code in
   let n_groups = ir.Ir.n_groups in
+  (* A class bitmap reference (t_class / t_class_rep) must name a 32-byte map
+     wholly inside re.code. A character-type operand must be a supported
+     single-type opcode (not \p/\P/\X — those decline at compile). *)
+  let map_off_ok (off : int) : bool = off >= 0 && off + 32 <= codelen in
+  let type_op_ok (op : int) : bool =
+    (op >= Pcre2_engine.Opcodes.op_not_digit
+    && op <= Pcre2_engine.Opcodes.op_anybyte)
+    || (op >= Pcre2_engine.Opcodes.op_anynl
+       && op <= Pcre2_engine.Opcodes.op_vspace)
+  in
   if Int.equal len 0 then Error "fast-verify: empty IR (no END)"
   else
     (* Pass 1: linear head walk — validate tags + operand widths, record
@@ -144,6 +155,50 @@ let check (ir : Ir.t) : (unit, string) result =
                          "fast-verify: %s at pc %d has inconsistent operands \
                           (reptype=%d min=%d max=%d)"
                          Ir.tag_name.(t) pc reptype lmin lmax)
+                  else Ok ())
+                else if Int.equal t Ir.t_type then (
+                  (* single character type: a supported type opcode. *)
+                  let op = code.(pc + 1) in
+                  if not (type_op_ok op) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: TYPE at pc %d has unsupported type \
+                          opcode %d"
+                         pc op)
+                  else Ok ())
+                else if Int.equal t Ir.t_wordbound then (
+                  let w = code.(pc + 1) in
+                  if not (Int.equal w 0 || Int.equal w 1) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: WORDBOUND at pc %d has bad want %d" pc w)
+                  else Ok ())
+                else if Int.equal t Ir.t_class then (
+                  let off = code.(pc + 1) in
+                  if not (map_off_ok off) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: CLASS at pc %d bitmap offset %d outside \
+                          re.code (%d bytes)"
+                         pc off codelen)
+                  else Ok ())
+                else if Int.equal t Ir.t_type_rep || Int.equal t Ir.t_class_rep
+                then (
+                  let reptype = code.(pc + 1) in
+                  let lmin = code.(pc + 2) and lmax = code.(pc + 3) in
+                  let payload = code.(pc + 4) in
+                  let payload_ok =
+                    if Int.equal t Ir.t_type_rep then type_op_ok payload
+                    else map_off_ok payload
+                  in
+                  if reptype < 0 || reptype > 2 || lmin < 0 || lmax < lmin
+                     || not payload_ok
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: %s at pc %d has inconsistent operands \
+                          (reptype=%d min=%d max=%d payload=%d)"
+                         Ir.tag_name.(t) pc reptype lmin lmax payload)
                   else Ok ())
                 else Ok ()
               in

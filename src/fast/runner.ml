@@ -29,6 +29,20 @@ module Chartables = Pcre2_engine.Chartables
 module Frames = Pcre2_engine.Frames
 module Limits = Pcre2_engine.Limits
 module Compile = Pcre2_engine.Compile
+module Opcodes = Pcre2_engine.Opcodes
+module Char_predicates = Pcre2_engine.Char_predicates
+
+(* Chunk E — repeat-kind discriminators (fast-design.md §2/§4). [setup_rep]
+   maps each REP superinstruction to one of these; the forward min/greedy
+   loops and the REP_MIN/REP_MAX backtracks dispatch on it. *)
+let rk_char = 0 (* rep_c1/rep_c2/rep_want *)
+let rk_ctype = 1 (* rep_mask/rep_want (\d \D \s \S \w \W) *)
+let rk_class = 2 (* rep_map_off (bitmap) *)
+let rk_hspace = 3 (* rep_want (\h \H) *)
+let rk_vspace = 4 (* rep_want (\v \V) *)
+let rk_allany = 5 (* OP_ALLANY / OP_ANYBYTE (any code unit) *)
+let rk_any = 6 (* OP_ANY (any except newline) *)
+let rk_anynl = 7 (* OP_ANYNL (\R, variable length) *)
 
 (* pcre2_match.c:87-88 — the two internal match() return codes used inside
    the loop (interpreter.ml:88-89). MATCH_MATCH = 1, MATCH_NOMATCH = 0. *)
@@ -132,6 +146,20 @@ type mb = {
   mutable rep_reptype : int; (* 0 min / 1 max / 2 pos *)
   mutable rep_cont : int; (* continuation pc (past the repeat) *)
   mutable rep_floor : int; (* maximize: position after lmin (Lstart_eptr) *)
+  (* Chunk E repeat scratch: the [rep_kind] discriminator selects the per-unit
+     test (fast-design.md §2/§4). rep_char (0) uses rep_c1/rep_c2/rep_want;
+     rep_ctype (1) uses rep_mask/rep_want; rep_class (2) uses rep_map_off;
+     rep_hspace (3)/rep_vspace (4) use rep_want; rep_allany (5)/rep_any (6)/
+     rep_anynl (7) carry no extra payload. Set by [setup_rep] on the forward
+     path and re-derived from the IR on backtrack (a nested repeat in the
+     continuation may clobber these freely). *)
+  mutable rep_kind : int;
+  mutable rep_mask : int; (* ctype mask (rep_ctype) *)
+  mutable rep_map_off : int; (* class bitmap byte offset in [bytecode] *)
+  (* Chunk E: the shared compiler's bytecode ([re.code]), pinned for the class
+     bitmap reads (t_class / t_class_rep); the 32-byte map stays in place. *)
+  mutable bytecode : Bytes.t;
+  mutable bsr_anycrlf : bool; (* bsr_convention = BSR_ANYCRLF (\R) *)
   (* the backtracking save stack *)
   ss : Save_stack.t;
 }
@@ -195,6 +223,11 @@ let make_mb (ss : Save_stack.t) : mb =
     rep_reptype = 0;
     rep_cont = 0;
     rep_floor = 0;
+    rep_kind = 0;
+    rep_mask = 0;
+    rep_map_off = 0;
+    bytecode = Bytes.empty;
+    bsr_anycrlf = false;
     ss;
   }
 
@@ -315,6 +348,155 @@ let rec char_run_cmp (mb : mb) (lit_pos : int) (lit_end : int) (eptr : int) : in
          (Char.code (String.unsafe_get mb.subject eptr)))
   then sig_backtrack
   else (char_run_cmp [@tailcall]) mb (lit_pos + 1) lit_end (eptr + 1)
+
+(* ---------- Character-type / class predicates (chunk E) ---------- *)
+
+(* pcre2_match.c:1930 + 2014 — Lbyte_map[fc/8] & (1u << (fc&7)): probe the
+   32-byte class bitmap at byte offset [off] in [mb.bytecode] (= re.code). In
+   non-UTF a code unit is 0..255, so OP_CLASS and OP_NCLASS both reduce to this
+   bitmap test (interpreter.ml:721 class_bit / scan_class_min). Returns true
+   iff [cc] is in the class. *)
+let class_bit_at (mb : mb) (off : int) (cc : int) : bool =
+  (* safe: Ir_verify proved off + 32 <= Bytes.length mb.bytecode, and cc <= 255
+     so cc lsr 3 <= 31 < 32. *)
+  not
+    (Int.equal
+       (Char.code (Bytes.unsafe_get mb.bytecode (off + (cc lsr 3)))
+       land (1 lsl (cc land 7)))
+       0)
+
+(* One code unit [cc] against a single character-type opcode that consumes
+   exactly one code unit and whose predicate is position-independent
+   (pcre2_match.c:2305-2470 non-UTF; the \D \d \S \s \W \w / \h \H \v \V /
+   OP_ALLANY / OP_ANYBYTE single arms). OP_ANY (newline-sensitive) and OP_ANYNL
+   (variable length) are NOT handled here — their arms are special. Used by the
+   single-type arm; the repeat hot loop uses the precomputed rep_mask / rep_kind
+   instead (equivalent by construction). *)
+let simple_type_match (type_op : int) (cc : int) : bool =
+  if Int.equal type_op Opcodes.op_digit then
+    not (Int.equal (Chartables.ctypes cc land Chartables.ctype_digit) 0)
+  else if Int.equal type_op Opcodes.op_not_digit then
+    Int.equal (Chartables.ctypes cc land Chartables.ctype_digit) 0
+  else if Int.equal type_op Opcodes.op_whitespace then
+    not (Int.equal (Chartables.ctypes cc land Chartables.ctype_space) 0)
+  else if Int.equal type_op Opcodes.op_not_whitespace then
+    Int.equal (Chartables.ctypes cc land Chartables.ctype_space) 0
+  else if Int.equal type_op Opcodes.op_wordchar then
+    not (Int.equal (Chartables.ctypes cc land Chartables.ctype_word) 0)
+  else if Int.equal type_op Opcodes.op_not_wordchar then
+    Int.equal (Chartables.ctypes cc land Chartables.ctype_word) 0
+  else if Int.equal type_op Opcodes.op_hspace then Char_predicates.hspace_byte cc
+  else if Int.equal type_op Opcodes.op_not_hspace then
+    not (Char_predicates.hspace_byte cc)
+  else if Int.equal type_op Opcodes.op_vspace then Char_predicates.vspace_byte cc
+  else if Int.equal type_op Opcodes.op_not_vspace then
+    not (Char_predicates.vspace_byte cc)
+  else true (* op_allany / op_anybyte — match any single code unit *)
+
+(* [setup_rep] decodes the REP superinstruction at [pc] into mb.rep_* (chunk E,
+   fast-design.md §2/§4). Called on the forward path (op_repeat) and re-called
+   on backtrack (KIND_REP_MIN/MAX) to restore the fields a nested repeat may
+   have clobbered — it writes only mb.rep_*, so it is idempotent. *)
+let setup_rep (mb : mb) (pc : int) : unit =
+  let code = mb.code in
+  let tag = code.(pc) in
+  mb.rep_pc <- pc;
+  mb.rep_reptype <- code.(pc + 1);
+  mb.rep_lmin <- code.(pc + 2);
+  mb.rep_lmax <- code.(pc + 3);
+  if Int.equal tag 18 (* t_rep *) then (
+    mb.rep_kind <- rk_char;
+    mb.rep_c1 <- code.(pc + 4);
+    mb.rep_c2 <- code.(pc + 4);
+    mb.rep_want <- true;
+    mb.rep_cont <- pc + 5)
+  else if Int.equal tag 19 (* t_repi *) then (
+    mb.rep_kind <- rk_char;
+    mb.rep_c1 <- code.(pc + 4);
+    mb.rep_c2 <- code.(pc + 5);
+    mb.rep_want <- true;
+    mb.rep_cont <- pc + 6)
+  else if Int.equal tag 20 (* t_notrep *) then (
+    mb.rep_kind <- rk_char;
+    mb.rep_c1 <- code.(pc + 4);
+    mb.rep_c2 <- code.(pc + 4);
+    mb.rep_want <- false;
+    mb.rep_cont <- pc + 5)
+  else if Int.equal tag 21 (* t_notrepi *) then (
+    mb.rep_kind <- rk_char;
+    mb.rep_c1 <- code.(pc + 4);
+    mb.rep_c2 <- code.(pc + 5);
+    mb.rep_want <- false;
+    mb.rep_cont <- pc + 6)
+  else if Int.equal tag 31 (* t_class_rep *) then (
+    mb.rep_kind <- rk_class;
+    mb.rep_map_off <- code.(pc + 4);
+    mb.rep_cont <- pc + 5)
+  else (
+    (* tag 30 t_type_rep — map the C type opcode to a rep_kind + payload. *)
+    let ct = code.(pc + 4) in
+    mb.rep_cont <- pc + 5;
+    if Int.equal ct Opcodes.op_digit then (
+      mb.rep_kind <- rk_ctype;
+      mb.rep_mask <- Chartables.ctype_digit;
+      mb.rep_want <- true)
+    else if Int.equal ct Opcodes.op_not_digit then (
+      mb.rep_kind <- rk_ctype;
+      mb.rep_mask <- Chartables.ctype_digit;
+      mb.rep_want <- false)
+    else if Int.equal ct Opcodes.op_whitespace then (
+      mb.rep_kind <- rk_ctype;
+      mb.rep_mask <- Chartables.ctype_space;
+      mb.rep_want <- true)
+    else if Int.equal ct Opcodes.op_not_whitespace then (
+      mb.rep_kind <- rk_ctype;
+      mb.rep_mask <- Chartables.ctype_space;
+      mb.rep_want <- false)
+    else if Int.equal ct Opcodes.op_wordchar then (
+      mb.rep_kind <- rk_ctype;
+      mb.rep_mask <- Chartables.ctype_word;
+      mb.rep_want <- true)
+    else if Int.equal ct Opcodes.op_not_wordchar then (
+      mb.rep_kind <- rk_ctype;
+      mb.rep_mask <- Chartables.ctype_word;
+      mb.rep_want <- false)
+    else if Int.equal ct Opcodes.op_hspace then (
+      mb.rep_kind <- rk_hspace;
+      mb.rep_want <- true)
+    else if Int.equal ct Opcodes.op_not_hspace then (
+      mb.rep_kind <- rk_hspace;
+      mb.rep_want <- false)
+    else if Int.equal ct Opcodes.op_vspace then (
+      mb.rep_kind <- rk_vspace;
+      mb.rep_want <- true)
+    else if Int.equal ct Opcodes.op_not_vspace then (
+      mb.rep_kind <- rk_vspace;
+      mb.rep_want <- false)
+    else if Int.equal ct Opcodes.op_anynl then mb.rep_kind <- rk_anynl
+    else if Int.equal ct Opcodes.op_any then mb.rep_kind <- rk_any
+    else (* op_allany / op_anybyte *) mb.rep_kind <- rk_allany)
+
+(* True iff the repeat instruction at [rep_pc] is a \R (OP_ANYNL) type repeat.
+   Used only on the (cold) greedy give-back path. *)
+let is_anynl_rep (mb : mb) (rep_pc : int) : bool =
+  Int.equal mb.code.(rep_pc) 30 (* t_type_rep *)
+  && Int.equal mb.code.(rep_pc + 4) Opcodes.op_anynl
+
+(* The corrected greedy give-back position for a maximizing repeat
+   (pcre2_match.c:4963-4967 / RM34). [x] is the candidate position after one
+   Feptr-- step; for a \R repeat, backing into the middle of a CRLF pair is not
+   a valid \R boundary, so step back once more. Non-\R repeats return [x]. *)
+let giveback_pos (mb : mb) (rep_pc : int) (floor : int) (x : int) : int =
+  if
+    is_anynl_rep mb rep_pc && x > floor && x < mb.end_subject
+    (* safe: 0 <= floor < x < end_subject <= String.length subject, so x and
+       x-1 are valid indices. *)
+    && Int.equal (Char.code (String.unsafe_get mb.subject x)) Newline.char_lf
+    && Int.equal
+         (Char.code (String.unsafe_get mb.subject (x - 1)))
+         Newline.char_cr
+  then x - 1
+  else x
 
 (* ---------- Shadow limit tick (§4) ---------- *)
 
@@ -549,10 +731,32 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       (* safe: ovb+1 < 2*oveccount = Array.length mb.ovector (Ir_verify). *)
       Array.unsafe_set mb.ovector (ovb + 1) (eptr - mb.start_subject);
       (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
-  | 18 | 19 | 20 | 21 ->
-      (* Single-char repeat superinstructions (fast-design.md §2/§4;
-         repeatchar/repeatnotchar interpreter.ml:3549-4128, non-UTF). *)
+  | 18 | 19 | 20 | 21 | 30 | 31 ->
+      (* Repeat superinstructions (fast-design.md §2/§4): char (18-21;
+         repeatchar/repeatnotchar interpreter.ml:3549-4128), character type
+         (30; repeattype interpreter.ml:4622-...) and class (31; the OP_CLASS
+         repeat interpreter.ml:1807-1872) — all non-UTF. *)
       (op_repeat [@tailcall]) mb pc eptr sp rdepth mcc
+  | 27 ->
+      (* TYPE (fast-design.md §2/§4) — a single character type. *)
+      (op_single_type [@tailcall]) mb pc code.(pc + 1) eptr sp rdepth mcc
+  | 28 ->
+      (* CLASS (fast-design.md §2) — a single 32-byte-bitmap class test
+         (OP_CLASS/OP_NCLASS, pcre2_match.c:1933-1972; in non-UTF a lone class
+         is class_min with lmin=lmax=1: one code unit, no choice point). *)
+      if eptr >= mb.end_subject then (
+        let r = scheck_partial mb eptr in
+        if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+      else
+        (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
+        let cc = Char.code (String.unsafe_get mb.subject eptr) in
+        if class_bit_at mb code.(pc + 1) cc then
+          (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc
+        else (backtrack [@tailcall]) mb sp mcc
+  | 29 ->
+      (* WORDBOUND \b / \B, non-UCP (fast-design.md §2;
+         pcre2_match.c:6258-6333 / interpreter.ml:3181-3332). *)
+      (op_wordbound [@tailcall]) mb pc code.(pc + 1) eptr sp rdepth mcc
   | 22 ->
       (* GROUP_START (fast-design.md §3; the C records the group-start eptr in
          the group frame's predecessor P, read at the ket, pcre2_match.c:6081/
@@ -742,10 +946,14 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
       let dsaved = Array.unsafe_get d (base + 2) in
       (run [@tailcall]) mb target e base dsaved mcc
 
-(* KIND_REP_MAX backtrack: try the continuation one position lower, down to
-   [floor] (Lstart_eptr). Positions above [floor] run in a child frame
-   (tick + rdepth d+1, mirroring maxbt's RMATCH); at [floor] the C dispatches
-   in place (rdepth d, no tick). *)
+(* KIND_REP_MAX backtrack (fast-design.md §4). Char / type / \R (\R via
+   [giveback_pos]) repeats try the continuation one position lower, down to
+   [floor] (Lstart_eptr): positions above [floor] run in a child frame
+   (tick + rdepth d+1, mirroring the C's typemax_bt / repeatchar maxbt RMATCH);
+   at [floor] the C dispatches in place (rdepth d, no tick,
+   pcre2_match.c:1451/4960). A CLASS repeat differs: its maxbt while head
+   (pcre2_match.c:2143) also RMATCHes the floor position (`Feptr >= Lstart`)
+   before failing, so floor is a ticked child, not in-place. *)
 and backtrack_rep_max (mb : mb) (sp : int) (mcc : int) : int =
   let d = mb.ss.Save_stack.data in
   let base = sp - Save_stack.width_rep_max in
@@ -754,22 +962,33 @@ and backtrack_rep_max (mb : mb) (sp : int) (mcc : int) : int =
   let floor = Array.unsafe_get d (base + 2) in
   let dd = Array.unsafe_get d (base + 3) in
   let cont = rep_pc + Ir.arity.(mb.code.(rep_pc)) in
-  if try_pos > floor then (
-    (* another give-back position: tick (rdepth d+1), keep the record with
-       try_pos decremented, retry the continuation at [try_pos]. *)
+  if Int.equal mb.code.(rep_pc) 31 (* t_class_rep *) then
+    (* CLASS: [floor] is itself a ticked RMATCH; below floor -> NOMATCH. *)
+    if try_pos >= floor then (
+      let mcc' = tick_child mb mcc (dd + 1) in
+      if mcc' < 0 then mcc'
+      else (
+        Array.unsafe_set d (base + 1) (try_pos - 1);
+        (run [@tailcall]) mb cont try_pos sp (dd + 1) mcc'))
+    else (backtrack [@tailcall]) mb base mcc (* pop, propagate *)
+  else if try_pos > floor then (
+    (* char / type / \R: another give-back position (tick, rdepth d+1). Store
+       the NEXT give-back position (with the \R mid-CRLF correction). *)
     let mcc' = tick_child mb mcc (dd + 1) in
     if mcc' < 0 then mcc'
     else (
-      Array.unsafe_set d (base + 1) (try_pos - 1);
+      Array.unsafe_set d (base + 1) (giveback_pos mb rep_pc floor (try_pos - 1));
       (run [@tailcall]) mb cont try_pos sp (dd + 1) mcc'))
   else
     (* try_pos = floor: the minimum-length position, tried in place at rdepth
        d, no tick; pop the record permanently. *)
     (run [@tailcall]) mb cont floor base dd mcc
 
-(* KIND_REP_MIN backtrack: match one more char at [eptr] and retry the
-   continuation (interpreter.ml RM25/RM27: Lmin++; if Lmin>=Lmax NOMATCH;
-   else match one char, RMATCH). Each retry is a child-frame tick. *)
+(* KIND_REP_MIN backtrack (fast-design.md §4): match one more unit at [eptr]
+   and retry the continuation (interpreter.ml RM25/RM27 char, RM23 class,
+   RM33 type: count++; if count>=Lmax NOMATCH; else match one, RMATCH). Each
+   retry is a child-frame tick. Re-derives the repeat's fields from the IR via
+   [setup_rep] (a nested repeat may have clobbered the mb.rep fields). *)
 and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
   let d = mb.ss.Save_stack.data in
   let base = sp - Save_stack.width_rep_min in
@@ -777,73 +996,216 @@ and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
   let count = Array.unsafe_get d (base + 1) in
   let eptr = Array.unsafe_get d (base + 2) in
   let dd = Array.unsafe_get d (base + 3) in
-  let code = mb.code in
-  let tag = code.(rep_pc) in
-  let two = Int.equal tag 19 (* REPI *) || Int.equal tag 21 (* NOTREPI *) in
-  let lmax = code.(rep_pc + 3) in
-  let c1 = code.(rep_pc + 4) in
-  let c2 = if two then code.(rep_pc + 5) else c1 in
-  let want = Int.equal tag 18 (* REP *) || Int.equal tag 19 (* REPI *) in
-  let cont = rep_pc + if two then 6 else 5 in
-  if count >= lmax then (backtrack [@tailcall]) mb base mcc (* pop, propagate *)
-  else if eptr >= mb.end_subject then
-    let r = scheck_partial mb eptr in
-    if r < 0 then r else (backtrack [@tailcall]) mb base mcc
+  setup_rep mb rep_pc;
+  if count >= mb.rep_lmax then (backtrack [@tailcall]) mb base mcc
   else
-    (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
-    let cc = Char.code (String.unsafe_get mb.subject eptr) in
-    if not (Bool.equal (Int.equal cc c1 || Int.equal cc c2) want) then
-      (backtrack [@tailcall]) mb base mcc
+    let k = mb.rep_kind in
+    if Int.equal k rk_any then
+      (rep_bt_min_any [@tailcall]) mb base count eptr dd mcc
+    else if Int.equal k rk_anynl then
+      (rep_bt_min_anynl [@tailcall]) mb base count eptr dd mcc
+    else if eptr >= mb.end_subject then
+      let r = scheck_partial mb eptr in
+      if r < 0 then r else (backtrack [@tailcall]) mb base mcc
+    else if not (rep_unit_matches mb eptr) then (backtrack [@tailcall]) mb base mcc
     else
       let mcc' = tick_child mb mcc (dd + 1) in
       if mcc' < 0 then mcc'
       else (
         Array.unsafe_set d (base + 1) (count + 1);
         Array.unsafe_set d (base + 2) (eptr + 1);
-        (run [@tailcall]) mb cont (eptr + 1) sp (dd + 1) mcc')
+        (run [@tailcall]) mb mb.rep_cont (eptr + 1) sp (dd + 1) mcc')
 
-(* ---------- Single-char repeat superinstructions (§2/§4) ----------
+(* RM33 for OP_ANY (pcre2_match.c:3973-3989): the reiterated char must not be a
+   newline; a CR at the very end could be a partial CRLF. *)
+and rep_bt_min_any (mb : mb) (base : int) (count : int) (eptr : int) (dd : int)
+    (mcc : int) : int =
+  let d = mb.ss.Save_stack.data in
+  if eptr >= mb.end_subject then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (backtrack [@tailcall]) mb base mcc
+  else if is_newline_at mb eptr then (backtrack [@tailcall]) mb base mcc
+  else
+    let hit =
+      mb.partial <> 0
+      && eptr + 1 >= mb.end_subject
+      && Int.equal mb.nltype Newline.nltype_fixed
+      && Int.equal mb.nllen 2
+      && Int.equal (Char.code (String.unsafe_get mb.subject eptr)) mb.nl0
+    in
+    if hit then mb.hitend <- true;
+    if hit && mb.partial > 1 then Errors.error_partial
+    else
+      let mcc' = tick_child mb mcc (dd + 1) in
+      if mcc' < 0 then mcc'
+      else (
+        Array.unsafe_set d (base + 1) (count + 1);
+        Array.unsafe_set d (base + 2) (eptr + 1);
+        (run [@tailcall]) mb mb.rep_cont (eptr + 1)
+          (base + Save_stack.width_rep_min)
+          (dd + 1) mcc')
 
-   Forward execution of one repeat instruction (REP/REPI/NOTREP/NOTREPI).
-   The invariant parameters are stashed in [mb.rep_*] on entry so the tight
-   min-loop / greedy-scan pass only the varying (i, eptr) plus control state;
-   the KIND_REP_MIN backtrack re-reads them from the IR, so a nested repeat
-   inside the continuation may clobber [mb.rep_*] freely. Mirrors
-   repeatchar/repeatnotchar (interpreter.ml:3549-4128) for the non-UTF case. *)
+(* RM33 for OP_ANYNL (pcre2_match.c:3994-4017): one more \R sequence (CR then
+   optional LF, LF, or VT/FF/NEL outside the ANYCRLF convention). *)
+and rep_bt_min_anynl (mb : mb) (base : int) (count : int) (eptr : int)
+    (dd : int) (mcc : int) : int =
+  if eptr >= mb.end_subject then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (backtrack [@tailcall]) mb base mcc
+  else
+    (* safe: eptr < mb.end_subject <= String.length mb.subject. Branches are
+       inlined per case, exactly like the forward loop [rep_min_anynl] — no
+       tuple per iteration (§8). *)
+    let fc = Char.code (String.unsafe_get mb.subject eptr) in
+    let e = eptr + 1 in
+    if Int.equal fc Newline.char_cr then
+      let e' =
+        if
+          e < mb.end_subject
+          && Int.equal (Char.code (String.unsafe_get mb.subject e)) Newline.char_lf
+        then e + 1
+        else e
+      in
+      (rep_bt_min_anynl_step [@tailcall]) mb base count e' dd mcc
+    else if Int.equal fc Newline.char_lf then
+      (rep_bt_min_anynl_step [@tailcall]) mb base count e dd mcc
+    else if
+      Int.equal fc Newline.char_vt || Int.equal fc Newline.char_ff
+      || Int.equal fc Newline.char_nel
+    then
+      if mb.bsr_anycrlf then (backtrack [@tailcall]) mb base mcc
+      else (rep_bt_min_anynl_step [@tailcall]) mb base count e dd mcc
+    else (backtrack [@tailcall]) mb base mcc
+
+(* Shared epilogue of [rep_bt_min_anynl]: one more \R sequence matched, ending
+   at [e'] — tick, bump the record's count/eptr, retry the continuation
+   (the RM33 RMATCH). All-int tail call, no allocation (§8). *)
+and rep_bt_min_anynl_step (mb : mb) (base : int) (count : int) (e' : int)
+    (dd : int) (mcc : int) : int =
+  let mcc' = tick_child mb mcc (dd + 1) in
+  if mcc' < 0 then mcc'
+  else (
+    let d = mb.ss.Save_stack.data in
+    (* safe: base+1/base+2 are inside the popped REP_MIN record [backtrack]
+       located at data.(sp-1). *)
+    Array.unsafe_set d (base + 1) (count + 1);
+    Array.unsafe_set d (base + 2) e';
+    (run [@tailcall]) mb mb.rep_cont e'
+      (base + Save_stack.width_rep_min)
+      (dd + 1) mcc')
+
+(* ---------- Repeat superinstructions (§2/§4) ----------
+
+   Forward execution of one repeat instruction. [setup_rep] stashes the
+   invariant parameters in [mb.rep_*]; the tight min/greedy loops pass only the
+   varying (i, eptr) + control state. Mirrors repeatchar/repeatnotchar
+   (interpreter.ml:3549-4128), the class repeat (interpreter.ml:1807-1872) and
+   repeattype (interpreter.ml:4622-...) for the non-UTF case. *)
 and op_repeat (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
-  let code = mb.code in
-  let tag = code.(pc) in
-  let two = Int.equal tag 19 (* REPI *) || Int.equal tag 21 (* NOTREPI *) in
-  mb.rep_pc <- pc;
-  mb.rep_reptype <- code.(pc + 1);
-  mb.rep_lmin <- code.(pc + 2);
-  mb.rep_lmax <- code.(pc + 3);
-  let c1 = code.(pc + 4) in
-  mb.rep_c1 <- c1;
-  mb.rep_c2 <- (if two then code.(pc + 5) else c1);
-  mb.rep_want <- (Int.equal tag 18 (* REP *) || Int.equal tag 19 (* REPI *));
-  mb.rep_cont <- (pc + if two then 6 else 5);
-  (rep_min_loop [@tailcall]) mb 0 eptr sp rdepth mcc
+  setup_rep mb pc;
+  let k = mb.rep_kind in
+  if Int.equal k rk_allany then (rep_min_allany [@tailcall]) mb eptr sp rdepth mcc
+  else if Int.equal k rk_any then (rep_min_any [@tailcall]) mb 0 eptr sp rdepth mcc
+  else if Int.equal k rk_anynl then
+    (rep_min_anynl [@tailcall]) mb 0 eptr sp rdepth mcc
+  else (rep_min_loop [@tailcall]) mb 0 eptr sp rdepth mcc
 
-(* True iff subject[eptr] satisfies the repeat's char test. Caseful: c2 = c1,
-   so the disjunction is a single compare; caseless: c1/c2 the fcc fold-pair
-   (repeatchar_tail Loc = mb->fcc[Lc], pcre2_match.c:1393); NOT variants have
-   [rep_want] = false. safe: caller proves eptr < end_subject. *)
-and rep_char_matches (mb : mb) (eptr : int) : bool =
+(* True iff subject[eptr] satisfies the repeat's per-unit test, dispatching on
+   [mb.rep_kind] (fast-design.md §4). char: c1/c2 fold-pair vs want; ctype:
+   the ctypes mask vs want; class: the bitmap; hspace/vspace: the byte
+   predicate vs want; allany: always. safe: caller proves eptr < end_subject.
+   \R (rk_anynl) / OP_ANY (rk_any) are NOT here — variable-length / newline-
+   sensitive, handled by their dedicated loops. *)
+and rep_unit_matches (mb : mb) (eptr : int) : bool =
   let cc = Char.code (String.unsafe_get mb.subject eptr) in
-  Bool.equal (Int.equal cc mb.rep_c1 || Int.equal cc mb.rep_c2) mb.rep_want
+  let k = mb.rep_kind in
+  if Int.equal k rk_char then
+    Bool.equal (Int.equal cc mb.rep_c1 || Int.equal cc mb.rep_c2) mb.rep_want
+  else if Int.equal k rk_ctype then
+    Bool.equal
+      (not (Int.equal (Chartables.ctypes cc land mb.rep_mask) 0))
+      mb.rep_want
+  else if Int.equal k rk_class then class_bit_at mb mb.rep_map_off cc
+  else if Int.equal k rk_hspace then
+    Bool.equal (Char_predicates.hspace_byte cc) mb.rep_want
+  else if Int.equal k rk_vspace then
+    Bool.equal (Char_predicates.vspace_byte cc) mb.rep_want
+  else true (* rk_allany *)
 
 and rep_min_loop (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
   (* Ensure the minimum count in place, no ticks (repeatchar_ci_min
-     interpreter.ml:3727-3749; SCHECK_PARTIAL at/past end). *)
+     interpreter.ml:3727-3749 / class_min 4351 / typemin_ctype 4894;
+     SCHECK_PARTIAL at/past end). char / ctype / class / hspace / vspace. *)
   if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
   else if eptr >= mb.end_subject then
     let r = scheck_partial mb eptr in
     if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
-  else if not (rep_char_matches mb eptr) then (backtrack [@tailcall]) mb sp mcc
+  else if not (rep_unit_matches mb eptr) then (backtrack [@tailcall]) mb sp mcc
   else (rep_min_loop [@tailcall]) mb (i + 1) (eptr + 1) sp rdepth mcc
+
+(* OP_ALLANY / OP_ANYBYTE min loop (pcre2_match.c:3280-3287): one bound check
+   for [lmin] code units. The scheck fires at the ORIGINAL eptr (not a
+   per-char eptr), which the bulk form preserves. *)
+and rep_min_allany (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) :
+    int =
+  if eptr > mb.end_subject - mb.rep_lmin then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
+  else (rep_after_min [@tailcall]) mb (eptr + mb.rep_lmin) sp rdepth mcc
+
+(* OP_ANY min loop (pcre2_match.c:3258-3278): a newline stops the match; a CR
+   at the very end of the subject could be a partial CRLF. *)
+and rep_min_any (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
+  else if eptr >= mb.end_subject then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
+  else if is_newline_at mb eptr then (backtrack [@tailcall]) mb sp mcc
+  else
+    let hit =
+      mb.partial <> 0
+      && eptr + 1 >= mb.end_subject
+      && Int.equal mb.nltype Newline.nltype_fixed
+      && Int.equal mb.nllen 2
+      && Int.equal (Char.code (String.unsafe_get mb.subject eptr)) mb.nl0
+    in
+    if hit then mb.hitend <- true;
+    if hit && mb.partial > 1 then Errors.error_partial
+    else (rep_min_any [@tailcall]) mb (i + 1) (eptr + 1) sp rdepth mcc
+
+(* OP_ANYNL min loop (pcre2_match.c:3302-3332): CR absorbs a following LF; LF;
+   VT/FF/NEL unless the ANYCRLF convention. *)
+and rep_min_anynl (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
+  else if eptr >= mb.end_subject then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
+  else
+    (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
+    let fc = Char.code (String.unsafe_get mb.subject eptr) in
+    let e = eptr + 1 in
+    if Int.equal fc Newline.char_cr then
+      let e' =
+        if
+          e < mb.end_subject
+          && Int.equal (Char.code (String.unsafe_get mb.subject e)) Newline.char_lf
+        then e + 1
+        else e
+      in
+      (rep_min_anynl [@tailcall]) mb (i + 1) e' sp rdepth mcc
+    else if Int.equal fc Newline.char_lf then
+      (rep_min_anynl [@tailcall]) mb (i + 1) e sp rdepth mcc
+    else if
+      Int.equal fc Newline.char_vt || Int.equal fc Newline.char_ff
+      || Int.equal fc Newline.char_nel
+    then
+      if mb.bsr_anycrlf then (backtrack [@tailcall]) mb sp mcc
+      else (rep_min_anynl [@tailcall]) mb (i + 1) e sp rdepth mcc
+    else (backtrack [@tailcall]) mb sp mcc
 
 and rep_after_min (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) :
     int =
@@ -851,8 +1213,8 @@ and rep_after_min (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) :
     (* Lmin == Lmax (EXACT / degenerate): continue in place, no tick. *)
     (run [@tailcall]) mb mb.rep_cont eptr sp rdepth mcc
   else if Int.equal mb.rep_reptype Ir.reptype_min then (
-    (* Minimize: RMATCH the continuation (RM25/RM27) — tick + push REP_MIN,
-       run at rdepth+1. *)
+    (* Minimize: RMATCH the continuation (RM25/RM27/RM23/RM33) — tick + push
+       REP_MIN, run at rdepth+1. *)
     let mcc' = tick_child mb mcc (rdepth + 1) in
     if mcc' < 0 then mcc'
     else (
@@ -867,21 +1229,104 @@ and rep_after_min (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) :
       Array.unsafe_set d (sp + 4) Save_stack.kind_rep_min;
       (run [@tailcall]) mb mb.rep_cont eptr need (rdepth + 1) mcc'))
   else (
-    (* Maximize or possessive: greedy scan from Lmin. floor = Lstart_eptr. *)
+    (* Maximize or possessive: greedy scan from Lmin. floor = Lstart_eptr.
+       Dispatch to the per-kind greedy scan. *)
     mb.rep_floor <- eptr;
-    (rep_greedy [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc)
+    let k = mb.rep_kind in
+    if Int.equal k rk_allany then
+      (rep_greedy_allany [@tailcall]) mb eptr sp rdepth mcc
+    else if Int.equal k rk_any then
+      (rep_greedy_any [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc
+    else if Int.equal k rk_anynl then
+      (rep_greedy_anynl [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc
+    else (rep_greedy [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc)
 
 and rep_greedy (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
-  (* Greedy scan up to Lmax (repeatchar_ci_maxscan interpreter.ml:3766-3791):
-     stop at Lmax, at a char mismatch, or at end_subject (SCHECK_PARTIAL). *)
-  if i >= mb.rep_lmax then (rep_greedy_done [@tailcall]) mb eptr sp rdepth mcc
+  (* Greedy scan up to Lmax (repeatchar_ci_maxscan interpreter.ml:3766-3791 /
+     class_maxscan 4402 / typemax_ctype 5480): stop at Lmax, at a mismatch, or
+     at end_subject (SCHECK_PARTIAL). char / ctype / class / hspace / vspace. *)
+  if i >= mb.rep_lmax then (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
   else if eptr >= mb.end_subject then
     let r = scheck_partial mb eptr in
-    if r < 0 then r else (rep_greedy_done [@tailcall]) mb eptr sp rdepth mcc
-  else if not (rep_char_matches mb eptr) then
-    (rep_greedy_done [@tailcall]) mb eptr sp rdepth mcc
+    if r < 0 then r else (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+  else if not (rep_unit_matches mb eptr) then
+    (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
   else (rep_greedy [@tailcall]) mb (i + 1) (eptr + 1) sp rdepth mcc
+
+(* OP_ALLANY / OP_ANYBYTE greedy (pcre2_match.c:4748-4757): grab up to
+   (Lmax - Lmin) more code units, or to end_subject (with the SCHECK). *)
+and rep_greedy_allany (mb : mb) (eptr : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  let n = mb.rep_lmax - mb.rep_lmin in
+  let avail = mb.end_subject - eptr in
+  if n > avail then
+    let r = scheck_partial mb mb.end_subject in
+    if r < 0 then r
+    else (rep_greedy_done_dispatch [@tailcall]) mb mb.end_subject sp rdepth mcc
+  else (rep_greedy_done_dispatch [@tailcall]) mb (eptr + n) sp rdepth mcc
+
+(* OP_ANY greedy (pcre2_match.c:4726-4746): stop at a newline; a CR at the very
+   end could be a partial CRLF. *)
+and rep_greedy_any (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  if i >= mb.rep_lmax then (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+  else if eptr >= mb.end_subject then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+  else if is_newline_at mb eptr then
+    (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+  else
+    let hit =
+      mb.partial <> 0
+      && eptr + 1 >= mb.end_subject
+      && Int.equal mb.nltype Newline.nltype_fixed
+      && Int.equal mb.nllen 2
+      && Int.equal (Char.code (String.unsafe_get mb.subject eptr)) mb.nl0
+    in
+    if hit then mb.hitend <- true;
+    if hit && mb.partial > 1 then Errors.error_partial
+    else (rep_greedy_any [@tailcall]) mb (i + 1) (eptr + 1) sp rdepth mcc
+
+(* OP_ANYNL greedy (pcre2_match.c:4759-4784): CR (absorb LF; a lone CR at end
+   breaks after being consumed), LF, or VT/FF/NEL outside ANYCRLF. *)
+and rep_greedy_anynl (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  if i >= mb.rep_lmax then (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+  else if eptr >= mb.end_subject then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+  else
+    (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
+    let fc = Char.code (String.unsafe_get mb.subject eptr) in
+    if Int.equal fc Newline.char_cr then
+      let e = eptr + 1 in
+      if e >= mb.end_subject then
+        (rep_greedy_done_dispatch [@tailcall]) mb e sp rdepth mcc
+      else
+        let e' =
+          if Int.equal (Char.code (String.unsafe_get mb.subject e)) Newline.char_lf
+          then e + 1
+          else e
+        in
+        (rep_greedy_anynl [@tailcall]) mb (i + 1) e' sp rdepth mcc
+    else if
+      (not (Int.equal fc Newline.char_lf))
+      && (mb.bsr_anycrlf
+         || (not (Int.equal fc Newline.char_vt))
+            && (not (Int.equal fc Newline.char_ff))
+            && not (Int.equal fc Newline.char_nel))
+    then (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+    else (rep_greedy_anynl [@tailcall]) mb (i + 1) (eptr + 1) sp rdepth mcc
+
+(* After a greedy scan to [pmax]: a CLASS repeat backtracks with the floor
+   position itself a ticked child (pcre2_match.c:2143 `>=`); every other kind
+   tries the floor in place. *)
+and rep_greedy_done_dispatch (mb : mb) (pmax : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  if Int.equal mb.rep_kind rk_class then
+    (rep_greedy_done_class [@tailcall]) mb pmax sp rdepth mcc
+  else (rep_greedy_done [@tailcall]) mb pmax sp rdepth mcc
 
 and rep_greedy_done (mb : mb) (pmax : int) (sp : int) (rdepth : int) (mcc : int)
     : int =
@@ -890,11 +1335,12 @@ and rep_greedy_done (mb : mb) (pmax : int) (sp : int) (rdepth : int) (mcc : int)
     (run [@tailcall]) mb mb.rep_cont pmax sp rdepth mcc
   else if Int.equal pmax mb.rep_floor then
     (* Maximize matched exactly Lmin: in place at rdepth, no tick (maxbt
-       eptr == Lstart_eptr -> dispatch, interpreter.ml:3807-3808). *)
+       eptr == Lstart_eptr -> dispatch, interpreter.ml:3807-3808 / 5522). *)
     (run [@tailcall]) mb mb.rep_cont pmax sp rdepth mcc
   else
     (* Maximize with extra chars: try the greedy end first (RMATCH -> tick,
-       rdepth+1), push REP_MAX to give back down to floor. *)
+       rdepth+1), push REP_MAX to give back down to floor. The first stored
+       give-back position carries the \R mid-CRLF correction. *)
     let mcc' = tick_child mb mcc (rdepth + 1) in
     if mcc' < 0 then mcc'
     else (
@@ -903,11 +1349,143 @@ and rep_greedy_done (mb : mb) (pmax : int) (sp : int) (rdepth : int) (mcc : int)
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
       let d = ss.Save_stack.data in
       Array.unsafe_set d sp mb.rep_pc;
-      Array.unsafe_set d (sp + 1) (pmax - 1) (* try_pos *);
+      Array.unsafe_set d (sp + 1) (giveback_pos mb mb.rep_pc mb.rep_floor (pmax - 1));
       Array.unsafe_set d (sp + 2) mb.rep_floor;
       Array.unsafe_set d (sp + 3) rdepth;
       Array.unsafe_set d (sp + 4) Save_stack.kind_rep_max;
       (run [@tailcall]) mb mb.rep_cont pmax need (rdepth + 1) mcc')
+
+(* CLASS maximize (pcre2_match.c:2143-2150): the floor position is itself a
+   ticked RMATCH (`while Feptr >= Lstart`), so ALWAYS push (even pmax == floor)
+   and give back down to and including floor; below floor -> NOMATCH. *)
+and rep_greedy_done_class (mb : mb) (pmax : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  if Int.equal mb.rep_reptype Ir.reptype_pos then
+    (run [@tailcall]) mb mb.rep_cont pmax sp rdepth mcc
+  else
+    let mcc' = tick_child mb mcc (rdepth + 1) in
+    if mcc' < 0 then mcc'
+    else (
+      let ss = mb.ss in
+      let need = sp + Save_stack.width_rep_max in
+      if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+      let d = ss.Save_stack.data in
+      Array.unsafe_set d sp mb.rep_pc;
+      Array.unsafe_set d (sp + 1) (pmax - 1) (* next give-back (class: no CRLF) *);
+      Array.unsafe_set d (sp + 2) mb.rep_floor;
+      Array.unsafe_set d (sp + 3) rdepth;
+      Array.unsafe_set d (sp + 4) Save_stack.kind_rep_max;
+      (run [@tailcall]) mb mb.rep_cont pmax need (rdepth + 1) mcc')
+
+(* Single character type (fast-design.md §2; the non-UTF single-type arms
+   pcre2_match.c:947-2470). OP_ANY (newline-sensitive) and OP_ANYNL (variable
+   length) are special; every other supported type is one code unit tested by
+   [simple_type_match]. *)
+and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
+    (rdepth : int) (mcc : int) : int =
+  if Int.equal type_op Opcodes.op_any then (
+    (* OP_ANY (pcre2_match.c:947-958 + op_allany tail 962-973). *)
+    if is_newline_at mb eptr then (backtrack [@tailcall]) mb sp mcc
+    else if
+      mb.partial <> 0
+      && Int.equal eptr (mb.end_subject - 1)
+      && Int.equal mb.nltype Newline.nltype_fixed
+      && Int.equal mb.nllen 2
+      (* safe: eptr = end_subject - 1 < String.length subject. *)
+      && Int.equal (Char.code (String.unsafe_get mb.subject eptr)) mb.nl0
+    then (
+      mb.hitend <- true;
+      if mb.partial > 1 then Errors.error_partial
+      else (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc)
+    else if eptr >= mb.end_subject then (
+      let r = scheck_partial mb eptr in
+      if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+    else (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc)
+  else if Int.equal type_op Opcodes.op_anynl then (
+    (* OP_ANYNL \R (pcre2_match.c:2377-2409). *)
+    if eptr >= mb.end_subject then (
+      let r = scheck_partial mb eptr in
+      if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+    else
+      (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
+      let fc = Char.code (String.unsafe_get mb.subject eptr) in
+      let e = eptr + 1 in
+      if Int.equal fc Newline.char_cr then
+        if e >= mb.end_subject then (
+          (* a lone CR at the end: could be a partial CRLF. *)
+          let r = scheck_partial mb e in
+          if r < 0 then r else (run [@tailcall]) mb (pc + 2) e sp rdepth mcc)
+        else
+          let e' =
+            if
+              Int.equal (Char.code (String.unsafe_get mb.subject e)) Newline.char_lf
+            then e + 1
+            else e
+          in
+          (run [@tailcall]) mb (pc + 2) e' sp rdepth mcc
+      else if Int.equal fc Newline.char_lf then
+        (run [@tailcall]) mb (pc + 2) e sp rdepth mcc
+      else if
+        Int.equal fc Newline.char_vt || Int.equal fc Newline.char_ff
+        || Int.equal fc Newline.char_nel
+      then
+        if mb.bsr_anycrlf then (backtrack [@tailcall]) mb sp mcc
+        else (run [@tailcall]) mb (pc + 2) e sp rdepth mcc
+      else (backtrack [@tailcall]) mb sp mcc)
+  else if eptr >= mb.end_subject then (
+    (* the simple 1-unit predicate types (\d \D \s \S \w \W / \h \H \v \V /
+       OP_ALLANY / OP_ANYBYTE): SCHECK_PARTIAL at/past end, then NOMATCH. *)
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+  else
+    (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
+    let cc = Char.code (String.unsafe_get mb.subject eptr) in
+    if simple_type_match type_op cc then
+      (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc
+    else (backtrack [@tailcall]) mb sp mcc
+
+(* WORDBOUND \b / \B, non-UCP (pcre2_match.c:6258-6333 /
+   interpreter.ml:3181-3332). [want] = 1 for \b (OP_WORD_BOUNDARY: a boundary
+   is required, so NOMATCH when cur == prev), 0 for \B (the reverse). The
+   previous-char read lowers [start_used_ptr] (the SCHECK_PARTIAL floor)
+   exactly as the C's earliest-consulted tracking (pcre2_match.c:6280); the
+   latest-consulted (last_used_ptr) only feeds rightchar/allusedtext, which the
+   fast seam does not carry, so it is not tracked. *)
+and op_wordbound (mb : mb) (pc : int) (want : int) (eptr : int) (sp : int)
+    (rdepth : int) (mcc : int) : int =
+  let prev_is_word =
+    if Int.equal eptr mb.start_subject then false
+    else
+      let lastptr = eptr - 1 in
+      (* safe: 0 <= lastptr < eptr <= end_subject <= String.length subject. *)
+      let fc = Char.code (String.unsafe_get mb.subject lastptr) in
+      if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
+      not (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0)
+  in
+  if eptr >= mb.end_subject then (
+    let r = scheck_partial mb eptr in
+    if r < 0 then r
+    else (word_bound_test [@tailcall]) mb pc want prev_is_word false eptr sp rdepth mcc)
+  else
+    (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
+    let fc = Char.code (String.unsafe_get mb.subject eptr) in
+    let cur_is_word =
+      not (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0)
+    in
+    (word_bound_test [@tailcall]) mb pc want prev_is_word cur_is_word eptr sp
+      rdepth mcc
+
+and word_bound_test (mb : mb) (pc : int) (want : int) (prev_is_word : bool)
+    (cur_is_word : bool) (eptr : int) (sp : int) (rdepth : int) (mcc : int) : int
+    =
+  (* pcre2_match.c:6328-6332 — \b: NOMATCH when cur == prev; \B: NOMATCH when
+     cur != prev. *)
+  let fail =
+    if Int.equal want 1 then Bool.equal cur_is_word prev_is_word
+    else not (Bool.equal cur_is_word prev_is_word)
+  in
+  if fail then (backtrack [@tailcall]) mb sp mcc
+  else (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
 
 and op_eod (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
@@ -1270,6 +1848,11 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
         (* Fill the match block (interpreter.ml:9868-9962 field block). *)
         mb.code <- ir.Ir.code;
         mb.lit <- ir.Ir.lit;
+        (* Chunk E: the shared compiler's bytecode (class bitmaps live here) and
+           the \R newline convention. *)
+        mb.bytecode <- re.Compile.code;
+        mb.bsr_anycrlf <-
+          Int.equal re.Compile.bsr_convention Options.bsr_anycrlf;
         mb.subject <- subject;
         mb.end_subject <- length;
         mb.start_subject <- 0;
@@ -1451,7 +2034,12 @@ let () =
   assert (Int.equal Ir.t_braminzero 24);
   assert (Int.equal Ir.t_ket_rmax 25);
   assert (Int.equal Ir.t_ket_rmin 26);
-  assert (Int.equal Ir.max_tag 26);
+  assert (Int.equal Ir.t_type 27);
+  assert (Int.equal Ir.t_class 28);
+  assert (Int.equal Ir.t_wordbound 29);
+  assert (Int.equal Ir.t_type_rep 30);
+  assert (Int.equal Ir.t_class_rep 31);
+  assert (Int.equal Ir.max_tag 31);
   (* Save-record KIND / width constants the runner inlines as literals. *)
   assert (Int.equal Save_stack.kind_alt 0);
   assert (Int.equal Save_stack.kind_cap 1);

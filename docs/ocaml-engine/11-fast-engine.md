@@ -90,8 +90,31 @@ interpreter is its differential oracle. Approved plan:
   interpreter (the oracle) ticks one per copy; porting it would tick fewer times
   and break the §4 LIMIT_MATCH tick parity. Not a coverage gap — a differential-
   contract decision (fast-design.md §2).
-- [ ] **E — Classes/types** — CLASS/NCLASS bitmap, XCLASS (via `Xclass`), type
-  singles+repeats; charpos loops (`:11831-12022`).
+- [x] **E — Classes/types** — CLASS/NCLASS bitmap (byte offset into re.code;
+  in non-UTF both reduce to the 32-byte bitmap probe) + class repeats
+  (OP_CR*, incl. the CLASS-maxbt floor tick, pcre2_match.c:2143); single
+  character types TYPE (\D\d\S\s\W\w / . / \C / \R / \h\H\v\V, with the OP_ANY
+  newline+CRLF-partial and OP_ANYNL variable-length arms) + type repeats
+  (OP_TYPESTAR..OP_TYPEPOSUPTO); single negated char OP_NOT/OP_NOTI (as a
+  NOT-rep{1,1}); \b/\B non-UCP (WORDBOUND, lowering start_used_ptr). New IR tags
+  TYPE/CLASS/WORDBOUND/TYPE_REP/CLASS_REP (27-31); the type/class repeats reuse
+  the four REP superinstructions' KIND_REP_MIN/MAX records + machinery
+  (`setup_rep` decode, `rep_kind` dispatch), \R give-back skips mid-CRLF
+  (`giveback_pos`). A tiny cited extraction `Char_predicates.hspace_byte/
+  vspace_byte` is now shared by the interpreter and the fast runner (no
+  behavior change — engine conformance byte-identical). Ratchet 770 → 1185;
+  fuzz fast-vs-interp clean over 310k+ cases. **Declined to chunk I:** OP_XCLASS
+  (in non-UTF/non-UCP the compiler only emits it for a \p/\P in a class, which
+  needs the property machinery — compile.ml:2199-2281, xclass ⟹ xclass_has_prop),
+  OP_PROP/OP_NOTPROP/OP_EXTUNI, the UCP word boundaries.
+  **charpos (`pcre2_jit_compile.c:11831-12130`) NOT ported — permanent
+  differential-contract decision (fast-design.md §2), same class as
+  detect_repeat.** It optimises a greedy type/class repeat followed by a fixed
+  char (`.*x`) by scanning for that char instead of trying the continuation at
+  every give-back position; those shapes now occur, but skipping the
+  non-matching positions ticks FEWER times than the interpreter (which RMATCHes
+  every give-back position, incl. failures), breaking §4 LIMIT_MATCH tick
+  parity. The per-position give-back is tick-identical without it.
 - [ ] **F — Backreferences** — REF/REFI/DNREF/DNREFI + ref repeats.
 - [ ] **G — Lookaround/atomic** — ASSERT* families, REVERSE/VREVERSE, ONCE.
 - [ ] **H — Verbs** — MARK/PRUNE/SKIP/THEN/COMMIT (+_ARG), ACCEPT/FAIL; SKIP_ARG rerun

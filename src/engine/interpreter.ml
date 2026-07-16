@@ -454,20 +454,13 @@ type match_state = {
   mutable assert_accept_frame : int; (* pcre2_match.c:604; -1 = NULL *)
 }
 
-(* pcre2_internal.h:424-427 — HSPACE_BYTE_CASES: HT, SPACE, NBSP. The
-   8-bit code-unit switches in pcre2_match.c use only these (the
-   HSPACE_MULTIBYTE_CASES arms are compiled out at
-   PCRE2_CODE_UNIT_WIDTH == 8). *)
-let hspace_byte (c : int) : bool =
-  Int.equal c 0x09 || Int.equal c 0x20 || Int.equal c 0xa0
+(* pcre2_internal.h:424-427 — HSPACE_BYTE_CASES: HT, SPACE, NBSP.
+   pcre2_internal.h:440-445 — VSPACE_BYTE_CASES: LF, VT, FF, CR, NEL. Extracted
+   to Char_predicates so the interpreter and the M11 fast engine share one
+   definition (no behavior change — the bodies are identical). *)
+let hspace_byte = Char_predicates.hspace_byte
 
-(* pcre2_internal.h:440-445 — VSPACE_BYTE_CASES: LF, VT, FF, CR, NEL. *)
-let vspace_byte (c : int) : bool =
-  Int.equal c Newline.char_lf
-  || Int.equal c Newline.char_vt
-  || Int.equal c Newline.char_ff
-  || Int.equal c Newline.char_cr
-  || Int.equal c Newline.char_nel
+let vspace_byte = Char_predicates.vspace_byte
 
 (* pcre2_internal.h:416-431 — HSPACE_CASES: the byte cases plus
    HSPACE_MULTIBYTE_CASES, for the UTF repeat loops that switch on a

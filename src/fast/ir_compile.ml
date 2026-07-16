@@ -35,32 +35,27 @@ let reason_of_op (op : int) : string =
   (* Simple-anchor variants and boundaries whose runtime semantics arrive
      with the runner (chunk C2+). *)
   if Int.equal op Op.op_set_som then named "\\K" "C2+"
-  else if Int.equal op Op.op_not_word_boundary then named "\\B" "C2+"
-  else if Int.equal op Op.op_word_boundary then named "\\b" "C2+"
-  else if Int.equal op Op.op_not_ucp_word_boundary then named "\\B (ucp)" "C2+"
-  else if Int.equal op Op.op_ucp_word_boundary then named "\\b (ucp)" "C2+"
-    (* UTF / UCP property machinery (chunk I). *)
+    (* UTF / UCP property machinery (chunk I). The UCP word-boundary opcodes
+       (OP_*_UCP_WORD_BOUNDARY) use Unicode properties even without UTF; the
+       non-UCP \b / \B (OP_WORD_BOUNDARY / OP_NOT_WORD_BOUNDARY) are handled in
+       [compile_branch]. *)
+  else if Int.equal op Op.op_not_ucp_word_boundary then named "\\B (ucp)" "I"
+  else if Int.equal op Op.op_ucp_word_boundary then named "\\b (ucp)" "I"
   else if Int.equal op Op.op_prop then named "\\p" "I"
   else if Int.equal op Op.op_notprop then named "\\P" "I"
   else if Int.equal op Op.op_extuni then named "\\X" "I"
-    (* Character types and \R / \h \H \v \V and any/allany/anybyte (chunk E). *)
-  else if op >= Op.op_not_digit && op <= Op.op_anybyte then
-    named "character type" "E"
-  else if op >= Op.op_anynl && op <= Op.op_vspace then named "character type" "E"
-    (* Negated single chars (chunk E). *)
-  else if Int.equal op Op.op_not || Int.equal op Op.op_noti then
-    named "negated char" "E"
-    (* Character-type repeats OP_TYPESTAR..OP_TYPEPOSUPTO (chunk E); the
-       single-char repeats OP_STAR..OP_NOTPOSUPTOI (33-84) are handled. *)
-  else if op >= Op.op_typestar && op <= Op.op_typeposupto then
-    named "type repeat" "E"
-    (* Class / ref repeat quantifiers OP_CRSTAR..OP_CRPOSRANGE (chunk E). *)
+    (* Class / ref repeat quantifiers OP_CRSTAR..OP_CRPOSRANGE: a class repeat
+       is consumed inline after its OP_CLASS/OP_NCLASS in [compile_branch]; a
+       standalone CR* here can only follow an (out-of-subset) OP_REF (chunk
+       F). *)
   else if op >= Op.op_crstar && op <= Op.op_crposrange then
-    named "class/ref repeat" "E"
-    (* Classes (chunk E). *)
-  else if Int.equal op Op.op_class then named "OP_CLASS" "E"
-  else if Int.equal op Op.op_nclass then named "OP_NCLASS" "E"
-  else if Int.equal op Op.op_xclass then named "OP_XCLASS" "E"
+    named "ref repeat" "F"
+    (* OP_XCLASS: in non-UTF/non-UCP the compiler only emits OP_XCLASS for a
+       class containing a Unicode property (\p/\P) — see compile.ml:2199-2281,
+       where xclass=true implies xclass_has_prop=true (wide chars > 255 cannot
+       occur non-UTF). Matching it needs the property machinery, so it is
+       declined to chunk I rather than ported. *)
+  else if Int.equal op Op.op_xclass then named "OP_XCLASS (\\p in class)" "I"
     (* Back references (chunk F). *)
   else if Int.equal op Op.op_ref then named "OP_REF" "F"
   else if Int.equal op Op.op_refi then named "OP_REFI" "F"
@@ -165,6 +160,52 @@ let rep_bounds (fidx : int) (count : int) : int * int * int =
 (* fidx that carry an IMM2 count before the char (UPTO/MINUPTO/EXACT/POSUPTO). *)
 let rep_has_count (fidx : int) : bool =
   Int.equal fidx 6 || Int.equal fidx 7 || Int.equal fidx 8 || Int.equal fidx 12
+
+(* ---------- Class-repeat decode (fast-design.md §2/§4) ----------
+
+   Decode a class/ref repeat quantifier OP_CRSTAR..OP_CRPOSRANGE (98-109) at
+   bytecode offset [q] into (reptype, lmin, lmax, byte_len). Mirrors the
+   OP_CLASS repeat dispatch (pcre2_match.c:1939-1971 / interpreter.ml
+   :1830-1872) via the rep_min/rep_max/rep_typ tables, indexed by
+   [q_op - OP_CRSTAR] (STAR MINSTAR PLUS MINPLUS QUERY MINQUERY RANGE MINRANGE
+   POSSTAR POSPLUS POSQUERY POSRANGE). The three RANGE forms read GET2 bounds
+   (a zero max means infinity). *)
+let cr_bounds (src : Bytes.t) (q : int) : int * int * int * int =
+  let crop = Char.code (Bytes.get src q) in
+  let idx = crop - Op.op_crstar in
+  match idx with
+  | 0 -> (Ir.reptype_max, 0, Ir.rep_inf, 1) (* CRSTAR *)
+  | 1 -> (Ir.reptype_min, 0, Ir.rep_inf, 1) (* CRMINSTAR *)
+  | 2 -> (Ir.reptype_max, 1, Ir.rep_inf, 1) (* CRPLUS *)
+  | 3 -> (Ir.reptype_min, 1, Ir.rep_inf, 1) (* CRMINPLUS *)
+  | 4 -> (Ir.reptype_max, 0, 1, 1) (* CRQUERY *)
+  | 5 -> (Ir.reptype_min, 0, 1, 1) (* CRMINQUERY *)
+  | 8 -> (Ir.reptype_pos, 0, Ir.rep_inf, 1) (* CRPOSSTAR *)
+  | 9 -> (Ir.reptype_pos, 1, Ir.rep_inf, 1) (* CRPOSPLUS *)
+  | 10 -> (Ir.reptype_pos, 0, 1, 1) (* CRPOSQUERY *)
+  | 6 | 7 | 11 ->
+      (* CRRANGE (6) / CRMINRANGE (7) / CRPOSRANGE (11): GET2 min, GET2 max
+         (0 => infinity); item length 1 + 2*IMM2. *)
+      let reptype =
+        if Int.equal idx 7 then Ir.reptype_min
+        else if Int.equal idx 11 then Ir.reptype_pos
+        else Ir.reptype_max
+      in
+      let lmin = C.get2 src (q + 1) in
+      let lmaxv = C.get2 src (q + 1 + Limits.imm2_size) in
+      let lmax = if Int.equal lmaxv 0 then Ir.rep_inf else lmaxv in
+      (reptype, lmin, lmax, 1 + (2 * Limits.imm2_size))
+  | _ -> (Ir.reptype_max, 1, 1, 1) (* not a CR opcode (defensive) *)
+
+let is_cr_op (op : int) : bool = op >= Op.op_crstar && op <= Op.op_crposrange
+
+(* A character-type opcode the fast engine matches in the non-UTF subset:
+   \D \d \S \s \W \w (ctypes), . (OP_ANY), OP_ALLANY/OP_ANYBYTE, \R (OP_ANYNL),
+   \h \H \v \V. OP_PROP/OP_NOTPROP/OP_EXTUNI need the property machinery (chunk
+   I) and are excluded here. *)
+let is_supported_type (op : int) : bool =
+  (op >= Op.op_not_digit && op <= Op.op_anybyte)
+  || (op >= Op.op_anynl && op <= Op.op_vspace)
 
 (* ---------- optimized_cbracket analysis (pcre2_jit_compile.c:404) ----------
 
@@ -534,6 +575,81 @@ let compile (re : C.re) : (Ir.t, string) result =
           in
           let ket_off = find_ket bra_off in
           p := ket_off + Op.op_lengths.(byte ket_off))
+        else if Int.equal op Op.op_not || Int.equal op Op.op_noti then (
+          (* Single negated char (pcre2_match.c:1107-1174 non-UTF;
+             interpreter.ml:1701-1717): "not this char", caseless via fcc for
+             OP_NOTI. Lowered as a NOT-char repeat with lmin=lmax=1 — min==max
+             creates no choice point and no tick, identical to the single arm
+             (repeatnotchar's Lmin==Lmax continue, pcre2_match.c:1483-1485). *)
+          let caseless = Int.equal op Op.op_noti in
+          let c1 = byte (!p + 1) in
+          push (if caseless then Ir.t_notrepi else Ir.t_notrep);
+          push Ir.reptype_min (* unread when lmin=lmax *);
+          push 1;
+          push 1;
+          push c1;
+          if caseless then push (Chartables.fcc c1);
+          p := !p + Op.op_lengths.(op))
+        else if Int.equal op Op.op_class || Int.equal op Op.op_nclass then (
+          (* OP_CLASS / OP_NCLASS (pcre2_match.c:1933-1972). In non-UTF every
+             code unit is 0..255, so both opcodes reduce to the 32-byte bitmap
+             test (class_bit, interpreter.ml:721); the bitmap stays in re.code
+             and the IR records its byte offset (like the JIT / XCLASS, no
+             copy). A following OP_CR* quantifier folds into a t_class_rep
+             (pcre2_match.c:1939-1966); otherwise a single t_class. *)
+          let map_off = !p + 1 in
+          let after = !p + Op.op_lengths.(op) (* past the 32-byte bitmap *) in
+          let nx = byte after in
+          if is_cr_op nx then (
+            let reptype, lmin, lmax, crlen = cr_bounds src after in
+            push Ir.t_class_rep;
+            push reptype;
+            push lmin;
+            push lmax;
+            push map_off;
+            p := after + crlen)
+          else (
+            push Ir.t_class;
+            push map_off;
+            p := after))
+        else if op >= Op.op_typestar && op <= Op.op_typeposupto then (
+          (* Character-type repeat OP_TYPESTAR..OP_TYPEPOSUPTO
+             (pcre2_match.c:2651-2701). The type opcode follows the optional
+             IMM2 count (UPTO/MINUPTO/EXACT/POSUPTO); a \p/\P or \X type needs
+             the property machinery, declined to chunk I. *)
+          let fidx = op - Op.op_typestar in
+          let count = if rep_has_count fidx then C.get2 src (!p + 1) else 0 in
+          let reptype, lmin, lmax = rep_bounds fidx count in
+          let type_off =
+            if rep_has_count fidx then !p + 1 + Limits.imm2_size else !p + 1
+          in
+          let tp = byte type_off in
+          if not (is_supported_type tp) then
+            raise (Unsupported (reason_of_op tp));
+          push Ir.t_type_rep;
+          push reptype;
+          push lmin;
+          push lmax;
+          push tp;
+          p := !p + Op.op_lengths.(op))
+        else if is_supported_type op then (
+          (* Single character type (pcre2_match.c:2305-2470 non-UTF; the
+             \D \d \S \s \W \w / . (OP_ANY) / \C (OP_ALLANY) / \R (OP_ANYNL) /
+             \h \H \v \V single arms). One code unit consumed; no choice
+             point, no tick. *)
+          push Ir.t_type;
+          push op;
+          p := !p + Op.op_lengths.(op))
+        else if
+          Int.equal op Op.op_word_boundary
+          || Int.equal op Op.op_not_word_boundary
+        then (
+          (* \b / \B, non-UCP (pcre2_match.c:6258-6333 /
+             interpreter.ml:3181-3332). want=1 for OP_WORD_BOUNDARY (\b),
+             want=0 for OP_NOT_WORD_BOUNDARY (\B). *)
+          push Ir.t_wordbound;
+          push (if Int.equal op Op.op_word_boundary then 1 else 0);
+          p := !p + Op.op_lengths.(op))
         else
           match anchor_tag op with
           | Some tag ->

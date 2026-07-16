@@ -22,14 +22,16 @@
         JIT's optimized cbracket entry-save / exhaustion-restore
         (pcre2_jit_compile.c:11045-11054 / 13443-13452).
      KIND_REP_MAX (width 5): [rep_pc; try_pos; floor; rdepth; KIND_REP_MAX]
-        a greedy single-char repeat: on backtrack retry the continuation at
-        [try_pos] (decrementing down to [floor]); rep_pc re-derives the
-        continuation pc. Mirrors repeatchar's RM26/RM28 (interpreter.ml
-        :3800-3809 / 7192-7243).
+        a greedy char / type / class repeat (chunk E reuses this): on backtrack
+        retry the continuation at [try_pos] (decrementing down to [floor]; a \R
+        repeat skips mid-CRLF; a CLASS repeat also tries [floor] itself with a
+        tick); rep_pc re-derives the kind + continuation pc via setup_rep.
+        Mirrors repeatchar's RM26/RM28 (interpreter.ml:3800-3809 / 7192-7243),
+        the class maxbt RM24 (:4436) and the type maxbt RM34 (:5515).
      KIND_REP_MIN (width 5): [rep_pc; count; eptr; rdepth; KIND_REP_MIN]
-        a minimizing single-char repeat: on backtrack match one more char at
-        [eptr] (count from [count] up to lmax) and retry. Mirrors RM25/RM27
-        (interpreter.ml:3758 / 7155-7234).
+        a minimizing char / type / class repeat: on backtrack match one more
+        unit at [eptr] (count from [count] up to lmax) and retry. Mirrors
+        RM25/RM27 (char), RM23 (class, :7325) and RM33 (type, :7364).
      KIND_CONT     (width 4): [target; eptr; rdepth; KIND_CONT]
         a chunk-D2 group choice point that, on backtrack, resumes at IR index
         [target] with [eptr]/[rdepth] restored and NO tick (the C's same-frame

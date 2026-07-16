@@ -405,6 +405,53 @@ let goldens : (string * string) list =
     (* SKIPZERO: a {0}-quantified group is elided entirely (no IR). *)
     ( "(?:abc){0}x",
       g [ "  0 BRA"; "  1 CHAR_RUN \"x\""; "  4 KET"; "  5 END" ] );
+    (* --- Chunk E: classes, types, word boundaries --- *)
+    (* A class (any of [abc] / [a-z]) compiles to one 32-byte-bitmap CLASS; the
+       IR records the map's byte offset in re.code. *)
+    ("[abc]", g [ "  0 BRA"; "  1 CLASS map=4"; "  3 KET"; "  4 END" ]);
+    ("[a-z]", g [ "  0 BRA"; "  1 CLASS map=4"; "  3 KET"; "  4 END" ]);
+    (* [^a] is a single negated char (OP_NOT), lowered as a NOT-char repeat
+       with lmin=lmax=1 (no choice point). *)
+    ( "[^a]",
+      g [ "  0 BRA"; "  1 NOTREP min {1,1} \"a\""; "  6 KET"; "  7 END" ] );
+    (* Single character types (the type opcode name is shown). *)
+    ("\\d", g [ "  0 BRA"; "  1 TYPE \\d"; "  3 KET"; "  4 END" ]);
+    (".", g [ "  0 BRA"; "  1 TYPE Any"; "  3 KET"; "  4 END" ]);
+    ("\\R", g [ "  0 BRA"; "  1 TYPE \\R"; "  3 KET"; "  4 END" ]);
+    ("\\h", g [ "  0 BRA"; "  1 TYPE \\h"; "  3 KET"; "  4 END" ]);
+    ("\\b", g [ "  0 BRA"; "  1 WORDBOUND \\b"; "  3 KET"; "  4 END" ]);
+    ("\\B", g [ "  0 BRA"; "  1 WORDBOUND \\B"; "  3 KET"; "  4 END" ]);
+    (* Type / class repeats. A trailing repeat auto-possessifies (POS). *)
+    ("\\d+", g [ "  0 BRA"; "  1 TYPE_REP pos {1,inf} \\d"; "  6 KET"; "  7 END" ]);
+    ( "\\w*",
+      g [ "  0 BRA"; "  1 TYPE_REP pos {0,inf} \\w"; "  6 KET"; "  7 END" ] );
+    ( "(?s).*",
+      g [ "  0 BRA"; "  1 TYPE_REP pos {0,inf} AllAny"; "  6 KET"; "  7 END" ] );
+    ( "[a-z]+",
+      g [ "  0 BRA"; "  1 CLASS_REP pos {1,inf} map=4"; "  6 KET"; "  7 END" ] );
+    ( "[0-9]{2,4}",
+      g [ "  0 BRA"; "  1 CLASS_REP pos {2,4} map=4"; "  6 KET"; "  7 END" ] );
+    (* A repeat followed by an OVERLAPPING atom stays greedy (max): the
+       following 'y' is in [a-z] / a digit is a digit, so auto-possessify does
+       not fire. (\\d+x auto-possessifies since 'x' is not a digit.) *)
+    ( "[a-z]*y",
+      g
+        [
+          "  0 BRA";
+          "  1 CLASS_REP max {0,inf} map=4";
+          "  6 CHAR_RUN \"y\"";
+          "  9 KET";
+          " 10 END";
+        ] );
+    ( "\\d+5",
+      g
+        [
+          "  0 BRA";
+          "  1 TYPE_REP max {1,inf} \\d";
+          "  6 CHAR_RUN \"5\"";
+          "  9 KET";
+          " 10 END";
+        ] );
   ]
 
 let golden_tests =
@@ -429,7 +476,6 @@ let unsupported_reason (pat : string) : string =
 let unsupported_cases : (string * string * string) list =
   [
     (* (label, pattern, expected reason) *)
-    ("character class", "[abc]", "fast: OP_CLASS (chunk E)");
     (* A back-referenced capture is declined at CAP_START by the
        optimized_cbracket gate (chunk F/J/K): its ovector slot cannot be used
        as the in-progress start scratch. *)
@@ -443,7 +489,16 @@ let unsupported_cases : (string * string * string) list =
     ( "possessive optional",
       "(a)*+",
       "fast: possessive group (BRAPOSZERO) (chunk G)" );
-    ("type repeat", "\\d+", "fast: type repeat (chunk E)");
+    (* Chunk E declines: a \p property in a class compiles to OP_XCLASS, which
+       needs the property machinery (chunk I); \p / \X singles and repeats and
+       the UCP word boundary are likewise chunk I. *)
+    ("prop in class (XCLASS)", "[\\p{L}]", "fast: OP_XCLASS (\\p in class) (chunk I)");
+    ("prop", "\\p{L}", "fast: \\p (chunk I)");
+    ("prop type repeat", "\\p{L}+", "fast: \\p (chunk I)");
+    ("extuni", "\\X", "fast: \\X (chunk I)");
+    (* The UCP verb turns on UCP mode, caught by the compile-level gate before
+       the UCP word-boundary opcode is even reached. *)
+    ("ucp mode", "(*UCP)\\ba", "fast: UCP mode (chunk I)");
     ("UTF mode", "(*UTF)abc", "fast: UTF mode (chunk I)");
     ("verb", "a(*FAIL)", "fast: verb (chunk H)");
   ]
@@ -512,6 +567,31 @@ let supported_patterns =
     "(?:abc){0}x";
     "^(?:a?b?)*$";
     "(a|b)+c";
+    (* Chunk E: classes, types, word boundaries. *)
+    "[abc]";
+    "[a-z]";
+    "[^a]";
+    "[^a-z]";
+    "\\d";
+    "\\D";
+    "\\w\\W\\s\\S";
+    ".";
+    "(?s).";
+    "\\R";
+    "\\h\\H\\v\\V";
+    "\\bfoo\\b";
+    "\\Bfoo";
+    "\\d+";
+    "\\w*";
+    "[a-z]+";
+    "[0-9]{2,4}";
+    "\\d+x";
+    "[a-z]*y";
+    "[a-z]++x";
+    "([a-z]+)(\\d+)";
+    "\\R+";
+    "(?:\\d|[a-f])+";
+    "a\\bc\\d[e-h]";
   ]
 
 let verify_ok = function
@@ -669,10 +749,28 @@ let sweep_patterns =
     "(?:abc){0}x";
     "^(?:a?b?)*$";
     "(a|bb|ccc)+";
-    (* unsupported (declined; verify not invoked) *)
+    (* Chunk E: classes / types / \R / \h\v / \b\B (accepted; verify passes). *)
     "[a-z]";
     "a.b";
     "\\d+";
+    "[abc]";
+    "[^abc]";
+    "[a-z0-9_]+";
+    "\\D\\S\\W";
+    "(?s).*";
+    "\\R";
+    "\\R+";
+    "(*BSR_ANYCRLF)\\R+";
+    "\\h+\\v*";
+    "\\bword\\b";
+    "\\Bx";
+    "\\d{2,5}";
+    "[0-9]{3}";
+    "[a-f]++";
+    "(\\w+)\\s+(\\w+)";
+    "^\\d+$";
+    "a[bc]d[^e]f";
+    (* unsupported (declined; verify not invoked) *)
     "(a)\\1";
     "(?=x)";
     "(?!x)";
@@ -923,6 +1021,140 @@ let parity_cases : (string * string * int * int32) list =
     ("(ab)+", "aba", 0, o_partial_soft);
     ("(ab)+c", "abab", 0, o_partial_soft);
     ("(?:ab)+", "aba", 0, o_partial_hard);
+    (* --- Chunk E: character classes --- *)
+    ("[abc]", "b", 0, 0l);
+    ("[abc]", "d", 0, 0l);
+    ("[abc]", "", 0, 0l);
+    ("[a-z]", "m", 0, 0l);
+    ("[a-z]", "5", 0, 0l);
+    ("[a-z]", "a", 0, 0l); (* range low boundary *)
+    ("[a-z]", "z", 0, 0l); (* range high boundary *)
+    ("[^abc]", "d", 0, 0l);
+    ("[^abc]", "a", 0, 0l);
+    ("[^a-z]", "5", 0, 0l);
+    ("[0-9]", "7", 0, 0l);
+    ("x[abc]y", "xby", 0, 0l);
+    ("(?i)[a-c]", "B", 0, 0l);
+    ("[abc]", "zzzb", 0, 0l); (* bump-along to the class hit *)
+    (* class at the subject boundaries *)
+    ("[a-z]", "abc", 2, 0l);
+    ("[a-z]$", "abc", 0, 0l);
+    ("^[a-z]", "abc", 0, 0l);
+    (* --- Chunk E: class repeats (greedy / lazy / possessive / empty) --- *)
+    ("[a-z]+", "abc", 0, 0l);
+    ("[a-z]+", "123", 0, 0l);
+    ("[a-z]*b", "aab", 0, 0l);
+    ("[a-z]*b", "b", 0, 0l);
+    ("[0-9]{2,4}", "12345", 0, 0l);
+    ("[0-9]{2,4}", "1", 0, 0l);
+    ("[0-9]{3}", "1234", 0, 0l);
+    ("[abc]*?d", "abcd", 0, 0l);
+    ("[abc]+?", "abc", 0, 0l);
+    ("[a-z]*", "", 0, 0l); (* empty-capable class repeat *)
+    ("[a-z]*", "123", 0, 0l);
+    ("[a-z]*a", "aaa", 0, 0l); (* greedy give-back boundary *)
+    ("[a-z]++x", "abcx", 0, 0l); (* possessive class repeat *)
+    ("[a-z]*+b", "aaab", 0, 0l); (* possessive eats all -> NOMATCH *)
+    ("([a-z]+)([0-9]+)", "abc123", 0, 0l);
+    (* --- Chunk E: type singles --- *)
+    ("\\d", "5", 0, 0l);
+    ("\\d", "a", 0, 0l);
+    ("\\D", "a", 0, 0l);
+    ("\\D", "5", 0, 0l);
+    ("\\s", " ", 0, 0l);
+    ("\\s", "a", 0, 0l);
+    ("\\S", "a", 0, 0l);
+    ("\\w", "a", 0, 0l);
+    ("\\w", "_", 0, 0l);
+    ("\\w", ".", 0, 0l);
+    ("\\W", ".", 0, 0l);
+    (".", "a", 0, 0l);
+    (".", "\n", 0, 0l); (* dot does not match newline *)
+    ("(?s).", "\n", 0, 0l); (* dotall: OP_ALLANY matches newline *)
+    ("a.c", "abc", 0, 0l);
+    ("a.c", "a\nc", 0, 0l);
+    (* --- Chunk E: type repeats --- *)
+    ("\\d+", "123", 0, 0l);
+    ("\\d+", "abc", 0, 0l);
+    ("\\d+x", "123x", 0, 0l);
+    ("\\d*", "", 0, 0l);
+    ("\\d*", "abc", 0, 0l);
+    ("\\w{2,3}", "abcd", 0, 0l);
+    ("\\w{2,3}", "a", 0, 0l);
+    ("\\d+?", "123", 0, 0l);
+    ("\\d+?x", "123x", 0, 0l);
+    (".*", "abc", 0, 0l);
+    (".*b", "aabb", 0, 0l);
+    ("(?s).*", "a\nb", 0, 0l);
+    ("\\d{3}", "1234", 0, 0l);
+    ("\\S+", "ab cd", 0, 0l);
+    ("\\D*\\d", "abc5", 0, 0l);
+    (* --- Chunk E: \R (default BSR_UNICODE and BSR_ANYCRLF) --- *)
+    ("\\R", "\n", 0, 0l);
+    ("\\R", "\r", 0, 0l);
+    ("\\R", "\r\n", 0, 0l); (* CRLF absorbed as one \R *)
+    ("\\R", "\r\nx", 0, 0l);
+    ("\\R", "a", 0, 0l);
+    ("\\R", "\x0b", 0, 0l); (* VT: matches under default unicode BSR *)
+    ("\\R", "\x85", 0, 0l); (* NEL *)
+    ("(*BSR_ANYCRLF)\\R", "\x0b", 0, 0l); (* VT: no match under ANYCRLF *)
+    ("(*BSR_ANYCRLF)\\R", "\r\n", 0, 0l);
+    ("(*BSR_ANYCRLF)\\R", "\n", 0, 0l);
+    ("\\R+", "\r\n\n\r", 0, 0l);
+    ("\\R*x", "\n\nx", 0, 0l);
+    ("a\\Rb", "a\r\nb", 0, 0l);
+    (* --- Chunk E: \h \H \v \V --- *)
+    ("\\h", " ", 0, 0l);
+    ("\\h", "\t", 0, 0l);
+    ("\\h", "\xa0", 0, 0l);
+    ("\\h", "a", 0, 0l);
+    ("\\H", "a", 0, 0l);
+    ("\\H", " ", 0, 0l);
+    ("\\v", "\n", 0, 0l);
+    ("\\v", "\x0b", 0, 0l);
+    ("\\v", "\r", 0, 0l);
+    ("\\v", "a", 0, 0l);
+    ("\\V", "a", 0, 0l);
+    ("\\V", "\n", 0, 0l);
+    ("\\h+", " \t ", 0, 0l);
+    ("\\v*", "\n\r", 0, 0l);
+    ("\\H+", "abc def", 0, 0l);
+    (* --- Chunk E: \b \B at start / end / between --- *)
+    ("\\bfoo", "foo", 0, 0l); (* boundary at start *)
+    ("\\bfoo", "xfoo", 0, 0l); (* boundary between x and f, matches at 1 *)
+    ("\\bfoo", " foo", 0, 0l);
+    ("foo\\b", "foo", 0, 0l); (* boundary at end *)
+    ("foo\\b", "foobar", 0, 0l); (* no boundary o|b -> NOMATCH *)
+    ("\\bfoo\\b", "foo bar", 0, 0l);
+    ("\\bfoo\\b", "foobar", 0, 0l);
+    ("a\\bb", "ab", 0, 0l); (* no boundary a|b -> NOMATCH *)
+    ("a\\Bb", "ab", 0, 0l); (* no boundary -> \B matches *)
+    ("\\Bfoo", "xfoo", 0, 0l); (* no boundary before foo (x|f) -> \B matches *)
+    ("\\Bfoo", " foo", 0, 0l); (* boundary -> \B fails at 1 *)
+    ("\\w+\\b", "abc def", 0, 0l);
+    ("\\b", "", 0, 0l); (* empty subject: no word char -> NOMATCH *)
+    ("\\b", "a", 0, 0l); (* boundary at start -> empty match [0,0] *)
+    ("\\B", "", 0, 0l); (* empty subject -> \B matches empty [0,0] *)
+    ("\\B", "a", 0, 0l); (* every position is a boundary -> NOMATCH *)
+    ("\\ba\\b", "a b a", 0, 0l);
+    (* \b lowering start_used_ptr affects PARTIAL (prev-char read) *)
+    ("\\bfoo", "xfo", 0, o_partial_soft);
+    ("\\bfoo", "xfo", 0, o_partial_hard);
+    (* --- Chunk E: PARTIAL interplay with classes / types / \R --- *)
+    ("\\d\\d", "1", 0, o_partial_soft);
+    ("\\d\\d", "1", 0, o_partial_hard);
+    ("[a-z]{3}", "ab", 0, o_partial_hard);
+    ("[a-z]{3}", "ab", 0, o_partial_soft);
+    ("\\d+x", "12", 0, o_partial_soft);
+    ("\\R", "\r", 0, o_partial_hard); (* lone CR: partial CRLF *)
+    ("a\\Rb", "a\r", 0, o_partial_soft);
+    (".{5}", "ab", 0, o_partial_soft);
+    ("(?s).{5}", "ab", 0, o_partial_soft);
+    (* anchored / endanchored with classes and types *)
+    ("[a-z]+", "abc", 0, o_anchored);
+    ("\\d+", "12ab", 0, o_endanchored);
+    ("\\d+", "12", 0, o_endanchored);
+    ("[a-z]", "5a", 0, o_anchored);
   ]
 
 let parity_tests =
@@ -1014,6 +1246,29 @@ let limit_match_boundary_test =
             ("(?:a|)+", "aaa");
             ("(a){2,4}", "aaaaa");
           ]);
+    (* Chunk E: type/class-repeat tick parity. A greedy type/class repeat
+       over-eats then backs off one code unit per RMATCH (each a tick); the
+       CLASS maxbt also ticks the floor position (pcre2_match.c:2143), so the
+       two engines must trip -47 at the SAME N. Sweep N across the boundary. *)
+    Alcotest.test_case "LIMIT_MATCH sweep, type/class repeat (fast == interp)"
+      `Quick (fun () ->
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 40 do
+              let f, e = run_both body n subj in
+              Alcotest.(check string)
+                (Printf.sprintf "fast == interp for /%s/ on %S at N=%d" body subj
+                   n)
+                e f
+            done)
+          [
+            ("\\d*\\d", "1111"); (* type-repeat greedy give-back *)
+            ("[a-z]*a", "aaaa"); (* class-repeat greedy give-back (floor tick) *)
+            ("\\d+?\\d", "1111"); (* lazy type-repeat extend *)
+            ("[a-z]{2,5}z", "aaaaaz"); (* class range repeat give-back *)
+            ("\\w+\\d", "abc1"); (* type-repeat over a mixed run *)
+            ("\\R+x", "\r\n\nx"); (* \R repeat give-back over CRLF *)
+          ]);
   ]
 
 (* ---------- 7. alloc pins ----------
@@ -1086,6 +1341,45 @@ let alloc_tests =
               (Printf.sprintf
                  "expected O(1) minor allocation for ~50k capture+repeat \
                   attempts, measured %.0f words"
+                 delta)
+              true (delta < 1000.));
+    (* Chunk E: a lazy \R repeat extending over a newline-heavy subject drives
+       the KIND_REP_MIN \R extension handler (rep_bt_min_anynl) once per CRLF
+       pair (~50k times before the trailing 'z' matches) — it must stay
+       allocation-free (§8: no tuples per iteration in the frame loop).
+       NO_AUTO_POSSESS keeps \R+? a true MINPLUS (without it the compiler
+       auto-possessifies \R+?z since 'z' cannot match \R, and the REP_MIN path
+       never runs); the trailing 'z' also satisfies the req_cu start
+       optimization so the attempt runs at all. Path heaviness verified
+       empirically: with a LIMIT_MATCH=10000 verb prefix this exec trips -47,
+       so the extension handler runs > 10k times. *)
+    Alcotest.test_case "alloc: O(1) lazy \\R extension over ~50k CRLF pairs"
+      `Slow (fun () ->
+        let o_no_auto_possess = 0x00004000l (* PCRE2_NO_AUTO_POSSESS *) in
+        match F.compile "\\R+?z" o_no_auto_possess with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            let b = Buffer.create ((2 * 50_000) + 1) in
+            for _ = 1 to 50_000 do
+              Buffer.add_string b "\r\n"
+            done;
+            Buffer.add_char b 'z';
+            let subject = Buffer.contents b in
+            let expect_match r =
+              match r with
+              | Ok (Some (0, 100_001)) -> ()
+              | Ok (Some _) | Ok None -> Alcotest.fail "expected match [0,100001]"
+              | Error c -> Alcotest.failf "unexpected error %d" c
+            in
+            expect_match (F.exec re subject 0 0l) (* warm-up *);
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            expect_match r;
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for lazy \\R extension over \
+                  ~50k CRLF pairs, measured %.0f words"
                  delta)
               true (delta < 1000.));
   ]
