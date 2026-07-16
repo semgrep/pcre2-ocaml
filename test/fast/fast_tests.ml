@@ -2781,6 +2781,51 @@ let invalid_utf_cases : (string * string * int * int32) list =
     (* verbs interacting with the fragment driver *)
     ("a(*COMMIT)b", "\xffacab", 0, 0l);
     ("a(*SKIP)b|ac", "\xffacab", 0, 0l);
+    (* ---------- \C (OP_ANYBYTE) leaving eptr mid-character, then OP_ANY /
+       OP_ALLANY forward advance (regression 61565-059bb076) ----------
+
+       \C consumes single code units, so after \C{n} the eptr can sit inside a
+       multi-byte character (a continuation byte). The forward advance of `.`
+       (OP_ANY) and DOTALL `.` (OP_ALLANY) is Feptr++; ACROSSCHAR
+       (pcre2_match.c:962-971 / 3024-3038 / 4495-4518), which from a
+       continuation byte consumes the REST of the interrupted character — NOT
+       one code unit (GETCHARLEN). The bug: the fast forward loops stepped by
+       cp_len, over-consuming across a split character (matching where the
+       interpreter/C report NOMATCH, or landing at the wrong span). Subject
+       "\xc9\x93\xe8\xaf\x8c\x64" is valid UTF-8: U+0253 (c9 93), U+8BCC
+       (e8 af 8c), 'd' (64). \C{3} lands at offset 3 (0xaf, mid-U+8BCC). *)
+    (* the minimized repro pattern family (exact + verb + optional literal) *)
+    ("(*THEN)-?\\C{3}.{3}", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    ("(*THEN)-?\\C{3}.{3}", "\xc9\x93\xe8\xaf\x8c\x6a\x64", 0, 0l);
+    (* OP_ANY exact / bounded / minimize / possessive after a mid-char \C *)
+    ("\\C{3}.{3}", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l) (* exact: NOMATCH *);
+    ("\\C{3}.{2}", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l) (* exact: MATCH *);
+    ("\\C{3}.{2,5}", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    ("\\C{3}.{2,5}?", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l) (* minimize forward min *);
+    ("\\C{3}.{2,5}+", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    ("\\C{3}.{0,5}\\x{8bcc}", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l) (* greedy give-back *);
+    (* OP_ALLANY (DOTALL .) exact / bounded / greedy / lazy after mid-char \C *)
+    ("\\C{3}(?s).{3}", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l) (* exact: NOMATCH *);
+    ("\\C{3}(?s).{2,5}", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    ("(?s)\\C{3}.*", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    ("(?s)\\C{3}.*?", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    ("(?s)\\C{3}.{1,3}?d", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    (* single (unquantified) OP_ANY / OP_ALLANY straddling a split character *)
+    ("\\C.\\C.", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    ("\\C(?s).\\C.", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    (* \C landing at other mid-char offsets (1 = 0x93, 4 = 0x8c) *)
+    ("\\C{1}.{3}", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    ("\\C{4}.{2}", "\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    (* \C repeat / OP_ANY spanning a REAL invalid-UTF fragment boundary *)
+    ("\\C{3}.{3}", "\xc9\x93\xe8\xaf\x8c\xff\x64", 0, 0l);
+    ("\\C{2}.{2}", "\xc9\x93\xff\xe8\xaf\x8c\x64", 0, 0l);
+    (* verb before the fragment end, then a mid-char \C advance *)
+    ("a(*COMMIT)\\C.{2}", "a\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    ("(*THEN)\\C{3}.{2}", "\xff\xc9\x93\xe8\xaf\x8c\x64", 0, 0l);
+    ("\\C+(*THEN)x", "\xce\xb1\xff\x78", 0, 0l);
+    (* partial matching at a mid-char \C + OP_ANY tail *)
+    ("\\C{3}.{3}", "\xc9\x93\xe8\xaf\x8c\x64", 0, o_partial_soft);
+    ("\\C{5}.{2}", "\xc9\x93\xe8\xaf\x8c\x64", 0, o_partial_hard);
   ]
 
 let invalid_utf_tests =
@@ -2949,6 +2994,44 @@ let alloc_tests =
               (Printf.sprintf
                  "expected O(1) minor allocation for the UTF give-back over \
                   ~50k 2-byte chars, measured %.0f words"
+                 delta)
+              true (delta < 1000.));
+    (* Regression 61565: the UTF OP_ANY / OP_ALLANY FORWARD advance now steps
+       Feptr++; ACROSSCHAR via [any_advance] (was cp_len). That continuation-
+       byte skip is the module-level tail-recursive [skip_cont_bytes] (NOT a
+       ref/while), so an anchored greedy `.` over ~50k TWO-BYTE chars — one
+       forward scan of ~50k [any_advance] calls, then ~50k give-back steps when
+       the trailing 'x' never matches — must stay O(1) minor allocation (a ref
+       box per char would measure ~100k words). NO_AUTO_POSSESS keeps .* a true
+       STAR; \A pins one attempt; U+0100 (C4 80) is a non-newline 2-byte char so
+       OP_ANY matches every char and the forward loop calls [any_advance]. *)
+    Alcotest.test_case
+      "alloc: O(1) UTF OP_ANY forward+give-back over ~50k 2-byte chars" `Slow
+      (fun () ->
+        let o_no_auto_possess = 0x00004000l in
+        match F.compile "(*UTF)\\A.*x" o_no_auto_possess with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            let b = Buffer.create (2 * 50_000) in
+            for _ = 1 to 50_000 do
+              Buffer.add_string b "\xc4\x80"
+            done;
+            let subject = Buffer.contents b in
+            let expect_nomatch r =
+              match r with
+              | Ok None -> ()
+              | Ok (Some _) -> Alcotest.fail "unexpected match"
+              | Error c -> Alcotest.failf "unexpected error %d" c
+            in
+            expect_nomatch (F.exec re subject 0 0l) (* warm-up *);
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            expect_nomatch r;
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for the UTF OP_ANY \
+                  forward+give-back over ~50k 2-byte chars, measured %.0f words"
                  delta)
               true (delta < 1000.));
     (* Chunk I2: the grapheme-cluster GIVE-BACK path — Extuni.extuni forward

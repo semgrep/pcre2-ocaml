@@ -557,6 +557,36 @@ let cp_len (mb : mb) (eptr : int) : int =
   let c0 = Char.code (String.unsafe_get mb.subject eptr) in
   if mb.utf && c0 >= 0xc0 then 1 + Utf.get_extralen c0 else 1
 
+(* pcre2_match.c:962-973 / 3024-3025 / 3038 / 4495-4496 / 4510 — the FORWARD
+   advance of OP_ANY / OP_ALLANY in UTF: Feptr++; then ACROSSCHAR(Feptr <
+   end_subject, Feptr, Feptr++) (pcre2_intmodedep.h:352-353). The interpreter
+   writes this as [Utf.forwardchartest mb.subject (eptr + 1) mb.end_subject]
+   (interpreter.ml op_allany_tail:4227-4229, typemin_utf_any/allany:5443-5468,
+   typemax_utf_any/allany:5766-5792). It differs from [cp_len] (GETCHARLEN,
+   which GETCHARINC uses in the char/type MINIMIZE resume, and which the
+   per-char predicate types use): step ONE code unit, THEN skip any trailing
+   continuation bytes. At a mid-character position (a continuation byte,
+   reachable only after \C splits a UTF character) cp_len returns 1 whereas this
+   consumes the rest of the interrupted character. Non-UTF: a plain step of one
+   code unit. safe: caller proves eptr < end_subject <= String.length subject.
+
+   Allocation-free: the continuation-byte skip is a module-level tail-recursive
+   int loop (NOT a ref/while as in [across_char], which is a per-ATTEMPT
+   bump-along helper; this is the per-CHARACTER `.` forward path, so a ref box
+   would allocate once per char of a UTF `.*`/`.+`, §8 / the §9 give-back
+   hazard's cousin). Mirrors the allocation-free [backchar_sub]. *)
+let rec skip_cont_bytes (s : string) (endp : int) (q : int) : int =
+  if
+    q < endp
+    (* safe: q < endp <= String.length s. *)
+    && Int.equal (Char.code (String.unsafe_get s q) land 0xc0) 0x80
+  then (skip_cont_bytes [@tailcall]) s endp (q + 1)
+  else q
+
+let any_advance (mb : mb) (eptr : int) : int =
+  let p = eptr + 1 in
+  if not mb.utf then p else skip_cont_bytes mb.subject mb.end_subject p
+
 (* pcre2_intmodedep.h:341-345 — BACKCHAR(eptr) over the subject: if [p] is not
    at the start of a character, move it back until it is. Allocation-free
    (tail-recursive int loop — NOT Utf.backchar, whose int-ref would allocate on
@@ -3696,9 +3726,12 @@ and op_repeat (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
   let k = mb.rep_kind in
   if Int.equal k rk_allany then
     if mb.utf then
-      (* Chunk I2 — UTF OP_ALLANY steps CHARACTERS (pcre2_match.c:3030-3039
-         min / 4820-4832 max): the generic per-char loops via rep_unit_utf. *)
-      (rep_min_loop [@tailcall]) mb 0 eptr sp rdepth mcc
+      (* UTF OP_ALLANY min loop: Feptr++; ACROSSCHAR per character
+         (pcre2_match.c:3028-3039; interpreter.ml typemin_utf_allany:5453-5469).
+         NOT the generic rep_unit_utf/cp_len loop: after \C the eptr can be
+         mid-character, where ACROSSCHAR and cp_len disagree (see
+         [any_advance]). *)
+      (rep_min_allany_utf [@tailcall]) mb 0 eptr sp rdepth mcc
     else (rep_min_allany [@tailcall]) mb eptr sp rdepth mcc
   else if Int.equal k rk_anybyte then
     (* Chunk I2 — \C min loop: one bound check, NO SCHECK_PARTIAL
@@ -3783,7 +3816,12 @@ and rep_unit_utf (mb : mb) (eptr : int) : int =
     else if Int.equal k rk_prop then
       (* Chunk I2 — property repeat, UTF: prop_test on the decoded point. *)
       Bool.equal (prop_test cp mb.rep_ptype mb.rep_pdata) mb.rep_want
-    else true (* rk_allany (chunk I2): UTF OP_ALLANY matches any character *)
+    else true
+    (* Total-function fallback for the if-chain. rk_allany UTF (which "matches
+       any character") no longer reaches here: it has dedicated ACROSSCHAR loops
+       (rep_min_allany_utf / rep_greedy_allany_utf) since cp_len under-consumes
+       a \C-split character; rk_any/rk_anynl/rk_anybyte/rk_extuni likewise have
+       dedicated loops. *)
   in
   if ok then len else 0
 
@@ -3809,13 +3847,30 @@ and rep_min_loop (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
 
 (* OP_ALLANY / OP_ANYBYTE min loop (pcre2_match.c:3280-3287): one bound check
    for [lmin] code units. The scheck fires at the ORIGINAL eptr (not a
-   per-char eptr), which the bulk form preserves. *)
+   per-char eptr), which the bulk form preserves. Non-UTF only (in UTF,
+   OP_ANYBYTE keeps this byte-bulk form via op_repeat's rk_anybyte arm, while
+   OP_ALLANY steps characters — see [rep_min_allany_utf]). *)
 and rep_min_allany (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) :
     int =
   if eptr > mb.end_subject - mb.rep_lmin then
     let r = scheck_partial mb eptr in
     if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc
   else (rep_after_min [@tailcall]) mb (eptr + mb.rep_lmin) sp rdepth mcc
+
+(* UTF OP_ALLANY min loop (pcre2_match.c:3028-3039; interpreter.ml
+   typemin_utf_allany:5453-5469): ensure [lmin] characters, each Feptr++;
+   ACROSSCHAR ([any_advance]). NO newline test (unlike OP_ANY) and NO per-unit
+   predicate — OP_ALLANY matches any character. SCHECK_PARTIAL at/past end
+   fires at the current per-char eptr. *)
+and rep_min_allany_utf (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
+  else if eptr >= mb.end_subject then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc
+  else
+    (rep_min_allany_utf [@tailcall]) mb (i + 1) (any_advance mb eptr) sp rdepth
+      mcc
 
 (* OP_ANY min loop (pcre2_match.c:3258-3278): a newline stops the match; a CR
    at the very end of the subject could be a partial CRLF. *)
@@ -3837,10 +3892,10 @@ and rep_min_any (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
     if hit then mb.hitend <- true;
     if hit && mb.partial > 1 then Errors.error_partial
     else
-      (* Chunk I — OP_ANY consumes one CHARACTER (multi-byte in UTF). *)
-      (rep_min_any [@tailcall]) mb (i + 1)
-        (eptr + if mb.utf then cp_len mb eptr else 1)
-        sp rdepth mcc
+      (* OP_ANY forward min: Feptr++; ACROSSCHAR (pcre2_match.c:3024-3025;
+         interpreter.ml typemin_utf_any:5448-5449). NOT cp_len: after \C the
+         eptr can be mid-character (a continuation byte). *)
+      (rep_min_any [@tailcall]) mb (i + 1) (any_advance mb eptr) sp rdepth mcc
 
 (* OP_ANYNL min loop (pcre2_match.c:3302-3332 non-UTF; 2998-3028 UTF, which
    decodes a code point — NEL is 2 bytes and LS/PS U+2028/U+2029 are 3, chunk
@@ -3930,11 +3985,13 @@ and rep_after_min (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) :
     let k = mb.rep_kind in
     if Int.equal k rk_allany then
       if mb.utf then
-        (* Chunk I2 — UTF OP_ALLANY greedy steps CHARACTERS
-           (pcre2_match.c:4820-4832; the Lmax = UINT32_MAX arm jumps straight
-           to end_subject + SCHECK — position- and SCHECK-identical to the
-           per-char loop, which stops at end_subject with one SCHECK). *)
-        (rep_greedy [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc
+        (* UTF OP_ALLANY maximize: Feptr++; ACROSSCHAR per character
+           (pcre2_match.c:4501-4518; interpreter.ml typemax_utf_allany:5776-5793).
+           The Lmax = UINT32_MAX arm jumps straight to end_subject + SCHECK —
+           position- and SCHECK-identical to the per-char loop, which stops at
+           end_subject with one SCHECK. NOT the generic cp_len loop (see
+           [any_advance]): after \C the eptr can be mid-character. *)
+        (rep_greedy_allany_utf [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc
       else (rep_greedy_allany [@tailcall]) mb eptr sp rdepth mcc
     else if Int.equal k rk_anybyte then
       (* Chunk I2 — \C greedy: the byte-bulk form (pcre2_match.c:4834-4845),
@@ -3967,7 +4024,9 @@ and rep_greedy (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
   else (rep_greedy [@tailcall]) mb (i + 1) (eptr + 1) sp rdepth mcc
 
 (* OP_ALLANY / OP_ANYBYTE greedy (pcre2_match.c:4748-4757): grab up to
-   (Lmax - Lmin) more code units, or to end_subject (with the SCHECK). *)
+   (Lmax - Lmin) more code units, or to end_subject (with the SCHECK). Non-UTF
+   (and, via op_repeat's rk_anybyte arm, \C in UTF — the byte-bulk form). UTF
+   OP_ALLANY steps characters via [rep_greedy_allany_utf]. *)
 and rep_greedy_allany (mb : mb) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
   let n = mb.rep_lmax - mb.rep_lmin in
@@ -3977,6 +4036,25 @@ and rep_greedy_allany (mb : mb) (eptr : int) (sp : int) (rdepth : int)
     if r < 0 then r
     else (rep_greedy_done_dispatch [@tailcall]) mb mb.end_subject sp rdepth mcc
   else (rep_greedy_done_dispatch [@tailcall]) mb (eptr + n) sp rdepth mcc
+
+(* UTF OP_ALLANY maximize scan (pcre2_match.c:4501-4518; interpreter.ml
+   typemax_utf_allany:5776-5793): grab up to Lmax characters, each Feptr++;
+   ACROSSCHAR ([any_advance]), stopping at end_subject with one SCHECK. NO
+   newline test and NO per-unit predicate. The C's Lmax = UINT32_MAX arm jumps
+   straight to end_subject + SCHECK; this per-char loop reaches the same
+   position with the same single SCHECK, so it is position- and
+   SCHECK-identical. *)
+and rep_greedy_allany_utf (mb : mb) (i : int) (eptr : int) (sp : int)
+    (rdepth : int) (mcc : int) : int =
+  if i >= mb.rep_lmax then
+    (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+  else if eptr >= mb.end_subject then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r
+    else (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+  else
+    (rep_greedy_allany_utf [@tailcall]) mb (i + 1) (any_advance mb eptr) sp
+      rdepth mcc
 
 (* OP_ANY greedy (pcre2_match.c:4726-4746): stop at a newline; a CR at the very
    end could be a partial CRLF. *)
@@ -3999,10 +4077,10 @@ and rep_greedy_any (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
     if hit then mb.hitend <- true;
     if hit && mb.partial > 1 then Errors.error_partial
     else
-      (* Chunk I — OP_ANY consumes one CHARACTER (multi-byte in UTF). *)
-      (rep_greedy_any [@tailcall]) mb (i + 1)
-        (eptr + if mb.utf then cp_len mb eptr else 1)
-        sp rdepth mcc
+      (* OP_ANY forward greedy: Feptr++; ACROSSCHAR (pcre2_match.c:4495-4496;
+         interpreter.ml typemax_utf_any:5771-5772). NOT cp_len (see
+         [any_advance]): after \C the eptr can be mid-character. *)
+      (rep_greedy_any [@tailcall]) mb (i + 1) (any_advance mb eptr) sp rdepth mcc
 
 (* OP_ANYNL greedy (pcre2_match.c:4759-4784 non-UTF; 4786-4818 UTF, which
    decodes a code point — chunk I2): CR (absorb LF; a lone CR at end breaks
@@ -4152,10 +4230,10 @@ and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
       let r = scheck_partial mb eptr in
       if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
     else
-      (* OP_ANY consumes one CHARACTER (multi-byte in UTF). *)
-      (run [@tailcall]) mb (pc + 2)
-        (eptr + if mb.utf then cp_len mb eptr else 1)
-        sp rdepth mcc)
+      (* OP_ANY falls through to the OP_ALLANY tail: Feptr++; ACROSSCHAR
+         (pcre2_match.c:962-971; interpreter.ml op_allany_tail:4227-4229). NOT
+         cp_len (see [any_advance]): after \C the eptr can be mid-character. *)
+      (run [@tailcall]) mb (pc + 2) (any_advance mb eptr) sp rdepth mcc)
   else if Int.equal type_op Opcodes.op_anynl then (
     (* OP_ANYNL \R (pcre2_match.c:2377-2409; GETCHARINCTEST decodes a code
        point in UTF — NEL/LS/PS are multi-byte, chunk I2). *)
@@ -4206,8 +4284,16 @@ and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
        every other type consumes the whole character. safe: eptr < end_subject. *)
     let cp = cur_cp mb eptr in
     if simple_type_match_cp type_op cp then
-      let adv = if Int.equal type_op Opcodes.op_anybyte then 1 else cp_len mb eptr in
-      (run [@tailcall]) mb (pc + 2) (eptr + adv) sp rdepth mcc
+      let e =
+        if Int.equal type_op Opcodes.op_anybyte then eptr + 1
+          (* \C: exactly one code unit, no ACROSSCHAR (pcre2_match.c:984-988). *)
+        else if Int.equal type_op Opcodes.op_allany then any_advance mb eptr
+          (* OP_ALLANY: Feptr++; ACROSSCHAR (pcre2_match.c:962-971) — after \C
+             the eptr can be mid-character, where cp_len would under-consume. *)
+        else eptr + cp_len mb eptr
+          (* per-char predicate types: GETCHARINCTEST (pcre2_match.c:2305-2470). *)
+      in
+      (run [@tailcall]) mb (pc + 2) e sp rdepth mcc
     else
       (* Chunk K1b — every single predicate type GETCHARINCTESTs before its
          test (pcre2_match.c:2305-2470): a mismatch records the post-read
