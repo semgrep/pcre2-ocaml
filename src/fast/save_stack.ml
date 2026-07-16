@@ -30,6 +30,19 @@
         a minimizing single-char repeat: on backtrack match one more char at
         [eptr] (count from [count] up to lmax) and retry. Mirrors RM25/RM27
         (interpreter.ml:3758 / 7155-7234).
+     KIND_CONT     (width 4): [target; eptr; rdepth; KIND_CONT]
+        a chunk-D2 group choice point that, on backtrack, resumes at IR index
+        [target] with [eptr]/[rdepth] restored and NO tick (the C's same-frame
+        `break` after RM9/RM10/RM7 NOMATCH or the KETRMIN reiteration). Used by
+        OP_BRAZERO (skip), OP_BRAMINZERO (enter group), the greedy KETRMAX
+        give-back and the lazy KETRMIN reiteration (fast-design.md §3).
+     KIND_GSTART   (width 3): [g; old_start; KIND_GSTART]
+        a chunk-D2 repeated-group iteration entry (t_group_start): on backtrack
+        restore [mb.group_start.(g)] to the enclosing iteration's start, then
+        keep popping. This mirrors the C's per-frame group-start: each
+        iteration runs in its own frame whose predecessor P->eptr is preserved
+        across backtracking (pcre2_match.c:6107), so re-entering an earlier
+        iteration's branch sees ITS start, not a later iteration's.
 
    Scratch reuse mirrors Frames' scratch pattern (frames.ml:282-403) with its
    OWN [busy] flag — it does NOT share Frames' scratch slot. A single
@@ -45,10 +58,14 @@ let kind_alt = 0
 let kind_cap = 1
 let kind_rep_max = 2
 let kind_rep_min = 3
+let kind_cont = 4
+let kind_gstart = 5
 let width_alt = 4
 let width_cap = 4
 let width_rep_max = 5
 let width_rep_min = 5
+let width_cont = 4
+let width_gstart = 3
 
 (* Widest record — the runner reserves this much headroom on a push. *)
 let max_record_width = 5

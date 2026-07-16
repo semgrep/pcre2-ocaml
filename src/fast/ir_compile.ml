@@ -71,30 +71,28 @@ let reason_of_op (op : int) : string =
   else if Int.equal op Op.op_script_run then named "OP_SCRIPT_RUN" "K"
   else if Int.equal op Op.op_callout then named "OP_CALLOUT" "K"
   else if Int.equal op Op.op_callout_str then named "OP_CALLOUT_STR" "K"
-    (* Repeated groups: a KET that repeats (chunk D). *)
-  else if Int.equal op Op.op_ketrmax then named "repeated group (KETRMAX)" "D"
-  else if Int.equal op Op.op_ketrmin then named "repeated group (KETRMIN)" "D"
-  else if Int.equal op Op.op_ketrpos then named "repeated group (KETRPOS)" "D"
+    (* Repeated-group kets KETRMAX/KETRMIN are lowered in [compile_group]
+       (chunk D2). The possessive repeating ket KETRPOS stays declined
+       (possessive groups → chunk G; see the [compile_group] guard). *)
+  else if Int.equal op Op.op_ketrpos then named "possessive group (KETRPOS)" "G"
     (* Lookaround / lookbehind reverse / atomic (chunk G). *)
   else if Int.equal op Op.op_reverse then named "OP_REVERSE" "G"
   else if Int.equal op Op.op_vreverse then named "OP_VREVERSE" "G"
   else if op >= Op.op_assert && op <= Op.op_assertback_na then
     named "lookaround" "G"
   else if Int.equal op Op.op_once then named "OP_ONCE" "G"
-    (* Groups this chunk does not lower. Non-capturing OP_BRA and capturing
-       OP_CBRA/OP_SCBRA are handled in [compile_group]; the possessive
-       (OP_*POS) and empty-checking non-capturing (OP_SBRA) brackets, plus
-       OP_CLOSE / OP_SKIPZERO, are declined (see the D-bullet notes). *)
-  else if Int.equal op Op.op_brapos then named "OP_BRAPOS" "G"
-  else if Int.equal op Op.op_cbrapos then named "OP_CBRAPOS" "G"
-  else if Int.equal op Op.op_sbra then named "OP_SBRA" "D"
-  else if Int.equal op Op.op_sbrapos then named "OP_SBRAPOS" "G"
-  else if Int.equal op Op.op_scbrapos then named "OP_SCBRAPOS" "G"
+    (* Groups: non-capturing OP_BRA, capturing OP_CBRA/OP_SCBRA and the
+       empty-checking non-capturing OP_SBRA are handled in [compile_group]
+       (chunk D2). The possessive brackets (OP_*POS) resist the minimal-save
+       design (their KETRPOS frame-juggling protocol) and are declined to
+       chunk G, as is OP_BRAPOSZERO. OP_CLOSE (before ACCEPT) → chunk H. *)
+  else if Int.equal op Op.op_brapos then named "possessive group (BRAPOS)" "G"
+  else if Int.equal op Op.op_cbrapos then named "possessive group (CBRAPOS)" "G"
+  else if Int.equal op Op.op_sbrapos then named "possessive group (SBRAPOS)" "G"
+  else if Int.equal op Op.op_scbrapos then named "possessive group (SCBRAPOS)" "G"
+  else if Int.equal op Op.op_braposzero then
+    named "possessive group (BRAPOSZERO)" "G"
   else if Int.equal op Op.op_close then named "OP_CLOSE" "H"
-  else if Int.equal op Op.op_skipzero then named "OP_SKIPZERO" "D"
-  else if
-    op >= Op.op_brazero && op <= Op.op_braposzero
-  then named "OP_BRAZERO" "D"
     (* Conditionals (chunk J). *)
   else if Int.equal op Op.op_cond then named "OP_COND" "J"
   else if Int.equal op Op.op_scond then named "OP_SCOND" "J"
@@ -291,6 +289,15 @@ let compile (re : C.re) : (Ir.t, string) result =
     let set (i : int) (v : int) : unit = !buf.(i) <- v in
     let lit = Buffer.create 32 in
     let opt_cbracket = optimized_cbracket re in
+    (* Chunk D2: fresh id per empty-check-tracked repeated group (grouploop
+       bracket + KETRMAX/KETRMIN); indexes [mb.group_start] at run time
+       (fast-design.md §3). OP_BRA repeats (bra_loop) get [Ir.no_group]. *)
+    let n_groups = ref 0 in
+    let fresh_group () : int =
+      let g = !n_groups in
+      incr n_groups;
+      g
+    in
 
     (* [compile_group bra_off]: lower a group (OP_BRA / OP_CBRA / OP_SCBRA
        ... OP_KET) starting at [bra_off]; returns the bytecode offset just
@@ -309,11 +316,18 @@ let compile (re : C.re) : (Ir.t, string) result =
     let rec compile_group (bra_off : int) : int =
       let op = byte bra_off in
       let is_capture = Int.equal op Op.op_cbra || Int.equal op Op.op_scbra in
-      (* grouploop lowering (ALT for every branch + t_fail) applies to
-         capturing brackets; OP_BRA keeps bra_loop lowering. *)
-      let grouploop = is_capture in
-      if not (Int.equal op Op.op_bra || is_capture) then
+      let is_sbra = Int.equal op Op.op_sbra in
+      let is_bra = Int.equal op Op.op_bra in
+      (* Possessive brackets (OP_*POS) use the KETRPOS frame-juggling protocol
+         (pcre2_match.c:5283-5328), which resists the minimal-save design —
+         declined to chunk G (fast-design.md §3). *)
+      if not (is_bra || is_capture || is_sbra) then
         raise (Unsupported (reason_of_op op));
+      (* grouploop lowering (ALT for every branch + t_fail) applies to the
+         brackets the C dispatches through GROUPLOOP — OP_CBRA/OP_SCBRA
+         (capturing) and OP_SBRA (empty-checking non-capturing); OP_BRA keeps
+         bra_loop lowering (interpreter.ml:2416-2452). *)
+      let grouploop = is_capture || is_sbra in
       let ovbase =
         if is_capture then (
           let num = C.get2 src (bra_off + 1 + Limits.link_size) in
@@ -326,10 +340,6 @@ let compile (re : C.re) : (Ir.t, string) result =
           2 * num)
         else -1
       in
-      if is_capture then (
-        push Ir.t_cap_start;
-        push ovbase);
-      push Ir.t_bra;
       (* Collect branch-body start offsets by following the BRA/ALT link
          chain, and the trailing KET offset (mirrors the interpreter's
          GET-based branch walk, pcre2_match.c:5349-5372/5894-5897). *)
@@ -342,10 +352,33 @@ let compile (re : C.re) : (Ir.t, string) result =
       in
       let branch_offs, ket_off = collect bra_off [] in
       let ket_op = byte ket_off in
-      (* A KETRMAX/KETRMIN/KETRPOS bracket is a repeated group (chunk D
-         declines these; SCBRA/SBRA only ever appear with such a ket). *)
-      if not (Int.equal ket_op Op.op_ket) then
+      (* Chunk D2: KETRMAX/KETRMIN are lowered as repeating kets; the
+         possessive KETRPOS is declined to chunk G (its bracket was already
+         declined above, so this only fires defensively). Any other ket is
+         out of subset. *)
+      let is_max = Int.equal ket_op Op.op_ketrmax in
+      let is_min = Int.equal ket_op Op.op_ketrmin in
+      let repeating = is_max || is_min in
+      if not (Int.equal ket_op Op.op_ket || repeating) then
         raise (Unsupported (reason_of_op ket_op));
+      (* The empty-string loop check runs at the ket for grouploop brackets
+         only (C's P != NULL — pcre2_match.c:5922/6107); an OP_BRA repeat has
+         P == NULL, so it never force-breaks (and can never match empty). A
+         tracked group records its per-iteration start in [mb.group_start.(g)]
+         via a t_group_start at the group entry. *)
+      let group_id =
+        if repeating && grouploop then fresh_group () else Ir.no_group
+      in
+      (* [entry_pc] is the IR index a repeating ket loops back to: the
+         t_group_start (grouploop) or the BRA marker (bra_loop). *)
+      let entry_pc = here () in
+      if repeating && grouploop then (
+        push Ir.t_group_start;
+        push group_id);
+      if is_capture then (
+        push Ir.t_cap_start;
+        push ovbase);
+      push Ir.t_bra;
       let nbr = List.length branch_offs in
       (* End-of-branch jumps to fix up to the KET once its index is known. *)
       let jmp_fixups = ref [] in
@@ -383,11 +416,22 @@ let compile (re : C.re) : (Ir.t, string) result =
         push Ir.t_fail;
         if !prev_cp >= 0 then set !prev_cp fail_pc;
         prev_cp := -1);
+      (* The ket. For a capture the CAP_END writes the group's end slot
+         (pcre2_match.c:6077-6084) — and, for a repeat, precedes the repeat
+         logic exactly as the C writes captures before the empty-string test.
+         A repeating ket then loops back to [entry_pc] or continues past
+         (t_ket_rmax/t_ket_rmin); a non-repeating non-capturing group keeps
+         its structural t_ket marker (chunk D). Branch JMPs target [ket_ir]
+         (the CAP_END for captures, else the first ket instruction). *)
       let ket_ir = here () in
       if is_capture then (
         push Ir.t_cap_end;
-        push ovbase)
-      else push Ir.t_ket;
+        push ovbase);
+      if repeating then (
+        push (if is_max then Ir.t_ket_rmax else Ir.t_ket_rmin);
+        push entry_pc;
+        push group_id)
+      else if not is_capture then push Ir.t_ket;
       List.iter (fun j -> set j ket_ir) !jmp_fixups;
       ket_off + Op.op_lengths.(ket_op)
     (* [compile_branch p0]: lower one branch body; stops at (without
@@ -457,8 +501,39 @@ let compile (re : C.re) : (Ir.t, string) result =
           p := !p + Op.op_lengths.(Op.op_chari))
         else if
           Int.equal op Op.op_bra || Int.equal op Op.op_cbra
-          || Int.equal op Op.op_scbra
+          || Int.equal op Op.op_scbra || Int.equal op Op.op_sbra
         then p := compile_group !p
+        else if Int.equal op Op.op_brazero || Int.equal op Op.op_braminzero
+        then (
+          (* OP_BRAZERO / OP_BRAMINZERO (pcre2_match.c:5224-5238) — the greedy
+             / lazy zero-repeat wrapper preceding a group. Both lower to a
+             choice point (KIND_CONT) plus the group body; BRAZERO falls
+             through into the group and skips on backtrack, BRAMINZERO jumps
+             past the group and enters it on backtrack (fast-design.md §3).
+             The skip target (past the group) is patched after the group is
+             lowered. OP_lengths[OP_BRAZERO] = 1, so the group starts at
+             !p + 1. *)
+          push (if Int.equal op Op.op_brazero then Ir.t_brazero else Ir.t_braminzero);
+          let skip_operand = here () in
+          push 0 (* skip placeholder, resolved past the group *);
+          let after = compile_group (!p + Op.op_lengths.(op)) in
+          set skip_operand (here ());
+          p := after)
+        else if Int.equal op Op.op_skipzero then (
+          (* OP_SKIPZERO (pcre2_match.c:5242-5246) — a {0}-quantified group:
+             never entered, so emit no IR; just advance the bytecode pointer
+             past the whole (dead) group, exactly as the C does
+             (Fecode++; skip alts; += 1 + LINK_SIZE). Skipping the walk means
+             an unsupported construct INSIDE a {0} group cannot decline the
+             pattern — strictly safe, since the group is dead code. *)
+          let bra_off = !p + Op.op_lengths.(op) in
+          let rec find_ket (q : int) : int =
+            let nxt = q + link q in
+            if Int.equal (byte nxt) Op.op_alt then (find_ket [@tailcall]) nxt
+            else nxt
+          in
+          let ket_off = find_ket bra_off in
+          p := ket_off + Op.op_lengths.(byte ket_off))
         else
           match anchor_tag op with
           | Some tag ->
@@ -474,7 +549,12 @@ let compile (re : C.re) : (Ir.t, string) result =
       if not (Int.equal end_op Op.op_end) then
         raise (Unsupported (reason_of_op end_op));
       push Ir.t_end;
-      { Ir.code = Array.sub !buf 0 !n; lit = Buffer.contents lit; re }
+      {
+        Ir.code = Array.sub !buf 0 !n;
+        lit = Buffer.contents lit;
+        re;
+        n_groups = !n_groups;
+      }
     with
     | ir -> Ok ir
     | exception Unsupported reason -> Error reason

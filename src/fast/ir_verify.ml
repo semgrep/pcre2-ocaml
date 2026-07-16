@@ -22,6 +22,7 @@ let check (ir : Ir.t) : (unit, string) result =
   let len = Array.length code in
   let litlen = String.length ir.Ir.lit in
   let top_bracket = ir.Ir.re.Pcre2_engine.Compile.top_bracket in
+  let n_groups = ir.Ir.n_groups in
   if Int.equal len 0 then Error "fast-verify: empty IR (no END)"
   else
     (* Pass 1: linear head walk — validate tags + operand widths, record
@@ -59,8 +60,16 @@ let check (ir : Ir.t) : (unit, string) result =
             if pc >= len then Ok ()
             else
               let t = code.(pc) in
+              (* Chunk D2: BRAZERO/BRAMINZERO carry a skip target (operand at
+                 pc+1); KET_RMAX/KET_RMIN carry a loop-back [entry] (pc+1) —
+                 all must be valid instruction heads, like ALT/JMP targets. *)
+              let has_head_target =
+                Int.equal t Ir.t_alt || Int.equal t Ir.t_jmp
+                || Int.equal t Ir.t_brazero || Int.equal t Ir.t_braminzero
+                || Int.equal t Ir.t_ket_rmax || Int.equal t Ir.t_ket_rmin
+              in
               let step =
-                if Int.equal t Ir.t_alt || Int.equal t Ir.t_jmp then (
+                if has_head_target then (
                   let tgt = code.(pc + 1) in
                   if tgt < 0 || tgt >= len then
                     Error
@@ -73,6 +82,28 @@ let check (ir : Ir.t) : (unit, string) result =
                          "fast-verify: %s at pc %d target %d not an \
                           instruction head"
                          Ir.tag_name.(t) pc tgt)
+                  else if
+                    (* KET_RMAX/KET_RMIN also carry a group id (pc+2): -1 (no
+                       empty check) or a valid [0, n_groups) slot. *)
+                    (Int.equal t Ir.t_ket_rmax || Int.equal t Ir.t_ket_rmin)
+                    &&
+                    let g = code.(pc + 2) in
+                    g < Ir.no_group || g >= n_groups
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: %s at pc %d group id %d out of range \
+                          (n_groups %d)"
+                         Ir.tag_name.(t) pc code.(pc + 2) n_groups)
+                  else Ok ())
+                else if Int.equal t Ir.t_group_start then (
+                  let g = code.(pc + 1) in
+                  if g < 0 || g >= n_groups then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: GROUP_START at pc %d group id %d out of \
+                          range (n_groups %d)"
+                         pc g n_groups)
                   else Ok ())
                 else if Int.equal t Ir.t_char_run then (
                   let off = code.(pc + 1) and l = code.(pc + 2) in

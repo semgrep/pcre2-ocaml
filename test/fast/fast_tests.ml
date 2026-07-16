@@ -262,6 +262,149 @@ let goldens : (string * string) list =
           "  6 KET";
           "  7 END";
         ] );
+    (* Chunk D2: a greedy repeated capturing group (OP_CBRA + KETRMAX). The
+       group entry is GROUP_START (records the iteration start for the empty
+       check) then CAP_START; the ket is CAP_END + KET_RMAX looping back to
+       the GROUP_START (entry=1). *)
+    ( "(a)+",
+      g
+        [
+          "  0 BRA";
+          "  1 GROUP_START g=0";
+          "  3 CAP_START ovbase=2";
+          "  5 BRA";
+          "  6 ALT next=13";
+          "  8 CHAR_RUN \"a\"";
+          " 11 JMP 14";
+          " 13 FAIL";
+          " 14 CAP_END ovbase=2";
+          " 16 KET_RMAX entry=1 g=0";
+          " 19 KET";
+          " 20 END";
+        ] );
+    (* Greedy zero-or-more: BRAZERO wraps the repeated group; its skip target
+       is past the group (skip=21). *)
+    ( "(a)*",
+      g
+        [
+          "  0 BRA";
+          "  1 BRAZERO skip=21";
+          "  3 GROUP_START g=0";
+          "  5 CAP_START ovbase=2";
+          "  7 BRA";
+          "  8 ALT next=15";
+          " 10 CHAR_RUN \"a\"";
+          " 13 JMP 16";
+          " 15 FAIL";
+          " 16 CAP_END ovbase=2";
+          " 18 KET_RMAX entry=3 g=0";
+          " 21 KET";
+          " 22 END";
+        ] );
+    (* Greedy zero-or-one: BRAZERO wraps a NON-repeating group (plain KET, no
+       GROUP_START / KET_RMAX). *)
+    ( "(a)?",
+      g
+        [
+          "  0 BRA";
+          "  1 BRAZERO skip=16";
+          "  3 CAP_START ovbase=2";
+          "  5 BRA";
+          "  6 ALT next=13";
+          "  8 CHAR_RUN \"a\"";
+          " 11 JMP 14";
+          " 13 FAIL";
+          " 14 CAP_END ovbase=2";
+          " 16 KET";
+          " 17 END";
+        ] );
+    (* Lazy zero-or-one: BRAMINZERO. *)
+    ( "(a)??",
+      g
+        [
+          "  0 BRA";
+          "  1 BRAMINZERO skip=16";
+          "  3 CAP_START ovbase=2";
+          "  5 BRA";
+          "  6 ALT next=13";
+          "  8 CHAR_RUN \"a\"";
+          " 11 JMP 14";
+          " 13 FAIL";
+          " 14 CAP_END ovbase=2";
+          " 16 KET";
+          " 17 END";
+        ] );
+    (* Lazy one-or-more capturing group: KET_RMIN. *)
+    ( "(a)+?",
+      g
+        [
+          "  0 BRA";
+          "  1 GROUP_START g=0";
+          "  3 CAP_START ovbase=2";
+          "  5 BRA";
+          "  6 ALT next=13";
+          "  8 CHAR_RUN \"a\"";
+          " 11 JMP 14";
+          " 13 FAIL";
+          " 14 CAP_END ovbase=2";
+          " 16 KET_RMIN entry=1 g=0";
+          " 19 KET";
+          " 20 END";
+        ] );
+    (* Non-capturing repeated group: OP_BRA lowers bra_loop-style (single
+       branch, no ALT), so the ket carries g=-1 (no empty check — the C's
+       P == NULL) and loops back to the BRA marker (entry=1). *)
+    ( "(?:ab)+",
+      g
+        [
+          "  0 BRA";
+          "  1 BRA";
+          "  2 CHAR_RUN \"ab\"";
+          "  5 KET_RMAX entry=1 g=-1";
+          "  8 KET";
+          "  9 END";
+        ] );
+    (* Empty-capable non-capturing repeat: OP_SBRA lowers grouploop-style
+       (ALT every branch + FAIL) WITH a tracked group id (g=0) for the
+       empty-string loop check. *)
+    ( "(?:a|)+",
+      g
+        [
+          "  0 BRA";
+          "  1 GROUP_START g=0";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 16";
+          " 11 ALT next=15";
+          " 13 JMP 16";
+          " 15 FAIL";
+          " 16 KET_RMAX entry=1 g=0";
+          " 19 KET";
+          " 20 END";
+        ] );
+    (* Empty-capable capturing repeat (OP_SCBRA): the classic nested
+       star-of-star. *)
+    ( "(a*)*",
+      g
+        [
+          "  0 BRA";
+          "  1 BRAZERO skip=23";
+          "  3 GROUP_START g=0";
+          "  5 CAP_START ovbase=2";
+          "  7 BRA";
+          "  8 ALT next=17";
+          " 10 REP max {0,inf} \"a\"";
+          " 15 JMP 18";
+          " 17 FAIL";
+          " 18 CAP_END ovbase=2";
+          " 20 KET_RMAX entry=3 g=0";
+          " 23 KET";
+          " 24 END";
+        ] );
+    (* SKIPZERO: a {0}-quantified group is elided entirely (no IR). *)
+    ( "(?:abc){0}x",
+      g [ "  0 BRA"; "  1 CHAR_RUN \"x\""; "  4 KET"; "  5 END" ] );
   ]
 
 let golden_tests =
@@ -291,8 +434,15 @@ let unsupported_cases : (string * string * string) list =
        optimized_cbracket gate (chunk F/J/K): its ovector slot cannot be used
        as the in-progress start scratch. *)
     ("referenced capture", "(a)\\1", "fast: referenced capture (chunk F/J/K)");
-    ("optional group", "(a)?b", "fast: OP_BRAZERO (chunk D)");
-    ("repeated group", "(a)+", "fast: repeated group (KETRMAX) (chunk D)");
+    (* Chunk D2: possessive group repeats stay declined (their KETRPOS
+       frame-juggling protocol resists the minimal-save design → chunk G). *)
+    ("possessive group", "(a)++", "fast: possessive group (CBRAPOS) (chunk G)");
+    ( "possessive non-capturing",
+      "(?:ab)++",
+      "fast: possessive group (BRAPOS) (chunk G)" );
+    ( "possessive optional",
+      "(a)*+",
+      "fast: possessive group (BRAPOSZERO) (chunk G)" );
     ("type repeat", "\\d+", "fast: type repeat (chunk E)");
     ("UTF mode", "(*UTF)abc", "fast: UTF mode (chunk I)");
     ("verb", "a(*FAIL)", "fast: verb (chunk H)");
@@ -343,6 +493,25 @@ let supported_patterns =
     "(?m)^a$";
     "(a)(b)(c)(d)";
     "x(a+)x";
+    (* Chunk D2: quantified + optional groups. *)
+    "(a)+";
+    "(a)*";
+    "(a)?";
+    "(a)??";
+    "(a)*?";
+    "(a)+?";
+    "(?:ab)+";
+    "(?:ab)*";
+    "(?:a|)+";
+    "(a*)*";
+    "(?:a?)+";
+    "(ab|c)*";
+    "((a)(b))+";
+    "(?:(a)|(b))+";
+    "(a){2,4}";
+    "(?:abc){0}x";
+    "^(?:a?b?)*$";
+    "(a|b)+c";
   ]
 
 let verify_ok = function
@@ -480,6 +649,26 @@ let sweep_patterns =
     "(?m)^(a|b)$";
     "a{2,4}b";
     "(a)b|c";
+    (* Chunk D2: quantified/optional groups (accepted; verify must pass). *)
+    "(a)?b";
+    "(a)+";
+    "(a)*";
+    "(a)??";
+    "(a)*?";
+    "(a)+?";
+    "(?:ab)+";
+    "(?:xy)*z";
+    "(?:a|)+";
+    "(a*)*";
+    "(a*)+";
+    "(?:a?)*";
+    "(ab|c)*d";
+    "((a)(b))+";
+    "(?:(a)|(b))*";
+    "(a){2,4}b";
+    "(?:abc){0}x";
+    "^(?:a?b?)*$";
+    "(a|bb|ccc)+";
     (* unsupported (declined; verify not invoked) *)
     "[a-z]";
     "a.b";
@@ -493,8 +682,10 @@ let sweep_patterns =
     "a\\b";
     "\\Kabc";
     "(?>ab)";
-    "(a)?b";
-    "(a)+";
+    (* possessive group repeats stay declined (chunk G) *)
+    "(a)++";
+    "(?:ab)*+";
+    "(a*)++";
     "\\p{Common}{3}(())";
   ]
 
@@ -677,6 +868,61 @@ let parity_cases : (string * string * int * int32) list =
     ("(?m)^", "a\nb", 1, 0l);
     ("(?m)^a", "a", 0, o_notbol);
     ("(?m)a$", "a", 0, o_noteol);
+    (* --- Chunk D2: quantified + optional groups --- *)
+    (* greedy / lazy quantifiers on a capturing group; last-iteration capture
+       wins, earlier iterations restored on give-back *)
+    ("(a)+", "aaa", 0, 0l);
+    ("(a)+", "", 0, 0l);
+    ("(a)*", "aaa", 0, 0l);
+    ("(a)*", "", 0, 0l);
+    ("(a)?", "a", 0, 0l);
+    ("(a)?", "", 0, 0l);
+    ("(a)??", "a", 0, 0l);
+    ("(a)*?", "aaa", 0, 0l);
+    ("(a)+?", "aaa", 0, 0l);
+    ("(a)+?b", "aaab", 0, 0l);
+    (* nested alternation group, greedy repeat; capture is the last branch hit *)
+    ("(ab|c)*", "abcab", 0, 0l);
+    ("(ab|c)*", "", 0, 0l);
+    ("(a|b)+c", "abababc", 0, 0l);
+    (* non-capturing bra_loop repeat (no empty check) *)
+    ("(?:ab)+", "abab", 0, 0l);
+    ("(?:ab)+", "aba", 0, 0l);
+    ("(?:ab)*c", "ababc", 0, 0l);
+    ("(?:(a)|(b))+", "ab", 0, 0l);
+    ("(?:(a)|(b))+", "ba", 0, 0l);
+    (* nested captures across iterations, rc high-water *)
+    ("((a)(b))+", "abab", 0, 0l);
+    ("(a)(b)|(a)", "a", 0, 0l);
+    (* empty-capable repeated groups — the classic empty-loop cases *)
+    ("(a*)*", "aaa", 0, 0l);
+    ("(a*)*", "", 0, 0l);
+    ("(a*)+", "aaa", 0, 0l);
+    ("(?:a|)+", "aaa", 0, 0l);
+    ("(?:a|)+", "", 0, 0l);
+    ("(?:a?)+", "b", 0, 0l);
+    ("(?:a?b?)*", "ab", 0, 0l);
+    ("^(?:a?b?)*$", "aabb", 0, 0l);
+    ("^(?:a?b?)*$", "a--", 0, 0l);
+    ("^(?:a?b?)*$", "", 0, 0l);
+    ("(a+)+", "aaa", 0, 0l);
+    ("(a+)+b", "aaac", 0, 0l);
+    (* {n,m} on a group unrolls into BRAZERO-nested plain groups + SKIPZERO *)
+    ("(a){2,4}", "aaaaa", 0, 0l);
+    ("(a){2,4}", "a", 0, 0l);
+    ("(a){2}", "aa", 0, 0l);
+    ("(?:abc){0}x", "x", 0, 0l);
+    (* anchored group repeat *)
+    ("(a)+", "aa", 0, o_anchored);
+    (* NOTEMPTY on a zero-capable group repeat *)
+    ("(a)*", "", 0, o_notempty);
+    ("(?:a|)+", "b", 0, o_notempty);
+    (* PARTIAL × group repeat *)
+    ("(a)+", "aa", 0, o_partial_hard);
+    ("(a){3}", "aa", 0, o_partial_hard);
+    ("(ab)+", "aba", 0, o_partial_soft);
+    ("(ab)+c", "abab", 0, o_partial_soft);
+    ("(?:ab)+", "aba", 0, o_partial_hard);
   ]
 
 let parity_tests =
@@ -742,6 +988,32 @@ let limit_match_boundary_test =
         let f4, e4 = run_both "a*ab" 4 "aaaaab" in
         Alcotest.(check string) "N=4 interp matches" "M@0[0,6]" e4;
         Alcotest.(check string) "N=4 fast == interp" e4 f4);
+    (* Chunk D2: group-repeat tick parity. A repeated group is frame-per-
+       iteration in the C (grouploop RMATCH + KETRMAX RM7), so the two engines
+       must tick identically at EVERY match-limit N — sweeping N across the
+       whole boundary is a stronger pin than a single value. Both must give
+       -47 below the trip point and the SAME result at/above it. *)
+    Alcotest.test_case "LIMIT_MATCH sweep, group repeat (fast == interp)" `Quick
+      (fun () ->
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 40 do
+              let f, e = run_both body n subj in
+              Alcotest.(check string)
+                (Printf.sprintf "fast == interp for /%s/ on %S at N=%d" body subj
+                   n)
+                e f
+            done)
+          [
+            ("(a)+", "aaa");
+            ("(a)*b", "aaab");
+            ("(ab|c)+", "abcab");
+            ("(?:ab)+", "abab");
+            ("(a)+?b", "aaab");
+            ("(a*)*", "aaa");
+            ("(?:a|)+", "aaa");
+            ("(a){2,4}", "aaaaa");
+          ]);
   ]
 
 (* ---------- 7. alloc pins ----------

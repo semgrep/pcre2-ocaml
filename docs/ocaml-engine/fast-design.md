@@ -74,6 +74,11 @@ following the tag. Widths are `Ir.arity`:
 | 19 | `REPI` | `reptype; lmin; lmax; c1; c2` | 6 | caseless single-char repeat (`c2 = fcc(c1)`) |
 | 20 | `NOTREP` | `reptype; lmin; lmax; c` | 5 | caseful negated-char repeat (match `≠ c`) |
 | 21 | `NOTREPI` | `reptype; lmin; lmax; c1; c2` | 6 | caseless negated-char repeat (match `∉ {c1,c2}`) |
+| 22 | `GROUP_START` | `g` | 2 | repeated-group iteration entry: record the start position in `mb.group_start.(g)` (empty-check source), pushing a `KIND_GSTART` to restore it on backtrack |
+| 23 | `BRAZERO` | `skip` | 2 | greedy zero-repeat (`OP_BRAZERO`): try the group (tick, child frame), skip to `skip` (past the group) on backtrack |
+| 24 | `BRAMINZERO` | `skip` | 2 | lazy zero-repeat (`OP_BRAMINZERO`): jump to `skip` (the continuation) first (tick, child frame), enter the group (`pc+2`) on backtrack |
+| 25 | `KET_RMAX` | `entry; g` | 3 | greedy repeating ket (`OP_KETRMAX`): empty-check `g` (`no_group` = none) then loop back to `entry` (tick), give back the continuation (`pc+3`) on backtrack |
+| 26 | `KET_RMIN` | `entry; g` | 3 | lazy repeating ket (`OP_KETRMIN`): empty-check `g` then try the continuation (`pc+3`, tick), reiterate at `entry` on backtrack |
 
 **Chunk D additions.** `CIRCM`/`DOLLM` are the multiline anchors (their arms
 carry no operands; runtime semantics only). `CAP_START`/`CAP_END` bracket a
@@ -101,6 +106,51 @@ dumps, jump targets land on real heads); the runner (chunk C2) advances past the
 anchors carry no operands — their runtime semantics land in chunk C2. Multiline `^`/`$`
 (`OP_CIRCM`/`OP_DOLLM`), `\b`/`\B`, `\K` are NOT this subset → `Unsupported "... (chunk
 C2+)"`.
+
+**Chunk D2 additions — quantified and optional GROUPS.** A repeated group
+(bytecode bracket + `OP_KETRMAX`/`OP_KETRMIN`) lowers to the chunk-D group
+body (ALT choice points + FAIL / bra_loop last branch) with two changes: (1)
+if the bracket is a grouploop bracket (`OP_CBRA`/`OP_SCBRA`/`OP_SBRA` — the C's
+`P != NULL`), a `GROUP_START g` precedes the group and the ket carries the
+matching `g`, so the empty-string loop check compares the ket position to the
+iteration start; an `OP_BRA` repeat (bra_loop, `P == NULL`) carries `g =
+Ir.no_group` = −1 and never force-breaks (it can't match empty, mirroring the
+C's short-circuit). (2) The ket is `KET_RMAX`/`KET_RMIN` whose `entry` loops
+back to the group entry (the `GROUP_START`, or the `BRA` marker for bra_loop).
+`OP_BRAZERO`/`OP_BRAMINZERO` (the greedy/lazy zero-repeat wrappers before a
+group, for `*`/`*?` and the `{n,m}` optional tail) become one instruction plus
+the group body; the skip target (past the group) is patched after the group is
+lowered. `OP_SKIPZERO` (a `{0}` group) is elided entirely — no IR, the walk
+just steps past the dead bytecode (so an unsupported construct inside a `{0}`
+group cannot decline the pattern — strictly safe, the group is never entered).
+
+**Declined to chunk G — possessive group repeats.** `OP_KETRPOS` +
+`OP_BRAPOS`/`OP_CBRAPOS`/`OP_SCBRAPOS`/`OP_SBRAPOS` + `OP_BRAPOSZERO`
+(`(?:…)++`, `(…)*+`, …). The C's KETRPOS protocol (`pcre2_match.c:5283-5328`)
+juggles frames — `OP_KETRPOS` copies the whole frame-copy region back to the
+predecessor `P` and returns `MATCH_KETRPOS`, and the `POSSESSIVE_GROUP` loop
+(RM8) iterates one at a time from the outer level, committing each iteration
+(discarding its internal backtracking) while still restoring the group's
+captures if the whole group is backtracked past. That commit-but-restore
+interplay does not map onto the minimal per-choice-point save records without a
+frame-copy-back mechanism the fast engine deliberately lacks; it belongs to
+chunk G (atomic/`OP_ONCE` groups, already declined there). The IR compiler
+declines them precisely (`"fast: possessive group (…) (chunk G)"`).
+
+**detect_repeat (`pcre2_jit_compile.c:1699-1835`) — DECLINED PERMANENTLY (not
+a coverage gap).** Now that group repeats exist, detect_repeat's recognised
+bytecode shapes (a run of identical `(?:X)(?:X)…` collapsed to `OP_EXACT n`, or
+`(?:AB){4,6}` → a `{3}` prefix + a bounded `OP_UPTO`/`OP_MINUPTO` tail) DO
+occur. But the shared compiler already UNROLLS `{n,m}` into physical bracket
+copies (each with its own `OP_KET`), and the interpreter — the fast engine's
+differential oracle — runs those copies as-is, ticking (`RMATCH`) once per
+copy. detect_repeat is a JIT-ONLY normalization that re-collapses the copies;
+the JIT never had a tick-parity obligation. Porting it would make the fast
+engine tick FEWER times than the interpreter for an unrolled repeat, so a
+`(*LIMIT_MATCH=N)` cap (`-47`) would trip at a different N — a §4 tick-parity
+violation and a fuzz `--mode fast-vs-interp` divergence. It is therefore NOT
+ported, by design; the unrolled copies are lowered individually (correct,
+tick-identical) instead.
 
 `Ir.dump : Format.formatter -> Ir.t -> unit` prints one `%3d TAG operands` line per head
 (debug_printer.ml style); `CHAR_RUN`/`CHARI` show the escaped literal, `ALT` shows
@@ -179,6 +229,8 @@ first:
 | `KIND_CAP` | 4 | `ovbase; old_start; old_end; KIND_CAP` | each `CAP_START` | restore `ovector[ovbase]`/`[ovbase+1]`, then keep popping |
 | `KIND_REP_MAX` | 5 | `rep_pc; try_pos; floor; rdepth; KIND_REP_MAX` | greedy repeat with extra chars | retry the continuation at `try_pos` (decrement to `floor`) |
 | `KIND_REP_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REP_MIN` | minimizing repeat with `lmin<lmax` | match one more char at `eptr`, retry the continuation |
+| `KIND_CONT` | 4 | `target; eptr; rdepth; KIND_CONT` | BRAZERO / BRAMINZERO / greedy KETRMAX / lazy KETRMIN | resume at IR index `target` (restore `eptr`/`rdepth`), NO tick |
+| `KIND_GSTART` | 3 | `g; old_start; KIND_GSTART` | each `GROUP_START` (tracked repeated group) | restore `mb.group_start.(g)`, then keep popping |
 
 `match_call_count`, `hitend`, `start_used_ptr` are NOT saved (monotonic /
 constant per attempt). `sp` is a runner tail-call parameter; push/pop are
@@ -202,6 +254,49 @@ enclosing group's cleanup already rolls back everything a failed branch wrote
 (verified: `(?:(a)x|ay)` on "ay" gives group 1 unset, matching the interp).
 `rc` (the pcre2 pair count) is recomputed at END as `highest set group + 1`
 (= the interpreter's `end_offset_top/2 + 1`), not tracked incrementally.
+
+**Group-repeat protocol (chunk D2 — the minimal-record design).** The C runs a
+repeated group frame-per-iteration: entering the group RMATCHes a branch
+(grouploop RM2, or bra_loop's RM1/same-frame), and the repeating ket RMATCHes
+back to the bracket (KETRMAX RM7) or forward to the continuation (KETRMIN RM6),
+each iteration in a fresh frame. The fast engine drives the SAME loop with the
+existing group lowering plus four instructions and one shared record kind:
+
+- `KET_RMAX` (greedy): if the iteration matched empty (`eptr = group_start.(g)`,
+  the C's `Feptr == P->eptr`), break the loop and continue past the group (no
+  record, no tick — matching the C's `Fecode += 1+LINK_SIZE; break`). Else push
+  a `KIND_CONT` resuming at the continuation (the give-back point), tick, and
+  loop to `entry`. The `entry` re-runs the group body, whose first `ALT`
+  (grouploop) ticks again — so a grouploop reiteration is 2 ticks (RM7 +
+  grouploop) and a bra_loop reiteration is 1 (RM7 only, no entry ALT), exactly
+  the C's frame counts. On backtrack, `KIND_CONT` runs the continuation with NO
+  tick (the C's same-frame `break` after RM7 NOMATCH).
+- `KET_RMIN` (lazy): empty case as above; else push a `KIND_CONT` resuming at
+  `entry` (the reiteration point), tick, and run the continuation. On backtrack,
+  `KIND_CONT` reiterates at `entry` with NO tick (the C's `Fecode -= GET; break`
+  dispatching the bracket in the same frame — the entry's grouploop ALT then
+  ticks).
+- `BRAZERO`/`BRAMINZERO` share `KIND_CONT`: BRAZERO ticks, pushes a give-back to
+  the skip target, and falls into the group; BRAMINZERO ticks, pushes an
+  enter-the-group point, and jumps to the skip (continuation). Both restore
+  with NO tick on backtrack (RM9/RM10's same-frame `break`).
+- The empty-string loop check needs each iteration's start position. A single
+  `mb.group_start : int array` (indexed by the compile-time group id `g`, sized
+  `ir.n_groups`, reused/grown across execs) holds it: `GROUP_START g` writes the
+  current position and pushes a `KIND_GSTART` saving the OLD value; on backtrack
+  `KIND_GSTART` restores it. This mirrors the C exactly — each C iteration keeps
+  its start in its own frame (`P->eptr`), preserved across backtracking into an
+  earlier iteration's branch; the `KIND_GSTART` restore reproduces that
+  preservation for the shared slot (without it, a later iteration's
+  `GROUP_START` clobbers an earlier one and the empty check loops — the bug the
+  `^(?:a?b?)*$` conformance unit caught). An `OP_BRA` (bra_loop) repeat carries
+  `g = Ir.no_group` and skips the check (the C's `P == NULL`; OP_BRA can never
+  match empty, so the check would never fire anyway — but this stays faithful).
+- Captures across iterations: each iteration's `CAP_START`/`CAP_END` write group
+  `N`'s slots and push a `KIND_CAP` cleanup, so the LAST completed iteration's
+  capture survives at END and a given-back iteration is restored by its
+  `KIND_CAP` (verified: `(a)+` on `"aa"` → group 1 = `[1,2]`; `(a*)*` on `""` →
+  group 1 = `[0,0]`; both match the interpreter).
 
 **`optimized_cbracket` (`pcre2_jit_compile.c:404`, cleared `:1145-1184`).**
 `Ir_compile.optimized_cbracket` ports the JIT flag: a capture is "optimized"
@@ -266,7 +361,13 @@ child frame. `grouploop`'s single/last branch ticks (the top level "can't optimi
 | backtrack pop `KIND_ALT` → handler non-`ALT`/`FAIL`, saved `d = 0` (top-level last branch) | 1 (rdepth 1) | 1 | frame 1 |
 | backtrack pop `KIND_ALT` → handler is `ALT`/`FAIL`, or saved `d >= 1` | 0 | saved `d` | none |
 | `JMP`, `KET`, `CHAR_RUN`, `CHARI`, `SOD`/`SOM`/`EOD`/`EODN`/`CIRC`/`DOLL`/`CIRCM`/`DOLLM`, `END` | 0 | unchanged | none |
-| `CAP_START`, `CAP_END`, `FAIL` | 0 | unchanged | none |
+| `CAP_START`, `CAP_END`, `FAIL`, `GROUP_START` | 0 | unchanged | none |
+| `BRAZERO` / `BRAMINZERO` (enter the group / continuation) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| `KET_RMAX`/`KET_RMIN`, empty iteration (`eptr = group_start`) | 0 | `d` | none |
+| `KET_RMAX` non-empty: greedy loop-back (RM7, push `KIND_CONT`) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| `KET_RMIN` non-empty: continuation try (RM6, push `KIND_CONT`) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| backtrack pop `KIND_CONT` (BRAZERO skip / BRAMINZERO enter / KETRMAX give-back / KETRMIN reiterate) | 0 | saved `d` | none |
+| backtrack pop `KIND_GSTART` (restore `group_start`, keep popping) | 0 | — | none |
 | repeat min-loop / greedy scan (per char consumed) | 0 | unchanged | none |
 | `REP`/`REPI`/`NOTREP`/`NOTREPI` EXACT (`lmin=lmax`) or possessive | 0 | unchanged | none |
 | minimize repeat, `lmin<lmax`: first continuation try (push `KIND_REP_MIN`) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
@@ -282,6 +383,19 @@ top level; nested `OP_BRA` is `bra_loop` (rdepth `>= 1`, no THEN in chunk D).
 Its last branch is reached either by falling through the `BRA` (single-branch)
 or via the preceding `ALT`'s handler landing on a non-`ALT`/`FAIL` head with
 saved `d = 0`; both tick.
+
+**Group repeats (chunk D2) compose the ket tick with the entry tick.** A
+`KET_RMAX`/`KET_RMIN` row above ticks ONCE (the C's RM7/RM6 RMATCH into a child
+frame); the reiteration then re-runs the group entry, whose first `ALT` ticks
+AGAIN for a grouploop group (`OP_CBRA`/`OP_SCBRA`/`OP_SBRA`) but not for a
+bra_loop single-branch group (`OP_BRA`, no entry `ALT`). So a grouploop KETRMAX
+reiteration is 2 ticks (RM7 + grouploop RM2) and a bra_loop one is 1 (RM7
+only), matching the interpreter's frame counts exactly (interpreter.ml
+6117-6120 RM7 → grouploop/bra_loop). The `BRAZERO`/`BRAMINZERO` tick precedes
+the group's own entry tick the same way (the C's RM9/RM10 frame wraps the
+bracket dispatch). Verified continuously by the fuzz `--mode fast-vs-interp`
+`LIMIT_MATCH=2000` differential (0 divergences over 200k+ cases including
+group repeats) and the group-repeat `LIMIT_MATCH` N-sweep test.
 
 **Capturing groups (chunk D) are `grouploop`, so their LAST branch ticks too.**
 `OP_CBRA`/`OP_SCBRA` (interpreter.ml:2434-2444 → `grouploop`) record a

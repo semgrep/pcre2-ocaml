@@ -46,6 +46,22 @@ let t_repi = 19 (* [t_repi;   reptype; lmin; lmax; c1; c2] — caseless char rep
 let t_notrep = 20 (* [t_notrep; reptype; lmin; lmax; c]      — caseful NOT rep *)
 let t_notrepi = 21 (* [t_notrepi;reptype; lmin; lmax; c1; c2] — caseless NOT rep *)
 
+(* Chunk D2 additions (fast-design.md §2/§3) — quantified and optional groups.
+   A repeated group's entry records its per-iteration start position (for the
+   empty-string loop check) in [mb.group_start.(g)]; its ket loops back to the
+   group entry ([t_group_start]/the bracket) or continues past. Optional-group
+   wrappers OP_BRAZERO/OP_BRAMINZERO become a choice point (KIND_CONT). *)
+let t_group_start = 22 (* [t_group_start; g] — record group g's iter start *)
+let t_brazero = 23 (* [t_brazero; skip]  — greedy optional: try group, skip on bt *)
+let t_braminzero = 24 (* [t_braminzero; skip] — lazy optional: skip, enter on bt *)
+let t_ket_rmax = 25 (* [t_ket_rmax; entry; g] — greedy repeating ket (OP_KETRMAX) *)
+let t_ket_rmin = 26 (* [t_ket_rmin; entry; g] — lazy repeating ket (OP_KETRMIN) *)
+
+(* Sentinel [g] for a repeated group whose bracket is OP_BRA (bra_loop, C's
+   P == NULL): NO empty-string check (the C short-circuits it, and OP_BRA can
+   never match empty), so no [t_group_start] and no [mb.group_start] slot. *)
+let no_group = -1
+
 (* Repeat type constants (mirror interpreter.ml:106-108 reptype min/max/pos). *)
 let reptype_min = 0
 let reptype_max = 1
@@ -56,7 +72,7 @@ let reptype_pos = 2
 let rep_inf = 0xFFFFFFFF
 
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 21
+let max_tag = 26
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -85,6 +101,11 @@ let arity =
     6 (* t_repi: reptype, lmin, lmax, c1, c2 *);
     5 (* t_notrep: reptype, lmin, lmax, c *);
     6 (* t_notrepi: reptype, lmin, lmax, c1, c2 *);
+    2 (* t_group_start: g *);
+    2 (* t_brazero: skip *);
+    2 (* t_braminzero: skip *);
+    3 (* t_ket_rmax: entry, g *);
+    3 (* t_ket_rmin: entry, g *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -113,13 +134,21 @@ let tag_name =
     "REPI";
     "NOTREP";
     "NOTREPI";
+    "GROUP_START";
+    "BRAZERO";
+    "BRAMINZERO";
+    "KET_RMAX";
+    "KET_RMIN";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
    instruction stream; [lit] backs [t_char_run] items; [re] is pinned as the
    source of any (future) variable-length payloads and of the options /
-   top_bracket the runner (chunk C2) needs. *)
-type t = { code : int array; lit : string; re : C.re }
+   top_bracket the runner (chunk C2) needs. [n_groups] (chunk D2) is the
+   number of empty-check-tracked repeated groups: the runner allocates a
+   [group_start] array of that size, indexed by the group id in
+   [t_group_start]/[t_ket_rmax]/[t_ket_rmin]. *)
+type t = { code : int array; lit : string; re : C.re; n_groups : int }
 
 (* ---------- Decode accessors (fast-design.md §2) ----------
    Positional reads used by the runner (chunk C2) and the verifier. They
@@ -158,6 +187,23 @@ let rep_c1 (ir : t) (pc : int) : int = ir.code.(pc + 4)
 (* Only [t_repi]/[t_notrepi] carry a second (other-case) char at offset 5. *)
 let rep_c2 (ir : t) (pc : int) : int = ir.code.(pc + 5)
 
+(* Chunk D2 operands (fast-design.md §2/§3). *)
+
+(* [t_group_start] operand — the repeated group's id (index into
+   [mb.group_start]); the arm records the current position there. *)
+let group_start_id (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* [t_brazero]/[t_braminzero] operand — the IR index PAST the group (the
+   skip target: BRAZERO resumes here on backtrack; BRAMINZERO jumps here on
+   entry and resumes at the group on backtrack). *)
+let braz_skip (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* [t_ket_rmax]/[t_ket_rmin] operands — [entry] is the IR index of the group
+   entry to loop back to; [g] is the empty-check group id ([no_group] = no
+   check). The continuation past the ket is [pc + 3]. *)
+let ket_entry (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let ket_group (ir : t) (pc : int) : int = ir.code.(pc + 2)
+
 (* ---------- Text dump (fast-design.md §2) ----------
    Stable, debug_printer.ml-style listing for golden tests: one line per
    instruction, [%3d TAG operands]. Printf/Format here is a debug path
@@ -195,6 +241,16 @@ let render (ir : t) (pc : int) (t : int) : string =
     Printf.sprintf "CAP_START ovbase=%d" (cap_ovbase ir pc)
   else if Int.equal t t_cap_end then
     Printf.sprintf "CAP_END ovbase=%d" (cap_ovbase ir pc)
+  else if Int.equal t t_group_start then
+    Printf.sprintf "GROUP_START g=%d" (group_start_id ir pc)
+  else if Int.equal t t_brazero then
+    Printf.sprintf "BRAZERO skip=%d" (braz_skip ir pc)
+  else if Int.equal t t_braminzero then
+    Printf.sprintf "BRAMINZERO skip=%d" (braz_skip ir pc)
+  else if Int.equal t t_ket_rmax then
+    Printf.sprintf "KET_RMAX entry=%d g=%d" (ket_entry ir pc) (ket_group ir pc)
+  else if Int.equal t t_ket_rmin then
+    Printf.sprintf "KET_RMIN entry=%d g=%d" (ket_entry ir pc) (ket_group ir pc)
   else if
     Int.equal t t_rep || Int.equal t t_repi || Int.equal t t_notrep
     || Int.equal t t_notrepi

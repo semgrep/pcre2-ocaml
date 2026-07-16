@@ -67,11 +67,29 @@ interpreter is its differential oracle. Approved plan:
   repeated groups KETRMAX/KETRMIN/KETRPOS + OP_BRAZERO/OP_SKIPZERO (optional /
   quantified groups → chunk D-adjacent, need the empty-string loop check), a
   back-referenced/conditional/recursed capture (its referencing opcode is out
-  of subset → chunk F/J/K). **detect_repeat (`:1699-1850`) NOT ported** — it
+  of subset → chunk F/J/K). **detect_repeat (`:1699-1835`) NOT ported** — it
   normalises repeated identical GROUPS (walks brackets: `OP_BRA`+`OP_KETRMAX`
   etc.), which are declined here (group repeats are out of subset), so its
   recognised bytecode shapes never occur for single-char repeats. It belongs to
   the chunk that admits group repeats.
+- [x] **D2 — Quantified + optional GROUPS** — the constructs chunk D declined.
+  Repeated groups KETRMAX/KETRMIN + their brackets, incl. OP_SBRA/OP_SCBRA (the
+  empty-string loop check via `mb.group_start` + `KIND_GSTART` restore, mirroring
+  the C's per-frame `P->eptr`, pcre2_match.c:6107); optional groups
+  OP_BRAZERO/OP_BRAMINZERO (`KIND_CONT`) and OP_SKIPZERO (elided). New IR tags
+  GROUP_START/BRAZERO/BRAMINZERO/KET_RMAX/KET_RMIN; new save kinds KIND_CONT +
+  KIND_GSTART (fast-design.md §2/§3/§4). Frame-per-iteration tick parity (RM6/
+  RM7/RM9/RM10 + grouploop/bra_loop entry) verified by the fuzz fast-vs-interp
+  LIMIT_MATCH differential (0 divergences / 200k+) and a group-repeat LIMIT_MATCH
+  N-sweep. Ratchet 701 → 770. **Declined to chunk G:** possessive group repeats
+  OP_KETRPOS + OP_BRAPOS/CBRAPOS/SCBRAPOS/SBRAPOS/BRAPOSZERO — the KETRPOS
+  frame-copy-back protocol (pcre2_match.c:5283-5328) resists the minimal-save
+  design (commit-per-iteration yet restore-captures-on-backtrack-past).
+  **detect_repeat (`pcre2_jit_compile.c:1699-1835`) DECLINED PERMANENTLY** — it
+  re-collapses the shared compiler's unrolled `{n,m}` bracket copies, which the
+  interpreter (the oracle) ticks one per copy; porting it would tick fewer times
+  and break the §4 LIMIT_MATCH tick parity. Not a coverage gap — a differential-
+  contract decision (fast-design.md §2).
 - [ ] **E — Classes/types** — CLASS/NCLASS bitmap, XCLASS (via `Xclass`), type
   singles+repeats; charpos loops (`:11831-12022`).
 - [ ] **F — Backreferences** — REF/REFI/DNREF/DNREFI + ref repeats.

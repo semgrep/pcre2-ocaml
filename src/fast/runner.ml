@@ -110,6 +110,14 @@ type mb = {
   mutable ovector : int array;
   mutable oveccount : int; (* re.top_bracket + 1 (pairs) *)
   mutable rc : int; (* high-water pair count at a successful END *)
+  (* Repeated-group iteration-start positions (chunk D2, fast-design.md §3),
+     indexed by the group id in t_group_start / t_ket_rmax / t_ket_rmin.
+     Slot g holds the eptr at the START of group g's current iteration; a
+     t_group_start writes it, the repeating ket reads it for the empty-string
+     loop check (pcre2_match.c:6107, Feptr != P->eptr). Written only by g's
+     entry and read only by g's ket, so no save/restore is needed. Sized
+     [ir.n_groups], reused/grown across execs. *)
+  mutable group_start : int array;
   (* Repeat scratch (single-char repeat superinstructions): the invariant
      parameters of the repeat currently being scanned (fast-design.md §2/§4).
      Live only during a repeat's forward min-loop / greedy scan; the REP_MIN
@@ -177,6 +185,7 @@ let make_mb (ss : Save_stack.t) : mb =
     ovector = [||];
     oveccount = 1;
     rc = 1;
+    group_start = [||];
     rep_pc = 0;
     rep_want = true;
     rep_c1 = 0;
@@ -343,6 +352,23 @@ let rc_of_ovector (mb : mb) : int =
     else (scan [@tailcall]) (n - 1)
   in
   scan (mb.oveccount - 1)
+
+(* Push a KIND_CONT record [target; eptr; rdepth; KIND_CONT] at [sp]
+   (fast-design.md §3): the chunk-D2 group choice point shared by BRAZERO,
+   BRAMINZERO, the greedy KETRMAX give-back and the lazy KETRMIN reiteration.
+   Module-level + fully applied so the loop builds no closure (§8); grows the
+   save stack cold when a push would overflow. *)
+let push_cont (mb : mb) (sp : int) (target : int) (eptr : int) (rdepth : int) :
+    unit =
+  let ss = mb.ss in
+  let need = sp + Save_stack.width_cont in
+  if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+  let d = ss.Save_stack.data in
+  (* safe: [grow] ensured Array.length d >= sp + width_cont. *)
+  Array.unsafe_set d sp target;
+  Array.unsafe_set d (sp + 1) eptr;
+  Array.unsafe_set d (sp + 2) rdepth;
+  Array.unsafe_set d (sp + 3) Save_stack.kind_cont
 
 (* ---------- The fused loop (§3) ---------- *)
 
@@ -527,6 +553,84 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       (* Single-char repeat superinstructions (fast-design.md §2/§4;
          repeatchar/repeatnotchar interpreter.ml:3549-4128, non-UTF). *)
       (op_repeat [@tailcall]) mb pc eptr sp rdepth mcc
+  | 22 ->
+      (* GROUP_START (fast-design.md §3; the C records the group-start eptr in
+         the group frame's predecessor P, read at the ket, pcre2_match.c:6081/
+         6107) — store this iteration's start position for the empty-string
+         loop check, saving the enclosing iteration's start in a KIND_GSTART
+         record so backtracking into an earlier iteration's branch restores it
+         (the C keeps each iteration's start in its own frame). No tick. *)
+      let g = code.(pc + 1) in
+      let ss = mb.ss in
+      let need = sp + Save_stack.width_gstart in
+      if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+      let d = ss.Save_stack.data in
+      (* safe: [grow] ensured length >= sp + width_gstart; g in [0, n_groups)
+         (Ir_verify) so it indexes mb.group_start. *)
+      Array.unsafe_set d sp g;
+      Array.unsafe_set d (sp + 1) (Array.unsafe_get mb.group_start g);
+      Array.unsafe_set d (sp + 2) Save_stack.kind_gstart;
+      Array.unsafe_set mb.group_start g eptr;
+      (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_gstart) rdepth
+        mcc
+  | 23 ->
+      (* BRAZERO (fast-design.md §3; OP_BRAZERO pcre2_match.c:5224-5230) —
+         greedy zero-repeat wrapper: RMATCH(bracket, RM9) tries the group
+         first (tick, child frame), skips it on backtrack. Push a KIND_CONT
+         resuming at [skip] (past the group), then fall through into the group
+         body at rdepth+1. *)
+      let mcc' = tick_child mb mcc (rdepth + 1) in
+      if mcc' < 0 then mcc'
+      else (
+        push_cont mb sp code.(pc + 1) eptr rdepth;
+        (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_cont)
+          (rdepth + 1) mcc')
+  | 24 ->
+      (* BRAMINZERO (fast-design.md §3; OP_BRAMINZERO pcre2_match.c:5232-5238)
+         — lazy zero-repeat wrapper: RMATCH(continuation, RM10) tries the rest
+         WITHOUT the group first (tick, child frame), enters the group on
+         backtrack. Push a KIND_CONT resuming at the group entry (pc+2), then
+         jump to [skip] (the continuation) at rdepth+1. *)
+      let mcc' = tick_child mb mcc (rdepth + 1) in
+      if mcc' < 0 then mcc'
+      else (
+        push_cont mb sp (pc + 2) eptr rdepth;
+        (run [@tailcall]) mb code.(pc + 1) eptr (sp + Save_stack.width_cont)
+          (rdepth + 1) mcc')
+  | 25 ->
+      (* KET_RMAX (fast-design.md §3/§4; OP_KETRMAX pcre2_match.c:6107-6120) —
+         greedy repeating ket. The empty-string loop check
+         (Feptr != P->eptr): if this iteration matched empty, forcibly break
+         the loop and carry on past the group (no tick). Otherwise record a
+         give-back point (KIND_CONT resuming at the continuation pc+3) and try
+         one more iteration — RMATCH(bracode, RM7): tick, loop to [entry]. *)
+      let g = code.(pc + 2) in
+      if g >= 0 && Int.equal eptr (Array.unsafe_get mb.group_start g) then
+        (* empty match: break the loop, continue past the group. *)
+        (run [@tailcall]) mb (pc + 3) eptr sp rdepth mcc
+      else
+        let mcc' = tick_child mb mcc (rdepth + 1) in
+        if mcc' < 0 then mcc'
+        else (
+          push_cont mb sp (pc + 3) eptr rdepth;
+          (run [@tailcall]) mb code.(pc + 1) eptr (sp + Save_stack.width_cont)
+            (rdepth + 1) mcc')
+  | 26 ->
+      (* KET_RMIN (fast-design.md §3/§4; OP_KETRMIN pcre2_match.c:6109-6114) —
+         lazy repeating ket. Empty match forcibly breaks the loop (as KETRMAX).
+         Otherwise try the rest of the pattern first — RMATCH(continuation,
+         RM6): tick, run pc+3 at rdepth+1 — recording a reiteration point
+         (KIND_CONT resuming at [entry]) for backtrack. *)
+      let g = code.(pc + 2) in
+      if g >= 0 && Int.equal eptr (Array.unsafe_get mb.group_start g) then
+        (run [@tailcall]) mb (pc + 3) eptr sp rdepth mcc
+      else
+        let mcc' = tick_child mb mcc (rdepth + 1) in
+        if mcc' < 0 then mcc'
+        else (
+          push_cont mb sp code.(pc + 1) eptr rdepth;
+          (run [@tailcall]) mb (pc + 3) eptr (sp + Save_stack.width_cont)
+            (rdepth + 1) mcc')
   | 0 ->
       (* END (fast-design.md §2; op_end_tail interpreter.ml:3416-3492 /
          pcre2_match.c:876-940) — accept, subject to the empty-match and
@@ -613,10 +717,30 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
       (* KIND_REP_MAX [rep_pc; try_pos; floor; rdepth; kind] — greedy repeat
          give-back (interpreter.ml maxbt RM26/RM28). *)
       (backtrack_rep_max [@tailcall]) mb sp mcc
-    else
+    else if Int.equal kind Save_stack.kind_rep_min then
       (* KIND_REP_MIN [rep_pc; count; eptr; rdepth; kind] — minimizing repeat
          extend-by-one (interpreter.ml RM25/RM27). *)
       (backtrack_rep_min [@tailcall]) mb sp mcc
+    else if Int.equal kind Save_stack.kind_gstart then (
+      (* KIND_GSTART [g; old_start; kind] (fast-design.md §3) — restore group
+         g's iteration-start slot to the enclosing iteration's value and keep
+         popping (the C's per-frame group start, pcre2_match.c:6107). *)
+      let base = sp - Save_stack.width_gstart in
+      let g = Array.unsafe_get d base in
+      (* safe: g written by GROUP_START, in [0, n_groups). *)
+      Array.unsafe_set mb.group_start g (Array.unsafe_get d (base + 1));
+      (backtrack [@tailcall]) mb base mcc)
+    else
+      (* KIND_CONT [target; eptr; rdepth; kind] (fast-design.md §3) — a
+         chunk-D2 group choice point: resume at [target] with [eptr]/[rdepth]
+         restored and NO tick. This is the C's same-frame `break` after an
+         RM9/RM10/RM7 NOMATCH (skip the group / carry on past the group) or
+         the KETRMIN reiteration `Fecode -= GET; break`. *)
+      let base = sp - Save_stack.width_cont in
+      let target = Array.unsafe_get d base in
+      let e = Array.unsafe_get d (base + 1) in
+      let dsaved = Array.unsafe_get d (base + 2) in
+      (run [@tailcall]) mb target e base dsaved mcc
 
 (* KIND_REP_MAX backtrack: try the continuation one position lower, down to
    [floor] (Lstart_eptr). Positions above [floor] run in a child frame
@@ -1172,6 +1296,11 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
         mb.oveccount <- oveccount;
         if Array.length mb.ovector < 2 * oveccount then
           mb.ovector <- Array.make (2 * oveccount) Frames.unset;
+        (* Repeated-group iteration-start scratch (chunk D2): one int per
+           empty-check-tracked group; reused/grown across execs. Contents are
+           written by t_group_start before any read, so no reset is needed. *)
+        if Array.length mb.group_start < ir.Ir.n_groups then
+          mb.group_start <- Array.make ir.Ir.n_groups 0;
         mb.anchored <-
           not
             (Int.equal
@@ -1317,9 +1446,16 @@ let () =
   assert (Int.equal Ir.t_repi 19);
   assert (Int.equal Ir.t_notrep 20);
   assert (Int.equal Ir.t_notrepi 21);
-  assert (Int.equal Ir.max_tag 21);
+  assert (Int.equal Ir.t_group_start 22);
+  assert (Int.equal Ir.t_brazero 23);
+  assert (Int.equal Ir.t_braminzero 24);
+  assert (Int.equal Ir.t_ket_rmax 25);
+  assert (Int.equal Ir.t_ket_rmin 26);
+  assert (Int.equal Ir.max_tag 26);
   (* Save-record KIND / width constants the runner inlines as literals. *)
   assert (Int.equal Save_stack.kind_alt 0);
   assert (Int.equal Save_stack.kind_cap 1);
   assert (Int.equal Save_stack.kind_rep_max 2);
-  assert (Int.equal Save_stack.kind_rep_min 3)
+  assert (Int.equal Save_stack.kind_rep_min 3);
+  assert (Int.equal Save_stack.kind_cont 4);
+  assert (Int.equal Save_stack.kind_gstart 5)
