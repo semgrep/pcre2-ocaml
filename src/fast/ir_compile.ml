@@ -119,6 +119,14 @@ let compile (re : C.re) : (Ir.t, string) result =
   else if not (Int.equal (re.C.overall_options land Opt.ucp) 0) then
     Error "fast: UCP mode (chunk I)"
   else if re.C.top_bracket > 0 then Error "fast: capturing groups (chunk D)"
+  else if not (Int.equal (re.C.overall_options land Opt.firstline) 0) then
+    (* PCRE2_FIRSTLINE constrains an unanchored match to the first line. The
+       C enforces this partly through the start-of-match scans' shortened
+       end_subject (pcre2_match.c:7164-7186), which the naive chunk-C2 driver
+       does not replicate; a bump_bottom-only stop (pcre2_match.c:7584-7588)
+       diverges at the newline position for patterns with a first code unit.
+       Declined until the JIT start-opts land (chunk L, fast-design.md §5). *)
+    Error "fast: PCRE2_FIRSTLINE (chunk L)"
   else
     let src = re.C.code in
     let byte (p : int) : int = Char.code (Bytes.get src p) in

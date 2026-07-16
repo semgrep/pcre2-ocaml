@@ -11,6 +11,8 @@ module Ir = Pcre2_fast.Ir
 module Ir_compile = Pcre2_fast.Ir_compile
 module Ir_verify = Pcre2_fast.Ir_verify
 module C = Pcre2_engine.Compile
+module E = Pcre2_engine.Engine
+module F = Pcre2_fast
 
 (* ---------- helpers ---------- *)
 
@@ -414,6 +416,225 @@ let sweep_tests =
           sweep_patterns);
   ]
 
+(* ---------- 5. runner exec parity vs the interpreter ----------
+
+   On every pattern the fast engine ACCEPTS, exec_full must be byte-identical
+   to Pcre2_engine.Engine.exec_full (the differential oracle): same rc class,
+   ovector, and startchar. A pattern the fast engine declines (Unsupported)
+   is skipped (the runner never sees it). *)
+
+(* Match options (pcre2.h.generic). *)
+let o_notbol = 0x00000001l
+let o_noteol = 0x00000002l
+let o_notempty = 0x00000004l
+let o_notempty_atstart = 0x00000008l
+let o_partial_soft = 0x00000010l
+let o_partial_hard = 0x00000020l
+let o_anchored = 0x80000000l
+let o_endanchored = 0x20000000l
+let o_bad = 0x00000100l (* PCRE2_FIRSTLINE — not a valid MATCH option -> -34 *)
+
+(* A comparable normal form of an exec_result (mark is always None in this
+   subset, so it is not compared; startchar is folded in for Match/Partial). *)
+let norm : E.exec_result -> string = function
+  | E.Match { ovector; start_char; _ } ->
+      Printf.sprintf "M[%d,%d]@%d" ovector.(0) ovector.(1) start_char
+  | E.No_match _ -> "NM"
+  | E.Partial { start; _ } -> Printf.sprintf "P%d" start
+  | E.Error { code; _ } -> Printf.sprintf "E%d" code
+
+let parity_cases : (string * string * int * int32) list =
+  [
+    (* literal match / miss at various offsets *)
+    ("abc", "abc", 0, 0l);
+    ("abc", "xabc", 0, 0l);
+    ("abc", "xabc", 1, 0l);
+    ("abc", "ab", 0, 0l);
+    ("abc", "", 0, 0l);
+    ("abc", "zzz", 0, 0l);
+    (* alternation backtracking order (leftmost branch wins) *)
+    ("a|ab", "ab", 0, 0l);
+    ("ab|a", "ab", 0, 0l);
+    ("foo|foobar", "foobar", 0, 0l);
+    ("(?:a|b)c", "bc", 0, 0l);
+    ("(?:a|b|c)d", "cd", 0, 0l);
+    ("a(?:b(?:c|d)e|f)g", "abdeg", 0, 0l);
+    ("a(?:b(?:c|d)e|f)g", "afg", 0, 0l);
+    (* empty-branch groups: empty match ovector [k,k] *)
+    ("(?:|a)", "a", 0, 0l);
+    ("(?:a|)", "b", 0, 0l);
+    ("(?:)", "x", 0, 0l);
+    ("(?:|a)b", "ab", 0, 0l);
+    (* caseless single chars *)
+    ("(?i)abc", "ABC", 0, 0l);
+    ("(?i)abc", "aBc", 0, 0l);
+    ("(?i)abc", "abd", 0, 0l);
+    (* anchors *)
+    ("^abc", "abc", 0, 0l);
+    ("^abc", "xabc", 1, 0l);
+    ("abc$", "abc", 0, 0l);
+    ("\\Aabc", "abc", 0, 0l);
+    ("abc\\z", "abc", 0, 0l);
+    ("abc\\Z", "abc\n", 0, 0l);
+    ("a\\Zb", "a\nb", 0, 0l);
+    (* \G at nonzero offset *)
+    ("\\Gabc", "abc", 0, 0l);
+    ("\\Gbc", "abc", 1, 0l);
+    ("\\Gbc", "abc", 0, 0l);
+    (* notbol / noteol *)
+    ("^a", "a", 0, o_notbol);
+    ("a$", "a", 0, o_noteol);
+    ("^a", "a", 0, 0l);
+    (* NOTEMPTY / NOTEMPTY_ATSTART on empty-capable patterns *)
+    ("(?:|a)", "b", 0, o_notempty);
+    ("(?:a|)", "b", 0, o_notempty);
+    ("(?:a|)", "b", 0, o_notempty_atstart);
+    ("(?:|a)", "ba", 0, o_notempty);
+    (* ANCHORED at match time *)
+    ("abc", "xabc", 0, o_anchored);
+    ("abc", "abc", 0, o_anchored);
+    ("a|b", "xb", 0, o_anchored);
+    (* ENDANCHORED *)
+    ("a", "ab", 0, o_endanchored);
+    ("ab", "ab", 0, o_endanchored);
+    ("a|ab", "ab", 0, o_endanchored);
+    (* PARTIAL soft / hard: "ab" pattern vs "a" subject *)
+    ("ab", "a", 0, o_partial_soft);
+    ("ab", "a", 0, o_partial_hard);
+    ("abc", "ab", 0, o_partial_soft);
+    ("abc", "ab", 0, o_partial_hard);
+    ("abc", "xab", 0, o_partial_soft);
+    ("\\Aabc", "ab", 0, o_partial_hard);
+    ("(?:a|b)cd", "bc", 0, o_partial_soft);
+    (* BADOFFSET / bad option bits *)
+    ("abc", "ab", 5, 0l);
+    ("abc", "abc", -1, 0l);
+    ("abc", "abc", 0, o_bad);
+  ]
+
+let parity_tests =
+  List.map
+    (fun (pat, subj, off, opts) ->
+      Alcotest.test_case
+        (Printf.sprintf "parity %S %S off=%d opt=0x%lx" pat subj off opts)
+        `Quick
+        (fun () ->
+          match (F.compile pat 0l, E.compile pat 0l) with
+          | Ok fre, Ok ere ->
+              let f = norm (F.exec_full fre subj off opts) in
+              let e = norm (E.exec_full ere subj off opts) in
+              Alcotest.(check string)
+                (Printf.sprintf "fast vs interp for %S/%S" pat subj)
+                e f
+          | Error (F.Unsupported _), _ ->
+              (* declined: nothing to compare (the runner never runs it) *)
+              ()
+          | Error _, _ | _, Error _ ->
+              Alcotest.failf "compile mismatch for %S" pat))
+    parity_cases
+
+(* ---------- 6. LIMIT_MATCH tick-boundary parity ----------
+
+   The pattern below tries all six top-level branches before matching (or
+   failing) the last one; the interpreter and the fast engine must tick
+   identically and therefore trip PCRE2_ERROR_MATCHLIMIT (-47) at the SAME N.
+   Boundary found empirically against the interpreter: matching subject "f"
+   needs 7 ticks (frame 0 + 6 branch entries), so N <= 6 => -47, N >= 7 =>
+   Match. Both engines are pinned. *)
+let limit_match_boundary_test =
+  let run_both n subj =
+    let pat = Printf.sprintf "(*LIMIT_MATCH=%d)a|b|c|d|e|f" n in
+    match (F.compile pat 0l, E.compile pat 0l) with
+    | Ok fre, Ok ere ->
+        (norm (F.exec_full fre subj 0 0l), norm (E.exec_full ere subj 0 0l))
+    | _ -> Alcotest.failf "compile failed for %S" pat
+  in
+  [
+    Alcotest.test_case "LIMIT_MATCH boundary (fast == interp)" `Quick (fun () ->
+        (* below the boundary: both hit the match limit *)
+        let f6, e6 = run_both 6 "f" in
+        Alcotest.(check string) "N=6 interp is MATCHLIMIT" "E-47" e6;
+        Alcotest.(check string) "N=6 fast == interp" e6 f6;
+        (* at the boundary: both complete the match *)
+        let f7, e7 = run_both 7 "f" in
+        Alcotest.(check string) "N=7 interp matches" "M[0,1]@0" e7;
+        Alcotest.(check string) "N=7 fast == interp" e7 f7;
+        (* a non-matching subject: the start bitmap skips every attempt on
+           both sides, so neither ticks -> both NOMATCH regardless of N *)
+        let f1z, e1z = run_both 1 "z" in
+        Alcotest.(check string) "N=1/z interp NOMATCH" "NM" e1z;
+        Alcotest.(check string) "N=1/z fast == interp" e1z f1z);
+  ]
+
+(* ---------- 7. alloc pins ----------
+
+   The fast runner allocates nothing per attempt and only O(1) small records
+   per exec (fast-design.md §3 / port-conventions §8). Methods mirror
+   test/pcre2_tests.ml:327-354 (per-attempt) and :647-687 (per-exec). *)
+let alloc_tests =
+  [
+    Alcotest.test_case "alloc: O(1) per ~100k failing attempts" `Slow
+      (fun () ->
+        match F.compile "qz" 0l with
+        | Error _ -> Alcotest.fail "compile qz failed"
+        | Ok re ->
+            let subject = String.make 100_000 'q' in
+            (* warm-up: one-time lazy init + scratch seeding *)
+            (match F.exec re subject 0 0l with
+            | Ok None -> ()
+            | _ -> Alcotest.fail "expected no match (warm-up)");
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            (match r with
+            | Ok None -> ()
+            | _ -> Alcotest.fail "expected no match");
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for ~100k attempts, measured \
+                  %.0f words"
+                 delta)
+              true (delta < 1000.));
+    Alcotest.test_case "alloc: < 60 minor words per exec" `Slow (fun () ->
+        match F.compile "qz" 0l with
+        | Error _ -> Alcotest.fail "compile qz failed"
+        | Ok re ->
+            let subject = "qqqq" in
+            (match F.exec re subject 0 0l with
+            | Ok None -> ()
+            | _ -> Alcotest.fail "expected no match (warm-up)");
+            let before = Gc.minor_words () in
+            for _ = 1 to 1_000 do
+              ignore (F.exec re subject 0 0l)
+            done;
+            let delta = (Gc.minor_words () -. before) /. 1000. in
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected < 60 minor words/exec at the Fast seam, measured \
+                  %.1f words/exec"
+                 delta)
+              true (delta < 60.));
+  ]
+
+(* ---------- 8. ulimit-free stack-safety smoke ----------
+
+   A 1 MiB subject with an alternation-heavy pattern that fails at every
+   position: the bump-along + runner are iterative ([@tailcall]), so the run
+   completes without a native-stack blow-up. *)
+let stack_safety_tests =
+  [
+    Alcotest.test_case "1MB subject, alternation-heavy, completes" `Slow
+      (fun () ->
+        match F.compile "(?:a|b|c|d|e|f|g|h)(?:i|j|k|l)Z" 0l with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            let subject = String.make (1024 * 1024) 'x' in
+            (match F.exec re subject 0 0l with
+            | Ok None -> ()
+            | Ok (Some _) -> Alcotest.fail "unexpected match"
+            | Error c -> Alcotest.failf "unexpected error %d" c));
+  ]
+
 let () =
   Alcotest.run "pcre2_fast_ir"
     [
@@ -421,4 +642,8 @@ let () =
       ("unsupported reasons", unsupported_tests);
       ("verifier", verifier_tests);
       ("sweep", sweep_tests);
+      ("runner parity", parity_tests);
+      ("limit-match boundary", limit_match_boundary_test);
+      ("alloc pins", alloc_tests);
+      ("stack safety", stack_safety_tests);
     ]

@@ -10,4 +10,4 @@
  (public_name pcre2-fuzz-diff)
  (package pcre2-dev)
  (modules fuzz_diff)
- (libraries pcre2.engine pcre2-dev.test-driver))
+ (libraries pcre2.engine pcre2.fast pcre2-dev.test-driver))

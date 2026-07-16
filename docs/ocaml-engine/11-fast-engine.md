@@ -46,11 +46,14 @@ interpreter is its differential oracle. Approved plan:
   BRA/KET markers, ALT choice points + JMP (n-1 lowering, §3), simple anchors, END;
   compile-level UTF/UCP/top_bracket gates; `Ir.dump` goldens (17) + unsupported-reason +
   corrupt-IR verifier tests + sweep (46 cases, test/fast/). Seam unchanged (runner is C2).
-- [ ] **C2 — save stack + fused runner + seam wiring** — save_stack (scratch reuse, §3
-  records), the fused tail-loop runner over the C1 subset, shadow limit accounting (§4),
-  naive bump-along driver, `t` becomes the IR record, always-on cheap verifier subset in
+- [x] **C2 — save stack + fused runner + seam wiring** — save_stack (scratch reuse, §3
+  records: 3-int `[handler; eptr; rdepth]`), the fused tail-loop runner over the C1 subset,
+  shadow limit accounting (§4 tick table), `t` becomes the IR record, always-on verifier in
   `Fast.compile`; fuzz `--mode fast-vs-interp`; runner units + fast alloc pins;
-  `--driver=fast` ratchet rises past 307.
+  `--driver=fast` ratchet rose 307 → 493. Deviation: the scalar start-of-match scan
+  (first_cu/start_bits/startline/minlength/req_cu, uncached) had to land here (not chunk L)
+  for LIMIT tick parity + the anchored-gate partial correctness (§4); `PCRE2_FIRSTLINE`
+  declined at compile ("chunk L").
 - [ ] **D — Captures + char repeats** — CBRA/SCBRA/CBRAPOS/CLOSE + ovector saves +
   optimized_cbracket (`:404,1145-1184`); repeat superinstructions + detect_repeat (`:1699`).
 - [ ] **E — Classes/types** — CLASS/NCLASS bitmap, XCLASS (via `Xclass`), type

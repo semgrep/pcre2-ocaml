@@ -124,33 +124,103 @@ e2: ALT next=e3        ; choice point for B2: on fail resume at e3 (B3's entry)
 ```
 
 so there are `n-1` `ALT` choice points and `n-1` `JMP`s. `ALT next=` is the save-record
-HANDLER: at run time (chunk C2) an `ALT` pushes a save record `[handler = next; eptr]` and
+HANDLER: at run time (chunk C2) an `ALT` pushes a save record and
 falls through into its branch body; on backtrack the runner pops it, restores `eptr`, and
 tail-loops at `handler`. The C's dual-role `OP_ALT` (branch separator that, in forward
 flow, jumps to the KET) is split into a branch-entry `ALT` (choice point) plus a
 branch-tail `JMP` (skip to KET). `ALT` handlers chain: `ALT_k.next` = the entry of branch
 `k+1`, which is that branch's own `ALT` for `k+1 < n`, or `Bn`'s body for `k+1 = n`. A
-single-branch group emits just `BRA … KET` (no choice point). The C1 save-record width for
-`ALT` is fixed (2 ints); wider records (ovector saves, repeat counters) arrive in chunk D.
+single-branch group emits just `BRA … KET` (no choice point).
 - §6 stack-safety and §8 hot-loop rules of port-conventions.md bind unchanged: iterative
   only, no exceptions across the loop, zero allocation, `[@tailcall]`, `unsafe_*` only
   under bounds-proof comments. Cold instructions go out-of-line (icache; global `-inline`
   regressed in M10).
 
-## §4 Limits — shadow C-frame accounting
+**Save-record layout (landed in chunk C2, `save_stack.ml`).** A record is a fixed
+`record_width = 3` ints, pushed at each `ALT` (and popped on backtrack), low index first:
 
-Trip points must be byte-identical to the interpreter:
+| slot | field | meaning |
+|---|---|---|
+| 0 | `handler` | IR index to resume at on backtrack (= the `ALT`'s `next`) |
+| 1 | `eptr` | subject position to restore |
+| 2 | `rdepth` | virtual frame depth to restore (§4 shadow accounting) |
 
-- `match_call_count`: ticked once per C-`new_frame`-equivalent event (group entry and every
-  RMATCH choice point — `Ir_compile` tags these sites), compare-old-then-bump exactly as
-  interpreter.ml:1260-1267/1301-1306; reset per attempt (interpreter.ml:9324 site).
-- Depth: virtual `rdepth` (loop parameter), child = parent + 1, vs `match_limit_depth`.
-- Heap: a virtual frame count × `Frames.frame_size_bytes_for ~top_bracket`, checked with
-  `Frames.create`/`grow` arithmetic — `HEAPLIMIT`/`NOMEMORY` fire at C-identical byte
-  points even though physical save records are smaller. The runner tracks virtual frame
-  high-water wherever `Frames.push` would run.
-- Continuous check: fuzz `(*LIMIT_MATCH=2000)` differential — any `-47` divergence
-  fast-vs-interp is a bug.
+`match_call_count`, `hitend`, `start_used_ptr` are NOT saved — the first is monotonic
+(never restored), the second monotonic within an attempt, the third constant per attempt.
+`sp` (the stack top, an int count) is a runner tail-call parameter; push/pop are explicit
+`ss.data.(sp+k)` index arithmetic inlined at the `ALT`/backtrack sites. The stack resets to
+`sp = 0` per attempt (write-before-read; no clearing). Backtracking with `sp = 0` returns
+`MATCH_NOMATCH` (the C's RRETURN unwinding to frame 0).
+
+**Scratch policy (chunk C2).** `save_stack.ml` retains ONE module-level `int array` across
+execs, guarded by its OWN `Atomic.t busy` flag (NOT Frames' scratch slot); a concurrent exec
+(flag held) falls back to a fresh, never-retained array. `runner.ml` caches ONE match block
+(`mb`, the arena-slot-equivalent record holding this state) whose `ss` is the save-stack
+scratch, reused only when the exec owns the flag — the single acquire gates both, mirroring
+the interpreter's scratch trio (frames.ml scratch slot + `fresh_trio`). Growth is geometric;
+on release an array over `scratch_max_retained_ints` (131072 ints, ~1 MiB) is dropped
+(frames.ml precedent). Steady state (single-threaded): zero per-exec record/stack
+allocation — only the `outcome` record + the result wrapper (measured < 60 minor words/exec,
+0 per bump-along attempt).
+
+## §4 Limits — shadow C-frame accounting (landed in chunk C2)
+
+Trip points are byte-identical to the interpreter. The `mb` record (runner.ml) carries the
+shadow state; there is no physical frame arena.
+
+- `match_call_count` (`mcc`, a runner tail-call parameter): ticked once per
+  C-`new_frame`-equivalent event, compare-old-then-bump exactly as
+  interpreter.ml:1260-1267/1301-1306; reset to 0 per attempt (the `mcc = 1` start after the
+  frame-0 tick), interpreter.ml:9324 site.
+- Depth: virtual `rdepth` (runner parameter); a child branch runs at `rdepth + 1`, restored
+  from the save record on backtrack; the check is `new_rdepth >= match_limit_depth`.
+- Heap: virtual `heapframes_size` (simulated C bytes) initialized by the `Frames.create`
+  arithmetic and grown by the `Frames.grow` arithmetic for frame index `n = new_rdepth`
+  (`frame_size_bytes = Frames.frame_size_bytes_for ~top_bracket:0 = 136`); `HEAPLIMIT` /
+  `NOMEMORY` fire at C-identical byte points. Persists across attempts within one exec
+  (only grows), re-initialized per exec.
+- Order at a child tick (transcribes rmatch, interpreter.ml:1188-1267): (1) heap push/grow
+  for frame `new_rdepth`, then (2) `mcc` vs `match_limit`, then (3) `new_rdepth` vs
+  `match_limit_depth`.
+- Limits resolved as `min(re.limit_*, Limits.*)` per interpreter.ml:9825-9837.
+
+**Tick-site table (IR instruction / event → ticks).** `d` = current `rdepth`. Derived from
+the OP_BRA/OP_ALT/OP_KET arms: only branch entries that the C rmatches (`grouploop` for the
+top-level group — rdepth 0; `bra_loop` non-last branches for nested groups) tick and enter a
+child frame. `grouploop`'s single/last branch ticks (the top level "can't optimize" case);
+`bra_loop`'s last branch does not (runs in the same frame).
+
+| event | ticks | rdepth after | heap push |
+|---|---|---|---|
+| attempt entry (frame 0) | 1 (rdepth 0) | 0 | none |
+| `BRA`, next head is `ALT` (multi-branch) | 0 | `d` | none |
+| `BRA`, single-branch, `d = 0` (top-level group) | 1 (rdepth 1) | 1 | frame 1 |
+| `BRA`, single-branch, `d >= 1` (nested group) | 0 | `d` | none |
+| `ALT` (any non-last branch entry) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| backtrack pop → handler is non-`ALT`, saved `d = 0` (top-level last branch) | 1 (rdepth 1) | 1 | frame 1 |
+| backtrack pop → handler is `ALT`, or saved `d >= 1` | 0 | saved `d` | none |
+| `JMP`, `KET`, `CHAR_RUN`, `CHARI`, `SOD`/`SOM`/`EOD`/`EODN`/`CIRC`/`DOLL`, `END` | 0 | unchanged | none |
+
+The only `grouploop` group in this subset is the whole-pattern outer `BRA` (dispatched at
+rdepth 0 — nested groups are always entered from a child branch, rdepth `>= 1`). Its last
+branch is reached either by falling through the `BRA` (single-branch) or via the preceding
+`ALT`'s handler landing on a non-`ALT` head with saved `d = 0`; both tick (rows 3 and 6).
+
+**Start-of-match scan is required for tick parity (chunk C2, not deferred).** A skipped
+attempt does ZERO ticks, so a naive bump-along that runs attempts the interpreter's
+first_cu/start_bits/startline/minlength/req_cu scans skip would trip `(*LIMIT_MATCH=N)`
+(`-47`) where the interpreter does not, AND — for the anchored first_cu/start_bits gate,
+which breaks unconditionally with no partial exception (pcre2_match.c:7188-7215, unlike
+first_cu_tail:7300-7315) — would surface a PARTIAL the interpreter suppresses when
+`allowemptypartial` holds (e.g. `\A0` on `""` under `PARTIAL_SOFT`: `\A` gives
+`max_lookbehind = 1`). runner.ml therefore ports the scalar (uncached, result-identical)
+bump_top + first_cu_tail + tail_opts scans; only the memchr result-caching and the
+JIT range-skip table are left to chunk L. `PCRE2_FIRSTLINE` is declined at compile
+(`Ir_compile`) — its enforcement is entangled with those scans' shortened `end_subject`.
+
+- Continuous check: fuzz `--mode fast-vs-interp` with the imposed `LIMIT_MATCH=2000`
+  differential — any `-47`/`-2`/ovector divergence fast-vs-interp is a bug (0 over 150k+
+  cases in chunk C2).
 
 ## §5 Start-of-match (JIT-mirrored ONLY; lands in chunks L/M)
 

@@ -1,61 +1,138 @@
-(* Fast engine seam — chunk B skeleton (fast-design.md par. 1).
-
-   Compilation runs the SHARED compiler (Pcre2_engine.Engine.compile_ctx →
-   Pcre2_engine.Compile), so real PCRE2 compile errors surface with exact
-   number/offset parity from day one. The IR compiler does not exist yet
-   (chunk C), so every successfully compiled pattern is rejected with
-   [Unsupported] — NEVER executed via the interpreter (no-fallback
-   contract). [t] is consequently uninhabited in this chunk; the match-side
-   functions are refutation cases the type checker proves unreachable, and
-   they gain bodies when chunk C introduces the IR record. *)
+(* Fast engine seam — chunk C2 (fast-design.md §1). Compilation runs the
+   SHARED compiler (Pcre2_engine.Engine.compile_ctx → Pcre2_engine.Compile), so
+   real PCRE2 compile errors surface with exact number/offset parity, then the
+   IR compiler (Ir_compile) lowers the bytecode; any construct it does not
+   handle yields [Unsupported]. A compiled [t] is executed ONLY by the fast
+   runner (Runner) — NEVER by the interpreter (the no-fallback contract). On
+   accepted patterns observable behavior is identical to
+   Pcre2_engine.Engine.exec/exec_full/exec_captures (rc/ovector/mark/startchar
+   and limit trip points, fast-design.md §4). *)
 
 module E = Pcre2_engine.Engine
+module C = Pcre2_engine.Compile
+module Opt = Pcre2_engine.Options
+module Errors = Pcre2_engine.Errors
+module R = Runner
 
-(** {1 Unstable internals — exposed for tests only (M11 chunk C1)}
+(** {1 Unstable internals — exposed for tests only (M11 chunk C1/C2)}
 
     [Ir], [Ir_compile] and [Ir_verify] are the fast engine's IR, its compiler
     and its static verifier. They are NOT part of the public seam and may
-    change without notice; only [test/fast] should reference them. The seam's
-    public functions/types below are unchanged (chunk C1 adds no runner, so
-    [compile] still yields [Unsupported] for every pattern). *)
+    change without notice; only [test/fast] should reference them. *)
 
 module Ir = Ir
 module Ir_compile = Ir_compile
 module Ir_verify = Ir_verify
 
-type t = |
+(* The compiled fast pattern is the pre-decoded IR (Ir.t = { code; lit; re }):
+   the runner reads [code]/[lit] and derives limits/flags from the pinned
+   [re] per exec (Runner.exec, mirroring the interpreter's per-exec mb fill,
+   pcre2_match.c:6956-7046). Abstract at the seam (pcre2_fast.mli). *)
+type t = Ir.t
 
 type compile_error =
   | Compile_error of { errcode : int; erroroffset : int }
   | Unsupported of string
 
+(* Compile through the SHARED compiler (Pcre2_engine.Compile) directly — the
+   [Pcre2_engine.Engine.t] returned by Engine.compile_ctx is abstract, but the
+   IR compiler needs the concrete [Compile.re]. This mirrors Engine.compile_ctx
+   (engine.ml:31-45) exactly, so real compile errors carry the same
+   number/offset pair the engine driver reports. *)
 let compile_ctx ?(newline = 0) ?(bsr = 0) ?(extra = 0) (pattern : string)
     (options : int32) : (t, compile_error) result =
-  match E.compile_ctx ~newline ~bsr ~extra pattern options with
-  | Error (errcode, erroroffset) -> Error (Compile_error { errcode; erroroffset })
-  | Ok _re ->
-      Error
-        (Unsupported "fast: IR compiler not yet implemented (chunk C, 11-fast-engine.md)")
+  let dflt = C.default_compile_context in
+  let ccontext =
+    {
+      dflt with
+      C.newline_convention =
+        (if Int.equal newline 0 then dflt.C.newline_convention else newline);
+      bsr_convention =
+        (if Int.equal bsr 0 then dflt.C.bsr_convention else bsr);
+      extra_options = extra;
+    }
+  in
+  match C.pcre2_compile ~ccontext pattern ~options:(Opt.of_int32 options) with
+  | Error (errcode, erroroffset) ->
+      Error (Compile_error { errcode; erroroffset })
+  | Ok re -> (
+      match Ir_compile.compile re with
+      | Error reason -> Error (Unsupported reason)
+      | Ok ir -> (
+          (* Always-on verifier: since the fast engine has NO runtime
+             fallback (fast-design.md §1/§9), a compiled program that could
+             reach an unhandled instruction must be declined, never executed.
+             Ir_compile is deterministic and correct, so this never fires in
+             practice; if it ever did, an [Unsupported] skip is strictly safe
+             (a decline, never a wrong answer). The full walk is cheap
+             (linear, compile is cold). *)
+          match Ir_verify.check ir with
+          | Ok () -> Ok ir
+          | Error diag ->
+              Error
+                (Unsupported
+                   ("fast: internal IR verification failed: " ^ diag))))
 
 let compile (pattern : string) (options : int32) : (t, compile_error) result =
   compile_ctx pattern options
 
-(* [t] is uninhabited until chunk C: these are compiler-checked dead code. *)
-let exec (re : t) (_subject : string) (_offset : int) (_options : int32) :
+let exec (re : t) (subject : string) (offset : int) (options : int32) :
     ((int * int) option, int) result =
-  match re with _ -> .
+  let o = R.exec re ~subject ~offset ~options:(Opt.of_int32 options) in
+  if o.R.orc > 0 then Ok (Some (o.R.ostart, o.R.oend))
+  else if Int.equal o.R.orc Errors.error_nomatch
+          || Int.equal o.R.orc Errors.error_partial
+  then Ok None
+  else Error o.R.orc
 
-let exec_full (re : t) (_subject : string) (_offset : int) (_options : int32) :
+let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
     E.exec_result =
-  match re with _ -> .
+  let o = R.exec re ~subject ~offset ~options:(Opt.of_int32 options) in
+  if o.R.orc > 0 then
+    E.Match { ovector = [| o.R.ostart; o.R.oend |]; mark = None; start_char = o.R.ostart }
+  else if Int.equal o.R.orc Errors.error_nomatch then E.No_match { mark = None }
+  else if Int.equal o.R.orc Errors.error_partial then
+    E.Partial { start = o.R.ostart; mark = None }
+  else E.Error { code = o.R.orc; start_char = 0 }
 
-let exec_captures (re : t) (_subject : string) (_offset : int)
-    (_options : int32) :
+let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
     (((int * int) array * (string * int) array) option, int) result =
-  match re with _ -> .
+  let o = R.exec re ~subject ~offset ~options:(Opt.of_int32 options) in
+  if o.R.orc > 0 then
+    (* top_bracket = 0 in this subset: a single ovector pair, no name table. *)
+    Ok (Some ([| (o.R.ostart, o.R.oend) |], [||]))
+  else if Int.equal o.R.orc Errors.error_nomatch
+          || Int.equal o.R.orc Errors.error_partial
+  then Ok None
+  else Error o.R.orc
 
-let capture_groups (re : t) : (string * int) array = match re with _ -> .
-let info (re : t) : E.info = match re with _ -> .
+(* top_bracket = 0 in this subset -> no named groups. Built from the pinned
+   [Compile.re] (Engine.t is abstract at the seam, so we cannot delegate to
+   Engine.info/Engine.capture_groups): identical fields to Engine.info /
+   Engine.capture_groups (engine.ml:59-90). *)
+let capture_groups (re : t) : (string * int) array =
+  let r = re.Ir.re in
+  Array.init r.C.name_count (fun i ->
+      let base = i * r.C.name_entry_size in
+      let number = C.get2 r.C.name_table base in
+      let start = base + Pcre2_engine.Limits.imm2_size in
+      let len = ref 0 in
+      while
+        not (Char.equal (Bytes.get r.C.name_table (start + !len)) '\000')
+      do
+        incr len
+      done;
+      (Bytes.sub_string r.C.name_table start !len, number))
+
+let info (re : t) : E.info =
+  let r = re.Ir.re in
+  {
+    E.argoptions = r.C.compile_options;
+    alloptions = r.C.overall_options;
+    newline = r.C.newline_convention;
+    bsr = r.C.bsr_convention;
+    capture_count = r.C.top_bracket;
+  }
 let error_message = E.error_message
 let version = E.version
 
