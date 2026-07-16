@@ -137,3 +137,14 @@ not apply verbatim there. Instead:
 - `src/matcher/` carries the FROZEN convenience semantics (find_iter/captures_iter
   empty-match quirk included) — §5's freeze applies to it verbatim; `src/pcre2.mli` stays
   at zero diff (the real API freeze).
+
+### §9 named hazard: local `let rec` closures in give-back/backtrack paths
+
+Three review rounds (chunks E, I1, I2) caught the same §8 violation: a local
+`let rec` helper inside a runner function that captures `mb`/locals allocates a
+~6-word closure PER CALL under non-flambda, and give-back paths call it once per
+backtracking step. Rule: in `src/fast/runner.ml`, every helper reachable from the
+frame loop is a MODULE-LEVEL function taking its state as explicit arguments
+(the interpreter's `extuni_bt_inner` shape). Every new give-back path lands with
+an alloc pin whose subject forces a full-length give-back sweep (no early
+terminator; `\A` + no-req_cu discipline), mutation-tested against the closure form.

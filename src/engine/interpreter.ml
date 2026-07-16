@@ -471,95 +471,18 @@ let hspace_char = Char_predicates.hspace_char
 
 let vspace_char = Char_predicates.vspace_char
 
-(* pcre2_match.c:2576-2583 (= 2903-2916, 3723-3736, 4311-4319) — the
-   PT_CLIST scan: cp = PRIV(ucd_caseless_sets) + <property value>;
-   for (;;) { if (fc < *cp) <no match>; if (fc == *cp++) <match>; }.
-   Terminates inside the table: the sets are ascending and end with
-   NOTACHAR = 0xffffffff (pcre2_ucd.c:114-143), which exceeds every
-   decoded character (getutf8 yields at most 0x7fffffff), so the fc < *cp
-   exit always fires by the set's end. *)
-let rec prop_clist_member (fc : int) (cp : int) : bool =
-  let v = Ucd_tables.ucd_caseless_sets.(cp) in
-  if fc < v then false
-  else if Int.equal fc v then true
-  else (prop_clist_member [@tailcall]) fc (cp + 1)
+(* pcre2_match.c:2576-2583 — the PT_CLIST scan; the body moved to
+   Char_predicates.prop_clist_member (M11 chunk I2 pure extraction, shared
+   with the fast runner — identical body, citation there). *)
+let prop_clist_member = Char_predicates.prop_clist_member
 
-(* pcre2_match.c:2493-2610 — the Unicode property test shared by the
-   OP_PROP/OP_NOTPROP single-character arm and the property repeat loops
-   (min 2726-2974, minimize 3515-3801, maximize 4115-4381): does
-   character [c] have property ([ptype], [pdata])?
+let _ = prop_clist_member
 
-   DEVIATION(structure): the C repeats this switch inline at each of
-   those four sites with the notmatch / (Lctype == OP_NOTPROP)
-   comparison folded into every case; factored here once — each call
-   site keeps its own comparison, control flow and evaluation order.
-   Cases in the C's order, with the C's exact category groupings; the
-   PT_CLIST arms' fc < */== *cp exits reduce to set membership compared
-   against notmatch at the call site, exactly as the other cases.
-   Callers exclude property types above PT_BOOL (the C switches'
-   defaults: PCRE2_ERROR_INTERNAL). The C fetches the ucd_record once
-   per character (GET_UCD); cases probing several record fields do the
-   same through [Ucd.record_index]. *)
-let prop_test (c : int) (ptype : int) (pdata : int) : bool =
-  if Int.equal ptype Opcodes.pt_any then true (* 2495-2497 *)
-  else if Int.equal ptype Opcodes.pt_lamp then
-    (* pcre2_match.c:2499-2505 *)
-    let chartype = Ucd.chartype c in
-    Int.equal chartype Ucp.ucp_lu
-    || Int.equal chartype Ucp.ucp_ll
-    || Int.equal chartype Ucp.ucp_lt
-  else if Int.equal ptype Opcodes.pt_gc then
-    (* pcre2_match.c:2507-2510 — Fecode[2] ==
-       PRIV(ucp_gentype)[prop->chartype]. *)
-    Int.equal pdata Tables.ucp_gentype.(Ucd.chartype c)
-  else if Int.equal ptype Opcodes.pt_pc then
-    (* pcre2_match.c:2512-2515 *)
-    Int.equal pdata (Ucd.chartype c)
-  else if Int.equal ptype Opcodes.pt_sc then
-    (* pcre2_match.c:2517-2520 *)
-    Int.equal pdata (Ucd.script c)
-  else if Int.equal ptype Opcodes.pt_scx then
-    (* pcre2_match.c:2522-2528 — script match, or the Script Extensions
-       set bit (MAPBIT bound proof: Ucd.script_set_contains). *)
-    let ri = Ucd.record_index c in
-    Int.equal pdata (Ucd_tables.script ri) || Ucd.script_set_contains ri pdata
-  else if Int.equal ptype Opcodes.pt_alnum then
-    (* pcre2_match.c:2532-2537 — these are specials. *)
-    let gentype = Tables.ucp_gentype.(Ucd.chartype c) in
-    Int.equal gentype Ucp.ucp_l || Int.equal gentype Ucp.ucp_n
-  else if Int.equal ptype Opcodes.pt_space || Int.equal ptype Opcodes.pt_pxspace
-  then
-    (* pcre2_match.c:2539-2557 — Perl space and POSIX space are identical
-       since Perl 5.18 / PCRE 8.34: the HSPACE/VSPACE cases, else general
-       category Z. *)
-    hspace_char c || vspace_char c
-    || Int.equal Tables.ucp_gentype.(Ucd.chartype c) Ucp.ucp_z
-  else if Int.equal ptype Opcodes.pt_word then
-    (* pcre2_match.c:2559-2566 *)
-    let chartype = Ucd.chartype c in
-    let gentype = Tables.ucp_gentype.(chartype) in
-    Int.equal gentype Ucp.ucp_l
-    || Int.equal gentype Ucp.ucp_n
-    || Int.equal chartype Ucp.ucp_mn
-    || Int.equal chartype Ucp.ucp_pc
-  else if Int.equal ptype Opcodes.pt_clist then
-    (* pcre2_match.c:2568-2584 (the width-32 MAX_UTF guard is compiled
-       out in the 8-bit library) *)
-    prop_clist_member c pdata
-  else if Int.equal ptype Opcodes.pt_ucnc then
-    (* pcre2_match.c:2586-2591 — CHAR_DOLLAR_SIGN 0x24,
-       CHAR_COMMERCIAL_AT 0x40, CHAR_GRAVE_ACCENT 0x60. *)
-    Int.equal c 0x24 || Int.equal c 0x40 || Int.equal c 0x60
-    || (c >= 0xa0 && c <= 0xd7ff)
-    || c >= 0xe000
-  else if Int.equal ptype Opcodes.pt_bidicl then
-    (* pcre2_match.c:2593-2596 — UCD_BIDICLASS_PROP(prop) == Fecode[2]. *)
-    Int.equal (Ucd.bidiclass c) pdata
-  else
-    (* PT_BOOL (pcre2_match.c:2598-2604) — MAPBIT over the
-       Boolean-property set (bound proof: Ucd.boolprop_set_contains);
-       the callers' ptype <= PT_BOOL gate makes this the last case. *)
-    Ucd.boolprop_set_contains (Ucd.record_index c) pdata
+(* pcre2_match.c:2493-2610 — the Unicode property test; the body moved to
+   Char_predicates.prop_test (M11 chunk I2 pure extraction, shared with the
+   fast runner so the two engines cannot diverge — identical body, full
+   citations there). *)
+let prop_test = Char_predicates.prop_test
 
 (* pcre2_intmodedep.h:341-345 — BACKCHAR(eptr) over the subject: if the
    position is not at the start of a character, move it back until it is.
@@ -751,16 +674,10 @@ let rec strcmp_code_eq (mb : match_block) (p1 : int) (p2 : int) : bool =
    length > 0, p < start_subject + Fovector[Loffset+1] <= end_subject
    <= String.length mb.subject. [eptr] starts at Feptr >= 0 (mb
    invariant). *)
-(* pcre2_match.c:424-429 — match_ref()'s caseless-set probe: walk the
-   NOTACHAR-terminated ascending list at [pp] in
-   Ucd_tables.ucd_caseless_sets; `if (c < *pp) return -1` is the
-   no-match exit (entries ascend and end with NOTACHAR = 0xffffffff,
-   larger than any code point). *)
-let rec caseless_set_member (c : int) (pp : int) : bool =
-  let v = Ucd_tables.ucd_caseless_sets.(pp) in
-  if c < v then false
-  else if Int.equal c v then true
-  else (caseless_set_member [@tailcall]) c (pp + 1)
+(* pcre2_match.c:424-429 — match_ref()'s caseless-set probe; the body moved
+   to Char_predicates.caseless_set_member (M11 chunk I2 pure extraction,
+   shared with the fast runner — identical body, citation there). *)
+let caseless_set_member = Char_predicates.caseless_set_member
 
 (* pcre2_match.c:390-434 — match_ref()'s caseless compare loop in UTF
    and/or UCP mode: match characters up to the end of the REFERENCE
@@ -3223,14 +3140,10 @@ and dispatch (st : match_state) (f : int) : int =
           let fc = getchar_subject mb.subject lastptr in
           if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
           if ucp_op then
-            (* pcre2_match.c:6283-6289 — the UCD chartype/category
-               probe. *)
-            let chartype = Ucd.chartype fc in
-            let category = Tables.ucp_gentype.(chartype) in
-            Int.equal category Ucp.ucp_l
-            || Int.equal category Ucp.ucp_n
-            || Int.equal chartype Ucp.ucp_mn
-            || Int.equal chartype Ucp.ucp_pc
+            (* pcre2_match.c:6283-6289 — the UCD chartype/category probe
+               (body moved to Char_predicates.ucp_wordchar, chunk I2 pure
+               extraction shared with the fast runner). *)
+            Char_predicates.ucp_wordchar fc
           else
             (* pcre2_match.c:6292 — CHMAX_255(fc) && ctype_word. *)
             fc <= 255
@@ -3249,13 +3162,9 @@ and dispatch (st : match_state) (f : int) : int =
           let fc = Char.code (String.unsafe_get mb.subject lastptr) in
           if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
           if ucp_op then
-            (* pcre2_match.c:6283-6289 — the UCD probe, without UTF. *)
-            let chartype = Ucd.chartype fc in
-            let category = Tables.ucp_gentype.(chartype) in
-            Int.equal category Ucp.ucp_l
-            || Int.equal category Ucp.ucp_n
-            || Int.equal chartype Ucp.ucp_mn
-            || Int.equal chartype Ucp.ucp_pc
+            (* pcre2_match.c:6283-6289 — the UCD probe, without UTF
+               (Char_predicates.ucp_wordchar, as above). *)
+            Char_predicates.ucp_wordchar fc
           else
             (* pcre2_match.c:6292 — CHMAX_255(fc) is TRUE for a non-UTF
                8-bit code unit. *)
@@ -3276,14 +3185,10 @@ and dispatch (st : match_state) (f : int) : int =
         let fc = Utf.getchar mb.subject eptr in
         if nextptr > mb.last_used_ptr then mb.last_used_ptr <- nextptr;
         if ucp_op then
-          (* pcre2_match.c:6316-6322 — the UCD probe. *)
-          let chartype = Ucd.chartype fc in
-          let category = Tables.ucp_gentype.(chartype) in
+          (* pcre2_match.c:6316-6322 — the UCD probe
+             (Char_predicates.ucp_wordchar, as above). *)
           (word_boundary_tail [@tailcall]) st f prev_is_word
-            (Int.equal category Ucp.ucp_l
-            || Int.equal category Ucp.ucp_n
-            || Int.equal chartype Ucp.ucp_mn
-            || Int.equal chartype Ucp.ucp_pc)
+            (Char_predicates.ucp_wordchar fc)
         else
           (* pcre2_match.c:6325 — CHMAX_255(fc) && ctype_word. *)
           (word_boundary_tail [@tailcall]) st f prev_is_word
@@ -3298,14 +3203,10 @@ and dispatch (st : match_state) (f : int) : int =
         let fc = Char.code (String.unsafe_get mb.subject eptr) in
         if nextptr > mb.last_used_ptr then mb.last_used_ptr <- nextptr;
         if ucp_op then
-          (* pcre2_match.c:6316-6322 — the UCD probe, without UTF. *)
-          let chartype = Ucd.chartype fc in
-          let category = Tables.ucp_gentype.(chartype) in
+          (* pcre2_match.c:6316-6322 — the UCD probe, without UTF
+             (Char_predicates.ucp_wordchar, as above). *)
           (word_boundary_tail [@tailcall]) st f prev_is_word
-            (Int.equal category Ucp.ucp_l
-            || Int.equal category Ucp.ucp_n
-            || Int.equal chartype Ucp.ucp_mn
-            || Int.equal chartype Ucp.ucp_pc)
+            (Char_predicates.ucp_wordchar fc)
         else
           (word_boundary_tail [@tailcall]) st f prev_is_word
             (not

@@ -662,6 +662,59 @@ let goldens : (string * string) list =
         ] );
   ]
 
+(* Chunk I2 goldens — the four new tags + the UCP word boundary encoding.
+   pt_any = 0, pt_gc = 2 (pdata Ucp.ucp_l = 1), pt_pc = 3 (pdata Ucp.ucp_lu =
+   9); PROP width 4, PROP_REP width 7, EXTUNI width 1, EXTUNI_REP width 4. *)
+let i2_goldens : (string * string) list =
+  [
+    (* \p{Any} itself compiles to OP_ALLANY (a compile-time optimization), so
+       the PROP single golden uses a real property. *)
+    ( "\\p{Lu}",
+      g [ "  0 BRA"; "  1 PROP ptype=3 pdata=9"; "  5 KET"; "  6 END" ] );
+    ( "\\P{L}",
+      g [ "  0 BRA"; "  1 NOTPROP ptype=2 pdata=1"; "  5 KET"; "  6 END" ] );
+    (* auto-possessified: \p{Lu}+ at the end of the pattern becomes POSPLUS. *)
+    ( "\\p{Lu}+",
+      g
+        [
+          "  0 BRA";
+          "  1 PROP_REP pos {1,inf} is ptype=3 pdata=9";
+          "  8 KET";
+          "  9 END";
+        ] );
+    (* the shared compiler splits {2,4}? into EXACT{2} + MINUPTO{0,2}. *)
+    ( "\\P{L}{2,4}?",
+      g
+        [
+          "  0 BRA";
+          "  1 PROP_REP min {2,2} not ptype=2 pdata=1";
+          "  8 PROP_REP min {0,2} not ptype=2 pdata=1";
+          " 15 KET";
+          " 16 END";
+        ] );
+    ("\\X", g [ "  0 BRA"; "  1 EXTUNI"; "  2 KET"; "  3 END" ]);
+    (* {2,} splits into EXACT{2} + auto-possessified STAR. *)
+    ( "\\X{2,}",
+      g
+        [
+          "  0 BRA";
+          "  1 EXTUNI_REP min {2,2}";
+          "  5 EXTUNI_REP pos {0,inf}";
+          "  9 KET";
+          " 10 END";
+        ] );
+    ( "(*UCP)\\bx\\B",
+      g
+        [
+          "  0 BRA";
+          "  1 WORDBOUND \\b ucp";
+          "  3 CHAR_RUN \"x\"";
+          "  6 WORDBOUND \\B ucp";
+          "  8 KET";
+          "  9 END";
+        ] );
+  ]
+
 let golden_tests =
   List.map
     (fun (pat, expected) ->
@@ -672,7 +725,7 @@ let golden_tests =
           Alcotest.(check string)
             (Printf.sprintf "IR dump for %S" pat)
             expected (dump_of pat)))
-    goldens
+    (goldens @ i2_goldens)
 
 (* Chunk F: a DNREF golden needs DUPNAMES (duplicate group names), so it
    compiles with that option rather than through the plain [dump_of]. Both
@@ -751,22 +804,11 @@ let unsupported_cases : (string * string * string) list =
       "fast: repeated atomic group / assertion (chunk G+)" );
     (* Chunk I supports UTF mode and OP_XCLASS (wide chars, ranges AND \p
        properties, via the self-contained Xclass helper), so "[\\p{L}]" and
-       "(*UTF)abc" are now ACCEPTED. Still deferred to chunk I2: STANDALONE
-       \p / \P (OP_PROP/OP_NOTPROP) and their repeats, \X (OP_EXTUNI), UCP mode
-       (property predicates / multi-case sets / UCP word boundary), and
-       PCRE2_MATCH_INVALID_UTF (fragment carry-on). *)
-    ("prop", "\\p{L}", "fast: \\p (chunk I2)");
-    ("prop type repeat", "\\p{L}+", "fast: \\p (chunk I2)");
-    ("extuni", "\\X", "fast: \\X (chunk I2)");
-    (* The UCP verb turns on UCP mode, caught by the compile-level gate. *)
-    ("ucp mode", "(*UCP)\\ba", "fast: UCP mode (chunk I2)");
-    (* A caseless backreference in UTF folds code points (variable byte
-       lengths); deferred to chunk I2. *)
-    ("caseless backref in UTF", "(*UTF)(?i)(\\x{23a})\\1", "fast: caseless backreference in UTF (chunk I2)");
-    (* \R in UTF (multi-byte NEL/LS/PS) and UTF lookbehind (char-wise
-       REVERSE) are deferred to chunk I2. *)
-    ("R repeat in UTF", "(*UTF)\\R+", "fast: \\R (OP_ANYNL) in UTF (chunk I2)");
-    ("lookbehind in UTF", "(*UTF)(?<=a)b", "fast: lookbehind (OP_REVERSE) in UTF (chunk I2)");
+       "(*UTF)abc" are ACCEPTED. Chunk I2 lowered the rest of the chunk-I
+       decline list — standalone \p / \P and their repeats, \X, UCP mode,
+       PCRE2_MATCH_INVALID_UTF, caseless backrefs in UTF, UTF lookbehind and
+       \R / (?s). / \C repeats in UTF — so none of those decline any more
+       (parity is pinned in parity_cases / the LIMIT_MATCH sweeps below). *)
     (* Chunk H supports MARK/PRUNE/SKIP/THEN/COMMIT (+_ARG), FAIL, ACCEPT and
        OP_CLOSE (so "a(*FAIL)", "(*MARK:x)a", "a(*PRUNE)b", "a(*ACCEPT)", and
        ( *THEN) with atomic positive assertions, are now ACCEPTED). Two
@@ -1744,6 +1786,170 @@ let parity_cases : (string * string * int * int32) list =
     (* possessive + partial / anchored *)
     ("(?:ab)++", "abab", 0, o_partial_soft);
     ("(a)++", "aaa", 0, o_anchored);
+    (* ---------- Chunk I2: UCP mode, properties, \X, UTF remainder ----------
+       Extra code points: Α/α = CE 91 / CE B1, β = CE B2, σ/ς/Σ = CF 83 /
+       CF 82 / CE A3, KELVIN U+212A = E2 84 AA, long s U+017F = C5 BF,
+       Ⱥ U+023A = C8 BA, ⱥ U+2C65 = E2 B1 A5, ARABIC-INDIC ONE U+0661 = D9 A1,
+       U+30FC = E3 83 BC (sc Common, scx Hiragana+Katakana), NEL = C2 85,
+       LS U+2028 = E2 80 A8, PS U+2029 = E2 80 A9, combining acute = CC 81,
+       regional indicators A/B U+1F1E6/U+1F1E7 = F0 9F 87 A6 / F0 9F 87 A7,
+       thumbs-up U+1F44D = F0 9F 91 8D, ZWJ U+200D = E2 80 8D. *)
+    (* single properties: general category, particular, script, negation *)
+    ("(*UTF)\\p{L}", "\xce\xb1", 0, 0l);
+    ("(*UTF)\\p{L}", "1", 0, 0l);
+    ("(*UTF)\\p{Lu}", "\xce\x91", 0, 0l);
+    ("(*UTF)\\p{Lu}", "\xce\xb1", 0, 0l);
+    ("(*UTF)\\p{L&}", "\xce\xb1", 0, 0l);
+    ("(*UTF)\\p{Nd}+x", "12\xd9\xa1x", 0, 0l);
+    ("(*UTF)\\P{L}", "\xce\xb1", 0, 0l);
+    ("(*UTF)\\P{L}+x", "12 x", 0, 0l);
+    ("(*UTF)\\p{Greek}+a", "\xce\xb1\xce\xb2a", 0, 0l);
+    ("(*UTF)\\p{Han}", "\xce\xb1", 0, 0l);
+    (* script vs script-extensions on U+30FC (sc=Common, scx incl. Katakana) *)
+    ("(*UTF)\\p{sc:Katakana}", "\xe3\x83\xbc", 0, 0l);
+    ("(*UTF)\\p{scx:Katakana}", "\xe3\x83\xbc", 0, 0l);
+    ("(*UTF)\\p{Katakana}", "\xe3\x83\xbc", 0, 0l);
+    (* PCRE2 special property types: alnum / space / word / UCNC / bidi / bool *)
+    ("(*UTF)\\p{Xan}+!", "a1\xce\xb1!", 0, 0l);
+    ("(*UTF)\\p{Xps}+x", " \xe2\x80\x83x", 0, 0l);
+    ("(*UTF)\\p{Xsp}+x", " \tx", 0, 0l);
+    ("(*UTF)\\p{Xwd}+!", "a_\xce\xb1!", 0, 0l);
+    ("(*UTF)\\p{Xuc}", "$", 0, 0l);
+    ("(*UTF)\\p{Xuc}", "b", 0, 0l);
+    ("(*UTF)\\p{bc:L}", "a", 0, 0l);
+    ("(*UTF)\\p{bc:AL}", "a", 0, 0l);
+    ("(*UTF)\\p{Alphabetic}", "\xce\xb1", 0, 0l);
+    ("(*UTF)\\p{White_Space}", "\xe2\x80\x83", 0, 0l);
+    (* PT_ANY, incl. the hoisted NOTPROP min-loop check *)
+    ("\\p{Any}+", "ab", 0, 0l);
+    ("\\P{Any}", "a", 0, 0l);
+    ("\\P{Any}+", "a", 0, 0l);
+    ("\\P{Any}*x", "x", 0, 0l);
+    ("\\P{Any}+", "", 0, o_partial_soft) (* hoist precedes SCHECK_PARTIAL *);
+    (* property repeats: greedy give-back / lazy extend / bounded / possessive;
+       non-UTF \p works on bytes too *)
+    ("(*UTF)(*NO_AUTO_POSSESS)\\p{L}*!", "ab\xce\xb1!", 0, 0l);
+    ("(*UTF)(*NO_AUTO_POSSESS)\\p{L}*\\x{3b1}", "ab\xce\xb1", 0, 0l);
+    ("(*UTF)\\p{L}+?x", "abx", 0, 0l);
+    ("(*UTF)\\p{L}{2,3}!", "abcd!", 0, 0l);
+    ("(*UTF)\\p{L}++a", "aaa", 0, 0l);
+    ("\\p{L}+", "ab\xe9", 0, 0l) (* non-UTF: é (0xE9) is Ll *);
+    ("\\p{Lu}+x", "AB\xc9x", 0, 0l);
+    (* UCP mode: \d \w \s become properties at parse time *)
+    ("(*UCP)\\w+", "ab\xe9", 0, 0l);
+    ("\\w+", "ab\xe9", 0, 0l) (* ASCII contrast: stops before é *);
+    ("(*UCP)\\d+x", "12\xb2x", 0, 0l) (* superscript two is No, not Nd *);
+    ("(*UCP)\\s+x", "\xa0 x", 0, 0l) (* NBSP is Zs under UCP *);
+    ("\\s+x", "\xa0 x", 0, 0l);
+    ("(*UTF)(*UCP)\\w+!", "a\xce\xb1_1!", 0, 0l);
+    ("(*UTF)(*UCP)\\d+!", "1\xd9\xa1!", 0, 0l);
+    (* UCP word boundary (\b/\B), with and without UTF *)
+    ("(*UCP)a\\b", "a\xe9", 0, 0l) (* é is a word char under UCP: no boundary *);
+    ("a\\b", "a\xe9", 0, 0l) (* ASCII \b: boundary after 'a' *);
+    ("(*UCP)\\ba", "\xe9a", 0, 0l);
+    ("\\ba", "\xe9a", 0, 0l);
+    ("(*UCP)a\\B\\S", "a\xe9", 0, 0l);
+    ("(*UTF)(*UCP)\\b\\x{3b1}", "a \xce\xb1", 0, 0l);
+    ("(*UTF)(*UCP)a\\b", "a\xce\xb1", 0, 0l);
+    ("(*UTF)a\\b", "a\xce\xb1", 0, 0l) (* non-UCP contrast in UTF *);
+    ("(*UTF)(*UCP)\\B\\x{3b1}", "b\xce\xb1", 0, 0l);
+    (* UCP caseless without UTF: CHARI/NOTI/repeat folds via Ucd.othercase;
+       othercase(0xFF) = U+0178 truncates to 0x78 in first_cu2 (the C's
+       PCRE2_UCHAR cast) — parity covers the start-scan too *)
+    ("(*UCP)(?i)\\xe9", "\xc9", 0, 0l);
+    ("(*UCP)(?i)[^\\xe9]", "\xc9", 0, 0l);
+    ("(*UCP)(?i)\\xe9+x", "\xe9\xc9\xe9x", 0, 0l);
+    ("(*UCP)(?i)\\xff", "x\xff", 0, 0l);
+    ("(*UCP)(?i)a\\xff", "a\xff", 0, 0l);
+    (* multi-case caseless sets (PT_CLIST): k/K/KELVIN, s/S/long-s, the sigmas —
+       singles, repeats, classes and backrefs *)
+    ("(*UTF)(?i)k+x", "kK\xe2\x84\xaax", 0, 0l);
+    ("(*UTF)(?i)\\x{212a}", "k", 0, 0l);
+    ("(*UTF)(?i)s+x", "sS\xc5\xbfx", 0, 0l);
+    ("(*UTF)(?i)\\x{3c3}+x", "\xcf\x83\xcf\x82\xce\xa3x", 0, 0l);
+    ("(*UTF)(?i)[\\x{3c3}]+x", "\xcf\x82\xce\xa3x", 0, 0l);
+    ("(*UTF)(?i)[^k]", "\xe2\x84\xaa", 0, 0l);
+    ("(*UTF)(?i)(k)\\1x", "k\xe2\x84\xaax", 0, 0l);
+    ("(*UTF)(?i)(\\x{212a})\\1", "\xe2\x84\xaak", 0, 0l);
+    ("(*UTF)(?i)(\\x{3c3})\\1+x", "\xcf\x83\xcf\x82\xce\xa3x", 0, 0l);
+    (* caseless UTF backrefs with LENGTH-CHANGING folds (Ⱥ 2 bytes / ⱥ 3
+       bytes): singles, repeats, and the RM22 varied-lengths give-back *)
+    ("(*UTF)(?i)(\\x{23a})\\1", "\xc8\xba\xe2\xb1\xa5", 0, 0l);
+    ("(*UTF)(?i)(\\x{23a})\\1", "\xe2\xb1\xa5\xc8\xba", 0, 0l);
+    ("(*UTF)(?i)(\\x{23a}x)\\1\\1", "\xc8\xbax\xe2\xb1\xa5x\xc8\xbax", 0, 0l);
+    ( "(*UTF)(?i)(\\x{23a})\\1*\\x{23a}",
+      "\xc8\xba\xe2\xb1\xa5\xc8\xba\xe2\xb1\xa5",
+      0,
+      0l );
+    ("(*UTF)(?i)(\\x{23a})\\1*?\\x{2c65}", "\xc8\xba\xe2\xb1\xa5", 0, 0l);
+    ("(*UTF)(?i)(k)\\1{1,3}x", "k\xe2\x84\xaakx", 0, 0l);
+    ("(*UTF)(?i)(k)\\1{2}", "k\xe2\x84\xaak", 0, 0l);
+    (* caseless backref under UCP without UTF (uni fold, one unit per char) *)
+    ("(*UCP)(?i)(\\xe9)\\1", "\xe9\xc9", 0, 0l);
+    ("(*UCP)(?i)(\\xe9)\\1+x", "\xe9\xc9\xe9x", 0, 0l);
+    (* \X grapheme clusters: combining marks, CRLF, RI pairs, ZWJ joins;
+       single, repeated, lazy, bounded, and the cluster-wise give-back *)
+    ("(*UTF)\\X", "e\xcc\x81", 0, 0l);
+    ("(*UTF)\\X\\X", "e\xcc\x81a", 0, 0l);
+    ("(*UTF)\\X+", "e\xcc\x81e\xcc\x81", 0, 0l);
+    ("(*UTF)(*NO_AUTO_POSSESS)\\X*e", "e\xcc\x81e", 0, 0l);
+    ("(*UTF)\\X+?a", "e\xcc\x81a", 0, 0l);
+    ("(*UTF)\\X{2}", "e\xcc\x81a", 0, 0l);
+    ("(*UTF)\\X{3}", "e\xcc\x81a", 0, 0l);
+    ("\\X+", "ab\r\n", 0, 0l) (* non-UTF \X; CRLF is one cluster *);
+    ("\\X", "\r\n", 0, o_partial_soft);
+    ( "(*UTF)\\X",
+      "\xf0\x9f\x87\xa6\xf0\x9f\x87\xa7\xf0\x9f\x87\xa6",
+      0,
+      0l ) (* RI pair = one cluster, third RI starts the next *);
+    ("(*UTF)\\X+", "\xf0\x9f\x87\xa6\xf0\x9f\x87\xa7\xf0\x9f\x87\xa6", 0, 0l);
+    ( "(*UTF)\\X",
+      "\xf0\x9f\x91\x8d\xe2\x80\x8d\xf0\x9f\x91\x8d",
+      0,
+      0l ) (* EP ZWJ EP joins into one cluster *);
+    ("(*UTF)\\Xx", "e\xcc\x81\xcc\x81x", 0, 0l) (* stacked marks *);
+    (* \R in UTF: multi-byte members NEL/LS/PS, repeats, give-back, BSR *)
+    ("(*UTF)\\R", "\xc2\x85", 0, 0l);
+    ("(*UTF)\\R", "\xe2\x80\xa8", 0, 0l);
+    ("(*UTF)\\R", "\xe2\x80\xa9", 0, 0l);
+    ("(*UTF)\\R+x", "\r\n\xc2\x85\xe2\x80\xa9x", 0, 0l);
+    ("(*UTF)(*NO_AUTO_POSSESS)\\R*\\x{85}", "\r\n\xc2\x85", 0, 0l);
+    ("(*UTF)\\R+?\\n", "\xe2\x80\xa8\n", 0, 0l);
+    ("(*UTF)\\R{2}x", "\xc2\x85\xe2\x80\xa8x", 0, 0l);
+    ("(*BSR_ANYCRLF)(*UTF)\\R", "\xc2\x85", 0, 0l);
+    ("(*BSR_ANYCRLF)(*UTF)\\R+x", "\r\n\xc2\x85x", 0, 0l);
+    (* (?s). and \C repeats in UTF: char-step vs code-unit-step *)
+    ("(*UTF)(?s).*x", "\xce\xb1\n\xce\xb2x", 0, 0l);
+    ("(*UTF)(?s).{2}$", "\xce\xb1\xce\xb2", 0, 0l);
+    ("(*UTF)(*NO_AUTO_POSSESS)(?s).*\\x{3b2}", "\xce\xb1\xce\xb2", 0, 0l);
+    ("(*UTF)(?s).+?x", "\xce\xb1x", 0, 0l);
+    ("(*UTF)\\C\\C$", "\xce\xb1", 0, 0l) (* \C: two units of one char *);
+    ("(*UTF)\\C+\\n", "\xce\xb1x\n", 0, 0l);
+    ("(*UTF)\\C{2,}", "\xce\xb1x", 0, 0l);
+    ("(*UTF)\\C{3}", "\xce\xb1", 0, o_partial_soft) (* \C min: NO scheck *);
+    ( "(*UTF)a\\C{3}",
+      "a\xce\xb1",
+      0,
+      o_partial_soft )
+    (* the no-SCHECK \C min bound (pcre2_match.c:3041-3044) is only
+       observable once something was consumed (start_used < eptr): a spurious
+       SCHECK would report a partial here, the C reports NOMATCH *);
+    ("(*UTF)a\\C{3}", "a\xce\xb1", 0, o_partial_hard);
+    ("(*UTF)(*NO_AUTO_POSSESS)a\\C*x", "a\xce\xb1x", 0, 0l);
+    (* UTF lookbehind: fixed and variable, at multi-byte boundaries *)
+    ("(*UTF)(?<=\\x{3b1})b", "\xce\xb1b", 0, 0l);
+    ("(*UTF)(?<=\\x{3b1})b", "ab", 0, 0l);
+    ("(*UTF)(?<=a\\x{3b1})b", "a\xce\xb1b", 0, 0l);
+    ("(*UTF)(?<!\\x{3b1})b", "\xce\xb1b", 0, 0l);
+    ("(*UTF)(?<!\\x{3b1})b", "ab", 0, 0l);
+    ("(*UTF)(?<=\\x{3b1}{2,3})x", "\xce\xb1\xce\xb1x", 0, 0l);
+    ("(*UTF)(?<=\\x{3b1}{2,3})x", "\xce\xb1x", 0, 0l);
+    ("(*UTF)(?<=\\d{1,2}\\x{3b1})x", "12\xce\xb1x", 0, 0l);
+    ("(*UTF)(?<=.)x", "\xf0\x9f\x98\x80x", 0, 0l) (* 4-byte back-step *);
+    ("(*UTF)(?<=^.)x", "\xf0\x9f\x98\x80x", 0, 0l);
+    ("(*UTF)(?<=\\x{3b1})\\x{3b2}", "\xce\xb1\xce\xb2", 2, 0l)
+    (* start offset: max_lookbehind back-up + check_subject floor *);
+    ("(*UTF)(?<=(\\x{3b1}|\\x{3b2}\\x{3b1}))x", "\xce\xb2\xce\xb1x", 0, 0l);
   ]
 
 let parity_tests =
@@ -1968,6 +2174,68 @@ let limit_match_boundary_test =
             ("(?:a?)*+b", "aab"); (* possessive with empty-match break *)
             ("(?:a+)++b", "aaab"); (* nested possessive *)
           ]);
+    (* Chunk I2: property / \X / \R-in-UTF / \C / UCP / caseless-UTF-ref tick
+       parity. Property repeats take the char/type maxbt shape (floor tried IN
+       PLACE, no tick — pcre2_match.c:4387-4398 RM222); \X repeats give back
+       one CLUSTER per ticked RMATCH with the floor in place (4426-4437
+       RM220); \R gives back one CHARACTER (with the mid-CRLF skip) per RM202
+       tick; a caseless UTF ref repeat with differing copy lengths re-scans
+       per RM22 tick. Same design rules as the XCLASS sweep above: \A pins ONE
+       attempt so the divergent tick is binding, a req_cu ('9' / a multi-byte
+       tail) keeps tail_opts from skipping the attempt, and
+       ( *NO_AUTO_POSSESS) keeps the greedy repeats true maximizers. *)
+    Alcotest.test_case "LIMIT_MATCH sweep, I2 prop/extuni/UTF (fast == interp)"
+      `Quick (fun () ->
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 40 do
+              let f, e = run_both body n subj in
+              Alcotest.(check string)
+                (Printf.sprintf "fast == interp for /%s/ on %S at N=%d" body subj
+                   n)
+                e f
+            done)
+          [
+            (* prop greedy give-back down to the floor (floor in place) *)
+            ("(*NO_AUTO_POSSESS)\\A\\p{L}*9", "abc!9");
+            ("(*UTF)(*NO_AUTO_POSSESS)\\A\\p{L}*9", "\xce\xb1\xce\xb2!9");
+            (* prop floor-exact bounded repeat *)
+            ("(*NO_AUTO_POSSESS)\\A\\p{L}{2,5}9", "ab9");
+            (* prop lazy extend *)
+            ("(*UTF)\\A\\p{L}*?9", "\xce\xb1\xce\xb29");
+            (* PT_ANY NOTPROP hoist (no per-char ticks before NOMATCH) *)
+            ("\\A\\P{Any}{1,3}9", "ab9");
+            (* \X cluster give-back (each give-back a tick, floor in place) *)
+            ("(*UTF)(*NO_AUTO_POSSESS)\\A\\X*9", "e\xcc\x81e\xcc\x81!9");
+            ("(*NO_AUTO_POSSESS)\\A\\X*9", "ab!9");
+            (* \X lazy extend (RM218) *)
+            ("(*UTF)\\A\\X+?9", "e\xcc\x81e9");
+            (* \X bounded give-back exhausting to the FLOOR (\X matches any
+               cluster, so only a bounded lmin > 0 makes the floor reachable
+               with the continuation failing there — pins the char/type
+               floor-IN-PLACE shape against the class floor-tick one) *)
+            ("(*NO_AUTO_POSSESS)\\A\\X{2,4}9", "abcd!9");
+            ( "(*UTF)(*NO_AUTO_POSSESS)\\A\\X{2,4}9",
+              "e\xcc\x81e\xcc\x81e\xcc\x81!9" );
+            (* \R in UTF: greedy give-back over multi-byte members + CRLF *)
+            ("(*UTF)(*NO_AUTO_POSSESS)\\A\\R*9", "\r\n\xc2\x85!9");
+            ("(*UTF)\\A\\R+?9", "\xe2\x80\xa8\n9");
+            (* (?s). in UTF: char-step greedy give-back *)
+            ("(*UTF)(*NO_AUTO_POSSESS)\\A(?s).*9", "\xce\xb1\xce\xb2!9");
+            (* \C in UTF: byte-bulk greedy, char-wise give-back *)
+            ("(*UTF)(*NO_AUTO_POSSESS)\\A\\C{2,4}9", "\xce\xb1x9");
+            (* UCP \w = property repeat; UCP \b transitions *)
+            ("(*UCP)(*NO_AUTO_POSSESS)\\A\\w*9", "ab\xe9!9");
+            ("(*UCP)\\A.\\b.", "a!b");
+            (* UTF variable lookbehind: one RM37 tick per back-length *)
+            ("(*UTF)\\A..(?<=\\x{3b1}{1,3})x", "\xce\xb1\xce\xb1x");
+            (* caseless UTF backref repeat, samelengths (RM21 give-back) *)
+            ("(*UTF)(?i)\\A(k)\\1*9", "kkk!9");
+            (* caseless UTF backref repeat, DIFFERING lengths (RM22 rescan) *)
+            ( "(*UTF)(?i)\\A(\\x{23a})\\1*9",
+              "\xc8\xba\xe2\xb1\xa5\xc8\xba!9" );
+            ("(*UTF)(?i)\\A(\\x{23a})\\1*?9", "\xc8\xba\xe2\xb1\xa59");
+          ]);
     Alcotest.test_case "LIMIT_MATCH sweep, verbs (fast == interp)" `Quick
       (fun () ->
         List.iter
@@ -2045,6 +2313,90 @@ let ref_options_tests =
              | Error _, _ | _, Error _ ->
                  Alcotest.failf "compile mismatch for %S" pat))
        ref_options_cases
+
+(* ---------- 6c. MATCH_INVALID_UTF fragment parity vs the interpreter ----------
+
+   PCRE2_MATCH_INVALID_UTF (0x04000000, compile option — no inline verb
+   exists) turns on the fragmented-matching driver (pcre2_match.c:7650-7699,
+   chunk I2): the subject is split at invalid UTF-8, each fragment matched
+   with per-fragment NOTBOL/NOTEOL, \z/bumpalong against the true end, and a
+   partial returned only from the final fragment. Each case compares
+   exec_full (rc class + ovector + startchar) against the interpreter, with
+   match options for the partial/anchored interplay. *)
+let miu = 0x04080000l (* PCRE2_UTF lor PCRE2_MATCH_INVALID_UTF *)
+
+let invalid_utf_cases : (string * string * int * int32) list =
+  [
+    (* fully valid subject: the plain path *)
+    ("ab", "ab", 0, 0l);
+    (* bad lead byte before/inside/after the match *)
+    ("ab", "\xffab", 0, 0l);
+    ("ab", "a\xffab", 0, 0l);
+    ("ab", "ab\xff", 0, 0l);
+    ("ab", "a\xff\xffab\xff", 0, 0l);
+    ("xyz", "\xffab\xffcd", 0, 0l);
+    (* truncated character at the end = a final invalid fragment boundary *)
+    ("ab", "ab\xce", 0, 0l);
+    ("ab$", "ab\xce", 0, 0l);
+    ("ab\\z", "ab\xce", 0, 0l);
+    (* continuation-byte garbage start: entry check skips bad units *)
+    ("ab", "\x80\x80ab", 0, 0l);
+    ("^ab", "\x80ab", 0, 0l) (* start skipped, ^ anchors the true start *);
+    (* per-fragment NOTBOL: a later fragment never matches ^ *)
+    ("^b", "a\xffb", 0, 0l);
+    ("(?m)^b", "a\xffb", 0, 0l);
+    ("(?m)^b", "a\n\xffb", 0, 0l);
+    (* per-fragment NOTEOL: $ fails at a non-final fragment end *)
+    ("ab$", "ab\xffcd", 0, 0l);
+    ("ab$", "\xffab", 0, 0l);
+    ("(?m)b$", "ab\xffcd", 0, 0l);
+    (* \z tests the TRUE end across fragments *)
+    ("ab\\z", "ab\xffab", 0, 0l);
+    ("ab\\Z", "ab\xffab", 0, 0l);
+    (* multi-byte chars inside fragments *)
+    ("\\x{3b1}+x", "\xff\xce\xb1\xce\xb1x", 0, 0l);
+    ("a.b", "\xffa\xce\xb1b", 0, 0l);
+    (* start offset into / past a bad unit *)
+    ("b", "\xffab", 2, 0l);
+    ("b", "a\xffb", 1, 0l);
+    (* partial matching: only the FINAL fragment may report a partial *)
+    ("abcd", "\xffab", 0, o_partial_hard);
+    ("abcd", "\xffab", 0, o_partial_soft);
+    ("abcd", "ab\xffab", 0, o_partial_soft);
+    ("abcd", "ab\xffab", 0, o_partial_hard);
+    ("abcd", "\xffabc", 0, o_partial_soft);
+    ("ab", "ab\xffa", 0, o_partial_soft) (* full match beats a partial *);
+    (* anchored: one attempt per fragment start *)
+    ("ab", "\xffab", 0, o_anchored);
+    ("ab", "\xffxab", 0, o_anchored);
+    (* lookbehind/word-boundary floors are the fragment start (check_subject) *)
+    ("(?<=a)b", "\xffab", 0, 0l);
+    ("(?<=a)b", "a\xffb", 0, 0l);
+    ("\\bb", "a\xffb", 0, 0l);
+    ("\\Bb", "a\xffb", 0, 0l);
+    (* verbs interacting with the fragment driver *)
+    ("a(*COMMIT)b", "\xffacab", 0, 0l);
+    ("a(*SKIP)b|ac", "\xffacab", 0, 0l);
+  ]
+
+let invalid_utf_tests =
+  List.map
+    (fun (pat, subj, off, mopts) ->
+      Alcotest.test_case
+        (Printf.sprintf "invalid-utf %S %S off=%d opt=0x%lx" pat subj off mopts)
+        `Quick
+        (fun () ->
+          match (F.compile pat miu, E.compile pat miu) with
+          | Ok fre, Ok ere ->
+              let f = norm (F.exec_full fre subj off mopts) in
+              let e = norm (E.exec_full ere subj off mopts) in
+              Alcotest.(check string)
+                (Printf.sprintf "fast vs interp for %S/%S" pat subj)
+                e f
+          | Error (F.Unsupported _), _ -> ()
+          | Error _, _ | _, Error _ ->
+              Alcotest.failf "compile mismatch for %S" pat))
+    invalid_utf_cases
 
 (* ---------- 7. alloc pins ----------
 
@@ -2195,6 +2547,111 @@ let alloc_tests =
                   ~50k 2-byte chars, measured %.0f words"
                  delta)
               true (delta < 1000.));
+    (* Chunk I2: the grapheme-cluster GIVE-BACK path — Extuni.extuni forward
+       steps (int-only, compiler-eliminated local refs) AND the per-give-back
+       [extuni_back] cluster re-walk, which must be closure-free
+       (runner.ml extuni_back_walk is module-level; a local `let rec` would
+       cost ~6 words per step = ~150k words here). ~25k two-char clusters
+       (e + COMBINING ACUTE) with NO digit anywhere: the greedy scan eats
+       every cluster, then \d fails at ALL ~25k give-back positions down to
+       the floor (a full give-back sweep), then NOMATCH. \d carries no req_cu
+       and \A pins the single attempt. *)
+    Alcotest.test_case "alloc: O(1) \\X cluster give-back over ~25k clusters"
+      `Slow (fun () ->
+        let o_no_auto_possess = 0x00004000l in
+        match F.compile "(*UTF)\\A\\X*\\d" o_no_auto_possess with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            let b = Buffer.create (3 * 25_000) in
+            for _ = 1 to 25_000 do
+              Buffer.add_string b "e\xcc\x81"
+            done;
+            let subject = Buffer.contents b in
+            let expect_nomatch r =
+              match r with
+              | Ok None -> ()
+              | Ok (Some _) -> Alcotest.fail "unexpected match"
+              | Error c -> Alcotest.failf "unexpected error %d" c
+            in
+            expect_nomatch (F.exec re subject 0 0l) (* warm-up *);
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            expect_nomatch r;
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for the \\X give-back over \
+                  ~25k clusters, measured %.0f words"
+                 delta)
+              true (delta < 1000.));
+    (* Chunk I2: the property test (prop_test / Ucd record reads) in the
+       repeat hot loop, forward scan AND full char-wise give-back: ~50k
+       two-byte letters with NO digit, so \d fails at every give-back
+       position down to the floor. *)
+    Alcotest.test_case "alloc: O(1) \\p{L} give-back over ~50k chars" `Slow
+      (fun () ->
+        let o_no_auto_possess = 0x00004000l in
+        match F.compile "(*UTF)\\A\\p{L}*\\d" o_no_auto_possess with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            let b = Buffer.create (2 * 50_000) in
+            for _ = 1 to 50_000 do
+              Buffer.add_string b "\xce\xb1"
+            done;
+            let subject = Buffer.contents b in
+            let expect_nomatch r =
+              match r with
+              | Ok None -> ()
+              | Ok (Some _) -> Alcotest.fail "unexpected match"
+              | Error c -> Alcotest.failf "unexpected error %d" c
+            in
+            expect_nomatch (F.exec re subject 0 0l) (* warm-up *);
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            expect_nomatch r;
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for the \\p{L} give-back \
+                  over ~50k chars, measured %.0f words"
+                 delta)
+              true (delta < 1000.));
+    (* Chunk I2: the RM22 differing-lengths caseless-UTF ref-repeat backtrack
+       ([backtrack_ref_max2] + the module-level [ref_max2_rescan] — a local
+       `let rec` would cost ~6 words per RM22 step = ~6k words here). Group =
+       2-byte U+023A; ~1000 copies alternating 3-byte U+2C65 / 2-byte U+023A
+       (differing lengths force RM22); \d fails at every retry, so the
+       maximize gives back one copy per step with a forward rescan each
+       time. *)
+    Alcotest.test_case "alloc: O(1) RM22 ref give-back over ~1000 copies"
+      `Slow (fun () ->
+        match F.compile "(*UTF)(?i)\\A(\\x{23a})\\1*\\d" 0l with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            let b = Buffer.create 4096 in
+            Buffer.add_string b "\xc8\xba" (* the group: U+023A *);
+            for _ = 1 to 500 do
+              Buffer.add_string b "\xe2\xb1\xa5" (* U+2C65, 3 bytes *);
+              Buffer.add_string b "\xc8\xba" (* U+023A, 2 bytes *)
+            done;
+            let subject = Buffer.contents b in
+            let expect_nomatch r =
+              match r with
+              | Ok None -> ()
+              | Ok (Some _) -> Alcotest.fail "unexpected match"
+              | Error c -> Alcotest.failf "unexpected error %d" c
+            in
+            expect_nomatch (F.exec re subject 0 0l) (* warm-up *);
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            expect_nomatch r;
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for the RM22 give-back over \
+                  ~1000 copies, measured %.0f words"
+                 delta)
+              true (delta < 1000.));
   ]
 
 (* ---------- 8. ulimit-free stack-safety smoke ----------
@@ -2225,6 +2682,7 @@ let () =
       ("sweep", sweep_tests);
       ("runner parity", parity_tests);
       ("backref option parity", ref_options_tests);
+      ("invalid-utf fragment parity", invalid_utf_tests);
       ("limit-match boundary", limit_match_boundary_test);
       ("alloc pins", alloc_tests);
       ("stack safety", stack_safety_tests);

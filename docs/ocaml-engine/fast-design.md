@@ -85,7 +85,7 @@ following the tag. Widths are `Ir.arity`:
 | 26 | `KET_RMIN` | `entry; g` | 3 | lazy repeating ket (`OP_KETRMIN`): empty-check `g` then try the continuation (`pc+3`, tick), reiterate at `entry` on backtrack |
 | 27 | `TYPE` | `type_op` | 2 | one character-type test; `type_op` is the C opcode (`OP_NOT_DIGIT`..`OP_VSPACE` / `OP_ANY` / `OP_ALLANY` / `OP_ANYBYTE` / `OP_ANYNL`). `OP_ANY` (newline-sensitive + CRLF-partial) and `OP_ANYNL` (\R, variable length) get special arms; the rest are one code unit via `simple_type_match` |
 | 28 | `CLASS` | `map_off` | 2 | one 32-byte-bitmap class test (`OP_CLASS`/`OP_NCLASS` — identical in non-UTF where every code unit is 0..255). `map_off` = byte offset of the bitmap in `re.code` (like the JIT / XCLASS, no copy) |
-| 29 | `WORDBOUND` | `want` | 2 | `\b` (`want=1`, `OP_WORD_BOUNDARY`) / `\B` (`want=0`, `OP_NOT_WORD_BOUNDARY`), non-UCP. The prev-char read lowers `mb.start_used_ptr` (the SCHECK_PARTIAL floor, pcre2_match.c:6280) |
+| 29 | `WORDBOUND` | `want` | 2 | `\b` / `\B`: `want` bit 0 = boundary wanted (`OP_WORD_BOUNDARY`/`OP_UCP_WORD_BOUNDARY`), bit 1 (chunk I2) = the UCP variant, whose word test uses `Char_predicates.ucp_wordchar` (pcre2_match.c:6283-6289/6316-6322) even without UTF. The prev-char read lowers `mb.start_used_ptr` (the SCHECK_PARTIAL floor, pcre2_match.c:6280) |
 | 30 | `TYPE_REP` | `reptype; lmin; lmax; type_op` | 5 | character-type repeat (`OP_TYPESTAR`..`OP_TYPEPOSUPTO`) |
 | 31 | `CLASS_REP` | `reptype; lmin; lmax; map_off` | 5 | class repeat (`OP_CLASS`/`OP_NCLASS` + an `OP_CR*` quantifier) |
 | 32 | `REF` | `ovbase; caseless` | 3 | numbered backref (`OP_REF`/`OP_REFI`), no repeat: `match_ref` once (`ovbase = 2N`, fast public ovector), then continue |
@@ -115,6 +115,10 @@ following the tag. Widths are `Ir.arity`:
 | 56 | `CLOSE` | `ovbase; referenced` | 3 | `OP_CLOSE` before an ACCEPT: close capture N, pushing a KIND_CAP so it rolls back if ACCEPT then backtracks. `referenced=1` reads the start from `mb.cap_start[ovbase]`, else ovector[ovbase] already holds it |
 | 57 | `XCLASS` | `data_off` | 2 | one `OP_XCLASS` test (chunk I): match one code point via `Pcre2_engine.Xclass.xclass` against the class data offset `data_off` (the flag code unit in `re.code` = OP_XCLASS position + 1 + LINK_SIZE). Wide chars, ranges, `\p` properties; UTF and non-UTF |
 | 58 | `XCLASS_REP` | `reptype; lmin; lmax; data_off` | 5 | `OP_XCLASS` + an `OP_CR*` quantifier (chunk I): routes through the shared REP machinery as `rk_xclass` (`rep_map_off` holds `data_off`) |
+| 59 | `PROP` | `notprop; ptype; pdata` | 4 | one `OP_PROP`/`OP_NOTPROP` character-property test (chunk I2, pcre2_match.c:2479-2614) via the shared `Char_predicates.prop_test` (the pure extraction the interpreter also aliases). One character, no choice point, no tick |
+| 60 | `PROP_REP` | `reptype; lmin; lmax; notprop; ptype; pdata` | 7 | a property TYPE repeat (chunk I2, pcre2_match.c:2708-2714): the shared REP machinery as `rk_prop` (char/type maxbt shape — floor in place; the PT_ANY-NOTPROP min-loop hoist of :2731-2732 fires before any SCHECK) |
+| 61 | `EXTUNI` | — | 1 | one `\X` extended grapheme cluster (chunk I2, pcre2_match.c:2617-2635) via `Pcre2_engine.Extuni.extuni` + CHECK_PARTIAL. No choice point, no tick |
+| 62 | `EXTUNI_REP` | `reptype; lmin; lmax` | 4 | `\X` type repeat (chunk I2, pcre2_match.c:2976-2996/3804-3827/4401-4466): dedicated cluster-wise loops (`rk_extuni`, CHECK_PARTIAL after each step); the greedy give-back steps one CLUSTER per tick (`extuni_back`, the RM220 pair-table re-walk) with the floor tried in place |
 
 **Chunk H additions — backtracking control verbs, FAIL, ACCEPT, CLOSE.** Eight
 new tags (49-56) and one save kind (KIND_VERB 13). Verbs turn backtracking into
@@ -467,26 +471,82 @@ isolated-0x80 error at 0); then back up `max_lookbehind` CHARACTERS to
 `Engine.Error start_char` at the seam). `PCRE2_NO_UTF_CHECK` skips it
 (`check_subject = 0`), exactly as the C.
 
-**Declined to chunk I2 (precise compile-time declines).** UCP mode
-(OP_PROP/OP_NOTPROP/OP_EXTUNI/UCP word boundary), `PCRE2_MATCH_INVALID_UTF`
-(fragment carry-on), caseless backreferences in UTF (variable-byte-length
-`Ucd.othercase`/caseset fold), UTF lookbehind (char-wise OP_REVERSE/OP_VREVERSE),
-`\R` (OP_ANYNL) in UTF — BOTH the single test and its repeats (multi-byte
-NEL/LS/PS members; variable-length give-back), OP_ALLANY / OP_ANYBYTE repeats in
-UTF (char-step / no-SCHECK partial subtleties). Each is a first-opcode
-`Unsupported "... (chunk I2)"`, so accepted patterns are never mis-lowered;
-verified by conformance `--driver=fast --failures` (empty) and fuzz
-fast-vs-interp (0 divergences, 500k+ cases). §3 (save records) and §4 (tick
-sites) gain NO new rows or save kinds from chunk I: every UTF arm ticks at the
-same site as its non-UTF twin (repeats reuse the existing REP_MIN/REP_MAX rows;
-the char-wise BACKCHAR give-back ticks once per CHARACTER exactly as the C's
-RM203/RM34/RM201/RM101), and the NEW `XCLASS_REP` — identical in UTF and
-non-UTF — takes the CLASS maxbt row: the floor position is a ticked RMATCH
-(RM101, pcre2_match.c:2278-2288 ≡ CLASS's RM24/:2143), routed through
-`rep_greedy_done_class` and the class-like branch of `backtrack_rep_max` (tags
-31 AND 58) — the same §4 tick-parity requirement recorded for CLASS in chunk E.
-The §3 "snapshot completeness proof" chunk-K revisit flag is untouched (chunk I
-adds no recursion / subroutine re-entry).
+§3 (save records) and §4 (tick sites) gained NO new rows or save kinds from
+chunk I1: every UTF arm ticks at the same site as its non-UTF twin (repeats
+reuse the existing REP_MIN/REP_MAX rows; the char-wise BACKCHAR give-back
+ticks once per CHARACTER exactly as the C's RM203/RM34/RM201/RM101), and the
+NEW `XCLASS_REP` — identical in UTF and non-UTF — takes the CLASS maxbt row:
+the floor position is a ticked RMATCH (RM101, pcre2_match.c:2278-2288 ≡
+CLASS's RM24/:2143), routed through `rep_greedy_done_class` and the class-like
+branch of `backtrack_rep_max` (tags 31 AND 58) — the same §4 tick-parity
+requirement recorded for CLASS in chunk E.
+
+**Chunk I2 additions — UCP mode and the UTF remainder.** The I1 decline list is
+fully lowered; the UCP and `PCRE2_MATCH_INVALID_UTF` compile gates are removed.
+Four new tags (59-62, above), one new save kind (KIND_REF_MAX2 14, §3), and
+runner arms:
+
+- **Properties** (`PROP`/`PROP_REP`) and the **UCP word boundary** share the
+  interpreter's predicates via a pure extraction into
+  `Pcre2_engine.Char_predicates` (`prop_test`, `prop_clist_member`,
+  `caseless_set_member`, `ucp_wordchar` — the interpreter now aliases them, so
+  the two engines cannot diverge; engine conformance stayed byte-identical).
+  PT_ANY..PT_BOOL all covered; a `ptype > PT_BOOL` (the C's
+  PCRE2_ERROR_INTERNAL default, unreachable from a compiled program) is
+  declined defensively at IR compile so accepted IR never carries one.
+- **UCP mode** otherwise only changes the CASELESS FOLD: the IR compiler folds
+  `(utf || ucp) && c > 127` through `Ucd.othercase` (pcre2_match.c:1388/1626 —
+  CHARI/NOT singles and all four char-repeat families), the runner's CHARI arm
+  gains the UCP-without-UTF othercase branch (:1075-1092), `match_ref` takes
+  the uni-mode fold under `utf || ucp`, and [exec]'s `first_cu2`/`req_cu2` get
+  the `> 127 && ucp && !utf` `Ucd.othercase land 0xff` branch (:7101-7107).
+  UCP `\d\w\s` need nothing new — the parser already substituted properties.
+- **Multi-case caseless sets** ride PT_CLIST (the compiler rewrites a caseless
+  char with a multi-entry caseset into `OP_PROP PT_CLIST`) and
+  `caseless_set_member` in the uni-mode `match_ref` — no separate CHARI work
+  (the C's OP_CHARI tests only `othercase`, pcre2_match.c:1065-1069).
+- **`\X`** (`EXTUNI`/`EXTUNI_REP`) steps clusters via `Pcre2_engine.Extuni`
+  (allocation-free: int-only, its local refs are compiler-eliminated — pinned
+  by an alloc test); the repeat's give-back steps back one CLUSTER at a time
+  (`extuni_back`, the RM220 pair-table-only re-walk, pcre2_match.c:4437-4465)
+  through the ordinary KIND_REP_MAX record.
+- **Caseless backreferences in UTF/UCP** use the uni-mode compare
+  (pcre2_match.c:390-434: othercase + caseless set, length measured along the
+  REFERENCE, consumed subject length via `mb.ref_length`). A caseless UTF ref
+  REPEAT tracks the C's `samelengths` (5122/5144); differing copy lengths
+  (e.g. U+023A/U+2C65) route the maximize to the RM22 rescan path — the new
+  KIND_REF_MAX2 record (§3).
+- **UTF lookbehind**: `REVERSE` walks back char-wise floored at
+  `mb.check_subject` (:5797-5804); `VREVERSE` backs up char-wise with the
+  interpreter's continuation-byte crossing pin (bounded BACKCHAR, C-undefined
+  region — the DEVIATION note is transcribed at `op_vreverse_utf`), and the
+  RM37 forward step crosses characters (FORWARDCHARTEST, :5881).
+- **`\R` in UTF** decodes code points (NEL/LS/PS are multi-byte) in the
+  single arm and all repeat loops; the UTF greedy give-back is BACKCHAR + the
+  mid-CRLF skip (:4944-4947). **OP_ALLANY repeats in UTF** step characters
+  (the generic per-char loops; the C's `Lmax = UINT32_MAX` jump-to-end arm is
+  position- and SCHECK-identical). **OP_ANYBYTE repeats** get their own
+  `rk_anybyte`: byte-bulk min WITHOUT SCHECK_PARTIAL (:3041-3044), byte-bulk
+  greedy (:4834-4845), but CHAR-wise minimize-extend and give-back (the RM219
+  GETCHARINC / RM202 BACKCHAR) — so `backtrack_rep_max`'s in-place floor case
+  now runs the continuation at `try_pos` (which a \C give-back can place
+  BELOW a mid-character floor, the C's `<=` loop-head break, :4935-4940).
+- **`PCRE2_MATCH_INVALID_UTF`** is driver-level: the entry check gains the
+  bad-start skip / end-truncation / re-validate loop (pcre2_match.c:6807-6929)
+  and the bump-along gains the ENDLOOP fragment carry-on
+  (`endloop`/`next_fragment`/`fragment_restart`, :7637-7699) with
+  per-fragment NOTBOL/NOTEOL (`set_frag_options` recomputes the effective
+  flags from the caller's base options), `mb.true_end_subject` (OP_EOD and the
+  bumpalong limit test the TRUE end; everything else the fragment end), and
+  per-fragment `hitend`/`match_partial` resets. `mb.startchar` carries the
+  C's match_data->startchar for error returns.
+
+The §3 "snapshot completeness proof" chunk-K revisit flag is untouched: chunk
+I2 adds no recursion / subroutine re-entry, and the new arms read NEITHER
+`mb.group_start` nor `mb.cap_start` (PROP/EXTUNI consume subject characters
+only; KIND_REF_MAX2 re-derives its state from the IR + ovector like
+KIND_REF_MIN), so the proof's read-site enumeration is unchanged — the real
+revisit remains chunk K.
 
 `Ir.dump : Format.formatter -> Ir.t -> unit` prints one `%3d TAG operands` line per head
 (debug_printer.ml style); `CHAR_RUN`/`CHARI` show the escaped literal, `ALT` shows
@@ -504,13 +564,16 @@ adds no recursion / subroutine re-entry).
   mid-match.
 
 `Ir_compile.compile : Compile.re -> (Ir.t, string) result` walks `re.code` (mirroring
-debug_printer.ml's opcode walk; LINK_SIZE = 2 via `Compile.get`). Compile-level gates run
-BEFORE the walk: `PCRE2_UCP` → `"fast: UCP mode (chunk I2)"`,
-`PCRE2_MATCH_INVALID_UTF` → `"... (chunk I2)"`, `PCRE2_FIRSTLINE` → `"... (chunk
-L)"` (chunk I removed the `PCRE2_UTF` gate — UTF mode is now lowered by the
-UTF-aware walk + runner UTF arms). (Chunk D removed the `top_bracket > 0`
-gate — capturing groups are now lowered.) The first out-of-subset opcode
-yields `Error "fast: <construct> (chunk X)"` (taxonomy §6).
+debug_printer.ml's opcode walk; LINK_SIZE = 2 via `Compile.get`). ONE compile-level
+gate runs BEFORE the walk: `PCRE2_FIRSTLINE` → `"... (chunk L)"` (chunk I removed
+the `PCRE2_UTF` gate, chunk I2 removed the `PCRE2_UCP` and
+`PCRE2_MATCH_INVALID_UTF` gates; chunk D removed the `top_bracket > 0` one).
+The first out-of-subset opcode yields `Error "fast: <construct> (chunk X)"`
+(taxonomy §6) — after I2 the remaining decline reasons are conditionals
+(OP_COND/SCOND + refs, chunk J), recursion / script-run / callouts (chunk K),
+`\K` (C2+), repeated atomic groups/assertions (G+), `( *ACCEPT)` inside an
+assertion and `( *THEN)` with a non-atomic assertion (H+), and
+`PCRE2_FIRSTLINE` (L).
 
 ## §3 Runner and save records (choice-point IR landed in C1; runner in C2)
 
@@ -572,6 +635,7 @@ first:
 | `KIND_CAPSTART` | 3 | `ovbase; old_cap_start; KIND_CAPSTART` | each `CAP_START_REF` (referenced capture entry) | restore `mb.cap_start.(ovbase)` to the enclosing value, then keep popping (the ovector was already rolled back by the CLOSE's `KIND_CAP`) |
 | `KIND_REF_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REF_MIN` | minimizing ref repeat with `lmin<lmax` (RM20) | match one more copy at `eptr` (`count` up to Lmax), retry the continuation; `rep_pc` re-derives ovbase/caseless/Lmax/cont |
 | `KIND_REF_MAX` | 6 | `cont; try_pos; flength; lstart; rdepth; KIND_REF_MAX` | maximizing ref repeat, samelengths (RM21) | give back one copy (`try_pos` −= `flength`, down to and INCLUDING `lstart`), retry the continuation; below `lstart` → NOMATCH |
+| `KIND_REF_MAX2` | 6 | `ref_pc; lmax_cur; try_eptr; lstart; rdepth; KIND_REF_MAX2` | maximizing ref repeat, DIFFERING lengths (RM22, chunk I2 — caseless UTF only, pcre2_match.c:5164-5184) | `try_eptr = lstart` → NOMATCH; else `lmax_cur--`, re-scan `lmax_cur − lmin` copies forward from `lstart` (match_ref known to succeed, rc discarded like the C's (void)), retry the continuation at the new end (tick) |
 | `KIND_ONCE` | `2*oveccount+2` | `ov_snapshot[2,2n); prev_once_base; saved_mark; subtype; KIND_ONCE` | each `ONCE` (atomic group / atomic positive assertion) | restore the snapshot + `mb.once_base` + `mb.mark`, then keep popping. `subtype` (chunk H) = 0 atomic group / 1 pos-assert, read only by `backtrack_code` (THEN escape vs contain) |
 | `KIND_NASSERT` | `2*oveccount+4` | `ov_snapshot; prev_once_base; cont; eptr_enter; rdepth_enter; saved_mark; KIND_NASSERT` | each `NASSERT` (negative assertion) | ALL branches failed = SUCCESS: restore snapshot + `mb.once_base` + entry `mb.mark`, continue at `cont` with the entry eptr/rdepth |
 | `KIND_VREVERSE` | 6 | `body_pc; cur_lmax; lmin; cur_eptr; rdepth; KIND_VREVERSE` | each `VREVERSE` (RM37) | `if cur_lmax<=lmin` NOMATCH, else give up one back-step (`cur_lmax--`, `cur_eptr++`) and retry the branch body |
@@ -840,6 +904,26 @@ reproduced by `rep_greedy_done_class`. The single `t_type` / `t_class` /
 Verified by the fuzz `--mode fast-vs-interp` `LIMIT_MATCH=2000` differential (0
 divergences over 310k+ cases with classes/types/\R/\b) and the type/class-repeat
 `LIMIT_MATCH` N-sweep test.
+
+**Chunk I2 tick sites.** Property repeats (`PROP_REP`) reuse the char/type
+rows exactly (RM222's maxbt tries the floor IN PLACE, pcre2_match.c:4387-4398;
+the RM208-RM225 minimize resumes are the REP_MIN rows); the PT_ANY-NOTPROP
+min-loop hoist (:2731-2732) NOMATCHes with no tick and no SCHECK. `\X`
+repeats (`EXTUNI_REP`) also take the char/type rows — RM220's maxbt tries the
+floor in place (:4426-4440) with each give-back a ticked child stepping one
+CLUSTER, and RM218's minimize extend is the REP_MIN row with CHECK_PARTIAL
+after the cluster step. `\R`-in-UTF / UTF-OP_ALLANY / OP_ANYBYTE repeats
+reuse their existing rows (char-wise give-back, RM202/RM219). The
+varied-lengths caseless-UTF ref maximize (KIND_REF_MAX2) ticks once at the
+greedy end (the first RM22 RMATCH) and once per rescan-retry; the
+`try_eptr = lstart` pop is tick-free (:5174). A UTF `VREVERSE` is unchanged
+(RM37 rows; the forward step just crosses characters). Single `PROP` /
+`EXTUNI` / UCP `WORDBOUND` arms never tick (one character / zero width, no
+choice point). Verified by the fuzz `--mode fast-vs-interp` LIMIT_MATCH
+differential and the I2 prop/extuni/UTF LIMIT_MATCH N-sweep (whose
+load-bearing pins were mutation-tested: the extuni floor-tick shape, the prop
+floor dispatch, the RM22 pop tick and the \C no-SCHECK min each fail the
+suite when deliberately broken).
 
 **Backreferences (chunk F) tick like the C's REF_REPEAT.** A single `REF`/
 `DNREF` and the `CAP_START_REF`/`CAP_END_REF` bracket never tick (the C's

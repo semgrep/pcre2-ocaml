@@ -35,6 +35,8 @@ module Utf = Pcre2_engine.Utf
 module Ucd = Pcre2_engine.Ucd
 module Xclass = Pcre2_engine.Xclass
 module Valid_utf = Pcre2_engine.Valid_utf
+module Extuni = Pcre2_engine.Extuni
+module Tables = Pcre2_engine.Tables
 
 (* Chunk E — repeat-kind discriminators (fast-design.md §2/§4). [setup_rep]
    maps each REP superinstruction to one of these; the forward min/greedy
@@ -48,6 +50,17 @@ let rk_allany = 5 (* OP_ALLANY / OP_ANYBYTE (any code unit) *)
 let rk_any = 6 (* OP_ANY (any except newline) *)
 let rk_anynl = 7 (* OP_ANYNL (\R, variable length) *)
 let rk_xclass = 8 (* OP_XCLASS repeat (chunk I; rep_map_off holds data_off) *)
+let rk_prop = 9 (* OP_PROP/OP_NOTPROP repeat (chunk I2; rep_ptype/rep_pdata/rep_want) *)
+let rk_extuni = 10 (* OP_EXTUNI repeat (chunk I2; cluster-wise loops) *)
+
+(* OP_ANYBYTE repeat (chunk I2). Split from rk_allany: in UTF the two differ —
+   \C's min loop is a bulk bound check WITHOUT SCHECK_PARTIAL
+   (pcre2_match.c:3041-3044, unlike OP_ALLANY's per-char SCHECK loop at
+   3030-3039), its greedy scan is the byte-bulk form (4834-4845) while
+   OP_ALLANY steps characters (4820-4832), and both give back char-wise
+   (RM202 BACKCHAR). Non-UTF \C compiles to OP_ALLANY, so rk_anybyte is
+   UTF-only in practice. *)
+let rk_anybyte = 11
 
 (* pcre2_match.c:87-88 — the two internal match() return codes used inside
    the loop (interpreter.ml:88-89). MATCH_MATCH = 1, MATCH_NOMATCH = 0. *)
@@ -84,6 +97,11 @@ let vt_skip = 3
 let vt_skip_arg = 4
 let vt_then = 5
 
+(* pcre2_match.c:2493-2610 — the shared Unicode property test (chunk I2):
+   Char_predicates.prop_test is the pure extraction the interpreter also
+   aliases, so the two engines share one definition (full citations there). *)
+let prop_test = Char_predicates.prop_test
+
 (* ---------- The match block (per-exec, reused across execs) ----------
 
    The interpreter keeps this state in [match_block] + [driver_state]
@@ -98,7 +116,13 @@ type mb = {
   mutable lit : string; (* Ir.t lit — CHAR_RUN literal pool *)
   (* subject / offsets *)
   mutable subject : string;
-  mutable end_subject : int; (* usable end; = length (no UTF fragments) *)
+  mutable end_subject : int;
+      (* usable end: = [true_end_subject] except while matching a non-final
+         invalid-UTF fragment (chunk I2), where it stops before the bad code
+         unit (pcre2_match.c:6898/7693). *)
+  mutable true_end_subject : int;
+      (* the actual subject end (pcre2_match.c:6608 / interpreter.ml:362);
+         read by OP_EOD (\z, pcre2_match.c:6156) and the fragment carry-on. *)
   mutable start_subject : int; (* always 0 in this port *)
   mutable start_offset : int;
   mutable attempt_start : int; (* start_match of the current attempt (\K absent) *)
@@ -112,6 +136,26 @@ type mb = {
      When set, character reads decode multi-byte UTF-8 and step over whole
      characters; the per-exec UTF validity check ran at the [exec] seam. *)
   mutable utf : bool;
+  (* Chunk I2 — UCP mode (re.overall_options & PCRE2_UCP). Constant per exec.
+     Selects the Unicode caseless folds/property paths even without UTF:
+     CHARI's othercase arm (pcre2_match.c:1075-1092) and match_ref's uni-mode
+     caseless compare (pcre2_match.c:388-434). *)
+  mutable ucp : bool;
+  (* Chunk I2 — match_data->startchar as the C maintains it for ERROR returns:
+     0 per exec (pcre2_match.c:6687), the absolute UTF error offset from the
+     entry check (6897), or the fragment-relative offset from the carry-on
+     validation (7675-7676). Read by [exec]'s outcome for a non-match,
+     non-partial negative rc (engine.ml exec_full reads md.startchar the same
+     way). *)
+  mutable startchar : int;
+  (* Chunk I2 — the caller's NOTBOL/NOTEOL option flags, kept apart from the
+     effective [notbol]/[noteol] because the invalid-UTF fragment driver ORs
+     per-fragment NOTBOL/NOTEOL into the match options (mb->moptions = options
+     | fragment_options, pcre2_match.c:7502; fragment_options set at
+     6920-6926/7683/7694). [set_frag_options] recomputes the effective flags
+     at each fragment restart. *)
+  mutable base_notbol : bool;
+  mutable base_noteol : bool;
   (* option-derived flags (moptions = options; constant per exec) *)
   mutable partial : int; (* 0 none / 1 soft / 2 hard *)
   mutable notempty : bool;
@@ -195,6 +239,10 @@ type mb = {
   mutable rep_kind : int;
   mutable rep_mask : int; (* ctype mask (rep_ctype) *)
   mutable rep_map_off : int; (* class bitmap byte offset in [bytecode] *)
+  (* Chunk I2 — property-repeat payload (rk_prop): the OP_PROP/OP_NOTPROP
+     ptype/pdata pair; the NOT sense rides in [rep_want]. *)
+  mutable rep_ptype : int;
+  mutable rep_pdata : int;
   (* Chunk E: the shared compiler's bytecode ([re.code]), pinned for the class
      bitmap reads (t_class / t_class_rep); the 32-byte map stays in place. *)
   mutable bytecode : Bytes.t;
@@ -268,12 +316,17 @@ let make_mb (ss : Save_stack.t) : mb =
     lit = "";
     subject = "";
     end_subject = 0;
+    true_end_subject = 0;
     start_subject = 0;
     start_offset = 0;
     attempt_start = 0;
     start_used_ptr = 0;
     check_subject = 0;
     utf = false;
+    ucp = false;
+    startchar = 0;
+    base_notbol = false;
+    base_noteol = false;
     partial = 0;
     notempty = false;
     notempty_atstart = false;
@@ -326,6 +379,8 @@ let make_mb (ss : Save_stack.t) : mb =
     rep_kind = 0;
     rep_mask = 0;
     rep_map_off = 0;
+    rep_ptype = 0;
+    rep_pdata = 0;
     bytecode = Bytes.empty;
     bsr_anycrlf = false;
     match_unset_backref = false;
@@ -474,6 +529,14 @@ let rec backchar_sub (s : string) (p : int) : int =
   if p > 0 && Int.equal (Char.code (String.unsafe_get s p) land 0xc0) 0x80 then
     (backchar_sub [@tailcall]) s (p - 1)
   else p
+
+(* GETCHAR (pcre2_intmodedep.h:298-303) over the subject with the lead byte
+   read through Utf.peek (interpreter.ml getchar_subject): tolerates a pinned
+   out-of-range position (peek reads 0 there — the word-boundary prev-probe /
+   grapheme back-walk precedent). Allocation-free. *)
+let getchar_sub (s : string) (pos : int) : int =
+  let c = Utf.peek s pos in
+  if c >= 0xc0 then Utf.getutf8 c s pos else c
 
 (* pcre2_match.c:992-1025 non-UTF OP_CHAR run (interpreter.ml:1509-1539),
    fused: compare [lit_pos, lit_end) against the subject from [eptr]. Each
@@ -640,6 +703,19 @@ let setup_rep (mb : mb) (pc : int) : unit =
     mb.rep_kind <- rk_xclass;
     mb.rep_map_off <- code.(pc + 4);
     mb.rep_cont <- pc + 5)
+  else if Int.equal tag 60 (* t_prop_rep *) then (
+    (* Chunk I2 — property repeat (pcre2_match.c:2708-2714): rep_want is the
+       POSITIVE sense (OP_PROP), false for OP_NOTPROP; ptype/pdata feed
+       prop_test per unit. *)
+    mb.rep_kind <- rk_prop;
+    mb.rep_want <- Int.equal code.(pc + 4) 0;
+    mb.rep_ptype <- code.(pc + 5);
+    mb.rep_pdata <- code.(pc + 6);
+    mb.rep_cont <- pc + 7)
+  else if Int.equal tag 62 (* t_extuni_rep *) then (
+    (* Chunk I2 — \X repeat: cluster-wise dedicated loops. *)
+    mb.rep_kind <- rk_extuni;
+    mb.rep_cont <- pc + 4)
   else (
     (* tag 30 t_type_rep — map the C type opcode to a rep_kind + payload. *)
     let ct = code.(pc + 4) in
@@ -682,13 +758,84 @@ let setup_rep (mb : mb) (pc : int) : unit =
       mb.rep_want <- false)
     else if Int.equal ct Opcodes.op_anynl then mb.rep_kind <- rk_anynl
     else if Int.equal ct Opcodes.op_any then mb.rep_kind <- rk_any
-    else (* op_allany / op_anybyte *) mb.rep_kind <- rk_allany)
+    else if Int.equal ct Opcodes.op_anybyte then
+      (* Chunk I2 — \C: split from rk_allany (UTF min/greedy/give-back
+         differences; see the rk_anybyte note above). *)
+      mb.rep_kind <- rk_anybyte
+    else (* op_allany *) mb.rep_kind <- rk_allany)
 
 (* True iff the repeat instruction at [rep_pc] is a \R (OP_ANYNL) type repeat.
    Used only on the (cold) greedy give-back path. *)
 let is_anynl_rep (mb : mb) (rep_pc : int) : bool =
   Int.equal mb.code.(rep_pc) 30 (* t_type_rep *)
   && Int.equal mb.code.(rep_pc + 4) Opcodes.op_anynl
+
+(* GETCHARINCTEST(fc, Feptr); Feptr = PRIV(extuni)(fc, Feptr,
+   mb->start_subject, mb->end_subject, utf, NULL) — the shared body of the
+   four OP_EXTUNI stepping sites (pcre2_match.c:2629-2631 = 2990-2992 =
+   3821-3823 = 4415-4417; interpreter.ml extuni_step): one grapheme cluster
+   from [eptr], returning the position after it. Allocation-free
+   (Extuni.extuni is int-only; its local refs are eliminated by the compiler
+   — the interpreter runs it inside ITS frame loop under the same §8 pin).
+   Caller contract: eptr < mb.end_subject. *)
+let extuni_at (mb : mb) (eptr : int) : int =
+  (* safe: eptr < mb.end_subject <= String.length mb.subject (caller
+     contract). *)
+  let c0 = Char.code (String.unsafe_get mb.subject eptr) in
+  let fc = if mb.utf && c0 >= 0xc0 then Utf.getutf8 c0 mb.subject eptr else c0 in
+  let e' =
+    if mb.utf && c0 >= 0xc0 then eptr + 1 + Utf.get_extralen c0 else eptr + 1
+  in
+  Extuni.extuni fc mb.subject e' mb.start_subject mb.end_subject mb.utf
+
+(* pcre2_match.c:4437-4465 (the RM220 resume + its inner for(;;);
+   interpreter.ml RM220 arm + extuni_bt_inner) — step BACK one grapheme
+   cluster from [pos] (> [floor]), bounded below by [floor] (Lstart_eptr):
+   move back one character, then keep moving left while the grapheme-break
+   pair table forbids a break between the previous character and the current
+   one. NOTE (transcribed from the C as-is): this re-walk uses only the pair
+   table, not the ZWJ/RI special rules. Returns the give-back position
+   (>= floor: [pos] and [floor] are character boundaries, so the walk's
+   BACKCHARs cannot cross below floor). *)
+(* pcre2_match.c:4452-4464 (interpreter.ml extuni_bt_inner) — the inner
+   for(;;) of the cluster back-walk: while the grapheme-break pair table
+   forbids a break between subject[fptr] and subject[p], keep stepping left.
+   Module-level + fully applied so the give-back path builds NO closure (§8 —
+   a local `let rec` here would allocate ~6 words per \X give-back step,
+   which the "\X cluster give-back" alloc pin measures). *)
+let rec extuni_back_walk (mb : mb) (floor : int) (p : int) (rgb : int) : int =
+  if p <= floor then p (* at start of char run *)
+  else
+    let fptr = p - 1 in
+    let fptr = if mb.utf then backchar_sub mb.subject fptr else fptr in
+    let fc =
+      if mb.utf then getchar_sub mb.subject fptr
+        (* safe: 0 <= fptr < p <= String.length mb.subject. *)
+      else Char.code (String.unsafe_get mb.subject fptr)
+    in
+    let lgb = Ucd.gbprop fc in
+    if Int.equal (Tables.ucp_gbtable.(lgb) land (1 lsl rgb)) 0 then p
+    else (extuni_back_walk [@tailcall]) mb floor fptr lgb
+
+let extuni_back (mb : mb) (floor : int) (pos : int) : int =
+  (* pcre2_match.c:4444-4450 — Feptr--; if (!utf) fc = *Feptr else
+     { BACKCHAR(Feptr); GETCHAR(fc, Feptr); }; rgb = UCD_GRAPHBREAK(fc).
+     pos - 1 >= floor >= 0 (caller guarantees pos > floor); backchar_sub /
+     getchar_sub clamp their reads. *)
+  let p0 = pos - 1 in
+  let p0 = if mb.utf then backchar_sub mb.subject p0 else p0 in
+  let fc0 =
+    if mb.utf then getchar_sub mb.subject p0
+      (* safe: 0 <= p0 < pos <= a previously in-bounds position <=
+         String.length mb.subject. *)
+    else Char.code (String.unsafe_get mb.subject p0)
+  in
+  extuni_back_walk mb floor p0 (Ucd.gbprop fc0)
+
+(* True iff the repeat instruction at [rep_pc] is a \X (t_extuni_rep) repeat
+   (cold give-back path only, chunk I2). *)
+let is_extuni_rep (mb : mb) (rep_pc : int) : bool =
+  Int.equal mb.code.(rep_pc) 62 (* t_extuni_rep *)
 
 (* The corrected greedy give-back position for a maximizing repeat
    (pcre2_match.c:4963-4967 / RM34). [x] is the candidate position after one
@@ -708,13 +855,17 @@ let giveback_pos (mb : mb) (rep_pc : int) (floor : int) (x : int) : int =
 
 (* Chunk I — the give-back position one unit before a char-boundary [pos] that
    the greedy scan reached (pos > floor): a CHARACTER back in UTF (BACKCHAR via
-   the allocation-free [backchar_sub], the C's RM34/RM203/RM101/RM201 BACKCHAR,
-   pcre2_match.c:1358/4966/2285/2115) or a code unit back otherwise (with the
-   non-UTF \R mid-CRLF correction). Caller guarantees pos > floor, so
+   the allocation-free [backchar_sub], the C's RM34/RM202/RM101/RM201 BACKCHAR,
+   pcre2_match.c:1358/4944/2285/2115) or a code unit back otherwise; both with
+   the \R mid-CRLF correction (pcre2_match.c:4945-4947 in UTF, 4963-4967
+   non-UTF). A \X repeat (chunk I2) steps back a whole grapheme CLUSTER
+   instead ([extuni_back], the RM220 resume). Caller guarantees pos > floor, so
    pos-1 >= floor >= 0. *)
 let rep_giveback (mb : mb) (rep_pc : int) (floor : int) (pos : int) : int =
   if pos > floor then
-    if mb.utf then backchar_sub mb.subject (pos - 1)
+    if is_extuni_rep mb rep_pc then extuni_back mb floor pos
+    else if mb.utf then
+      giveback_pos mb rep_pc floor (backchar_sub mb.subject (pos - 1))
     else giveback_pos mb rep_pc floor (pos - 1)
   else pos - 1 (* class sentinel: pos = floor, store floor-1 (below floor) *)
 
@@ -917,6 +1068,46 @@ let push_pos (mb : mb) (sp : int) (eptr : int) (rdepth : int) (zero_allowed : in
 
 (* ---------- Backreferences (chunk F, §2/§3) ---------- *)
 
+(* pcre2_match.c:390-434 — match_ref()'s caseless compare loop in UTF and/or
+   UCP mode (chunk I2; interpreter.ml match_ref_ci_uni): match characters up
+   to the end of the REFERENCE (p < endptr — the number of subject code units
+   matched may differ, e.g. U+023A/U+2C65 have different UTF-8 lengths, so
+   the length is checked along the reference, not the subject). Each pair
+   matches caseful, via UCD other-case, or via the character's caseless set
+   (Char_predicates.caseless_set_member). On success the number of subject
+   code units consumed goes through [mb.ref_length] (the C's shared exit at
+   479). Returns 0 matched / -1 no match / 1 partial. Bounds as [ref_cmp_ci]
+   below (p ranges over the captured substring; eptr < end_subject checked
+   per character). *)
+let rec ref_cmp_ci_uni (mb : mb) (p : int) (endptr : int) (eptr : int)
+    (eptr_start : int) : int =
+  if p >= endptr then (
+    mb.ref_length <- eptr - eptr_start (* 479 *);
+    0)
+  else if eptr >= mb.end_subject then 1 (* partial match, 408 *)
+  else
+    (* pcre2_match.c:410-419 — if (utf) GETCHARINC(c, eptr); GETCHARINC(d, p);
+       else one code unit each. safe: eptr < end_subject (checked above) and
+       p < endptr <= end_subject (the reference bounds contract). *)
+    let ce = Char.code (String.unsafe_get mb.subject eptr) in
+    let c = if mb.utf && ce >= 0xc0 then Utf.getutf8 ce mb.subject eptr else ce in
+    let eptr' =
+      if mb.utf && ce >= 0xc0 then eptr + 1 + Utf.get_extralen ce else eptr + 1
+    in
+    let cp = Char.code (String.unsafe_get mb.subject p) in
+    let d = if mb.utf && cp >= 0xc0 then Utf.getutf8 cp mb.subject p else cp in
+    let p' =
+      if mb.utf && cp >= 0xc0 then p + 1 + Utf.get_extralen cp else p + 1
+    in
+    (* pcre2_match.c:421-431 — ur = GET_UCD(d); other case, then the caseless
+       set. *)
+    if
+      Int.equal c d
+      || Int.equal c (Ucd.othercase d)
+      || Char_predicates.caseless_set_member c (Ucd.caseset d)
+    then (ref_cmp_ci_uni [@tailcall]) mb p' endptr eptr' eptr_start
+    else -1 (* no match, 427 *)
+
 (* pcre2_match.c:438-451 — match_ref()'s caseless compare loop, not in UTF or
    UCP mode: fold both code units through the lcc table (interpreter.ml
    match_ref_ci :815-826). Returns 0 all matched / -1 no match / 1 partial. *)
@@ -958,8 +1149,9 @@ let rec ref_memcmp (mb : mb) (p : int) (eptr : int) (length : int) : bool =
        (Char.code (String.unsafe_get mb.subject eptr))
      && (ref_memcmp [@tailcall]) mb (p + 1) (eptr + 1) (length - 1)
 
-(* pcre2_match.c:360-481 — match_ref() for the non-UTF, non-UCP subset
-   (interpreter.ml match_ref :899-957). Match the reference at group [ovbase]
+(* pcre2_match.c:360-481 — match_ref() (interpreter.ml match_ref :899-957;
+   the UTF/UCP caseless fold landed in chunk I2). Match the reference at group
+   [ovbase]
    (fast public convention, group N at [2N,2N+1]) against the subject at
    [eptr]. A referenced group's ovector slots are written ONLY at its close
    (t_cap_end_ref) and restored on backtrack, so [ovector.(ovbase) = UNSET]
@@ -984,11 +1176,19 @@ let match_ref (mb : mb) (ovbase : int) (caseless : bool) (eptr : int) : int =
        Fovector[offset+1] - Fovector[offset]. *)
     let p = mb.start_subject + Array.unsafe_get ov ovbase in
     let length = Array.unsafe_get ov (ovbase + 1) - Array.unsafe_get ov ovbase in
-    if caseless then (
-      (* pcre2_match.c:438-451 (non-UTF/UCP). *)
-      let rc = ref_cmp_ci mb p eptr length in
-      if Int.equal rc 0 then mb.ref_length <- length;
-      rc)
+    if caseless then
+      if mb.utf || mb.ucp then
+        (* pcre2_match.c:388-434 — the SUPPORT_UNICODE utf/ucp fold (chunk
+           I2): character-wise compare with UCD other-case and caseless-set
+           fallback; [ref_cmp_ci_uni] writes mb.ref_length itself on success
+           (the consumed subject length can differ from the reference length
+           in UTF mode). *)
+        ref_cmp_ci_uni mb p (p + length) eptr eptr
+      else (
+        (* pcre2_match.c:438-451 (non-UTF/UCP). *)
+        let rc = ref_cmp_ci mb p eptr length in
+        if Int.equal rc 0 then mb.ref_length <- length;
+        rc)
     else if mb.partial <> 0 then (
       (* pcre2_match.c:460-467 — caseful, partial: unit by unit. *)
       let rc = ref_cmp_cs_partial mb p eptr length in
@@ -1042,6 +1242,21 @@ let setup_ref_rep (mb : mb) (pc : int) : unit =
     mb.ref_ovbase <- dnref_scan mb code.(pc + 5) code.(pc + 4);
     mb.ref_caseless <- Int.equal code.(pc + 6) 1;
     mb.ref_cont <- pc + 7)
+
+(* pcre2_match.c:5177-5182 (interpreter.ml ref_max_rescan) — the RM22 resume's
+   forward re-scan: for (i = Lmin; i < Lmax; i++) re-match the reference —
+   match_ref is known to succeed every time (5164-5165), so its return code is
+   discarded, exactly as the C's (void) cast — and advance by the consumed
+   length. Reads the repeat invariants from mb.ref_* (set by [setup_ref_rep]
+   just before). Module-level + fully applied so the RM22 backtrack builds NO
+   closure (§8 — a local `let rec` here would allocate ~6 words per RM22
+   give-back step, which the RM22 alloc pin measures). Returns the position
+   after [lmax_cur] - i copies from [e]. *)
+let rec ref_max2_rescan (mb : mb) (lmax_cur : int) (i : int) (e : int) : int =
+  if i < lmax_cur then (
+    let (_ : int) = match_ref mb mb.ref_ovbase mb.ref_caseless e in
+    (ref_max2_rescan [@tailcall]) mb lmax_cur (i + 1) (e + mb.ref_length))
+  else e
 
 (* pcre2_match.c:6352 PRIV(strcmp) (interpreter.ml strcmp_code_eq :747-752): a
    zero-terminated code-unit compare of two verb names at byte offsets [p1]/[p2]
@@ -1097,6 +1312,16 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
           if Int.equal dc pch || Int.equal dc (Ucd.othercase pch) then
             (run [@tailcall]) mb (pc + 2) e' sp rdepth mcc
           else (backtrack [@tailcall]) mb sp mcc)
+        else if mb.ucp && pch >= 128 then
+          (* pcre2_match.c:1075-1092 (interpreter.ml:1579-1602) — UCP without
+             UTF (chunk I2): one character per code unit; cc != fc && cc !=
+             UCD_OTHERCASE(fc) is NOMATCH (the pattern char's other case may
+             be > 255 and then never equals a code unit). safe: eptr <
+             end_subject <= String.length subject. *)
+          let cc = Char.code (String.unsafe_get mb.subject eptr) in
+          if (not (Int.equal cc pch)) && not (Int.equal cc (Ucd.othercase pch))
+          then (backtrack [@tailcall]) mb sp mcc
+          else (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc
         else
           (* pcre2_match.c:1097-1103 non-UTF (and UTF with pattern char < 128,
              :1557-1570): fold one code unit through the lcc table. safe: eptr <
@@ -1254,8 +1479,8 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
   | 18 | 19 | 20 | 21 | 30 | 31 ->
       (* Repeat superinstructions (fast-design.md §2/§4): char (18-21;
          repeatchar/repeatnotchar interpreter.ml:3549-4128), character type
-         (30; repeattype interpreter.ml:4622-...) and class (31; the OP_CLASS
-         repeat interpreter.ml:1807-1872) — all non-UTF. *)
+         (30; repeattype interpreter.ml:4606-...) and class (31; the OP_CLASS
+         repeat interpreter.ml:1807-1872). *)
       (op_repeat [@tailcall]) mb pc eptr sp rdepth mcc
   | 27 ->
       (* TYPE (fast-design.md §2/§4) — a single character type. *)
@@ -1298,9 +1523,48 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       (* XCLASS_REP (chunk I; OP_XCLASS + OP_CR* repeat) — routes through the
          shared repeat machinery (rk_xclass). *)
       (op_repeat [@tailcall]) mb pc eptr sp rdepth mcc
+  | 59 ->
+      (* PROP (chunk I2; OP_PROP/OP_NOTPROP single, pcre2_match.c:2479-2614 /
+         interpreter.ml:2207-2242) — one character-property test: decode the
+         character (GETCHARINCTEST) and compare prop_test against the NOTPROP
+         sense. One character, no choice point, no tick. (The C's
+         ptype > PT_BOOL internal-error default is unreachable: Ir_verify
+         proved ptype <= PT_BOOL.) *)
+      if eptr >= mb.end_subject then (
+        (* pcre2_match.c:2481-2485 — SCHECK_PARTIAL(), then no match. *)
+        let r = scheck_partial mb eptr in
+        if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+      else
+        (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
+        let fc = cur_cp mb eptr in
+        if
+          Bool.equal
+            (prop_test fc code.(pc + 2) code.(pc + 3))
+            (Int.equal code.(pc + 1) 1)
+        then (backtrack [@tailcall]) mb sp mcc
+        else
+          (run [@tailcall]) mb (pc + 4) (eptr + cp_len mb eptr) sp rdepth mcc
+  | 60 | 62 ->
+      (* PROP_REP / EXTUNI_REP (chunk I2) — property / grapheme-cluster type
+         repeats through the shared repeat machinery (rk_prop / rk_extuni). *)
+      (op_repeat [@tailcall]) mb pc eptr sp rdepth mcc
+  | 61 ->
+      (* EXTUNI (chunk I2; OP_EXTUNI single, pcre2_match.c:2617-2635 /
+         interpreter.ml:2243-2265) — match one extended grapheme cluster: step
+         it (extuni_at), then CHECK_PARTIAL. No choice point, no tick. *)
+      if eptr >= mb.end_subject then (
+        (* pcre2_match.c:2622-2626 — SCHECK_PARTIAL(), then no match. *)
+        let r = scheck_partial mb eptr in
+        if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+      else
+        (* pcre2_match.c:2627-2632 — GETCHARINCTEST + PRIV(extuni). *)
+        let e' = extuni_at mb eptr in
+        (* CHECK_PARTIAL() (2633). *)
+        let r = if e' >= mb.end_subject then scheck_partial mb e' else 0 in
+        if r < 0 then r else (run [@tailcall]) mb (pc + 1) e' sp rdepth mcc
   | 29 ->
-      (* WORDBOUND \b / \B, non-UCP (fast-design.md §2;
-         pcre2_match.c:6258-6333 / interpreter.ml:3181-3332). *)
+      (* WORDBOUND \b / \B, ASCII or UCP per the operand's bit 1 (fast-design
+         .md §2; pcre2_match.c:6250-6333 / interpreter.ml:3181-3332). *)
       (op_wordbound [@tailcall]) mb pc code.(pc + 1) eptr sp rdepth mcc
   | 22 ->
       (* GROUP_START (fast-design.md §3; the C records the group-start eptr in
@@ -1444,12 +1708,17 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_cap) rdepth mcc
   | 38 ->
       (* REVERSE (fast-design.md §2/§3; OP_REVERSE pcre2_match.c:5793-5819 /
-         interpreter.ml:2644-2660) — fixed lookbehind step-back (non-UTF: code
-         unit count). If too close to the subject start, NOMATCH. Save the
-         earliest consulted character (start_used_ptr floor), then continue. No
-         tick, no choice point. *)
+         interpreter.ml:2632-2651) — fixed lookbehind step-back. In UTF the
+         count is CHARACTERS, walked back one BACKCHAR at a time and floored
+         at mb->check_subject (chunk I2; pcre2_match.c:5797-5804 /
+         interpreter.ml op_reverse_utf_loop); non-UTF it is a code-unit count
+         floored at the subject start (5808-5813). If too close to the start,
+         NOMATCH. Save the earliest consulted character (start_used_ptr
+         floor), then continue. No tick, no choice point. *)
       let number = code.(pc + 1) in
-      if number > eptr - mb.start_subject then (backtrack [@tailcall]) mb sp mcc
+      if mb.utf then (op_reverse_utf [@tailcall]) mb pc number eptr sp rdepth mcc
+      else if number > eptr - mb.start_subject then
+        (backtrack [@tailcall]) mb sp mcc
       else
         let e = eptr - number in
         if e < mb.start_used_ptr then mb.start_used_ptr <- e;
@@ -1800,6 +2069,11 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
       (* KIND_REF_MAX [cont; try_eptr; flength; lstart; rdepth; kind] —
          maximizing ref repeat give-back (RM21, pcre2_match.c:5154-5162). *)
       (backtrack_ref_max [@tailcall]) mb sp mcc
+    else if Int.equal kind Save_stack.kind_ref_max2 then
+      (* KIND_REF_MAX2 [ref_pc; lmax_cur; try_eptr; lstart; rdepth; kind] —
+         differing-lengths maximizing ref repeat (RM22, chunk I2,
+         pcre2_match.c:5172-5184). *)
+      (backtrack_ref_max2 [@tailcall]) mb sp mcc
     else if Int.equal kind Save_stack.kind_once then
       (* KIND_ONCE — the atomic construct is backtracked PAST (its body failed,
          or it committed and the continuation later failed): restore the group
@@ -2019,6 +2293,8 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
       (backtrack_code [@tailcall]) mb (sp - Save_stack.width_ref_min) mcc vcode
     else if Int.equal kind Save_stack.kind_ref_max then
       (backtrack_code [@tailcall]) mb (sp - Save_stack.width_ref_max) mcc vcode
+    else if Int.equal kind Save_stack.kind_ref_max2 then
+      (backtrack_code [@tailcall]) mb (sp - Save_stack.width_ref_max2) mcc vcode
     else
       (* KIND_CONT — a group choice point; discard and keep propagating. *)
       (backtrack_code [@tailcall]) mb (sp - Save_stack.width_cont) mcc vcode
@@ -2054,18 +2330,23 @@ and backtrack_rep_max (mb : mb) (sp : int) (mcc : int) : int =
         (run [@tailcall]) mb cont try_pos sp (dd + 1) mcc'))
     else (backtrack [@tailcall]) mb base mcc (* pop, propagate *)
   else if try_pos > floor then (
-    (* char / type / \R: another give-back position (tick, rdepth d+1). Store
-       the NEXT give-back position (one char in UTF; the \R mid-CRLF correction
-       otherwise). *)
+    (* char / type / \R / \X / property: another give-back position (tick,
+       rdepth d+1). Store the NEXT give-back position (one char in UTF, with
+       the \R mid-CRLF correction; one CLUSTER for \X). *)
     let mcc' = tick_child mb mcc (dd + 1) in
     if mcc' < 0 then mcc'
     else (
       Array.unsafe_set d (base + 1) (rep_giveback mb rep_pc floor try_pos);
       (run [@tailcall]) mb cont try_pos sp (dd + 1) mcc'))
   else
-    (* try_pos = floor: the minimum-length position, tried in place at rdepth
-       d, no tick; pop the record permanently. *)
-    (run [@tailcall]) mb cont floor base dd mcc
+    (* try_pos <= floor: the minimum-length position, tried IN PLACE at rdepth
+       d, no tick; pop the record permanently. try_pos = floor everywhere
+       except a \C repeat in UTF (chunk I2), whose char-wise BACKCHAR
+       give-back can land BELOW a mid-character floor — the C then dispatches
+       at that below-floor Feptr (the `<=` loop-head break,
+       pcre2_match.c:4935-4940), so the continuation runs at [try_pos], not
+       [floor]. *)
+    (run [@tailcall]) mb cont try_pos base dd mcc
 
 (* KIND_REP_MIN backtrack (fast-design.md §4): match one more unit at [eptr]
    and retry the continuation (interpreter.ml RM25/RM27 char, RM23 class,
@@ -2087,17 +2368,35 @@ and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
       (rep_bt_min_any [@tailcall]) mb base count eptr dd mcc
     else if Int.equal k rk_anynl then
       (rep_bt_min_anynl [@tailcall]) mb base count eptr dd mcc
+    else if Int.equal k rk_extuni then
+      (* Chunk I2 — \X minimize extend (RM218, pcre2_match.c:3807-3827):
+         bound check + SCHECK_PARTIAL, one cluster step, CHECK_PARTIAL, then
+         retry the continuation (tick). *)
+      if eptr >= mb.end_subject then
+        let r = scheck_partial mb eptr in
+        if r < 0 then r else (backtrack [@tailcall]) mb base mcc
+      else
+        let e' = extuni_at mb eptr in
+        let r = if e' >= mb.end_subject then scheck_partial mb e' else 0 in
+        if r < 0 then r
+        else
+          let mcc' = tick_child mb mcc (dd + 1) in
+          if mcc' < 0 then mcc'
+          else (
+            Array.unsafe_set d (base + 1) (count + 1);
+            Array.unsafe_set d (base + 2) e';
+            (run [@tailcall]) mb mb.rep_cont e' sp (dd + 1) mcc')
     else if eptr >= mb.end_subject then
       let r = scheck_partial mb eptr in
       if r < 0 then r else (backtrack [@tailcall]) mb base mcc
     else if mb.utf then
-      (* Chunk I — match one more CHARACTER. rk_allany matches any char
-         (OP_ALLANY: char length; OP_ANYBYTE: one code unit); the per-char kinds
-         use rep_unit_utf. *)
+      (* Chunk I — match one more CHARACTER: the UTF minimize resume (RM219,
+         pcre2_match.c:3836-3959) GETCHARINCs a full character for EVERY type
+         — including OP_ALLANY and OP_ANYBYTE (:3862-3864), even though \C's
+         forward min loop is byte-wise; the per-predicate kinds use
+         rep_unit_utf. *)
       let l =
-        if Int.equal k rk_allany then
-          if Int.equal mb.code.(rep_pc + 4) Opcodes.op_anybyte then 1
-          else cp_len mb eptr
+        if Int.equal k rk_allany || Int.equal k rk_anybyte then cp_len mb eptr
         else rep_unit_utf mb eptr
       in
       if Int.equal l 0 then (backtrack [@tailcall]) mb base mcc
@@ -2148,8 +2447,9 @@ and rep_bt_min_any (mb : mb) (base : int) (count : int) (eptr : int) (dd : int)
           (base + Save_stack.width_rep_min)
           (dd + 1) mcc')
 
-(* RM33 for OP_ANYNL (pcre2_match.c:3994-4017): one more \R sequence (CR then
-   optional LF, LF, or VT/FF/NEL outside the ANYCRLF convention). *)
+(* RM33 for OP_ANYNL (pcre2_match.c:3994-4017; the UTF minimize resume RM219
+   decodes a code point, :3866-3889 — chunk I2): one more \R sequence (CR then
+   optional LF, LF, or VT/FF/NEL/LS/PS outside the ANYCRLF convention). *)
 and rep_bt_min_anynl (mb : mb) (base : int) (count : int) (eptr : int)
     (dd : int) (mcc : int) : int =
   if eptr >= mb.end_subject then
@@ -2159,8 +2459,8 @@ and rep_bt_min_anynl (mb : mb) (base : int) (count : int) (eptr : int)
     (* safe: eptr < mb.end_subject <= String.length mb.subject. Branches are
        inlined per case, exactly like the forward loop [rep_min_anynl] — no
        tuple per iteration (§8). *)
-    let fc = Char.code (String.unsafe_get mb.subject eptr) in
-    let e = eptr + 1 in
+    let fc = if mb.utf then cur_cp mb eptr else Char.code (String.unsafe_get mb.subject eptr) in
+    let e = eptr + if mb.utf then cp_len mb eptr else 1 in
     if Int.equal fc Newline.char_cr then
       let e' =
         if
@@ -2175,6 +2475,7 @@ and rep_bt_min_anynl (mb : mb) (base : int) (count : int) (eptr : int)
     else if
       Int.equal fc Newline.char_vt || Int.equal fc Newline.char_ff
       || Int.equal fc Newline.char_nel
+      || Int.equal fc 0x2028 || Int.equal fc 0x2029
     then
       if mb.bsr_anycrlf then (backtrack [@tailcall]) mb base mcc
       else (rep_bt_min_anynl_step [@tailcall]) mb base count e dd mcc
@@ -2271,23 +2572,27 @@ and ref_min (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
       (run [@tailcall]) mb mb.ref_cont eptr need (rdepth + 1) mcc'))
   else
     (* pcre2_match.c:5120-5124 — maximize: Lstart = eptr (position after Lmin
-       copies); Flength = ref length (> 0 here — a set, non-zero group). In
-       non-UTF every iteration matches exactly Flength units (samelengths
-       always TRUE), so the rare RM22 rescan never occurs. *)
+       copies); Flength = ref length (> 0 here — a set, non-zero group).
+       Outside UTF every iteration matches exactly Flength units (samelengths
+       always TRUE); a CASELESS reference in UTF can consume differing unit
+       counts per copy, routing to the RM22 rescan path (chunk I2). *)
     let ov = mb.ovector in
     let flength =
       Array.unsafe_get ov (mb.ref_ovbase + 1) - Array.unsafe_get ov mb.ref_ovbase
     in
-    (ref_max_scan [@tailcall]) mb mb.ref_lmin flength eptr eptr sp rdepth mcc
+    (ref_max_scan [@tailcall]) mb mb.ref_lmin flength eptr eptr true sp rdepth
+      mcc
 
 (* pcre2_match.c:5126-5146 — the maximize greedy scan (interpreter.ml
-   ref_max_scan :6217-6252): match up to Lmax copies, each consuming Flength.
-   [lstart] is the position after Lmin copies (constant); [eptr] the running
-   end. A failing/partial copy breaks the scan WITHOUT advancing eptr (the C's
-   "can't use CHECK_PARTIAL because we don't want to update Feptr in the soft
-   partial case", 5132-5142). *)
+   ref_max_scan :6208-6243): match up to Lmax copies, tracking whether every
+   copy consumed the same number of units as the captured group ([same], the
+   C's samelengths BOOL, 5122/5144 — chunk I2; only a caseless UTF reference
+   can differ). [lstart] is the position after Lmin copies (constant); [eptr]
+   the running end; [i] the copy count so far. A failing/partial copy breaks
+   the scan WITHOUT advancing eptr (the C's "can't use CHECK_PARTIAL because
+   we don't want to update Feptr in the soft partial case", 5132-5142). *)
 and ref_max_scan (mb : mb) (i : int) (flength : int) (lstart : int) (eptr : int)
-    (sp : int) (rdepth : int) (mcc : int) : int =
+    (same : bool) (sp : int) (rdepth : int) (mcc : int) : int =
   if i < mb.ref_lmax then
     let rrc = match_ref mb mb.ref_ovbase mb.ref_caseless eptr in
     if not (Int.equal rrc 0) then (
@@ -2297,33 +2602,61 @@ and ref_max_scan (mb : mb) (i : int) (flength : int) (lstart : int) (eptr : int)
       then (
         mb.hitend <- true;
         if mb.partial > 1 then Errors.error_partial
-        else (ref_max_end [@tailcall]) mb flength lstart eptr sp rdepth mcc)
-      else (ref_max_end [@tailcall]) mb flength lstart eptr sp rdepth mcc)
+        else
+          (ref_max_end [@tailcall]) mb i flength lstart eptr same sp rdepth mcc)
+      else (ref_max_end [@tailcall]) mb i flength lstart eptr same sp rdepth mcc)
     else
+      (* pcre2_match.c:5144-5145 — if (slength != Flength) samelengths =
+         FALSE; Feptr += slength. *)
+      let same = if not (Int.equal mb.ref_length flength) then false else same in
       (ref_max_scan [@tailcall]) mb (i + 1) flength lstart (eptr + mb.ref_length)
-        sp rdepth mcc
-  else (ref_max_end [@tailcall]) mb flength lstart eptr sp rdepth mcc
+        same sp rdepth mcc
+  else (ref_max_end [@tailcall]) mb i flength lstart eptr same sp rdepth mcc
 
-(* pcre2_match.c:5154-5162 — the samelengths give-back while head: [eptr] is the
-   greedy end (>= lstart, so the first RMATCH(RM21) always fires). Tick, push
-   KIND_REF_MAX; the RM21 backtrack gives back Flength per failure down to and
-   INCLUDING lstart, then NOMATCH (5186). *)
-and ref_max_end (mb : mb) (flength : int) (lstart : int) (eptr : int) (sp : int)
-    (rdepth : int) (mcc : int) : int =
-  let mcc' = tick_child mb mcc (rdepth + 1) in
-  if mcc' < 0 then mcc'
+(* pcre2_match.c:5148-5186 — after the scan: if the length matched for each
+   repetition is the same as the length of the captured group, work backwards
+   Flength at a time (RM21); otherwise (chunk I2) the rare differing-lengths
+   path re-matches fewer and fewer copies forward from Lstart (RM22). *)
+and ref_max_end (mb : mb) (i : int) (flength : int) (lstart : int) (eptr : int)
+    (same : bool) (sp : int) (rdepth : int) (mcc : int) : int =
+  if same then (
+    (* pcre2_match.c:5154-5162 — the samelengths give-back while head: [eptr]
+       is the greedy end (>= lstart, so the first RMATCH(RM21) always fires).
+       Tick, push KIND_REF_MAX; the RM21 backtrack gives back Flength per
+       failure down to and INCLUDING lstart, then NOMATCH (5186). *)
+    let mcc' = tick_child mb mcc (rdepth + 1) in
+    if mcc' < 0 then mcc'
+    else (
+      let ss = mb.ss in
+      let need = sp + Save_stack.width_ref_max in
+      if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+      let d = ss.Save_stack.data in
+      Array.unsafe_set d sp mb.ref_cont;
+      Array.unsafe_set d (sp + 1) eptr;
+      Array.unsafe_set d (sp + 2) flength;
+      Array.unsafe_set d (sp + 3) lstart;
+      Array.unsafe_set d (sp + 4) rdepth;
+      Array.unsafe_set d (sp + 5) Save_stack.kind_ref_max;
+      (run [@tailcall]) mb mb.ref_cont eptr need (rdepth + 1) mcc'))
   else (
-    let ss = mb.ss in
-    let need = sp + Save_stack.width_ref_max in
-    if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
-    let d = ss.Save_stack.data in
-    Array.unsafe_set d sp mb.ref_cont;
-    Array.unsafe_set d (sp + 1) eptr;
-    Array.unsafe_set d (sp + 2) flength;
-    Array.unsafe_set d (sp + 3) lstart;
-    Array.unsafe_set d (sp + 4) rdepth;
-    Array.unsafe_set d (sp + 5) Save_stack.kind_ref_max;
-    (run [@tailcall]) mb mb.ref_cont eptr need (rdepth + 1) mcc')
+    (* pcre2_match.c:5164-5172 — differing lengths (chunk I2): Lmax = i (the
+       achieved copy count); the for(;;) starts with RMATCH(Fecode, RM22) at
+       the greedy end — tick, push KIND_REF_MAX2; each failure re-scans one
+       fewer copy from Lstart (the RM22 resume, [backtrack_ref_max2]). *)
+    let mcc' = tick_child mb mcc (rdepth + 1) in
+    if mcc' < 0 then mcc'
+    else (
+      let ss = mb.ss in
+      let need = sp + Save_stack.width_ref_max2 in
+      if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+      let d = ss.Save_stack.data in
+      Array.unsafe_set d sp mb.ref_pc;
+      Array.unsafe_set d (sp + 1) i (* lmax_cur *);
+      Array.unsafe_set d (sp + 2) eptr (* try_eptr *);
+      Array.unsafe_set d (sp + 3) lstart;
+      Array.unsafe_set d (sp + 4) rdepth;
+      Array.unsafe_set d (sp + 5) Save_stack.kind_ref_max2;
+      (run [@tailcall]) mb mb.ref_cont eptr need (rdepth + 1) mcc'))
 
 (* KIND_REF_MIN backtrack (RM20, pcre2_match.c:5102-5113 / interpreter.ml
    :7573-7604): the continuation failed; if Lmin < Lmax match one more copy and
@@ -2374,6 +2707,36 @@ and backtrack_ref_max (mb : mb) (sp : int) (mcc : int) : int =
       Array.unsafe_set d (base + 1) new_eptr;
       (run [@tailcall]) mb cont new_eptr sp (dd + 1) mcc'))
   else (backtrack [@tailcall]) mb base mcc (* Feptr < Lstart: NOMATCH, 5186 *)
+
+(* KIND_REF_MAX2 backtrack (RM22, pcre2_match.c:5172-5184 / interpreter.ml
+   :7606-7622 + ref_max_rescan — chunk I2): the differing-lengths maximize.
+   Fail once Feptr is back at Lstart (5174); otherwise Feptr = Lstart, Lmax--
+   (lmax_cur), re-scan lmax_cur - Lmin copies forward — match_ref is known to
+   succeed for those (5164-5165), its return discarded like the C's (void)
+   cast — then retry the continuation at the new end (tick). Re-derives the
+   repeat invariants from the IR via [setup_ref_rep]. *)
+and backtrack_ref_max2 (mb : mb) (sp : int) (mcc : int) : int =
+  let d = mb.ss.Save_stack.data in
+  let base = sp - Save_stack.width_ref_max2 in
+  let ref_pc = Array.unsafe_get d base in
+  let lmax_cur = Array.unsafe_get d (base + 1) in
+  let try_eptr = Array.unsafe_get d (base + 2) in
+  let lstart = Array.unsafe_get d (base + 3) in
+  let dd = Array.unsafe_get d (base + 4) in
+  if Int.equal try_eptr lstart then (backtrack [@tailcall]) mb base mcc
+    (* pcre2_match.c:5174 — fail after the minimal repetition. *)
+  else (
+    setup_ref_rep mb ref_pc;
+    let lmax_cur = lmax_cur - 1 (* Lmax--, 5176 *) in
+    (* pcre2_match.c:5177-5182 — for (i = Lmin; i < Lmax; i++): re-match and
+       advance (module-level [ref_max2_rescan] — no closure, §8). *)
+    let e = ref_max2_rescan mb lmax_cur mb.ref_lmin lstart in
+    let mcc' = tick_child mb mcc (dd + 1) in
+    if mcc' < 0 then mcc'
+    else (
+      Array.unsafe_set d (base + 1) lmax_cur;
+      Array.unsafe_set d (base + 2) e;
+      (run [@tailcall]) mb mb.ref_cont e sp (dd + 1) mcc'))
 
 (* ---------- Lookaround / atomic groups (chunk G, §2/§3) ---------- *)
 
@@ -2431,36 +2794,112 @@ and backtrack_nassert (mb : mb) (sp : int) (mcc : int) : int =
    by the maximum available branch length, then work forwards on failure (the
    RM37 loop) down to the minimum. The first attempt is a ticked RMATCH(RM37)
    at rdepth+1. *)
+and op_reverse_utf (mb : mb) (pc : int) (number : int) (eptr : int) (sp : int)
+    (rdepth : int) (mcc : int) : int =
+  (* pcre2_match.c:5797-5804 (interpreter.ml op_reverse_utf_loop) —
+     OP_REVERSE, UTF (chunk I2): while (number-- > 0) fail when Feptr <=
+     mb->check_subject, else Feptr--; BACKCHAR(Feptr). Then the shared tail
+     (5815-5818): lower start_used_ptr and continue. *)
+  if number > 0 then
+    if eptr <= mb.check_subject then (backtrack [@tailcall]) mb sp mcc
+    else
+      (* eptr - 1 >= check_subject >= 0 (guard above); backchar_sub clamps. *)
+      (op_reverse_utf [@tailcall]) mb pc (number - 1)
+        (backchar_sub mb.subject (eptr - 1))
+        sp rdepth mcc
+  else (
+    if eptr < mb.start_used_ptr then mb.start_used_ptr <- eptr;
+    (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc)
+
 and op_vreverse (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
   let lmin = mb.code.(pc + 1) in
   let lmax = mb.code.(pc + 2) in
   let body_pc = pc + 3 in
-  (* pcre2_match.c:5864-5865 — available = clamp(Feptr - start_subject, 0,
-     65535). *)
-  let diff = eptr - mb.start_subject in
-  let available = if diff > 65535 then 65535 else if diff > 0 then diff else 0 in
-  if lmin > available then (backtrack [@tailcall]) mb sp mcc
-    (* pcre2_match.c:5866 — too close to the start for even the minimum. *)
+  if mb.utf then
+    (* pcre2_match.c:5843-5857 (interpreter.ml op_vreverse_utf_loop) — UTF
+       (chunk I2): step back by CHARACTERS with BACKCHAR, stopping at the
+       subject start (NOMATCH when even the minimum cannot be reached; Lmax
+       clamped to the characters actually available). *)
+    (op_vreverse_utf [@tailcall]) mb body_pc lmin lmax 0 eptr sp rdepth mcc
   else
-    let cur_lmax = if lmax > available then available else lmax in
-    let start_eptr = eptr - cur_lmax in
-    let mcc' = tick_child mb mcc (rdepth + 1) in
-    if mcc' < 0 then mcc'
-    else (
-      let ss = mb.ss in
-      let need = sp + Save_stack.width_vreverse in
-      if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
-      let d = ss.Save_stack.data in
-      (* safe: [grow] ensured length >= sp + width_vreverse. Layout: [body_pc;
-         cur_lmax; lmin; cur_eptr; rdepth; KIND_VREVERSE]. *)
-      Array.unsafe_set d sp body_pc;
-      Array.unsafe_set d (sp + 1) cur_lmax;
-      Array.unsafe_set d (sp + 2) lmin;
-      Array.unsafe_set d (sp + 3) start_eptr;
-      Array.unsafe_set d (sp + 4) rdepth;
-      Array.unsafe_set d (sp + 5) Save_stack.kind_vreverse;
-      (run [@tailcall]) mb body_pc start_eptr need (rdepth + 1) mcc')
+    (* pcre2_match.c:5864-5865 — available = clamp(Feptr - start_subject, 0,
+       65535). *)
+    let diff = eptr - mb.start_subject in
+    let available =
+      if diff > 65535 then 65535 else if diff > 0 then diff else 0
+    in
+    if lmin > available then (backtrack [@tailcall]) mb sp mcc
+      (* pcre2_match.c:5866 — too close to the start for even the minimum. *)
+    else
+      let cur_lmax = if lmax > available then available else lmax in
+      (vreverse_try [@tailcall]) mb body_pc cur_lmax lmin (eptr - cur_lmax) sp
+        rdepth mcc
+
+and op_vreverse_utf (mb : mb) (body_pc : int) (lmin : int) (lmax : int)
+    (i : int) (eptr : int) (sp : int) (rdepth : int) (mcc : int) : int =
+  (* pcre2_match.c:5845-5856 (interpreter.ml op_vreverse_utf_loop, chunk I2) —
+     for (i = 0; i < Lmax; i++): stop at the subject start (NOMATCH below the
+     minimum, otherwise Lmax = i, 5848-5853), stepping back with `Feptr--;
+     BACKCHAR(Feptr)` (5854-5855); then fall into the shared RM37 loop
+     (5871-5876). DEVIATION (defined behavior where the C is undefined;
+     interpreter.ml op_vreverse_utf_loop's pin, transcribed): the C's BACKCHAR
+     is an unbounded continuation-byte walk that crosses below the subject
+     when the code units from start_subject up are ALL continuation bytes
+     (reachable under MATCH_INVALID_UTF's bad-start skip, a nonzero start
+     offset's unchecked prefix, or NO_UTF_CHECK garbage). The walk is bounded
+     at start_subject, and a bounded walk that still lands on a continuation
+     byte (exactly the crossing condition) cannot complete the back-step —
+     same effect as reaching start_subject in the 5848-5853 too-few/cap
+     logic, eptr left at its pre-step value. The stop test stays C-literal
+     (start_subject, NOT check_subject — see the interpreter's note: 10.44's
+     max_lookbehind does not count nested lookbehinds, so a nested VREVERSE
+     legitimately walks below check_subject on valid UTF). *)
+  if i < lmax then
+    if Int.equal eptr mb.start_subject then
+      if i < lmin then (backtrack [@tailcall]) mb sp mcc
+      else (vreverse_try [@tailcall]) mb body_pc i lmin eptr sp rdepth mcc
+    else
+      (* eptr - 1 >= start_subject = 0 (eptr <> start_subject above);
+         backchar_sub bounds the walk at 0. *)
+      let p = backchar_sub mb.subject (eptr - 1) in
+      if
+        (* safe: 0 <= p <= eptr - 1 < eptr <= mb.end_subject <= String.length
+           mb.subject. *)
+        Int.equal (Char.code (String.unsafe_get mb.subject p) land 0xc0) 0x80
+      then
+        (* pin: the bounded walk landed on a continuation byte — the step
+           cannot be completed (cap logic as above, eptr unchanged). *)
+        if i < lmin then (backtrack [@tailcall]) mb sp mcc
+        else (vreverse_try [@tailcall]) mb body_pc i lmin eptr sp rdepth mcc
+      else
+        (op_vreverse_utf [@tailcall]) mb body_pc lmin lmax (i + 1) p sp rdepth
+          mcc
+  else (vreverse_try [@tailcall]) mb body_pc lmax lmin eptr sp rdepth mcc
+
+and vreverse_try (mb : mb) (body_pc : int) (cur_lmax : int) (lmin : int)
+    (start_eptr : int) (sp : int) (rdepth : int) (mcc : int) : int =
+  (* pcre2_match.c:5871-5876 — now try matching, moving forward one character
+     on failure, until we reach the minimum back length: the for(;;) starts
+     with RMATCH(Fecode + 1 + 2*IMM2_SIZE, RM37) — tick + push KIND_VREVERSE,
+     run the branch body at rdepth+1 (shared by the UTF and non-UTF entry
+     paths, chunk I2). *)
+  let mcc' = tick_child mb mcc (rdepth + 1) in
+  if mcc' < 0 then mcc'
+  else (
+    let ss = mb.ss in
+    let need = sp + Save_stack.width_vreverse in
+    if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+    let d = ss.Save_stack.data in
+    (* safe: [grow] ensured length >= sp + width_vreverse. Layout: [body_pc;
+       cur_lmax; lmin; cur_eptr; rdepth; KIND_VREVERSE]. *)
+    Array.unsafe_set d sp body_pc;
+    Array.unsafe_set d (sp + 1) cur_lmax;
+    Array.unsafe_set d (sp + 2) lmin;
+    Array.unsafe_set d (sp + 3) start_eptr;
+    Array.unsafe_set d (sp + 4) rdepth;
+    Array.unsafe_set d (sp + 5) Save_stack.kind_vreverse;
+    (run [@tailcall]) mb body_pc start_eptr need (rdepth + 1) mcc')
 
 (* KIND_VREVERSE backtrack (RM37, pcre2_match.c:5877-5882): the branch failed at
    this back-length. `if (Lmax-- <= Lmin) NOMATCH` (compare OLD Lmax) else Feptr++
@@ -2478,7 +2917,13 @@ and backtrack_vreverse (mb : mb) (sp : int) (mcc : int) : int =
     let mcc' = tick_child mb mcc (dd + 1) in
     if mcc' < 0 then mcc'
     else (
-      let new_eptr = cur_eptr + 1 in
+      (* pcre2_match.c:5880-5881 — Feptr++; in UTF the step crosses the
+         character's remaining code units (FORWARDCHARTEST, chunk I2). *)
+      let new_eptr =
+        if mb.utf then
+          Utf.forwardchartest mb.subject (cur_eptr + 1) mb.end_subject
+        else cur_eptr + 1
+      in
       Array.unsafe_set d (base + 1) (cur_lmax - 1);
       Array.unsafe_set d (base + 3) new_eptr;
       (run [@tailcall]) mb body_pc new_eptr sp (dd + 1) mcc')
@@ -2552,10 +2997,31 @@ and op_repeat (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
   setup_rep mb pc;
   let k = mb.rep_kind in
-  if Int.equal k rk_allany then (rep_min_allany [@tailcall]) mb eptr sp rdepth mcc
+  if Int.equal k rk_allany then
+    if mb.utf then
+      (* Chunk I2 — UTF OP_ALLANY steps CHARACTERS (pcre2_match.c:3030-3039
+         min / 4820-4832 max): the generic per-char loops via rep_unit_utf. *)
+      (rep_min_loop [@tailcall]) mb 0 eptr sp rdepth mcc
+    else (rep_min_allany [@tailcall]) mb eptr sp rdepth mcc
+  else if Int.equal k rk_anybyte then
+    (* Chunk I2 — \C min loop: one bound check, NO SCHECK_PARTIAL
+       (pcre2_match.c:3041-3044, unlike OP_ALLANY). *)
+    if eptr > mb.end_subject - mb.rep_lmin then (backtrack [@tailcall]) mb sp mcc
+    else (rep_after_min [@tailcall]) mb (eptr + mb.rep_lmin) sp rdepth mcc
   else if Int.equal k rk_any then (rep_min_any [@tailcall]) mb 0 eptr sp rdepth mcc
   else if Int.equal k rk_anynl then
     (rep_min_anynl [@tailcall]) mb 0 eptr sp rdepth mcc
+  else if Int.equal k rk_extuni then
+    (rep_min_extuni [@tailcall]) mb 0 eptr sp rdepth mcc
+  else if
+    (* Chunk I2 — PT_ANY hoists the OP_NOTPROP check ahead of its min loop
+       (pcre2_match.c:2731-2732, inside the Lmin > 0 block): NOMATCH before
+       consuming anything (and before any SCHECK_PARTIAL). *)
+    Int.equal k rk_prop
+    && mb.rep_lmin > 0
+    && (not mb.rep_want)
+    && Int.equal mb.rep_ptype Opcodes.pt_any
+  then (backtrack [@tailcall]) mb sp mcc
   else (rep_min_loop [@tailcall]) mb 0 eptr sp rdepth mcc
 
 (* True iff subject[eptr] satisfies the repeat's per-unit test, dispatching on
@@ -2582,12 +3048,19 @@ and rep_unit_matches (mb : mb) (eptr : int) : bool =
     Bool.equal (Char_predicates.hspace_byte cc) mb.rep_want
   else if Int.equal k rk_vspace then
     Bool.equal (Char_predicates.vspace_byte cc) mb.rep_want
+  else if Int.equal k rk_prop then
+    (* Chunk I2 — a property repeat in NON-UTF (UCP mode, or a bare \p): one
+       character per code unit; prop_test == notmatch is a mismatch (the
+       property min/minimize/maximize loops, pcre2_match.c:2726-2974 /
+       3515-3801 / 4115-4381). *)
+    Bool.equal (prop_test cc mb.rep_ptype mb.rep_pdata) mb.rep_want
   else true (* rk_allany *)
 
 (* Chunk I — one UTF character at [eptr] against the repeat's per-unit test:
    returns the byte LENGTH consumed on a match (>= 1), else 0. Handles the
-   per-character kinds (char / ctype / class / xclass / \h / \v); the
-   variable-length / bulk kinds (rk_any / rk_anynl / rk_allany / rk_anybyte)
+   per-character kinds (char / ctype / class / xclass / \h / \v, plus — chunk
+   I2 — rk_prop and the UTF rk_allany, which matches any character); the
+   variable-length / bulk kinds (rk_any / rk_anynl / rk_anybyte / rk_extuni)
    have dedicated loops. safe: caller proves eptr < end_subject. Mirrors the
    interpreter's UTF single-char / class / xclass tests (getutf8 + code-point
    predicate; ctype guarded cp <= 255 — CHMAX_255). *)
@@ -2608,8 +3081,12 @@ and rep_unit_utf (mb : mb) (eptr : int) : int =
       Xclass.xclass cp mb.bytecode mb.rep_map_off mb.utf
     else if Int.equal k rk_hspace then
       Bool.equal (Char_predicates.hspace_char cp) mb.rep_want
-    else (* rk_vspace *)
+    else if Int.equal k rk_vspace then
       Bool.equal (Char_predicates.vspace_char cp) mb.rep_want
+    else if Int.equal k rk_prop then
+      (* Chunk I2 — property repeat, UTF: prop_test on the decoded point. *)
+      Bool.equal (prop_test cp mb.rep_ptype mb.rep_pdata) mb.rep_want
+    else true (* rk_allany (chunk I2): UTF OP_ALLANY matches any character *)
   in
   if ok then len else 0
 
@@ -2665,8 +3142,10 @@ and rep_min_any (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
         (eptr + if mb.utf then cp_len mb eptr else 1)
         sp rdepth mcc
 
-(* OP_ANYNL min loop (pcre2_match.c:3302-3332): CR absorbs a following LF; LF;
-   VT/FF/NEL unless the ANYCRLF convention. *)
+(* OP_ANYNL min loop (pcre2_match.c:3302-3332 non-UTF; 2998-3028 UTF, which
+   decodes a code point — NEL is 2 bytes and LS/PS U+2028/U+2029 are 3, chunk
+   I2): CR absorbs a following LF; LF; VT/FF/NEL/LS/PS unless the ANYCRLF
+   convention. *)
 and rep_min_anynl (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
   if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
@@ -2674,9 +3153,10 @@ and rep_min_anynl (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
     let r = scheck_partial mb eptr in
     if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
   else
-    (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
-    let fc = Char.code (String.unsafe_get mb.subject eptr) in
-    let e = eptr + 1 in
+    (* safe: eptr < mb.end_subject <= String.length mb.subject. GETCHARINC in
+       UTF (chunk I2); one code unit otherwise. *)
+    let fc = if mb.utf then cur_cp mb eptr else Char.code (String.unsafe_get mb.subject eptr) in
+    let e = eptr + if mb.utf then cp_len mb eptr else 1 in
     if Int.equal fc Newline.char_cr then
       let e' =
         if
@@ -2691,10 +3171,30 @@ and rep_min_anynl (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
     else if
       Int.equal fc Newline.char_vt || Int.equal fc Newline.char_ff
       || Int.equal fc Newline.char_nel
+      || Int.equal fc 0x2028 || Int.equal fc 0x2029
     then
       if mb.bsr_anycrlf then (backtrack [@tailcall]) mb sp mcc
       else (rep_min_anynl [@tailcall]) mb (i + 1) e sp rdepth mcc
     else (backtrack [@tailcall]) mb sp mcc
+
+(* OP_EXTUNI min loop (chunk I2; pcre2_match.c:2979-2996 / interpreter.ml
+   typemin_extuni): ensure the minimum number of grapheme clusters are
+   present — bound check + SCHECK_PARTIAL, one cluster step (extuni_at), then
+   CHECK_PARTIAL (which may return the hard-partial error). *)
+and rep_min_extuni (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
+  else if eptr >= mb.end_subject then
+    (* pcre2_match.c:2983-2987 — SCHECK_PARTIAL(), then no match. *)
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
+  else
+    (* pcre2_match.c:2988-2993 — GETCHARINCTEST + PRIV(extuni). *)
+    let e' = extuni_at mb eptr in
+    (* CHECK_PARTIAL() (2994). *)
+    let r = if e' >= mb.end_subject then scheck_partial mb e' else 0 in
+    if r < 0 then r
+    else (rep_min_extuni [@tailcall]) mb (i + 1) e' sp rdepth mcc
 
 and rep_after_min (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) :
     int =
@@ -2723,11 +3223,23 @@ and rep_after_min (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) :
     mb.rep_floor <- eptr;
     let k = mb.rep_kind in
     if Int.equal k rk_allany then
+      if mb.utf then
+        (* Chunk I2 — UTF OP_ALLANY greedy steps CHARACTERS
+           (pcre2_match.c:4820-4832; the Lmax = UINT32_MAX arm jumps straight
+           to end_subject + SCHECK — position- and SCHECK-identical to the
+           per-char loop, which stops at end_subject with one SCHECK). *)
+        (rep_greedy [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc
+      else (rep_greedy_allany [@tailcall]) mb eptr sp rdepth mcc
+    else if Int.equal k rk_anybyte then
+      (* Chunk I2 — \C greedy: the byte-bulk form (pcre2_match.c:4834-4845),
+         identical to the non-UTF OP_ALLANY bulk. *)
       (rep_greedy_allany [@tailcall]) mb eptr sp rdepth mcc
     else if Int.equal k rk_any then
       (rep_greedy_any [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc
     else if Int.equal k rk_anynl then
       (rep_greedy_anynl [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc
+    else if Int.equal k rk_extuni then
+      (rep_greedy_extuni [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc
     else (rep_greedy [@tailcall]) mb mb.rep_lmin eptr sp rdepth mcc)
 
 and rep_greedy (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
@@ -2786,8 +3298,9 @@ and rep_greedy_any (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
         (eptr + if mb.utf then cp_len mb eptr else 1)
         sp rdepth mcc
 
-(* OP_ANYNL greedy (pcre2_match.c:4759-4784): CR (absorb LF; a lone CR at end
-   breaks after being consumed), LF, or VT/FF/NEL outside ANYCRLF. *)
+(* OP_ANYNL greedy (pcre2_match.c:4759-4784 non-UTF; 4786-4818 UTF, which
+   decodes a code point — chunk I2): CR (absorb LF; a lone CR at end breaks
+   after being consumed), LF, or VT/FF/NEL/LS/PS outside ANYCRLF. *)
 and rep_greedy_anynl (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
   if i >= mb.rep_lmax then (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
@@ -2795,9 +3308,11 @@ and rep_greedy_anynl (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
     let r = scheck_partial mb eptr in
     if r < 0 then r else (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
   else
-    (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
-    let fc = Char.code (String.unsafe_get mb.subject eptr) in
+    (* safe: eptr < mb.end_subject <= String.length mb.subject. GETCHARLEN in
+       UTF (chunk I2); one code unit otherwise. *)
+    let fc = if mb.utf then cur_cp mb eptr else Char.code (String.unsafe_get mb.subject eptr) in
     if Int.equal fc Newline.char_cr then
+      (* pcre2_match.c:4766-4770 — if (++Feptr >= end) break; absorb LF. *)
       let e = eptr + 1 in
       if e >= mb.end_subject then
         (rep_greedy_done_dispatch [@tailcall]) mb e sp rdepth mcc
@@ -2813,9 +3328,35 @@ and rep_greedy_anynl (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
       && (mb.bsr_anycrlf
          || (not (Int.equal fc Newline.char_vt))
             && (not (Int.equal fc Newline.char_ff))
-            && not (Int.equal fc Newline.char_nel))
+            && (not (Int.equal fc Newline.char_nel))
+            && (not (Int.equal fc 0x2028))
+            && not (Int.equal fc 0x2029))
     then (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
-    else (rep_greedy_anynl [@tailcall]) mb (i + 1) (eptr + 1) sp rdepth mcc
+    else
+      (rep_greedy_anynl [@tailcall]) mb (i + 1)
+        (eptr + if mb.utf then cp_len mb eptr else 1)
+        sp rdepth mcc
+
+(* OP_EXTUNI greedy (chunk I2; pcre2_match.c:4401-4420 / interpreter.ml
+   extuni_maxscan): find the longest run of grapheme clusters — bound check +
+   SCHECK_PARTIAL breaks the scan; each step is one cluster (extuni_at)
+   followed by CHECK_PARTIAL (which may return the hard-partial error). *)
+and rep_greedy_extuni (mb : mb) (i : int) (eptr : int) (sp : int)
+    (rdepth : int) (mcc : int) : int =
+  if i >= mb.rep_lmax then
+    (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+  else if eptr >= mb.end_subject then
+    (* pcre2_match.c:4408-4412 — SCHECK_PARTIAL(); break. *)
+    let r = scheck_partial mb eptr in
+    if r < 0 then r
+    else (rep_greedy_done_dispatch [@tailcall]) mb eptr sp rdepth mcc
+  else
+    (* pcre2_match.c:4413-4418 — GETCHARINCTEST + PRIV(extuni). *)
+    let e' = extuni_at mb eptr in
+    (* CHECK_PARTIAL() (4419). *)
+    let r = if e' >= mb.end_subject then scheck_partial mb e' else 0 in
+    if r < 0 then r
+    else (rep_greedy_extuni [@tailcall]) mb (i + 1) e' sp rdepth mcc
 
 (* After a greedy scan to [pmax]: a CLASS repeat (pcre2_match.c:2143 `>=`,
    RM24/RM201) AND an XCLASS repeat (pcre2_match.c:2278-2288, RM101 — the same
@@ -2910,14 +3451,15 @@ and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
         (eptr + if mb.utf then cp_len mb eptr else 1)
         sp rdepth mcc)
   else if Int.equal type_op Opcodes.op_anynl then (
-    (* OP_ANYNL \R (pcre2_match.c:2377-2409). *)
+    (* OP_ANYNL \R (pcre2_match.c:2377-2409; GETCHARINCTEST decodes a code
+       point in UTF — NEL/LS/PS are multi-byte, chunk I2). *)
     if eptr >= mb.end_subject then (
       let r = scheck_partial mb eptr in
       if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
     else
       (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
-      let fc = Char.code (String.unsafe_get mb.subject eptr) in
-      let e = eptr + 1 in
+      let fc = if mb.utf then cur_cp mb eptr else Char.code (String.unsafe_get mb.subject eptr) in
+      let e = eptr + if mb.utf then cp_len mb eptr else 1 in
       if Int.equal fc Newline.char_cr then
         if e >= mb.end_subject then (
           (* a lone CR at the end: could be a partial CRLF. *)
@@ -2936,6 +3478,7 @@ and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
       else if
         Int.equal fc Newline.char_vt || Int.equal fc Newline.char_ff
         || Int.equal fc Newline.char_nel
+        || Int.equal fc 0x2028 || Int.equal fc 0x2029
       then
         if mb.bsr_anycrlf then (backtrack [@tailcall]) mb sp mcc
         else (run [@tailcall]) mb (pc + 2) e sp rdepth mcc
@@ -2970,18 +3513,25 @@ and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
    fast seam does not carry, so it is not tracked. *)
 and op_wordbound (mb : mb) (pc : int) (want : int) (eptr : int) (sp : int)
     (rdepth : int) (mcc : int) : int =
+  (* [want] bit 0 = boundary wanted, bit 1 = the UCP variant
+     (OP_UCP_WORD_BOUNDARY / OP_NOT_UCP_WORD_BOUNDARY, chunk I2): the word
+     test uses Unicode properties (Char_predicates.ucp_wordchar,
+     pcre2_match.c:6283-6289/6316-6322), even without UTF. *)
+  let ucp_op = Int.equal (want land 2) 2 in
   (* pcre2_match.c:6271-6292 — the previous character's word status. The floor
      is mb.check_subject (interpreter.ml:3183): non-UTF this is the subject
-     start (0), UTF the backed-up UTF-check start. In UTF the previous char is
-     BACKCHAR'd and decoded (:6271-6277). Non-UCP: a char > 255 is not a word
-     char (CHMAX_255 guard, :6292). *)
+     start (0), UTF the backed-up UTF-check start (or an invalid-UTF
+     fragment's start, chunk I2). In UTF the previous char is BACKCHAR'd and
+     decoded (:6271-6277). Non-UCP: a char > 255 is not a word char
+     (CHMAX_255 guard, :6292). *)
   let prev_is_word =
     if Int.equal eptr mb.check_subject then false
     else if mb.utf then (
       (* lastptr = BACKCHAR(eptr - 1) via the allocation-free [backchar_sub]
          (§8 — Utf.backchar's int-ref would allocate per probe); a landing on a
-         continuation byte (only reachable via a nested lookbehind, out of
-         subset) resolves to -1 where Utf.peek reads 0. *)
+         continuation byte resolves to -1 where Utf.peek reads 0
+         (interpreter.ml:3193-3209's crossing pin — reachable via a nested
+         lookbehind or an invalid-UTF fragment start). *)
       let lastptr =
         if eptr - 1 < 0 then -1
         else
@@ -2993,14 +3543,17 @@ and op_wordbound (mb : mb) (pc : int) (want : int) (eptr : int) (sp : int)
         if c0 >= 0xc0 then Utf.getutf8 c0 mb.subject lastptr else c0
       in
       if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
-      fc <= 255
-      && not (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0))
+      if ucp_op then Char_predicates.ucp_wordchar fc
+      else
+        fc <= 255
+        && not (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0))
     else
       let lastptr = eptr - 1 in
       (* safe: 0 <= lastptr < eptr <= end_subject <= String.length subject. *)
       let fc = Char.code (String.unsafe_get mb.subject lastptr) in
       if lastptr < mb.start_used_ptr then mb.start_used_ptr <- lastptr;
-      not (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0)
+      if ucp_op then Char_predicates.ucp_wordchar fc
+      else not (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0)
   in
   if eptr >= mb.end_subject then (
     let r = scheck_partial mb eptr in
@@ -3010,8 +3563,10 @@ and op_wordbound (mb : mb) (pc : int) (want : int) (eptr : int) (sp : int)
     (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
     let fc = if mb.utf then cur_cp mb eptr else Char.code (String.unsafe_get mb.subject eptr) in
     let cur_is_word =
-      fc <= 255
-      && not (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0)
+      if ucp_op then Char_predicates.ucp_wordchar fc
+      else
+        fc <= 255
+        && not (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0)
     in
     (word_bound_test [@tailcall]) mb pc want prev_is_word cur_is_word eptr sp
       rdepth mcc
@@ -3020,9 +3575,9 @@ and word_bound_test (mb : mb) (pc : int) (want : int) (prev_is_word : bool)
     (cur_is_word : bool) (eptr : int) (sp : int) (rdepth : int) (mcc : int) : int
     =
   (* pcre2_match.c:6328-6332 — \b: NOMATCH when cur == prev; \B: NOMATCH when
-     cur != prev. *)
+     cur != prev ([want] bit 0). *)
   let fail =
-    if Int.equal want 1 then Bool.equal cur_is_word prev_is_word
+    if Int.equal (want land 1) 1 then Bool.equal cur_is_word prev_is_word
     else not (Bool.equal cur_is_word prev_is_word)
   in
   if fail then (backtrack [@tailcall]) mb sp mcc
@@ -3030,9 +3585,10 @@ and word_bound_test (mb : mb) (pc : int) (want : int) (prev_is_word : bool)
 
 and op_eod (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
-  (* pcre2_match.c:6154-6163 (interpreter.ml:6334-6352) — end of subject.
-     true_end_subject = end_subject in this port (no UTF fragments). *)
-  if eptr < mb.end_subject then (backtrack [@tailcall]) mb sp mcc
+  (* pcre2_match.c:6154-6163 (interpreter.ml op_eod_tail) — end of subject:
+     \z tests the TRUE end (mb->true_end_subject), not a fragment end (chunk
+     I2; pcre2_match.c:6156). *)
+  if eptr < mb.true_end_subject then (backtrack [@tailcall]) mb sp mcc
   else if mb.partial <> 0 then (
     mb.hitend <- true;
     if mb.partial > 1 then Errors.error_partial
@@ -3095,15 +3651,31 @@ let rec memchr_sub (subject : string) (c : int) (hi : int) (i : int) : int =
   else if Int.equal (Char.code (String.unsafe_get subject i)) c then i
   else (memchr_sub [@tailcall]) subject c hi (i + 1)
 
-(* pcre2_match.c:7737-7766 (interpreter.ml:9539-9569) — the final result when
-   no attempt matched: PARTIAL if one was recorded (seam start = match_partial),
-   else NOMATCH. *)
-let final (mb : mb) : int =
-  if mb.match_partial >= 0 then (
+(* pcre2_match.c:7703-7766 (interpreter.ml endloop_tail :9499-9553) — the
+   driver epilogue for every non-match outcome at this seam (a MATCH returns
+   from run_attempt directly; [exec] builds its outcome): pass any real error
+   through (7743-7745); construct the partial result when one was recorded
+   (7747-7762: ovector[0] = match_partial, ovector[1] = end_subject); else the
+   classic NOMATCH (7764-7766). *)
+let endloop_tail (mb : mb) (rc : int) : int =
+  if
+    (not (Int.equal rc match_nomatch))
+    && not (Int.equal rc Errors.error_partial)
+  then rc
+  else if mb.match_partial >= 0 then (
     mb.match_start <- mb.match_partial;
     mb.match_end <- mb.end_subject;
     Errors.error_partial)
   else Errors.error_nomatch
+
+(* pcre2_match.c:7502 — mb->moptions = options | fragment_options: the
+   invalid-UTF fragment driver ORs NOTBOL/NOTEOL into the match options per
+   fragment (chunk I2; fragment_options set at 6920-6926 / 7683 / 7694). The
+   fast mb precomputes the effective notbol/noteol booleans; recompute them
+   from the caller's base flags at each fragment (re)start. *)
+let set_frag_options (mb : mb) (frag : int) : unit =
+  mb.notbol <- mb.base_notbol || not (Int.equal (frag land Options.notbol) 0);
+  mb.noteol <- mb.base_noteol || not (Int.equal (frag land Options.noteol) 0)
 
 (* pcre2_intmodedep.h:352-353 ACROSSCHAR — advance [pos] past any UTF-8
    continuation bytes, bounded by end_subject (the bump-along / STARTLINE
@@ -3145,7 +3717,7 @@ let rec bump_top (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
                    land (1 lsl (c land 7)))
                    0)
       in
-      if not ok then final mb
+      if not ok then (endloop [@tailcall]) mb match_nomatch req_cu_ptr
       else (tail_opts [@tailcall]) mb start_match req_cu_ptr
     else (tail_opts [@tailcall]) mb start_match req_cu_ptr
   else if mb.has_first_cu then
@@ -3204,7 +3776,8 @@ let rec bump_top (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
 and first_cu_tail (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
   (* pcre2_match.c:7300-7315 (interpreter.ml:9219-9233) — break on failure to
      find the first code unit at the true end, EXCEPT for partial matching. *)
-  if Int.equal mb.partial 0 && start_match >= mb.end_subject then final mb
+  if Int.equal mb.partial 0 && start_match >= mb.end_subject then
+    (endloop [@tailcall]) mb match_nomatch req_cu_ptr
   else (tail_opts [@tailcall]) mb start_match req_cu_ptr
 
 and tail_opts (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
@@ -3212,7 +3785,8 @@ and tail_opts (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
      Both are DISABLED for partial matching (a lower bound on a COMPLETE
      match), so partial keeps every attempt. *)
   if Int.equal mb.partial 0 then
-    if mb.end_subject - start_match < mb.minlength then final mb
+    if mb.end_subject - start_match < mb.minlength then
+      (endloop [@tailcall]) mb match_nomatch req_cu_ptr
     else
       let p = start_match + if mb.has_first_cu then 1 else 0 in
       if mb.has_req_cu && p > req_cu_ptr then
@@ -3232,17 +3806,21 @@ and tail_opts (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
               let r = memchr_sub mb.subject mb.req_cu mb.end_subject p in
               if r < 0 then mb.end_subject else r
           in
-          if np >= mb.end_subject then final mb
+          if np >= mb.end_subject then
+            (endloop [@tailcall]) mb match_nomatch req_cu_ptr
           else (run_attempt [@tailcall]) mb start_match np
         else (run_attempt [@tailcall]) mb start_match req_cu_ptr
       else (run_attempt [@tailcall]) mb start_match req_cu_ptr
   else (run_attempt [@tailcall]) mb start_match req_cu_ptr
 
 and run_attempt (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
-  (* pcre2_match.c:7485-7577 (interpreter.ml:9303-9381) — bumpalong-limit
+  (* pcre2_match.c:7485-7577 (interpreter.ml:9287-9365) — bumpalong-limit
      check, per-attempt resets, match(), then the rc switch. *)
-  (* bumpalong_limit = true_end_subject = end_subject (no offset limit). *)
-  if start_match > mb.end_subject then final mb
+  (* bumpalong_limit = true_end_subject (pcre2_match.c:6945 with an unset
+     offset limit); a fragment's shortened end_subject bounds bump_bottom
+     instead (7593). *)
+  if start_match > mb.true_end_subject then
+    (endloop [@tailcall]) mb match_nomatch req_cu_ptr
   else (
     mb.attempt_start <- start_match;
     mb.start_used_ptr <- start_match;
@@ -3269,11 +3847,12 @@ and run_attempt (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
     (* pcre2_match.c:7527-7577 (interpreter.ml:9328-9374) — the rc switch,
        including the backtracking-verb returns from [backtrack_code]. *)
     if Int.equal rc match_match then rc (* mb.match_start/end set by END *)
-    else if Int.equal rc Errors.error_partial then (
-      (* hard partial: mirror endloop_tail's partial construction. *)
-      mb.match_start <- mb.match_partial;
-      mb.match_end <- mb.end_subject;
-      Errors.error_partial)
+    else if Int.equal rc Errors.error_partial then
+      (* hard partial: goto ENDLOOP with the error (pcre2_match.c:7573-7576)
+         — in a non-final invalid-UTF fragment the carry-on continues to the
+         next fragment (7643-7647, chunk I2); otherwise endloop_tail builds
+         the partial result. *)
+      (endloop [@tailcall]) mb rc req_cu_ptr
     else if Int.equal rc match_skip_arg then (
       (* pcre2_match.c:7529-7539 — a MARK matching the SKIP arg was not found:
          re-run at the SAME start position with ignore_skip_arg = skip_arg_count
@@ -3294,16 +3873,22 @@ and run_attempt (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
          ignore_skip_arg. *)
       mb.ignore_skip_arg <- 0;
       (bump_bottom [@tailcall]) mb (across_char mb (start_match + 1)) req_cu_ptr)
-    else if Int.equal rc match_commit then final mb
-      (* pcre2_match.c:7567-7571 — COMMIT disables bumpalong (NOMATCH, no bump). *)
-    else rc (* limit / heap error, or any other negative code *))
+    else if Int.equal rc match_commit then
+      (* pcre2_match.c:7567-7571 — COMMIT disables bumpalong: rc = NOMATCH,
+         goto ENDLOOP. *)
+      (endloop [@tailcall]) mb match_nomatch req_cu_ptr
+    else
+      (* pcre2_match.c:7573-7576 — any other rc (limit / heap error) goes to
+         ENDLOOP, which passes it through. *)
+      (endloop [@tailcall]) mb rc req_cu_ptr)
 
 and bump_bottom (mb : mb) (new_start_match : int) (req_cu_ptr : int) : int =
   (* pcre2_match.c:7579-7616 (interpreter.ml:9376-9430) — advance to
      [new_start_match] (set by the NOMATCH/verb rc switch), stop if anchored or
      past the end, apply the CRLF skip, reset the per-attempt mark. Firstline is
      declined at compile. *)
-  if mb.anchored || new_start_match > mb.end_subject then final mb
+  if mb.anchored || new_start_match > mb.end_subject then
+    (endloop [@tailcall]) mb match_nomatch req_cu_ptr
   else
     let sm =
       if
@@ -3324,6 +3909,75 @@ and bump_bottom (mb : mb) (new_start_match : int) (req_cu_ptr : int) : int =
       else new_start_match
     in
     (bump_top [@tailcall]) mb sm req_cu_ptr
+
+and fragment_restart (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
+  (* pcre2_match.c:7139-7148 (interpreter.ml fragment_restart) —
+     FRAGMENT_RESTART: (re)set the per-fragment loop state, then enter the
+     bump-along loop. Also the initial entry point (the C falls through the
+     label; the 8-bit memchr caches are chunk L, absent here). *)
+  mb.match_partial <- -1 (* start_partial = match_partial = NULL, 7141 *);
+  mb.hitend <- false (* 7144 *);
+  (bump_top [@tailcall]) mb start_match req_cu_ptr
+
+and endloop (mb : mb) (rc : int) (req_cu_ptr : int) : int =
+  (* pcre2_match.c:7637-7648 (interpreter.ml endloop) — ENDLOOP: if
+     end_subject != true_end_subject we are handling invalid UTF and have just
+     processed a non-terminal fragment (chunk I2); on NOMATCH / PARTIAL carry
+     on to the next fragment (a partial match is returned to the caller only
+     at the very end of the subject). *)
+  if
+    mb.utf
+    && (not (Int.equal mb.end_subject mb.true_end_subject))
+    && (Int.equal rc match_nomatch || Int.equal rc Errors.error_partial)
+  then (next_fragment [@tailcall]) mb mb.end_subject req_cu_ptr
+  else endloop_tail mb rc
+
+and next_fragment (mb : mb) (frag_end : int) (req_cu_ptr : int) : int =
+  (* pcre2_match.c:7650-7699 (interpreter.ml next_fragment) — the fragment
+     carry-on for(;;): a loop is used to avoid trying to match against empty
+     fragments (if the pattern can match an empty string it would have done so
+     already). Each iteration enters with the previous fragment's end in
+     [frag_end] (the C's end_subject). *)
+  (* pcre2_match.c:7652-7659 — advance past the first bad code unit, then skip
+     invalid character starting code units. *)
+  let sm = ref (frag_end + 1) in
+  while
+    !sm < mb.true_end_subject && Utf.not_firstcu (Char.code mb.subject.[!sm])
+  do
+    incr sm
+  done;
+  if !sm >= mb.true_end_subject then (
+    (* pcre2_match.c:7662-7670 — hit the end of the subject: there isn't
+       another non-empty fragment, so give up. rc = MATCH_NOMATCH in case it
+       was partial; match_partial = NULL. *)
+    mb.match_partial <- -1;
+    endloop_tail mb match_nomatch)
+  else (
+    (* pcre2_match.c:7672-7676 — check the rest of the subject. *)
+    mb.check_subject <- !sm;
+    let erroroffset = ref 0 in
+    let vrc =
+      Valid_utf.valid_utf mb.subject ~start:!sm
+        ~length:(mb.true_end_subject - !sm)
+        erroroffset
+    in
+    if Int.equal vrc 0 then (
+      (* pcre2_match.c:7678-7685 — the rest of the subject is valid UTF. *)
+      mb.end_subject <- mb.true_end_subject;
+      set_frag_options mb Options.notbol;
+      (fragment_restart [@tailcall]) mb !sm req_cu_ptr)
+    else (
+      (* pcre2_match.c:7687-7698 — a subsequent UTF error: if the next
+         fragment is non-empty, set up to process it; otherwise let the loop
+         advance. The C wrote the fragment-relative error offset into
+         match_data->startchar through the out-pointer at 7675-7676 (dead
+         unless an error return follows). *)
+      mb.startchar <- !erroroffset;
+      mb.end_subject <- !sm + !erroroffset;
+      if mb.end_subject > !sm then (
+        set_frag_options mb (Options.notbol lor Options.noteol);
+        (fragment_restart [@tailcall]) mb !sm req_cu_ptr)
+      else (next_fragment [@tailcall]) mb mb.end_subject req_cu_ptr))
 
 (* ---------- Cross-exec scratch (mb reuse, §3 / frames.ml scratch trio) ---------- *)
 
@@ -3360,46 +4014,114 @@ let entry_error (rc : int) : outcome =
 let entry_error_off (rc : int) (off : int) : outcome =
   { orc = rc; ostart = off; oend = 0; ovec = [||]; omark = -1 }
 
-(* pcre2_match.c:6807-6905 (interpreter.ml:9677-9781) — the per-exec UTF check
-   for the NON-invalid path (PCRE2_MATCH_INVALID_UTF is declined at compile).
-   Returns [Ok check_subject] (the earliest position a lookbehind / \b prev
-   probe may read: [offset] backed up by max_lookbehind CHARACTERS) or
-   [Error (rc, abs_offset)] for an invalid first code unit (BADUTFOFFSET /
-   UTF8_ERR20) or an invalid sequence (the valid_utf code + absolute offset). *)
-let utf_check (re : Compile.re) (subject : string) (offset : int) (length : int)
-    : (int, int * int) result =
-  (* pcre2_match.c:6820-6845 — the first code unit must be a character start
-     (else BADUTFOFFSET when offset > 0, or an isolated-0x80 error at 0). *)
-  if offset < length && Utf.not_firstcu (Char.code subject.[offset]) then
-    if offset > 0 then Error (Errors.error_badutfoffset, 0)
-    else Error (Errors.error_utf8_err20, 0)
-  else
-    (* pcre2_match.c:6847-6872 — back up max_lookbehind characters (skipping
-       continuation bytes). For an accepted fast pattern there is no lookbehind,
-       so max_lookbehind = 0 and cs = offset; the loop is written in full for
-       fidelity. *)
-    let cs = ref offset in
-    let i = ref re.Compile.max_lookbehind in
-    while !i > 0 && !cs > 0 do
-      decr cs;
-      while !cs > 0 && Int.equal (Char.code subject.[!cs] land 0xc0) 0x80 do
-        decr cs
+(* pcre2_match.c:6807-6929 (interpreter.ml:9668-9772) — the per-exec UTF
+   check, since chunk I2 including the PCRE2_MATCH_INVALID_UTF path. Returns
+   [Ok (start_match, end_subject, check_subject, fragment_options, startchar)]
+   or [Error (rc, abs_offset)]:
+
+   - with [allow_invalid], bad start code units are skipped (6828-6836), and
+     the validation loop may truncate [end_subject] to stop before a bad code
+     unit (6896-6926) — setting NOTEOL as the first fragment's option and
+     recording the absolute error offset in [startchar] (the C's
+     match_data->startchar, dead unless an error return follows);
+   - without it, an invalid first code unit is BADUTFOFFSET (offset > 0) /
+     the isolated-0x80 error (offset 0), and an invalid sequence is the
+     valid_utf code with its absolute offset (6837-6845 / 6896-6903);
+   - [check_subject] is the earliest position a lookbehind / \b prev probe
+     may read: [start_match] backed up by max_lookbehind CHARACTERS, skipped
+     when bad start units were skipped (6847-6872). *)
+let utf_entry_check (re : Compile.re) (subject : string) (offset : int)
+    (length : int) (allow_invalid : bool) :
+    (int * int * int * int * int, int * int) result =
+  let start_match = ref offset in
+  let end_subject = ref length in
+  let fragment_options = ref 0 in
+  let startchar = ref 0 in
+  (* pcre2_match.c:6820-6845 — the first code unit must be a character
+     start. *)
+  let skipped_bad_start = ref false in
+  let first_cu_err =
+    if allow_invalid then (
+      (* pcre2_match.c:6828-6836 — just skip over such code units. *)
+      while
+        !start_match < !end_subject
+        && Utf.not_firstcu (Char.code subject.[!start_match])
+      do
+        incr start_match;
+        skipped_bad_start := true
       done;
-      decr i
-    done;
-    (* pcre2_match.c:6885-6903 — validate [cs, end). On error the absolute
-       offset is cs + the relative error offset. *)
-    let erroroffset = ref 0 in
-    let vrc =
-      Valid_utf.valid_utf subject ~start:!cs ~length:(length - !cs) erroroffset
+      0)
+    else if
+      !start_match < !end_subject
+      && Utf.not_firstcu (Char.code subject.[!start_match])
+    then
+      if offset > 0 then Errors.error_badutfoffset
+      else Errors.error_utf8_err20 (* isolated 0x80 byte *)
+    else 0
+  in
+  if first_cu_err < 0 then Error (first_cu_err, 0)
+  else (
+    (* pcre2_match.c:6847-6872 — back up max_lookbehind characters (skipping
+       continuation bytes), but don't do this if we skipped bad code units
+       above. *)
+    let cs = ref !start_match in
+    (if not !skipped_bad_start then
+       let i = ref re.Compile.max_lookbehind in
+       while !i > 0 && !cs > 0 do
+         decr cs;
+         while !cs > 0 && Int.equal (Char.code subject.[!cs] land 0xc0) 0x80 do
+           decr cs
+         done;
+         decr i
+       done);
+    (* pcre2_match.c:6885-6928 — validate [cs, end); a loop in case we
+       encounter bad UTF in the characters preceding start_match which we are
+       scanning because of a lookbehind. *)
+    let rec validate () : int =
+      let erroroffset = ref 0 in
+      let vrc =
+        Valid_utf.valid_utf subject ~start:!cs ~length:(length - !cs)
+          erroroffset
+      in
+      if Int.equal vrc 0 then 0 (* valid UTF string (6894) *)
+      else (
+        (* pcre2_match.c:6896-6903 — adjust the offset to be absolute; if
+           handling invalid UTF, set end_subject to stop before the bad code
+           unit, otherwise return the error. *)
+        startchar := !erroroffset + !cs;
+        if not allow_invalid then vrc
+        else (
+          end_subject := !startchar;
+          if !end_subject < !start_match then (
+            (* pcre2_match.c:6905-6918 — the end precedes start_match: the
+               invalid UTF is in the extra code units we reversed over
+               because of a lookbehind. Advance past the first bad code unit,
+               skip invalid character starting code units, and try again with
+               the original end point. *)
+            cs := !end_subject + 1;
+            while
+              !cs < !start_match && Utf.not_firstcu (Char.code subject.[!cs])
+            do
+              incr cs
+            done;
+            end_subject := length;
+            (validate [@tailcall]) ())
+          else (
+            (* pcre2_match.c:6920-6926 — set the not end of line option and
+               do the match. *)
+            fragment_options := Options.noteol;
+            0)))
     in
-    if Int.equal vrc 0 then Ok !cs else Error (vrc, !erroroffset + !cs)
+    let v = validate () in
+    if v < 0 then Error (v, !startchar)
+    else Ok (!start_match, !end_subject, !cs, !fragment_options, !startchar))
 
 let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
     outcome =
   let re = ir.Ir.re in
   let length = String.length subject in
   let utf = not (Int.equal (re.Compile.overall_options land Options.utf) 0) in
+  let ucp = not (Int.equal (re.Compile.overall_options land Options.ucp) 0) in
   (* pcre2_match.c:6595-6597 — undefined public match option bits -> -34. *)
   if not (Int.equal (options land lnot Options.public_match_options) 0) then
     entry_error Errors.error_badoption
@@ -3428,16 +4150,30 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
               0)
     then entry_error Errors.error_badoption
     else
-      (* pcre2_match.c:6807-6905 — the per-exec UTF validity check (chunk I).
-         A UTF error short-circuits here with its absolute offset; otherwise
-         [check_subject] is the lookbehind / \b prev-probe floor. *)
+      (* pcre2_match.c:6807-6929 — the per-exec UTF validity check (chunk I;
+         I2 added the PCRE2_MATCH_INVALID_UTF path, which forces the check
+         even under NO_UTF_CHECK, 6811). A UTF error short-circuits here with
+         its absolute offset; otherwise the check yields the (possibly
+         advanced) start, the (possibly truncated) fragment end, the
+         lookbehind / \b prev-probe floor, the first fragment's NOTBOL/NOTEOL
+         options and the recorded startchar. *)
+      let allow_invalid =
+        not
+          (Int.equal
+             (re.Compile.overall_options land Options.match_invalid_utf)
+             0)
+      in
       match
-        if utf && Int.equal (options land Options.no_utf_check) 0 then
-          utf_check re subject offset length
-        else Ok 0 (* mb->check_subject = subject (pcre2_match.c:6795) *)
+        if
+          utf
+          && (Int.equal (options land Options.no_utf_check) 0 || allow_invalid)
+        then utf_entry_check re subject offset length allow_invalid
+        else Ok (offset, length, 0, 0, 0)
+        (* mb->check_subject = subject (pcre2_match.c:6795) *)
       with
       | Error (rc, off) -> entry_error_off rc off
-      | Ok check_subject ->
+      | Ok (start_match0, end_subject0, check_subject, frag_opts0, startchar0)
+        ->
       (* pcre2_match.c:7036-7046 — pattern limits override the defaults only
          when smaller (interpreter.ml:9825-9837). *)
       let heap_limit =
@@ -3470,7 +4206,10 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
           else max_size
         else heapframes_size0
       in
-      if heapframes_size0 < 0 then entry_error heapframes_size0 (* HEAPLIMIT *)
+      if heapframes_size0 < 0 then
+        (* HEAPLIMIT before any attempt; startchar as the check left it
+           (pcre2_match.c:6897 sets it even when allow_invalid proceeds). *)
+        entry_error_off heapframes_size0 startchar0
       else (
         (* Acquire the scratch bundle (single acquire, gated reuse). *)
         let holds = Save_stack.try_acquire () in
@@ -3512,12 +4251,16 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
         mb.name_table <- re.Compile.name_table;
         mb.name_entry_size <- re.Compile.name_entry_size;
         mb.subject <- subject;
-        mb.end_subject <- length;
+        mb.end_subject <- end_subject0;
+        mb.true_end_subject <- length;
         mb.start_subject <- 0;
         mb.start_offset <- offset;
-        (* Chunk I — UTF mode + the lookbehind / \b prev-probe floor. *)
+        (* Chunk I — UTF mode + the lookbehind / \b prev-probe floor. Chunk
+           I2 — UCP mode + the startchar cell (see the mb fields). *)
         mb.utf <- utf;
+        mb.ucp <- ucp;
         mb.check_subject <- check_subject;
+        mb.startchar <- startchar0;
         mb.partial <- partial;
         mb.notempty <- not (Int.equal (options land Options.notempty) 0);
         mb.notempty_atstart <-
@@ -3527,8 +4270,12 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
             (Int.equal
                (re.Compile.overall_options lor options land Options.endanchored)
                0);
-        mb.notbol <- not (Int.equal (options land Options.notbol) 0);
-        mb.noteol <- not (Int.equal (options land Options.noteol) 0);
+        (* Chunk I2 — the effective NOTBOL/NOTEOL are base option flags OR the
+           current fragment's options (pcre2_match.c:7502); the first
+           fragment's arrive from the entry check. *)
+        mb.base_notbol <- not (Int.equal (options land Options.notbol) 0);
+        mb.base_noteol <- not (Int.equal (options land Options.noteol) 0);
+        set_frag_options mb frag_opts0;
         mb.dollar_endonly <-
           not (Int.equal (re.Compile.overall_options land Options.dollar_endonly) 0);
         mb.alt_circumflex <-
@@ -3561,9 +4308,10 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
           re.Compile.max_lookbehind > 0
           || not (Int.equal (re.Compile.flags land Compile.match_empty) 0);
         (* Start-of-match scan config (pcre2_match.c:7091-7131 + 7155-7160 /
-           interpreter.ml:9990-9048). first_cu2 / req_cu2 use the plain
-           lowercase-to-uppercase fold (Chartables.fcc); the UTF/UCP othercase
-           branch (:7101-7107) never applies (subset is non-UTF, non-UCP). *)
+           interpreter.ml:9968-10032). first_cu2 / req_cu2 use the fcc fold;
+           in the 8-bit library the UCD other case applies only when UCP is
+           set without UTF (:7101-7107 / :7123-7129, PCRE2_UCHAR truncation —
+           chunk I2). *)
         mb.no_start_optimize <-
           not (Int.equal (re.Compile.overall_options land Options.no_start_optimize) 0);
         mb.start_bitmap <- re.Compile.start_bitmap;
@@ -3577,7 +4325,10 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
           (if
              has_first_cu
              && not (Int.equal (re.Compile.flags land Compile.firstcaseless) 0)
-           then Chartables.fcc first_cu
+           then
+             if first_cu > 127 && ucp && not utf then
+               Ucd.othercase first_cu land 0xff
+             else Chartables.fcc first_cu
            else first_cu);
         mb.startline <-
           not (Int.equal (re.Compile.flags land Compile.startline) 0);
@@ -3594,7 +4345,10 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
           (if
              has_req_cu
              && not (Int.equal (re.Compile.flags land Compile.lastcaseless) 0)
-           then Chartables.fcc req_cu
+           then
+             if req_cu > 127 && ucp && not utf then
+               Ucd.othercase req_cu land 0xff
+             else Chartables.fcc req_cu
            else req_cu);
         mb.minlength <- re.Compile.minlength;
         mb.match_limit <- match_limit;
@@ -3647,17 +4401,28 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
             true)
           else false
         in
-        (* pcre2_match.c:6601-6602 + 7139-7151 (interpreter.ml:10100) — enter
-           the bump-along loop: start_match = offset, req_cu_ptr one before it. *)
+        (* pcre2_match.c:7139-7151 (interpreter.ml:10084) — enter the
+           bump-along loop through FRAGMENT_RESTART (also the initial entry):
+           start_match from the entry check (it may have skipped bad code
+           units under MATCH_INVALID_UTF), req_cu_ptr one before the ORIGINAL
+           offset (the C local). *)
         let rc =
           if not nl_valid then Errors.error_internal
-          else bump_top mb offset (offset - 1)
+          else fragment_restart mb start_match0 (offset - 1)
         in
         (* Copy results out of the reused [mb] before releasing the scratch.
            A match returns the pcre2 pair count (mb.rc > 0) and its 2*rc-int
            ovector; every other outcome carries only the whole-match bounds
            (meaningful for a partial). *)
-        let ostart = mb.match_start and oend = mb.match_end in
+        (* [ostart]: the match/partial start for those outcomes; for any other
+           negative rc the C's match_data->startchar (the UTF error offset the
+           check may have recorded — pcre2_match.c:6897/7675; 0 otherwise),
+           exactly what engine.ml exec_full surfaces for Error. *)
+        let ostart =
+          if Int.equal rc match_match || Int.equal rc Errors.error_partial then
+            mb.match_start
+          else mb.startchar
+        and oend = mb.match_end in
         let orc, ovec =
           if Int.equal rc match_match then (mb.rc, Array.sub mb.ovector 0 (2 * mb.rc))
           else (rc, [||])
@@ -3735,7 +4500,11 @@ let () =
   assert (Int.equal Ir.t_close 56);
   assert (Int.equal Ir.t_xclass 57);
   assert (Int.equal Ir.t_xclass_rep 58);
-  assert (Int.equal Ir.max_tag 58);
+  assert (Int.equal Ir.t_prop 59);
+  assert (Int.equal Ir.t_prop_rep 60);
+  assert (Int.equal Ir.t_extuni 61);
+  assert (Int.equal Ir.t_extuni_rep 62);
+  assert (Int.equal Ir.max_tag 62);
   (* Save-record KIND / width constants the runner inlines as literals. *)
   assert (Int.equal Save_stack.kind_alt 0);
   assert (Int.equal Save_stack.kind_cap 1);
@@ -3751,5 +4520,6 @@ let () =
   assert (Int.equal Save_stack.kind_vreverse 11);
   assert (Int.equal Save_stack.kind_pos 12);
   assert (Int.equal Save_stack.kind_verb 13);
+  assert (Int.equal Save_stack.kind_ref_max2 14);
   (* Chunk H widened KIND_ALT to carry the THEN scope boundary. *)
   assert (Int.equal Save_stack.width_alt 5)

@@ -61,12 +61,17 @@ let t_ket_rmin = 26 (* [t_ket_rmin; entry; g] — lazy repeating ket (OP_KETRMIN
 (* Chunk E additions (fast-design.md §2/§4) — character types and classes.
    [t_type] is a single character-type test whose operand is the C type
    opcode (OP_NOT_DIGIT..OP_VSPACE / OP_ANY / OP_ALLANY / OP_ANYBYTE /
-   OP_ANYNL); OP_PROP/OP_NOTPROP/OP_EXTUNI stay declined (chunk I). [t_class]
+   OP_ANYNL); OP_PROP/OP_NOTPROP/OP_EXTUNI have their own tags 59-62 (chunk
+   I2). [t_class]
    is a single 32-byte-bitmap class test (OP_CLASS/OP_NCLASS, identical in
    non-UTF where every code unit is 0..255); its operand is the byte offset of
    the bitmap in [re.code] (like the JIT / XCLASS, no copy). [t_wordbound] is
-   \b / \B (non-UCP); its operand is 1 for OP_WORD_BOUNDARY (\b) and 0 for
-   OP_NOT_WORD_BOUNDARY (\B). The type/class repeats reuse the REP superinstr
+   \b / \B; its operand [want] encodes bit 0 = boundary wanted (1 for
+   OP_WORD_BOUNDARY / OP_UCP_WORD_BOUNDARY, 0 for the NOT variants) and, since
+   chunk I2, bit 1 = the UCP variant (OP_UCP_WORD_BOUNDARY /
+   OP_NOT_UCP_WORD_BOUNDARY use Unicode properties for the word test even
+   without UTF, pcre2_match.c:6250-6256). The type/class repeats reuse the REP
+   superinstr
    machinery: [t_type_rep] / [t_class_rep] carry [reptype; lmin; lmax] then the
    type opcode / bitmap offset. *)
 let t_type = 27 (* [t_type; type_op]  — one char-type test *)
@@ -187,6 +192,23 @@ let t_close = 56 (* [t_close; ovbase; referenced] *)
 let t_xclass = 57 (* [t_xclass; data_off]                          *)
 let t_xclass_rep = 58 (* [t_xclass_rep; reptype; lmin; lmax; data_off] *)
 
+(* Chunk I2 (fast-design.md §2) — Unicode properties and grapheme clusters.
+
+   [t_prop] is a single OP_PROP/OP_NOTPROP character-property test
+   (pcre2_match.c:2479-2614): [notprop] = 1 for OP_NOTPROP; [ptype]/[pdata]
+   are the two property code units following the opcode (Fecode[1]/Fecode[2]),
+   tested via the shared Pcre2_engine.Char_predicates.prop_test. [t_prop_rep]
+   is a property TYPE repeat (OP_TYPESTAR..OP_TYPEPOSUPTO whose type opcode is
+   OP_PROP/OP_NOTPROP, pcre2_match.c:2708-2714) — it reuses the REP machinery
+   as rk_prop. [t_extuni] is a single \X extended grapheme cluster
+   (OP_EXTUNI, pcre2_match.c:2617-2635, via Pcre2_engine.Extuni.extuni);
+   [t_extuni_rep] its type-repeat form (pcre2_match.c:2976-2996 min /
+   3804-3827 minimize / 4401-4466 maximize), rk_extuni. *)
+let t_prop = 59 (* [t_prop; notprop; ptype; pdata]                    *)
+let t_prop_rep = 60 (* [t_prop_rep; reptype; lmin; lmax; notprop; ptype; pdata] *)
+let t_extuni = 61 (* [t_extuni]                                         *)
+let t_extuni_rep = 62 (* [t_extuni_rep; reptype; lmin; lmax]                *)
+
 (* Sentinel [g] for a repeated group whose bracket is OP_BRA (bra_loop, C's
    P == NULL): NO empty-string check (the C short-circuits it, and OP_BRA can
    never match empty), so no [t_group_start] and no [mb.group_start] slot. *)
@@ -202,7 +224,7 @@ let reptype_pos = 2
 let rep_inf = 0xFFFFFFFF
 
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 58
+let max_tag = 62
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -268,6 +290,10 @@ let arity =
     3 (* t_close: ovbase, referenced *);
     2 (* t_xclass: data_off *);
     5 (* t_xclass_rep: reptype, lmin, lmax, data_off *);
+    4 (* t_prop: notprop, ptype, pdata *);
+    7 (* t_prop_rep: reptype, lmin, lmax, notprop, ptype, pdata *);
+    1 (* t_extuni *);
+    4 (* t_extuni_rep: reptype, lmin, lmax *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -333,6 +359,10 @@ let tag_name =
     "CLOSE";
     "XCLASS";
     "XCLASS_REP";
+    "PROP";
+    "PROP_REP";
+    "EXTUNI";
+    "EXTUNI_REP";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -443,6 +473,16 @@ let rep_map_off (ir : t) (pc : int) : int = ir.code.(pc + 4)
    operand 4. *)
 let xclass_data (ir : t) (pc : int) : int = ir.code.(pc + 1)
 let rep_xclass_data (ir : t) (pc : int) : int = ir.code.(pc + 4)
+
+(* Chunk I2 (fast-design.md §2) — property operands: a lone [t_prop] carries
+   [notprop; ptype; pdata] at pc+1..pc+3; [t_prop_rep] carries them at
+   pc+4..pc+6 after the reptype/lmin/lmax triple. *)
+let prop_not (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let prop_ptype (ir : t) (pc : int) : int = ir.code.(pc + 2)
+let prop_pdata (ir : t) (pc : int) : int = ir.code.(pc + 3)
+let rep_prop_not (ir : t) (pc : int) : int = ir.code.(pc + 4)
+let rep_prop_ptype (ir : t) (pc : int) : int = ir.code.(pc + 5)
+let rep_prop_pdata (ir : t) (pc : int) : int = ir.code.(pc + 6)
 
 (* Chunk F operands (fast-design.md §2/§3). [t_ref] carries [ovbase; caseless]
    at pc+1/pc+2; [t_ref_rep] the reptype/lmin/lmax triple (rep_reptype/rep_lmin/
@@ -634,8 +674,40 @@ let render (ir : t) (pc : int) (t : int) : string =
   else if Int.equal t t_xclass then
     Printf.sprintf "XCLASS data=%d" (xclass_data ir pc)
   else if Int.equal t t_wordbound then
-    Printf.sprintf "WORDBOUND %s"
-      (if Int.equal (wordbound_want ir pc) 1 then "\\b" else "\\B")
+    (* Chunk I2 — [want] bit 0 = boundary wanted (\b vs \B), bit 1 = the UCP
+       variant (OP_UCP_WORD_BOUNDARY / OP_NOT_UCP_WORD_BOUNDARY). Non-UCP
+       dumps are unchanged. *)
+    let w = wordbound_want ir pc in
+    Printf.sprintf "WORDBOUND %s%s"
+      (if Int.equal (w land 1) 1 then "\\b" else "\\B")
+      (if Int.equal (w land 2) 2 then " ucp" else "")
+  else if Int.equal t t_prop then
+    Printf.sprintf "%s ptype=%d pdata=%d"
+      (if Int.equal (prop_not ir pc) 1 then "NOTPROP" else "PROP")
+      (prop_ptype ir pc) (prop_pdata ir pc)
+  else if Int.equal t t_prop_rep then (
+    let ty = rep_reptype ir pc in
+    let tystr =
+      if Int.equal ty reptype_min then "min"
+      else if Int.equal ty reptype_max then "max"
+      else "pos"
+    in
+    let lmax = rep_lmax ir pc in
+    let lmaxstr = if Int.equal lmax rep_inf then "inf" else string_of_int lmax in
+    Printf.sprintf "PROP_REP %s {%d,%s} %s ptype=%d pdata=%d" tystr
+      (rep_lmin ir pc) lmaxstr
+      (if Int.equal (rep_prop_not ir pc) 1 then "not" else "is")
+      (rep_prop_ptype ir pc) (rep_prop_pdata ir pc))
+  else if Int.equal t t_extuni_rep then (
+    let ty = rep_reptype ir pc in
+    let tystr =
+      if Int.equal ty reptype_min then "min"
+      else if Int.equal ty reptype_max then "max"
+      else "pos"
+    in
+    let lmax = rep_lmax ir pc in
+    let lmaxstr = if Int.equal lmax rep_inf then "inf" else string_of_int lmax in
+    Printf.sprintf "EXTUNI_REP %s {%d,%s}" tystr (rep_lmin ir pc) lmaxstr)
   else if Int.equal t t_type_rep then (
     let ty = rep_reptype ir pc in
     let tystr =

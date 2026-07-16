@@ -147,6 +147,20 @@ let kind_pos = 12
    passed through (mb.mark restored), except MARK catches a name-matching
    MATCH_SKIP_ARG and converts it to MATCH_SKIP (RM12, pcre2_match.c:6351-6356). *)
 let kind_verb = 13
+
+(* Chunk I2 (fast-design.md §3) — the varied-lengths maximizing ref repeat
+   (RM22, pcre2_match.c:5164-5184). Only reachable for a CASELESS reference in
+   UTF mode (case-equivalent characters can differ in UTF-8 length, e.g.
+   U+023A/U+2C65, so the copies' consumed lengths can differ and the RM21
+   fixed-step give-back cannot be used). Layout
+   [ref_pc; lmax_cur; try_eptr; lstart; rdepth; KIND_REF_MAX2], width 6:
+   on backtrack, if [try_eptr] = [lstart] NOMATCH (5174); else Lmax--
+   (lmax_cur), re-scan lmax_cur - lmin copies forward from [lstart]
+   (match_ref is known to succeed, its rc discarded like the C's (void) cast,
+   5177-5182) and retry the continuation at the new end. [ref_pc] re-derives
+   ovbase/caseless/lmin/cont via setup_ref_rep. *)
+let kind_ref_max2 = 14
+let width_ref_max2 = 6
 let width_verb = 5
 let width_vreverse = 6
 

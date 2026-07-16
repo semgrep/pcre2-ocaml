@@ -37,15 +37,6 @@ let reason_of_op (op : int) : string =
   (* Simple-anchor variants and boundaries whose runtime semantics arrive
      with the runner (chunk C2+). *)
   if Int.equal op Op.op_set_som then named "\\K" "C2+"
-    (* UTF / UCP property machinery (chunk I). The UCP word-boundary opcodes
-       (OP_*_UCP_WORD_BOUNDARY) use Unicode properties even without UTF; the
-       non-UCP \b / \B (OP_WORD_BOUNDARY / OP_NOT_WORD_BOUNDARY) are handled in
-       [compile_branch]. *)
-  else if Int.equal op Op.op_not_ucp_word_boundary then named "\\B (ucp)" "I2"
-  else if Int.equal op Op.op_ucp_word_boundary then named "\\b (ucp)" "I2"
-  else if Int.equal op Op.op_prop then named "\\p" "I2"
-  else if Int.equal op Op.op_notprop then named "\\P" "I2"
-  else if Int.equal op Op.op_extuni then named "\\X" "I2"
     (* Class / ref repeat quantifiers OP_CRSTAR..OP_CRPOSRANGE: a class repeat
        is consumed inline after its OP_CLASS/OP_NCLASS in [compile_branch]; a
        standalone CR* here can only follow an (out-of-subset) OP_REF (chunk
@@ -208,10 +199,10 @@ let is_ref_repeat_cr (op : int) : bool =
   || Int.equal op Op.op_crrange
   || Int.equal op Op.op_crminrange
 
-(* A character-type opcode the fast engine matches in the non-UTF subset:
+(* A character-type opcode matched through the generic TYPE / TYPE_REP tags:
    \D \d \S \s \W \w (ctypes), . (OP_ANY), OP_ALLANY/OP_ANYBYTE, \R (OP_ANYNL),
-   \h \H \v \V. OP_PROP/OP_NOTPROP/OP_EXTUNI need the property machinery (chunk
-   I) and are excluded here. *)
+   \h \H \v \V. OP_PROP/OP_NOTPROP/OP_EXTUNI have their own tags (chunk I2)
+   and are handled by explicit arms in [compile_branch]. *)
 let is_supported_type (op : int) : bool =
   (op >= Op.op_not_digit && op <= Op.op_anybyte)
   || (op >= Op.op_anynl && op <= Op.op_vspace)
@@ -316,23 +307,18 @@ let optimized_cbracket (re : C.re) : bool array =
   opt
 
 let compile (re : C.re) : (Ir.t, string) result =
-  (* Chunk I — UTF-8 mode is now lowered (multi-byte CHAR/CHARI/classes/types/
-     repeats via the char-aware walk below and the runner's UTF arms). UCP mode
-     (property predicates, multi-case sets, \X grapheme clusters) and
-     PCRE2_MATCH_INVALID_UTF (fragment carry-on) are deferred to chunk I2. *)
+  (* Chunk I — UTF-8 mode is lowered (multi-byte CHAR/CHARI/classes/types/
+     repeats via the char-aware walk below and the runner's UTF arms). Chunk I2
+     removed the UCP and PCRE2_MATCH_INVALID_UTF compile gates: UCP mode only
+     changes the CASELESS FOLD below ((utf||ucp) selects Ucd.othercase for
+     chars > 127 — pcre2_match.c:1086/1155/1388/1626) plus runner-side
+     semantics (properties, UCP word boundary, uni-mode caseless refs), and
+     PCRE2_MATCH_INVALID_UTF is driver-level (the fragment carry-on,
+     pcre2_match.c:7650-7699, landed in runner [exec]/[next_fragment]). *)
   let utf = not (Int.equal (re.C.overall_options land Opt.utf) 0) in
+  let ucp = not (Int.equal (re.C.overall_options land Opt.ucp) 0) in
   (* Compile-level gates BEFORE the walk (fast-design.md §6, task spec). *)
-  if not (Int.equal (re.C.overall_options land Opt.ucp) 0) then
-    Error "fast: UCP mode (chunk I2)"
-  else if
-    not (Int.equal (re.C.overall_options land Opt.match_invalid_utf) 0)
-  then
-    (* PCRE2_MATCH_INVALID_UTF forces the fragmented-matching driver
-       (pcre2_match.c:7650-7699, interpreter.ml:9451-9506) with NOTBOL/NOTEOL
-       per fragment. Deferred to chunk I2; the non-invalid UTF check (validate
-       or error) is landed in [exec]. *)
-    Error "fast: PCRE2_MATCH_INVALID_UTF (chunk I2)"
-  else if not (Int.equal (re.C.overall_options land Opt.firstline) 0) then
+  if not (Int.equal (re.C.overall_options land Opt.firstline) 0) then
     (* PCRE2_FIRSTLINE constrains an unanchored match to the first line. The
        C enforces this partly through the start-of-match scans' shortened
        end_subject (pcre2_match.c:7164-7186), which the naive chunk-C2 driver
@@ -791,7 +777,10 @@ let compile (re : C.re) : (Ir.t, string) result =
              decode it and, for a caseless repeat, fold via Ucd.othercase when
              > 127 (repeatchar_wide's Ucd.othercase fc, pcre2_match.c:1289-1294 /
              interpreter.ml:3571) else the fcc table (repeatchar_tail's
-             mb->fcc[Lc], pcre2_match.c:1393). *)
+             mb->fcc[Lc], pcre2_match.c:1393). Chunk I2 — UCP without UTF also
+             folds > 127 via Ucd.othercase: pcre2_match.c:1388-1389
+             (repeatchar_tail, positive) and 1626-1634 / interpreter.ml:3924
+             (repeatnotchar). *)
           let c0 = byte char_off in
           let c1 = if utf && c0 >= 0xc0 then Utf.getutf8_bytes c0 src char_off else c0 in
           push ir_tag;
@@ -800,7 +789,7 @@ let compile (re : C.re) : (Ir.t, string) result =
           push lmax;
           push c1;
           if caseless then
-            push (if utf && c1 > 127 then Ucd.othercase c1 else Chartables.fcc c1);
+            push (if (utf || ucp) && c1 > 127 then Ucd.othercase c1 else Chartables.fcc c1);
           p := !p + Op.op_lengths.(op) + char_extra char_off)
         else if Int.equal op Op.op_char then (
           (* pcre2_jit_compile.c:7479 (byte_sequence_compare) — fuse
@@ -862,19 +851,17 @@ let compile (re : C.re) : (Ir.t, string) result =
         else if Int.equal op Op.op_reverse then (
           (* OP_REVERSE (pcre2_match.c:5793-5819) — the fixed lookbehind
              back-step at the start of a lookbehind branch. GET2(code,p+1) =
-             number of CHARACTERS. In UTF the back-step is a char-wise backward
-             walk (BACKCHAR), not [eptr - number]; deferred to chunk I2. *)
-          if utf then
-            raise (Unsupported "fast: lookbehind (OP_REVERSE) in UTF (chunk I2)");
+             number of CHARACTERS: in UTF the runner walks back char-wise with
+             BACKCHAR (chunk I2, pcre2_match.c:5797-5804); non-UTF it is a
+             code-unit count. *)
           push Ir.t_reverse;
           push (C.get2 src (!p + 1));
           p := !p + Op.op_lengths.(op))
         else if Int.equal op Op.op_vreverse then (
           (* OP_VREVERSE (pcre2_match.c:5834-5883) — the variable lookbehind
-             back-step. GET2(p+1) = Lmin, GET2(p+1+IMM2) = Lmax; the branch body
-             follows at p + 1 + 2*IMM2. *)
-          if utf then
-            raise (Unsupported "fast: lookbehind (OP_VREVERSE) in UTF (chunk I2)");
+             back-step. GET2(p+1) = Lmin, GET2(p+1+IMM2) = Lmax (CHARACTER
+             counts in UTF — the runner's UTF arm walks back with BACKCHAR,
+             chunk I2); the branch body follows at p + 1 + 2*IMM2. *)
           push Ir.t_vreverse;
           push (C.get2 src (!p + 1));
           push (C.get2 src (!p + 1 + Limits.imm2_size));
@@ -928,7 +915,8 @@ let compile (re : C.re) : (Ir.t, string) result =
              (repeatnotchar's Lmin==Lmax continue, pcre2_match.c:1483-1485). *)
           let caseless = Int.equal op Op.op_noti in
           (* Chunk I — decode the code point; caseless fold via Ucd.othercase
-             (> 127, UTF) else the fcc table (pcre2_match.c:1129-1136/1660). *)
+             (> 127, UTF or UCP — pcre2_match.c:1129-1136 UTF, 1152-1159 UCP
+             without UTF) else the fcc table (pcre2_match.c:1170). *)
           let c0 = byte (!p + 1) in
           let c1 = if utf && c0 >= 0xc0 then Utf.getutf8_bytes c0 src (!p + 1) else c0 in
           push (if caseless then Ir.t_notrepi else Ir.t_notrep);
@@ -937,7 +925,7 @@ let compile (re : C.re) : (Ir.t, string) result =
           push 1;
           push c1;
           if caseless then
-            push (if utf && c1 > 127 then Ucd.othercase c1 else Chartables.fcc c1);
+            push (if (utf || ucp) && c1 > 127 then Ucd.othercase c1 else Chartables.fcc c1);
           p := !p + Op.op_lengths.(op) + char_extra (!p + 1))
         else if Int.equal op Op.op_class || Int.equal op Op.op_nclass then (
           (* OP_CLASS / OP_NCLASS (pcre2_match.c:1933-1972). In non-UTF every
@@ -996,48 +984,102 @@ let compile (re : C.re) : (Ir.t, string) result =
             if rep_has_count fidx then !p + 1 + Limits.imm2_size else !p + 1
           in
           let tp = byte type_off in
-          if not (is_supported_type tp) then
-            raise (Unsupported (reason_of_op tp));
-          (* Chunk I — \R (OP_ANYNL) has multi-byte members (NEL U+0085, LS/PS)
-             in UTF; its variable-length give-back is deferred to chunk I2.
-             OP_ALLANY ((?s). ) must step by CHARACTERS in UTF (unlike the bulk
-             byte scan the runner uses); its repeat is deferred to chunk I2 too.
-             OP_ANYBYTE (\C) stays a one-code-unit bulk scan (correct in UTF). *)
-          if utf && Int.equal tp Op.op_anynl then
-            raise (Unsupported "fast: \\R (OP_ANYNL) in UTF (chunk I2)");
-          if utf && Int.equal tp Op.op_allany then
-            raise (Unsupported "fast: (?s). repeat (OP_ALLANY) in UTF (chunk I2)");
-          (* OP_ANYBYTE (\C) repeat: its min-loop skips SCHECK_PARTIAL
-             (pcre2_match.c:3041-3044, unlike OP_ALLANY), a partial-match
-             subtlety deferred to chunk I2. The single \C (op_single_type) is
-             fine. *)
-          if utf && Int.equal tp Op.op_anybyte then
-            raise (Unsupported "fast: \\C repeat (OP_ANYBYTE) in UTF (chunk I2)");
-          push Ir.t_type_rep;
-          push reptype;
-          push lmin;
-          push lmax;
-          push tp;
-          p := !p + Op.op_lengths.(op))
+          if Int.equal tp Op.op_prop || Int.equal tp Op.op_notprop then (
+            (* Chunk I2 — a property TYPE repeat (pcre2_match.c:2708-2714):
+               proptype = Fecode[0], Lpropvalue = Fecode[1] after the type
+               opcode; the item carries 2 extra property code units
+               (debug_printer.ml:373-385 / [code_len] above). Lowered as
+               t_prop_rep (runner rk_prop). A property type above PT_BOOL is
+               the C switches' PCRE2_ERROR_INTERNAL default (2969-2972),
+               unreachable from a compiled program — declined defensively so
+               accepted IR never carries one. *)
+            let ptype = byte (type_off + 1) in
+            let pdata = byte (type_off + 2) in
+            if ptype > Op.pt_bool then
+              raise (Unsupported "fast: bad property type (internal)");
+            push Ir.t_prop_rep;
+            push reptype;
+            push lmin;
+            push lmax;
+            push (if Int.equal tp Op.op_notprop then 1 else 0);
+            push ptype;
+            push pdata;
+            p := !p + Op.op_lengths.(op) + 2)
+          else if Int.equal tp Op.op_extuni then (
+            (* Chunk I2 — \X grapheme-cluster repeat (pcre2_match.c:2976-2996):
+               lowered as t_extuni_rep (runner rk_extuni, cluster-wise loops +
+               cluster-wise give-back). *)
+            push Ir.t_extuni_rep;
+            push reptype;
+            push lmin;
+            push lmax;
+            p := !p + Op.op_lengths.(op))
+          else (
+            if not (is_supported_type tp) then
+              raise (Unsupported (reason_of_op tp));
+            (* Chunk I2 removed the chunk-I UTF declines for OP_ANYNL /
+               OP_ALLANY / OP_ANYBYTE repeats: the runner now has the
+               char-stepping UTF loops (rep_min_anynl/rep_greedy_anynl decode
+               code points; OP_ALLANY steps characters via the generic UTF
+               loops; OP_ANYBYTE keeps the no-SCHECK bulk min,
+               pcre2_match.c:3041-3044, with the RM219/RM202 char-wise
+               extend/give-back). *)
+            push Ir.t_type_rep;
+            push reptype;
+            push lmin;
+            push lmax;
+            push tp;
+            p := !p + Op.op_lengths.(op)))
         else if is_supported_type op then (
           (* Single character type (pcre2_match.c:2305-2470 non-UTF; the
              \D \d \S \s \W \w / . (OP_ANY) / \C (OP_ALLANY) / \R (OP_ANYNL) /
-             \h \H \v \V single arms). One code unit consumed; no choice
-             point, no tick. *)
-          if utf && Int.equal op Op.op_anynl then
-            raise (Unsupported "fast: \\R (OP_ANYNL) in UTF (chunk I2)");
+             \h \H \v \V single arms). One character consumed; no choice
+             point, no tick. (Chunk I2 removed the \R-in-UTF decline: the
+             runner's OP_ANYNL arm now decodes code points, NEL/LS/PS
+             included.) *)
           push Ir.t_type;
           push op;
+          p := !p + Op.op_lengths.(op))
+        else if Int.equal op Op.op_prop || Int.equal op Op.op_notprop then (
+          (* Chunk I2 — a single Unicode-property test (OP_PROP/OP_NOTPROP,
+             pcre2_match.c:2479-2614): [opcode; ptype; pdata]. A property type
+             above PT_BOOL is the C switch default PCRE2_ERROR_INTERNAL
+             (2606-2609), unreachable from a compiled program — declined
+             defensively. *)
+          let ptype = byte (!p + 1) in
+          if ptype > Op.pt_bool then
+            raise (Unsupported "fast: bad property type (internal)");
+          push Ir.t_prop;
+          push (if Int.equal op Op.op_notprop then 1 else 0);
+          push ptype;
+          push (byte (!p + 2));
+          p := !p + Op.op_lengths.(op))
+        else if Int.equal op Op.op_extuni then (
+          (* Chunk I2 — a single \X extended grapheme cluster (OP_EXTUNI,
+             pcre2_match.c:2617-2635). *)
+          push Ir.t_extuni;
           p := !p + Op.op_lengths.(op))
         else if
           Int.equal op Op.op_word_boundary
           || Int.equal op Op.op_not_word_boundary
+          || Int.equal op Op.op_ucp_word_boundary
+          || Int.equal op Op.op_not_ucp_word_boundary
         then (
-          (* \b / \B, non-UCP (pcre2_match.c:6258-6333 /
-             interpreter.ml:3181-3332). want=1 for OP_WORD_BOUNDARY (\b),
-             want=0 for OP_NOT_WORD_BOUNDARY (\B). *)
+          (* \b / \B (pcre2_match.c:6250-6333 / interpreter.ml:3181-3332).
+             [want] bit 0 = boundary wanted (OP_WORD_BOUNDARY /
+             OP_UCP_WORD_BOUNDARY); bit 1 (chunk I2) = the UCP variant, whose
+             word test uses Unicode properties even without UTF
+             (pcre2_match.c:6283-6289/6316-6322). *)
+          let boundary =
+            Int.equal op Op.op_word_boundary
+            || Int.equal op Op.op_ucp_word_boundary
+          in
+          let is_ucp =
+            Int.equal op Op.op_ucp_word_boundary
+            || Int.equal op Op.op_not_ucp_word_boundary
+          in
           push Ir.t_wordbound;
-          push (if Int.equal op Op.op_word_boundary then 1 else 0);
+          push ((if boundary then 1 else 0) lor if is_ucp then 2 else 0);
           p := !p + Op.op_lengths.(op))
         else if
           Int.equal op Op.op_ref || Int.equal op Op.op_refi
@@ -1053,14 +1095,12 @@ let compile (re : C.re) : (Ir.t, string) result =
           let caseless =
             Int.equal op Op.op_refi || Int.equal op Op.op_dnrefi
           in
-          (* Chunk I — a caseless backreference in UTF folds code points via
-             Ucd.othercase / the caseless sets and consumes a variable number of
-             code units (a captured char and its other case can differ in byte
-             length, e.g. U+023A / U+2C65); the fast match_ref is byte-based.
-             Deferred to chunk I2. Caseful refs are a byte-exact compare (fine
-             in UTF). *)
-          if utf && caseless then
-            raise (Unsupported "fast: caseless backreference in UTF (chunk I2)");
+          (* Chunk I2 — a caseless backreference in UTF/UCP mode folds code
+             points via Ucd.othercase / the caseless sets and, in UTF, may
+             consume a different number of code units per copy (the runner's
+             uni-mode match_ref + the RM22 varied-lengths repeat path,
+             pcre2_match.c:390-434 / 5164-5184). Caseful refs stay a byte-exact
+             compare. *)
           let is_dn = Int.equal op Op.op_dnref || Int.equal op Op.op_dnrefi in
           let ci = if caseless then 1 else 0 in
           (* REF: GET2(code, p+1) = group number; DNREF: GET2(code, p+1) = name

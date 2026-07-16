@@ -281,11 +281,63 @@ let check (ir : Ir.t) : (unit, string) result =
                          pc op)
                   else Ok ())
                 else if Int.equal t Ir.t_wordbound then (
+                  (* [want]: bit 0 = boundary wanted, bit 1 = UCP variant
+                     (chunk I2), so 0..3. *)
                   let w = code.(pc + 1) in
-                  if not (Int.equal w 0 || Int.equal w 1) then
+                  if w < 0 || w > 3 then
                     Error
                       (Printf.sprintf
                          "fast-verify: WORDBOUND at pc %d has bad want %d" pc w)
+                  else Ok ())
+                else if Int.equal t Ir.t_prop then (
+                  (* [notprop; ptype; pdata] (chunk I2): notprop in {0,1};
+                     ptype a known property type (<= PT_BOOL — the runner's
+                     prop_test covers exactly those); pdata one code unit. *)
+                  let np = code.(pc + 1) in
+                  let ptype = code.(pc + 2) in
+                  let pdata = code.(pc + 3) in
+                  if
+                    (not (Int.equal np 0 || Int.equal np 1))
+                    || ptype < 0
+                    || ptype > Pcre2_engine.Opcodes.pt_bool
+                    || pdata < 0 || pdata > 255
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: PROP at pc %d has bad operands \
+                          (not=%d ptype=%d pdata=%d)"
+                         pc np ptype pdata)
+                  else Ok ())
+                else if Int.equal t Ir.t_prop_rep then (
+                  (* [reptype; lmin; lmax; notprop; ptype; pdata] (chunk I2). *)
+                  let reptype = code.(pc + 1) in
+                  let lmin = code.(pc + 2) and lmax = code.(pc + 3) in
+                  let np = code.(pc + 4) in
+                  let ptype = code.(pc + 5) in
+                  let pdata = code.(pc + 6) in
+                  if
+                    reptype < 0 || reptype > 2 || lmin < 0 || lmax < lmin
+                    || (not (Int.equal np 0 || Int.equal np 1))
+                    || ptype < 0
+                    || ptype > Pcre2_engine.Opcodes.pt_bool
+                    || pdata < 0 || pdata > 255
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: PROP_REP at pc %d has bad operands \
+                          (reptype=%d min=%d max=%d not=%d ptype=%d pdata=%d)"
+                         pc reptype lmin lmax np ptype pdata)
+                  else Ok ())
+                else if Int.equal t Ir.t_extuni_rep then (
+                  (* [reptype; lmin; lmax] (chunk I2). *)
+                  let reptype = code.(pc + 1) in
+                  let lmin = code.(pc + 2) and lmax = code.(pc + 3) in
+                  if reptype < 0 || reptype > 2 || lmin < 0 || lmax < lmin then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: EXTUNI_REP at pc %d has bad operands \
+                          (reptype=%d min=%d max=%d)"
+                         pc reptype lmin lmax)
                   else Ok ())
                 else if Int.equal t Ir.t_class then (
                   let off = code.(pc + 1) in

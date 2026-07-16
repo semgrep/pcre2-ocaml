@@ -203,9 +203,43 @@ interpreter is its differential oracle. Approved plan:
   BOTH single and repeated (multi-byte NEL/LS/PS members + variable give-back);
   OP_ALLANY / OP_ANYBYTE repeats in UTF (char-step / no-SCHECK partial
   subtleties).
-- [ ] **I2 — UCP + UTF remainder** — PROP/NOTPROP/EXTUNI/UCP word boundary,
-  caseless via `Ucd.othercase`/caseset, caseless backrefs, UTF lookbehind, `\R`
-  in UTF, ALLANY/ANYBYTE repeats in UTF, MATCH_INVALID_UTF fragments.
+- [x] **I2 — UCP + UTF remainder** (chunk I closed) — the full I1 decline
+  list: OP_PROP/OP_NOTPROP singles + repeats (all property types PT_ANY..
+  PT_BOOL, via a pure extraction of the interpreter's prop predicates into
+  `Char_predicates` — prop_test/prop_clist_member/caseless_set_member/
+  ucp_wordchar, aliased back by the interpreter so the engines share one
+  definition), OP_EXTUNI singles + repeats (`Extuni.extuni`, cluster-wise
+  give-back via the RM220 pair-table re-walk), UCP word boundaries (WORDBOUND
+  want bit 1), UCP caseless folds ((utf||ucp) `Ucd.othercase` in the IR
+  compiler's CHARI/NOT/char-repeat folds, the runner's UCP-no-UTF CHARI arm,
+  and exec's first_cu2/req_cu2 othercase-land-0xff branch), multi-case
+  caseless sets (PT_CLIST + caseless_set_member in the uni-mode match_ref),
+  caseless backrefs in UTF/UCP (uni-mode fold; the RM22 differing-lengths
+  maximize via the new KIND_REF_MAX2 record — samelengths tracked per the C),
+  UTF lookbehind (char-wise REVERSE floored at check_subject; VREVERSE with
+  the interpreter's continuation-byte crossing pin + FORWARDCHARTEST RM37
+  step), `\R` in UTF (code-point decode incl. NEL/LS/PS in the single arm and
+  every repeat loop; BACKCHAR + mid-CRLF give-back), OP_ALLANY repeats in UTF
+  (char-step via the generic loops), OP_ANYBYTE repeats (new rk_anybyte:
+  no-SCHECK byte-bulk min pcre2_match.c:3041-3044, byte-bulk greedy, char-wise
+  RM219/RM202 extend/give-back — the maxbt in-place floor now runs at try_pos,
+  which \C can put below a mid-character floor), and PCRE2_MATCH_INVALID_UTF
+  (the fragment carry-on driver: entry bad-start skip / end truncation /
+  re-validate, ENDLOOP → next_fragment → FRAGMENT_RESTART with per-fragment
+  NOTBOL/NOTEOL, true_end_subject for \z + the bumpalong limit, per-fragment
+  hitend/match_partial resets, startchar for error returns). New IR tags
+  PROP/PROP_REP/EXTUNI/EXTUNI_REP (59-62) + save kind KIND_REF_MAX2 (14). The
+  UCP and MATCH_INVALID_UTF compile gates are removed. Ratchet 277/193/24 →
+  594/406/43 (testinput4/5/10), zero failures; fuzz fast-vs-interp clean; the
+  new LIMIT_MATCH N-sweep entries were mutation-tested (extuni floor tick,
+  prop floor dispatch, RM22 pop tick, \C no-SCHECK min — each deliberate
+  break fails the suite). §3 snapshot-proof revisit check: I2 adds no
+  recursion/subroutine re-entry and its arms read neither group_start nor
+  cap_start — the enumeration holds; the real revisit stays chunk K.
+  **Remaining declines after I2:** OP_COND/SCOND + conditional refs (chunk J);
+  OP_RECURSE / OP_SCRIPT_RUN / callouts (chunk K); `\K` (C2+); repeated
+  atomic group / assertion (G+); ( *ACCEPT) inside an assertion and ( *THEN)
+  with a non-atomic assertion (H+); PCRE2_FIRSTLINE (chunk L).
 - [ ] **J — Conditionals** — COND/SCOND + CREF/DNCREF/RREF/DNRREF/FALSE/TRUE.
 - [ ] **K — Recursion + script-run + callout no-ops** — full parity reached; no
   `Unsupported` remains for in-scope patterns.
