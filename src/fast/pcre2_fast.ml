@@ -85,16 +85,28 @@ let exec (re : t) (subject : string) (offset : int) (options : int32) :
   then Ok None
   else Error o.R.orc
 
+(* Decode a mark offset (a byte offset into re.code of a zero-terminated verb
+   name preceded by its length unit) into the name string, exactly as
+   Engine.mark_of_offset (engine.ml:101-105): the length is the code unit BEFORE
+   the name (mark[-1]) — NOT a NUL scan, since verb names may contain binary
+   zeros. -1 = no mark -> None. *)
+let mark_of_offset (re : C.re) (off : int) : string option =
+  if off < 0 then None
+  else
+    let len = Char.code (Bytes.get re.C.code (off - 1)) in
+    Some (Bytes.sub_string re.C.code off len)
+
 let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
     E.exec_result =
   let o = R.exec re ~subject ~offset ~options:(Opt.of_int32 options) in
+  let mark = mark_of_offset re.Ir.re o.R.omark in
   if o.R.orc > 0 then
     (* [ovec] holds the pcre2 rc pairs (Engine.exec_full's shape): the whole
        match + captures up to the high-water group; consumers pad the rest. *)
-    E.Match { ovector = o.R.ovec; mark = None; start_char = o.R.ostart }
-  else if Int.equal o.R.orc Errors.error_nomatch then E.No_match { mark = None }
+    E.Match { ovector = o.R.ovec; mark; start_char = o.R.ostart }
+  else if Int.equal o.R.orc Errors.error_nomatch then E.No_match { mark }
   else if Int.equal o.R.orc Errors.error_partial then
-    E.Partial { start = o.R.ostart; mark = None }
+    E.Partial { start = o.R.ostart; mark }
   else E.Error { code = o.R.orc; start_char = 0 }
 
 (* Named groups: (name, group_number) in PCRE2 name-table order. Built from

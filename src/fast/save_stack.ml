@@ -128,8 +128,33 @@ let kind_vreverse = 11
    propagate NOMATCH); the extra state slots are read only on the forward loop
    (t_ketrpos / t_possess_done). *)
 let kind_pos = 12
+
+(* Chunk H (fast-design.md §3) — the backtracking control verbs. A single
+   KIND_VERB record backs MARK and the fire-a-code verbs (PRUNE/COMMIT/SKIP/
+   SKIP_ARG/THEN, incl. the _ARG mark-setting forms). Layout [vtype; aux; eptr;
+   old_mark; KIND_VERB], width 5:
+     vtype    — which verb (runner vt_* discriminator);
+     aux      — the verb name offset (MARK/SKIP_ARG) or the THEN opcode's IR pc
+                (THEN); unused otherwise;
+     eptr     — the subject position when the verb executed (MARK's SKIP_ARG
+                catch position / SKIP's pass-back position);
+     old_mark — the enclosing mb.mark, restored on backtrack-past so mb.mark
+                tracks the C's per-frame Fmark (verbs that set no mark store the
+                current mark, a harmless self-restore).
+   On NORMAL backtrack (NOMATCH): MARK restores mb.mark and keeps popping; every
+   other vtype FIRES its verb code into [backtrack_code] (pcre2_match.c:6357/
+   6370/6383/6397/6424/6434). On a verb code already propagating, the record is
+   passed through (mb.mark restored), except MARK catches a name-matching
+   MATCH_SKIP_ARG and converts it to MATCH_SKIP (RM12, pcre2_match.c:6351-6356). *)
+let kind_verb = 13
+let width_verb = 5
 let width_vreverse = 6
-let width_alt = 4
+
+(* KIND_ALT grows by one slot in chunk H: [handler; eptr; rdepth; then_end;
+   KIND_ALT] (width 5). [then_end] is the THEN scope boundary copied from
+   Ir.alt_then_end at push time (fast-design.md §3); the hot NOMATCH backtrack
+   still reads handler/eptr/rdepth at slots 0/1/2 unchanged. *)
+let width_alt = 5
 let width_cap = 4
 let width_rep_max = 5
 let width_rep_min = 5

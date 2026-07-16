@@ -45,7 +45,11 @@ Principles (fixed by the plan) and the CONCRETE layout as implemented:
   caseless fusion is a possible chunk-M optimization citing those lines.
 - Variable-length payloads (XCLASS data, MARK names) stay in the original bytecode;
   the IR stores offsets into `re.code` (JIT does the same); `Ir.t` therefore pins
-  `Compile.re`. `Ir.t = { code : int array; lit : string; re : Compile.re }`.
+  `Compile.re`. `Ir.t = { code : int array; lit : string; re : Compile.re;
+  n_groups : int; alt_then_end : int array; once_subtype : int array }`
+  (chunk D2 added `n_groups`; chunk H added `alt_then_end` and `once_subtype`, two
+  compile-time side arrays indexed by IR `pc`, kept OUT of `code` so the dump / pc
+  numbering are unchanged — see §3).
 
 **Instruction table (chunk C1 subset).** `pc` = instruction head; operands are the ints
 following the tag. Widths are `Ir.arity`:
@@ -101,6 +105,32 @@ following the tag. Widths are `Ir.arity`:
 | 46 | `POSSESS` | `cap_ovbase; zero_allowed` | 3 | possessive-bracket ENTRY: push a KIND_POS boundary (snapshot + per-loop state), set `mb.once_base` |
 | 47 | `KETRPOS` | `body_entry; cap_ovbase` | 3 | possessive iteration commit (`OP_KETRPOS`): write the capture (if `cap_ovbase>0`), truncate to the boundary, loop back to `body_entry` (or break on empty) |
 | 48 | `POSSESS_DONE` | — | 1 | possessive loop end: success iff `matched_once \|\| zero_allowed`, else the group fails |
+| 49 | `MARK` | `name_off` | 2 | `OP_MARK`: set `mb.mark`/`mb.nomatch_mark` = the name's byte offset in `re.code`, push a KIND_VERB (`vt_mark`) that reverts the mark on backtrack and catches a name-matching `MATCH_SKIP_ARG` (RM12), continue |
+| 50 | `COMMIT` | `mark_off` | 2 | `OP_COMMIT`/`OP_COMMIT_ARG`: `mark_off` = -1 (plain) or the name offset (`_ARG`, also sets mark). Push a KIND_VERB (`vt_commit`); on the continuation's exhaustion it fires `MATCH_COMMIT` (disable bumpalong) |
+| 51 | `PRUNE` | `mark_off` | 2 | `OP_PRUNE`/`OP_PRUNE_ARG`: as COMMIT but fires `MATCH_PRUNE` (fail to bumpalong) |
+| 52 | `SKIP` | — | 1 | `OP_SKIP`: push a KIND_VERB (`vt_skip`); fires `MATCH_SKIP`, passing back the current position (`verb_skip_ptr = eptr`) |
+| 53 | `SKIP_ARG` | `name_off` | 2 | `OP_SKIP_ARG`: the rerun protocol. Count it; while `count <= ignore_skip_arg` it is a no-op; else push a KIND_VERB (`vt_skip_arg`) that fires `MATCH_SKIP_ARG` (`verb_skip_ptr` = the name offset) |
+| 54 | `THEN` | `mark_off` | 2 | `OP_THEN`/`OP_THEN_ARG`: push a KIND_VERB (`vt_then`); fires `MATCH_THEN`, passing back this opcode's IR pc (`verb_then_pc`) for the enclosing alternation's KIND_ALT scope check |
+| 55 | `ACCEPT` | — | 1 | `OP_ACCEPT`: end the whole match (shares the END recording; ENDANCHORED-and-not-at-end is a DIRECT NOMATCH return, pcre2_match.c:916) |
+| 56 | `CLOSE` | `ovbase; referenced` | 3 | `OP_CLOSE` before an ACCEPT: close capture N, pushing a KIND_CAP so it rolls back if ACCEPT then backtracks. `referenced=1` reads the start from `mb.cap_start[ovbase]`, else ovector[ovbase] already holds it |
+
+**Chunk H additions — backtracking control verbs, FAIL, ACCEPT, CLOSE.** Eight
+new tags (49-56) and one save kind (KIND_VERB 13). Verbs turn backtracking into
+scoped propagation: a verb whose continuation may fail pushes a KIND_VERB record;
+on the continuation's exhaustion (NOMATCH backtrack) the record FIRES its verb
+code, which then propagates up the save stack via a cold `backtrack_code` (§3),
+discarding choice points until a scope boundary handles it — mirroring the C's
+RRETURN of `MATCH_COMMIT..MATCH_THEN` through the frame stack. `OP_FAIL` reuses
+the existing `FAIL` marker (tag 15) — its runner arm is exactly a NOMATCH
+backtrack. THEN scoping is baked into the ALT records via a compile-time parallel
+array (§3). `OP_ASSERT_ACCEPT` (( *ACCEPT) inside an assertion) and a NON-ATOMIC
+positive assertion combined with ( *THEN) are DECLINED (`Unsupported`, chunk H+ —
+they need MATCH_ACCEPT propagation to the assertion boundary / a boundary a NA
+assertion does not have). The `hasthen` switch forces all `OP_BRA` groups to the
+grouploop lowering (ALT choice point for every branch + FAIL) when the pattern
+contains ( *THEN), so every alternation boundary exists for the scope check
+(interpreter.ml:2419-2425 / pcre2_match.c:5350). MARK/nomatch_mark are byte
+offsets into `re.code` decoded only at the seam (`mark_of_offset`).
 
 **Chunk D additions.** `CIRCM`/`DOLLM` are the multiline anchors (their arms
 carry no operands; runtime semantics only). `CAP_START`/`CAP_END` bracket a
@@ -463,8 +493,8 @@ first:
 
 | kind | width | layout | pushed at | on backtrack |
 |---|---|---|---|---|
-| `KIND_ALT` | 4 | `handler; eptr; rdepth; KIND_ALT` | each `ALT` | resume the next alternative at `handler` (restore `eptr`/`rdepth`) |
-| `KIND_CAP` | 4 | `ovbase; old_start; old_end; KIND_CAP` | each `CAP_START` | restore `ovector[ovbase]`/`[ovbase+1]`, then keep popping |
+| `KIND_ALT` | 5 | `handler; eptr; rdepth; then_end; KIND_ALT` | each `ALT` | resume the next alternative at `handler` (restore `eptr`/`rdepth`); `then_end` (chunk H) is the THEN scope boundary, read only by `backtrack_code` |
+| `KIND_CAP` | 4 | `ovbase; old_start; old_end; KIND_CAP` | each `CAP_START` / `CLOSE` | restore `ovector[ovbase]`/`[ovbase+1]`, then keep popping |
 | `KIND_REP_MAX` | 5 | `rep_pc; try_pos; floor; rdepth; KIND_REP_MAX` | greedy char / type / class repeat with extra units | retry the continuation at `try_pos` (decrement to `floor`; \R skips mid-CRLF; class also tries floor) |
 | `KIND_REP_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REP_MIN` | minimizing char / type / class repeat with `lmin<lmax` | match one more unit at `eptr`, retry the continuation |
 | `KIND_CONT` | 4 | `target; eptr; rdepth; KIND_CONT` | BRAZERO / BRAMINZERO / greedy KETRMAX / lazy KETRMIN | resume at IR index `target` (restore `eptr`/`rdepth`), NO tick |
@@ -472,10 +502,11 @@ first:
 | `KIND_CAPSTART` | 3 | `ovbase; old_cap_start; KIND_CAPSTART` | each `CAP_START_REF` (referenced capture entry) | restore `mb.cap_start.(ovbase)` to the enclosing value, then keep popping (the ovector was already rolled back by the CLOSE's `KIND_CAP`) |
 | `KIND_REF_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REF_MIN` | minimizing ref repeat with `lmin<lmax` (RM20) | match one more copy at `eptr` (`count` up to Lmax), retry the continuation; `rep_pc` re-derives ovbase/caseless/Lmax/cont |
 | `KIND_REF_MAX` | 6 | `cont; try_pos; flength; lstart; rdepth; KIND_REF_MAX` | maximizing ref repeat, samelengths (RM21) | give back one copy (`try_pos` −= `flength`, down to and INCLUDING `lstart`), retry the continuation; below `lstart` → NOMATCH |
-| `KIND_ONCE` | `2*oveccount` | `ov_snapshot[2,2n); prev_once_base; KIND_ONCE` | each `ONCE` (atomic group / atomic positive assertion) | restore the group-ovector snapshot + `mb.once_base`, then keep popping (propagate NOMATCH past the atomic construct) |
-| `KIND_NASSERT` | `2*oveccount+3` | `ov_snapshot; prev_once_base; cont; eptr_enter; rdepth_enter; KIND_NASSERT` | each `NASSERT` (negative assertion) | ALL branches failed = SUCCESS: restore snapshot + `mb.once_base`, continue at `cont` with the entry eptr/rdepth |
+| `KIND_ONCE` | `2*oveccount+2` | `ov_snapshot[2,2n); prev_once_base; saved_mark; subtype; KIND_ONCE` | each `ONCE` (atomic group / atomic positive assertion) | restore the snapshot + `mb.once_base` + `mb.mark`, then keep popping. `subtype` (chunk H) = 0 atomic group / 1 pos-assert, read only by `backtrack_code` (THEN escape vs contain) |
+| `KIND_NASSERT` | `2*oveccount+4` | `ov_snapshot; prev_once_base; cont; eptr_enter; rdepth_enter; saved_mark; KIND_NASSERT` | each `NASSERT` (negative assertion) | ALL branches failed = SUCCESS: restore snapshot + `mb.once_base` + entry `mb.mark`, continue at `cont` with the entry eptr/rdepth |
 | `KIND_VREVERSE` | 6 | `body_pc; cur_lmax; lmin; cur_eptr; rdepth; KIND_VREVERSE` | each `VREVERSE` (RM37) | `if cur_lmax<=lmin` NOMATCH, else give up one back-step (`cur_lmax--`, `cur_eptr++`) and retry the branch body |
-| `KIND_POS` | `2*oveccount+4` | `ov_snapshot; prev_once_base; iter_start; matched_once; zero_allowed; entry_rdepth; KIND_POS` | each `POSSESS` (possessive bracket) | backtrack PAST the group: restore snapshot + `mb.once_base`, keep popping (as `KIND_ONCE`); the extra slots are read only on the forward loop |
+| `KIND_POS` | `2*oveccount+5` | `ov_snapshot; prev_once_base; iter_start; matched_once; zero_allowed; entry_rdepth; saved_mark; KIND_POS` | each `POSSESS` (possessive bracket) | backtrack PAST the group: restore snapshot + `mb.once_base` + `mb.mark`, keep popping (as `KIND_ONCE`); the extra slots are read only on the forward loop |
+| `KIND_VERB` | 5 | `vtype; aux; eptr; old_mark; KIND_VERB` | each `MARK`/`COMMIT`/`PRUNE`/`SKIP`/`SKIP_ARG`/`THEN` (chunk H) | revert `mb.mark` = `old_mark`; MARK keeps backtracking (and catches a name-matching `MATCH_SKIP_ARG` → `MATCH_SKIP`); every other `vtype` FIRES its verb code into `backtrack_code` |
 
 `KIND_ONCE` / `KIND_NASSERT` / `KIND_POS` are VARIABLE-width (the group-ovector
 snapshot size depends on `oveccount`); `backtrack` derives the width from
@@ -488,6 +519,64 @@ boundary records so the atomic COMMIT can find the boundary without a
 constant per attempt). `sp` is a runner tail-call parameter; push/pop are
 explicit index arithmetic. The stack resets to `sp = 0` per attempt.
 Backtracking with `sp = 0` returns `MATCH_NOMATCH`.
+
+**Backtracking control verbs (chunk H — verb-code propagation).** The C's verb
+machinery propagates a special negative return `MATCH_COMMIT..MATCH_THEN` UP
+through the frame stack (each RM arm does `if rrc != MATCH_NOMATCH RRETURN(rrc)` —
+pass it up — with the assertion / atomic / THEN-scope exceptions). The fast engine
+reproduces this with a SECOND, cold backtrack function
+`backtrack_code (mb, sp, mcc, vcode)`, entered ONLY when a verb fires (a KIND_VERB
+record's `vt_*` on a NOMATCH backtrack), so the hot NOMATCH `backtrack` is
+unchanged. It walks the save stack:
+
+- **choice-point records** (`KIND_ALT`, `KIND_CONT`, `KIND_REP_MIN/MAX`,
+  `KIND_REF_MIN/MAX`, `KIND_VREVERSE`) are DISCARDED (the verb skips them — a
+  NOMATCH would retry them). EXCEPTION: at a `KIND_ALT` a `MATCH_THEN` whose
+  `verb_then_pc < then_end` (the ALT is a genuine ≥2-branch alternation and the
+  THEN is within this branch) is CONVERTED to NOMATCH by resuming the next
+  alternative (`resume_alt`, shared with the hot `backtrack`).
+- **restore-only records** (`KIND_CAP`, `KIND_GSTART`, `KIND_CAPSTART`,
+  `KIND_VERB`) run their restore (the C's frame unwind) then keep propagating.
+  A `KIND_VERB` for a MARK also reverts `mb.mark` and catches a name-matching
+  `MATCH_SKIP_ARG`, converting it to `MATCH_SKIP` (RM12).
+- **boundaries**: `KIND_ONCE`/`KIND_POS` — COMMIT/SKIP/PRUNE ESCAPE (restore
+  snapshot + `once_base` + `mark`, keep propagating); THEN ESCAPES an atomic
+  GROUP (subtype 0) but is CONTAINED at a positive ASSERTION (subtype 1) →
+  converted to NOMATCH (the assertion fails), reproducing RM3 vs RM2.
+  `KIND_NASSERT` — COMMIT/SKIP/PRUNE/THEN → the negative assertion SUCCEEDS
+  (continue at `cont`), EXCEPT `MATCH_SKIP_ARG`, which ESCAPES (RM4
+  `default: RRETURN`, pcre2_match.c:5567-5574).
+- reaching `sp = 0` returns `vcode` to the driver (`run_attempt`), whose rc-switch
+  mirrors interpreter.ml:9329-9374: SKIP_ARG → set `ignore_skip_arg` and re-run
+  at the same start (the rerun protocol); SKIP → advance to `verb_skip_ptr`;
+  PRUNE/THEN/NOMATCH → bump one; COMMIT → disable bumpalong.
+
+**THEN scoping — reconstructing the branch boundaries.** The C's grouploop THEN
+check `verb_ecode_ptr < next_ecode && ( *ecode == OP_ALT || *next_ecode ==
+OP_ALT)` (pcre2_match.c:5401-5407) is baked, at IR-compile time, into `then_end`
+per ALT: the handler value for a ≥2-branch alternation branch, else -1
+(single-branch → THEN never converts, it escapes). Stored in `Ir.alt_then_end`
+(a side array indexed by ALT pc, kept out of `code`) and copied into the KIND_ALT
+record at push time. The `PCRE2_HASTHEN` switch (`Ir_compile`: OP_BRA lowers
+grouploop-style when the pattern has ( *THEN), matching pcre2_match.c:5350)
+guarantees every alternation has ALT records for the scope check.
+
+**MARK state and the boundary snapshot (the chunk-K revisit, extended).** `mb.mark`
+is the C's per-frame `Fmark` (reset per attempt, set forward by MARK/`_ARG`
+verbs, reverted on backtrack-past by the KIND_VERB record); `mb.nomatch_mark` is
+the sticky failure mark (reset per exec, never reverted). An atomic COMMIT
+(`once_commit` / `t_ketrpos`) TRUNCATES the body's KIND_VERB (MARK) records, so —
+exactly as the chunk-G "snapshot completeness proof" required the ovector to be
+snapshotted — the KIND_ONCE / KIND_NASSERT / KIND_POS boundary records ALSO
+snapshot the entry `mb.mark` and restore it on backtrack-past (or, for a matched
+negative-assertion branch, at `t_nassert_match`). `mb.mark` is observable at END
+and via nothing else; `mb.group_start`/`mb.cap_start` stay OUT of the snapshot
+per the original proof, but a possessive CAPTURE now maintains `mb.cap_start`
+across its iterations (written at `POSSESS`/`KETRPOS`) so an `OP_CLOSE` at an
+inner ( *ACCEPT) reads the CURRENT iteration's start rather than the last
+committed one. **Chunk K (recursion) must still revisit the snapshot** for
+subroutine re-entry, and should note that the mark/`cap_start` additions here are
+subject to the same reasoning.
 
 **Capture save sets (chunk D — the minimal-save design).** A single global
 `mb.ovector` (size `2*(top_bracket+1)`, reused across execs, group slots reset
@@ -728,6 +817,26 @@ propagates NOMATCH with no tick). Thus every capturing-group branch ticks at
 `d+1` via its `ALT` (the `ALT` rows), and the `FAIL` head is only reached with
 saved `d >= 1` (captures nest inside the wrapper), never triggering the
 top-level `d = 0` tick. `CAP_START`/`CAP_END` themselves never tick.
+
+**Verbs (chunk H) tick ONCE at their `RMATCH`.** MARK/COMMIT/PRUNE/SKIP/THEN and a
+non-no-op SKIP_ARG each reach their continuation via `RMATCH(continuation, RMk)`
+(pcre2_match.c:6342/6367/6374/6380/6387/6393/6414/6430/6438), so each ticks a
+child frame at `rdepth+1` and the continuation runs at `rdepth+1` — the fast arms
+`tick_child (rdepth+1)` then run the continuation at `rdepth+1`. A no-op SKIP_ARG
+(`count <= ignore_skip_arg`) is the C's `break` (no RMATCH, no tick, same frame).
+OP_FAIL (a bare `RRETURN(NOMATCH)`), OP_ACCEPT (falls to op_end's direct return)
+and OP_CLOSE (`break`) do NOT tick. The verb-code propagation (`backtrack_code`)
+is pure unwinding: it ticks NOTHING except when it CONVERTS a THEN to NOMATCH at a
+`KIND_ALT`, where it calls `resume_alt` — the SAME tick path as a normal NOMATCH
+backtrack of that ALT (the §4 top-level heuristic). The `PCRE2_HASTHEN` grouploop
+switch changes tick counts for OP_BRA groups, but IDENTICALLY to the interpreter
+(which makes the same switch, pcre2_match.c:5350), so tick parity holds. The
+SKIP_ARG rerun re-runs the whole match at the same start with
+`skip_arg_count`/`ignore_skip_arg` reset exactly as the driver
+(interpreter.ml:7513/9339), so the Θ(n·m) tick flow matches. Verified by the
+fuzz `--mode fast-vs-interp` `LIMIT_MATCH=2000` differential (0 divergences over
+500k+ cases with verbs across 5 seeds) and the verb `LIMIT_MATCH` boundary/sweep
+tests.
 
 **Start-of-match scan is required for tick parity (chunk C2, not deferred).** A skipped
 attempt does ZERO ticks, so a naive bump-along that runs attempts the interpreter's

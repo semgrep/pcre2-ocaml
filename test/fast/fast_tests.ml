@@ -760,7 +760,22 @@ let unsupported_cases : (string * string * string) list =
        the UCP word-boundary opcode is even reached. *)
     ("ucp mode", "(*UCP)\\ba", "fast: UCP mode (chunk I)");
     ("UTF mode", "(*UTF)abc", "fast: UTF mode (chunk I)");
-    ("verb", "a(*FAIL)", "fast: verb (chunk H)");
+    (* Chunk H supports MARK/PRUNE/SKIP/THEN/COMMIT (+_ARG), FAIL, ACCEPT and
+       OP_CLOSE (so "a(*FAIL)", "(*MARK:x)a", "a(*PRUNE)b", "a(*ACCEPT)", and
+       ( *THEN) with atomic positive assertions, are now ACCEPTED). Two
+       combinations still decline: ( *ACCEPT) inside an assertion (needs
+       MATCH_ACCEPT propagation to the assertion boundary with capture fishing),
+       and ( *THEN) in a pattern that also has a NON-ATOMIC positive assertion
+       (no KIND_ONCE boundary to contain the THEN). *)
+    ( "accept in assertion",
+      "(?=a(*ACCEPT))",
+      "fast: (*ACCEPT) inside assertion (chunk H+)" );
+    ( "then with non-atomic lookahead (inside)",
+      "(*napla:a(*THEN)b)c",
+      "fast: (*THEN) with non-atomic assertion (chunk H+)" );
+    ( "then with non-atomic lookahead (after)",
+      "(*napla:a)b(*THEN)",
+      "fast: (*THEN) with non-atomic assertion (chunk H+)" );
   ]
 
 let unsupported_tests =
@@ -911,6 +926,36 @@ let supported_patterns =
     "(?:a+)++";
     "(?:)*+";
     "(a?)*+";
+    (* Chunk H: backtracking control verbs, FAIL, ACCEPT, CLOSE. *)
+    "a(*FAIL)";
+    "a(*F)";
+    "a(*ACCEPT)";
+    "(a(*ACCEPT))b";
+    "(*MARK:x)abc";
+    "(*:x)abc";
+    "a(*PRUNE)b";
+    "a(*PRUNE:x)b";
+    "a(*SKIP)b";
+    "a(*SKIP:x)b";
+    "a(*COMMIT)b";
+    "a(*COMMIT:x)b";
+    "a(*THEN)b|c";
+    "a(*THEN:x)b|c";
+    "(a(*THEN)b|c(*THEN)d)e";
+    "(*MARK:a)x(*SKIP:a)y|z";
+    "(?:a(*COMMIT)b|c)";
+    "(?>a(*:m))b|ac";
+    "(?!a(*COMMIT)b)c";
+    "(?!a(*THEN)b|c)d";
+    "(?:a|b(*THEN)c)+";
+    (* ( *THEN) with atomic positive assertions: contained via the KIND_ONCE
+       pos-assert subtype (inside and after the assertion). *)
+    "(?=a(*THEN)b)";
+    "(?=a(*THEN)b|c)d";
+    "(?<=a(*THEN))b";
+    "\\V??(?=(*MARK:c))(*THEN)";
+    "x(?=y)(*THEN)z|w";
+    "(?>a(*THEN)b)c";
   ]
 
 let verify_ok = function
@@ -1806,6 +1851,31 @@ let limit_match_boundary_test =
             ("(a)++b", "aaab"); (* possessive capture iterations *)
             ("(?:a?)*+b", "aab"); (* possessive with empty-match break *)
             ("(?:a+)++b", "aaab"); (* nested possessive *)
+          ]);
+    Alcotest.test_case "LIMIT_MATCH sweep, verbs (fast == interp)" `Quick
+      (fun () ->
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 40 do
+              let f, e = run_both body n subj in
+              Alcotest.(check string)
+                (Printf.sprintf "fast == interp for /%s/ on %S at N=%d" body subj
+                   n)
+                e f
+            done)
+          [
+            ("a(*PRUNE)b|ac", "ac"); (* PRUNE fails to bumpalong *)
+            ("a(*SKIP)b|ac", "ac"); (* SKIP advances the start *)
+            ("a(*THEN)b|ad", "ad"); (* THEN to next alternative *)
+            ("(a(*THEN)b|c(*THEN)d)e", "cde"); (* THEN in nested alternation *)
+            ("a(*COMMIT)b|ac", "ac"); (* COMMIT disables bumpalong *)
+            ("(*MARK:a)x(*SKIP:a)y|z", "xyz"); (* SKIP:name matched mark *)
+            ("(*MARK:b)x(*SKIP:a)y|z", "xzz"); (* SKIP:name unmatched -> rerun *)
+            ("\\d(*SKIP:x)\\d\\d\\d(*SKIP:x)|", "12345"); (* skiparg cubic-ish *)
+            ("(?:a(*THEN)b|c)+d", "cccd"); (* THEN inside a repeated group *)
+            ("(?=a(*THEN)b|c)cd", "cd"); (* THEN in an atomic pos assertion *)
+            ("(?!a(*COMMIT))b", "b"); (* COMMIT in negative assertion *)
+            ("a(*MARK:m)(b(*PRUNE)c|d)", "ad"); (* MARK + PRUNE in a group *)
           ]);
   ]
 

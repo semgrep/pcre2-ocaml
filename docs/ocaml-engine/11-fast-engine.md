@@ -153,8 +153,31 @@ interpreter is its differential oracle. Approved plan:
   a REPEATED atomic group / assertion (`(?>a)+` = Once … KetRmax — the
   per-iteration atomic commit combined with a repeating ket); SKIP_ARG / verbs
   stay chunk H; conditional assertions `(?(?=…)…)` stay chunk J (OP_COND).
-- [ ] **H — Verbs** — MARK/PRUNE/SKIP/THEN/COMMIT (+_ARG), ACCEPT/FAIL; SKIP_ARG rerun
-  protocol (interpreter.ml:9336-9377 semantics).
+- [x] **H — Verbs** — MARK/PRUNE/SKIP/THEN/COMMIT (+_ARG), FAIL, ACCEPT, OP_CLOSE;
+  SKIP_ARG rerun protocol (interpreter.ml:9329-9374 driver rc-switch). New IR tags
+  MARK/COMMIT/PRUNE/SKIP/SKIP_ARG/THEN/ACCEPT/CLOSE (49-56) + one save kind
+  KIND_VERB (13). Verbs propagate a MATCH_COMMIT..MATCH_THEN code up the save
+  stack via a cold `backtrack_code` (mirroring the C's RRETURN of a verb code
+  through the frame stack); choice points are discarded, restore-only records
+  (CAP/GSTART/CAPSTART) run their restore, and boundaries handle the code per
+  construct. THEN scoping is reconstructed from the enclosing alternation's ALT
+  records (a per-ALT `then_end` boundary in a compile-time parallel array +
+  the KIND_ALT record; the hasthen switch forces OP_BRA groups grouploop-style
+  so every alternation boundary is present — pcre2_match.c:5350). At an atomic
+  positive assertion's KIND_ONCE (tagged by a pos-assert subtype) THEN is
+  CONTAINED (→ NOMATCH, the assertion fails, pcre2_match.c:5504-5507); at an
+  atomic group / possessive boundary THEN escapes; at a negative assertion
+  KIND_NASSERT every verb code succeeds EXCEPT SKIP_ARG, which escapes (RM4
+  `default: RRETURN`, pcre2_match.c:5567-5574). MARK/nomatch_mark plumbed as
+  code offsets (mark_of_offset at the seam); boundary records snapshot the entry
+  mark (revert on backtrack-past, the atomic commit truncating inner MARK
+  records). Ratchet 893/534 → 1064/612 (testinput1/2); fuzz fast-vs-interp clean
+  over 500k+ cases (5 seeds). **Declined to chunk H+:** OP_ASSERT_ACCEPT
+  (( *ACCEPT) inside an assertion — needs MATCH_ACCEPT propagation to the
+  assertion boundary with capture fishing through nested boundaries); a
+  NON-ATOMIC positive assertion (OP_ASSERT_NA/ASSERTBACK_NA) in a pattern that
+  also contains ( *THEN) (a NA assertion has no KIND_ONCE boundary, so a THEN
+  reaching it cannot be contained).
 - [ ] **I — UTF/UCP** — runner UTF decode, per-exec validation, PROP/NOTPROP, caseless via
   `Ucd.othercase`, `\X`, MATCH_INVALID_UTF fragments.
 - [ ] **J — Conditionals** — COND/SCOND + CREF/DNCREF/RREF/DNRREF/FALSE/TRUE.

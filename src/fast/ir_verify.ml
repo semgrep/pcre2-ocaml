@@ -35,6 +35,14 @@ let check (ir : Ir.t) : (unit, string) result =
      wholly inside re.code. A character-type operand must be a supported
      single-type opcode (not \p/\P/\X — those decline at compile). *)
   let map_off_ok (off : int) : bool = off >= 0 && off + 32 <= codelen in
+  (* A verb name offset (t_mark / t_skip_arg / the _ARG mark offset) points at a
+     zero-terminated name in re.code, preceded by its length byte (chunk H): the
+     length byte at off-1 and the name span [off, off+len] (incl. the terminator)
+     must lie inside re.code so mark_of_offset / strcmp never read out of bounds. *)
+  let recode = ir.Ir.re.Pcre2_engine.Compile.code in
+  let name_off_ok (off : int) : bool =
+    off >= 1 && off < codelen && off + Char.code (Bytes.get recode (off - 1)) < codelen
+  in
   let type_op_ok (op : int) : bool =
     (op >= Pcre2_engine.Opcodes.op_not_digit
     && op <= Pcre2_engine.Opcodes.op_anybyte)
@@ -113,6 +121,20 @@ let check (ir : Ir.t) : (unit, string) result =
                          "fast-verify: %s at pc %d group id %d out of range \
                           (n_groups %d)"
                          Ir.tag_name.(t) pc code.(pc + 2) n_groups)
+                  else if
+                    (* Chunk H: the ALT's THEN scope boundary (Ir.alt_then_end)
+                       must be -1 or a valid instruction head. *)
+                    Int.equal t Ir.t_alt
+                    &&
+                    let te = ir.Ir.alt_then_end.(pc) in
+                    (not (Int.equal te (-1)))
+                    && (te < 0 || te >= len || not is_head.(te))
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: ALT at pc %d then_end %d not -1 or an \
+                          instruction head"
+                         pc ir.Ir.alt_then_end.(pc))
                   else Ok ())
                 else if Int.equal t Ir.t_group_start then (
                   let g = code.(pc + 1) in
@@ -367,6 +389,53 @@ let check (ir : Ir.t) : (unit, string) result =
                       (Printf.sprintf
                          "fast-verify: KETRPOS at pc %d ovbase %d out of range"
                          pc ovb)
+                  else Ok ())
+                else if Int.equal t Ir.t_mark || Int.equal t Ir.t_skip_arg then (
+                  (* [name_off]: a zero-terminated verb name in re.code. *)
+                  let off = code.(pc + 1) in
+                  if not (name_off_ok off) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: %s at pc %d name offset %d outside re.code \
+                          (%d bytes)"
+                         Ir.tag_name.(t) pc off codelen)
+                  else Ok ())
+                else if
+                  Int.equal t Ir.t_commit || Int.equal t Ir.t_prune
+                  || Int.equal t Ir.t_then
+                then (
+                  (* [mark_off]: -1 (plain verb) or a valid name offset (_ARG). *)
+                  let off = code.(pc + 1) in
+                  if (not (Int.equal off (-1))) && not (name_off_ok off) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: %s at pc %d mark offset %d outside re.code \
+                          (%d bytes)"
+                         Ir.tag_name.(t) pc off codelen)
+                  else Ok ())
+                else if Int.equal t Ir.t_once then (
+                  (* Chunk H: the KIND_ONCE subtype (Ir.once_subtype) must be a
+                     known value. *)
+                  let st = ir.Ir.once_subtype.(pc) in
+                  if not (Int.equal st Ir.once_group || Int.equal st Ir.once_pos_assert)
+                  then
+                    Error
+                      (Printf.sprintf "fast-verify: ONCE at pc %d bad subtype %d"
+                         pc st)
+                  else Ok ())
+                else if Int.equal t Ir.t_close then (
+                  (* [ovbase; referenced]. *)
+                  let ovb = code.(pc + 1) and r = code.(pc + 2) in
+                  if not (ovbase_ok ovb) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: CLOSE at pc %d ovbase %d out of range (top \
+                          bracket %d)"
+                         pc ovb top_bracket)
+                  else if not (Int.equal r 0 || Int.equal r 1) then
+                    Error
+                      (Printf.sprintf "fast-verify: CLOSE at pc %d bad referenced %d"
+                         pc r)
                   else Ok ())
                 else Ok ()
               in

@@ -147,6 +147,36 @@ let t_possess = 46 (* [t_possess; cap_ovbase; zero_allowed] — possessive entry
 let t_ketrpos = 47 (* [t_ketrpos; body_entry; cap_ovbase] — iteration commit *)
 let t_possess_done = 48 (* [t_possess_done]      — possessive loop end *)
 
+(* Chunk H additions (fast-design.md §2/§3) — backtracking control verbs and
+   forced accept/close.
+
+   The verbs convert backtracking into scoped propagation (pcre2_match.c:6336-
+   6442, interpreter.ml:3322-3397). Each verb whose continuation may fail pushes
+   a save record that, on the continuation's exhaustion (NOMATCH), FIRES its verb
+   code; that code then propagates up the save stack (runner [backtrack_code]),
+   discarding choice points until a scope boundary handles it (the interpreter's
+   RRETURN of MATCH_COMMIT..MATCH_THEN through the frame stack). MARK payloads
+   stay in [re.code] and are stored here as byte OFFSETS of the name (like the
+   engine's mark_of_offset, decoded only at the seam). [t_commit]/[t_prune]/
+   [t_then] carry [mark_off] = -1 for the plain verb or the name offset for the
+   _ARG form (which additionally sets mb.mark/nomatch_mark, pcre2_match.c:6373/
+   6386/6437); [t_skip] has no arg (SKIP passes back the current position);
+   [t_skip_arg] carries the name offset (the rerun protocol,
+   pcre2_match.c:6407-6424). *)
+let t_mark = 49 (* [t_mark; name_off]  — OP_MARK (set mark, catch SKIP_ARG) *)
+let t_commit = 50 (* [t_commit; mark_off] — OP_COMMIT / OP_COMMIT_ARG *)
+let t_prune = 51 (* [t_prune; mark_off]  — OP_PRUNE / OP_PRUNE_ARG *)
+let t_skip = 52 (* [t_skip]            — OP_SKIP *)
+let t_skip_arg = 53 (* [t_skip_arg; name_off] — OP_SKIP_ARG (rerun protocol) *)
+let t_then = 54 (* [t_then; mark_off]  — OP_THEN / OP_THEN_ARG *)
+let t_accept = 55 (* [t_accept]          — OP_ACCEPT (end the whole match) *)
+
+(* OP_CLOSE (pcre2_match.c:809-829) — close an open capture before OP_ACCEPT.
+   [ovbase] = 2N; [referenced] = 1 for a non-optimized (referenced) capture whose
+   in-progress start lives in mb.cap_start (else 0: an optimized capture whose
+   start is already in ovector[ovbase]). *)
+let t_close = 56 (* [t_close; ovbase; referenced] *)
+
 (* Sentinel [g] for a repeated group whose bracket is OP_BRA (bra_loop, C's
    P == NULL): NO empty-string check (the C short-circuits it, and OP_BRA can
    never match empty), so no [t_group_start] and no [mb.group_start] slot. *)
@@ -162,7 +192,7 @@ let reptype_pos = 2
 let rep_inf = 0xFFFFFFFF
 
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 48
+let max_tag = 56
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -218,6 +248,14 @@ let arity =
     3 (* t_possess: cap_ovbase, zero_allowed *);
     3 (* t_ketrpos: body_entry, cap_ovbase *);
     1 (* t_possess_done *);
+    2 (* t_mark: name_off *);
+    2 (* t_commit: mark_off *);
+    2 (* t_prune: mark_off *);
+    1 (* t_skip *);
+    2 (* t_skip_arg: name_off *);
+    2 (* t_then: mark_off *);
+    1 (* t_accept *);
+    3 (* t_close: ovbase, referenced *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -273,6 +311,14 @@ let tag_name =
     "POSSESS";
     "KETRPOS";
     "POSSESS_DONE";
+    "MARK";
+    "COMMIT";
+    "PRUNE";
+    "SKIP";
+    "SKIP_ARG";
+    "THEN";
+    "ACCEPT";
+    "CLOSE";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -282,7 +328,37 @@ let tag_name =
    number of empty-check-tracked repeated groups: the runner allocates a
    [group_start] array of that size, indexed by the group id in
    [t_group_start]/[t_ket_rmax]/[t_ket_rmin]. *)
-type t = { code : int array; lit : string; re : C.re; n_groups : int }
+type t = {
+  code : int array;
+  lit : string;
+  re : C.re;
+  n_groups : int;
+  (* Chunk H (fast-design.md §3) — THEN scope boundary per ALT choice point,
+     indexed by the ALT's [pc]. [alt_then_end.(alt_pc)] = the handler (next-
+     alternative entry) when the ALT belongs to a genuine >= 2-branch
+     alternation, else -1. A ( *THEN) firing converts to NOMATCH at a KIND_ALT
+     record (resuming that alternative) iff [then_pc < then_end] — reproducing
+     the C's `verb_ecode_ptr < next_ecode && ( *ecode == OP_ALT || *next_ecode ==
+     OP_ALT)` grouploop check (pcre2_match.c:5401-5407): the multi-branch bit is
+     baked into the -1 sentinel (single-branch groups never convert THEN, so it
+     escapes). Kept OUT of [code] so the IR dump / pc numbering are unchanged;
+     the runner copies [alt_then_end.(pc)] into the KIND_ALT save record at push
+     time. Non-ALT indices are unused (-1). *)
+  alt_then_end : int array;
+  (* Chunk H (fast-design.md §3) — KIND_ONCE boundary subtype per t_once [pc]:
+     0 = atomic group (OP_ONCE), 1 = atomic positive assertion (OP_ASSERT/
+     ASSERTBACK). Both push a KIND_ONCE, but a ( *THEN) backtracking to the
+     boundary is CONTAINED (converted to NOMATCH) for a positive assertion
+     (pcre2_match.c:5504-5507 / RM3 treats THEN as NOMATCH) yet ESCAPES an atomic
+     group (RM2's position scope check fails for a THEN after the group). Kept out
+     of [code] (dump unchanged); the runner copies it into the KIND_ONCE record
+     at push time. Non-t_once indices are unused (0). *)
+  once_subtype : int array;
+}
+
+(* Chunk H — KIND_ONCE subtype values. *)
+let once_group = 0
+let once_pos_assert = 1
 
 (* ---------- Decode accessors (fast-design.md §2) ----------
    Positional reads used by the runner (chunk C2) and the verifier. They
@@ -399,6 +475,27 @@ let possess_zero_allowed (ir : t) (pc : int) : int = ir.code.(pc + 2)
 let ketrpos_entry (ir : t) (pc : int) : int = ir.code.(pc + 1)
 let ketrpos_ovbase (ir : t) (pc : int) : int = ir.code.(pc + 2)
 
+(* Chunk H operands (fast-design.md §2/§3). *)
+
+(* [t_mark] / [t_skip_arg] operand — the byte OFFSET of the verb name in
+   [re.code] (mark_of_offset decodes it at the seam; the length byte is at
+   name_off - 1). *)
+let verb_name_off (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* [t_commit] / [t_prune] / [t_then] operand — the mark offset (-1 for the plain
+   verb, else the _ARG form's name offset which is also set as mb.mark). *)
+let verb_mark_off (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* [t_close] operands — the capture pair base 2N and whether it is a referenced
+   (non-optimized) capture (start in mb.cap_start) vs optimized (start already in
+   ovector[ovbase]). *)
+let close_ovbase (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let close_referenced (ir : t) (pc : int) : int = ir.code.(pc + 2)
+
+(* [t_alt] THEN scope boundary (fast-design.md §3) — see the [alt_then_end]
+   field. Read by the runner at ALT push time. *)
+let alt_then_end (ir : t) (alt_pc : int) : int = ir.alt_then_end.(alt_pc)
+
 (* ---------- Text dump (fast-design.md §2) ----------
    Stable, debug_printer.ml-style listing for golden tests: one line per
    instruction, [%3d TAG operands]. Printf/Format here is a debug path
@@ -487,6 +584,19 @@ let render (ir : t) (pc : int) (t : int) : string =
   else if Int.equal t t_ketrpos then
     Printf.sprintf "KETRPOS entry=%d ovbase=%d" (ketrpos_entry ir pc)
       (ketrpos_ovbase ir pc)
+  else if Int.equal t t_mark then
+    Printf.sprintf "MARK name_off=%d" (verb_name_off ir pc)
+  else if Int.equal t t_skip_arg then
+    Printf.sprintf "SKIP_ARG name_off=%d" (verb_name_off ir pc)
+  else if Int.equal t t_commit then
+    Printf.sprintf "COMMIT mark_off=%d" (verb_mark_off ir pc)
+  else if Int.equal t t_prune then
+    Printf.sprintf "PRUNE mark_off=%d" (verb_mark_off ir pc)
+  else if Int.equal t t_then then
+    Printf.sprintf "THEN mark_off=%d" (verb_mark_off ir pc)
+  else if Int.equal t t_close then
+    Printf.sprintf "CLOSE ovbase=%d ref=%d" (close_ovbase ir pc)
+      (close_referenced ir pc)
   else if Int.equal t t_group_start then
     Printf.sprintf "GROUP_START g=%d" (group_start_id ir pc)
   else if Int.equal t t_brazero then
