@@ -1,0 +1,8 @@
+; The engine-agnostic Matcher surface shared by the pcre2 library (Interp/Jit)
+; and additional engines (first user: pcre2.fast). Pure OCaml, stdlib +
+; ppx_deriving only -- builds under `dune build -p pcre2`.
+(library
+ (name pcre2_matcher)
+ (public_name pcre2.matcher)
+ (preprocess
+  (pps ppx_deriving.show ppx_deriving.eq)))

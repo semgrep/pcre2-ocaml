@@ -1,5 +1,5 @@
 (library
  (public_name pcre2)
- (libraries pcre2.engine)
+ (libraries pcre2.engine pcre2.matcher)
  (preprocess
   (pps ppx_deriving.show ppx_deriving.eq)))
