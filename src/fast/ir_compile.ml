@@ -16,6 +16,8 @@
 module C = Pcre2_engine.Compile
 module Op = Pcre2_engine.Opcodes
 module Opt = Pcre2_engine.Options
+module Limits = Pcre2_engine.Limits
+module Chartables = Pcre2_engine.Chartables
 
 (* Signals the first unsupported construct; caught at the top of [compile]
    and turned into [Error]. Compile-phase only — never crosses the runner
@@ -37,8 +39,6 @@ let reason_of_op (op : int) : string =
   else if Int.equal op Op.op_word_boundary then named "\\b" "C2+"
   else if Int.equal op Op.op_not_ucp_word_boundary then named "\\B (ucp)" "C2+"
   else if Int.equal op Op.op_ucp_word_boundary then named "\\b (ucp)" "C2+"
-  else if Int.equal op Op.op_circm then named "multiline ^" "C2+"
-  else if Int.equal op Op.op_dollm then named "multiline $" "C2+"
     (* UTF / UCP property machinery (chunk I). *)
   else if Int.equal op Op.op_prop then named "\\p" "I"
   else if Int.equal op Op.op_notprop then named "\\P" "I"
@@ -50,11 +50,13 @@ let reason_of_op (op : int) : string =
     (* Negated single chars (chunk E). *)
   else if Int.equal op Op.op_not || Int.equal op Op.op_noti then
     named "negated char" "E"
-    (* Single-char and type repeats OP_STAR..OP_TYPEPOSUPTO (chunk D). *)
-  else if op >= Op.op_star && op <= Op.op_typeposupto then named "char repeat" "D"
-    (* Class / ref repeat quantifiers OP_CRSTAR..OP_CRPOSRANGE (chunk D). *)
+    (* Character-type repeats OP_TYPESTAR..OP_TYPEPOSUPTO (chunk E); the
+       single-char repeats OP_STAR..OP_NOTPOSUPTOI (33-84) are handled. *)
+  else if op >= Op.op_typestar && op <= Op.op_typeposupto then
+    named "type repeat" "E"
+    (* Class / ref repeat quantifiers OP_CRSTAR..OP_CRPOSRANGE (chunk E). *)
   else if op >= Op.op_crstar && op <= Op.op_crposrange then
-    named "class/ref repeat" "D"
+    named "class/ref repeat" "E"
     (* Classes (chunk E). *)
   else if Int.equal op Op.op_class then named "OP_CLASS" "E"
   else if Int.equal op Op.op_nclass then named "OP_NCLASS" "E"
@@ -79,16 +81,16 @@ let reason_of_op (op : int) : string =
   else if op >= Op.op_assert && op <= Op.op_assertback_na then
     named "lookaround" "G"
   else if Int.equal op Op.op_once then named "OP_ONCE" "G"
-    (* Groups chunk C1 does not lower: possessive / capturing / empty-checking
-       brackets (chunk D). *)
-  else if Int.equal op Op.op_brapos then named "OP_BRAPOS" "D"
-  else if Int.equal op Op.op_cbra then named "OP_CBRA" "D"
-  else if Int.equal op Op.op_cbrapos then named "OP_CBRAPOS" "D"
+    (* Groups this chunk does not lower. Non-capturing OP_BRA and capturing
+       OP_CBRA/OP_SCBRA are handled in [compile_group]; the possessive
+       (OP_*POS) and empty-checking non-capturing (OP_SBRA) brackets, plus
+       OP_CLOSE / OP_SKIPZERO, are declined (see the D-bullet notes). *)
+  else if Int.equal op Op.op_brapos then named "OP_BRAPOS" "G"
+  else if Int.equal op Op.op_cbrapos then named "OP_CBRAPOS" "G"
   else if Int.equal op Op.op_sbra then named "OP_SBRA" "D"
-  else if Int.equal op Op.op_sbrapos then named "OP_SBRAPOS" "D"
-  else if Int.equal op Op.op_scbra then named "OP_SCBRA" "D"
-  else if Int.equal op Op.op_scbrapos then named "OP_SCBRAPOS" "D"
-  else if Int.equal op Op.op_close then named "OP_CLOSE" "D"
+  else if Int.equal op Op.op_sbrapos then named "OP_SBRAPOS" "G"
+  else if Int.equal op Op.op_scbrapos then named "OP_SCBRAPOS" "G"
+  else if Int.equal op Op.op_close then named "OP_CLOSE" "H"
   else if Int.equal op Op.op_skipzero then named "OP_SKIPZERO" "D"
   else if
     op >= Op.op_brazero && op <= Op.op_braposzero
@@ -102,7 +104,9 @@ let reason_of_op (op : int) : string =
   else if op >= Op.op_mark && op <= Op.op_assert_accept then named "verb" "H"
   else "fast: opcode " ^ string_of_int op ^ " (unclassified)"
 
-(* Anchor opcode -> IR tag for the chunk C1 subset; [None] otherwise. *)
+(* Anchor opcode -> IR tag; [None] otherwise. Chunk D adds the multiline
+   anchors OP_CIRCM/OP_DOLLM (their runner arms mirror interpreter.ml
+   :3108-3161 via Pcre2_engine.Newline was_newline/is_newline). *)
 let anchor_tag (op : int) : int option =
   if Int.equal op Op.op_sod then Some Ir.t_sod
   else if Int.equal op Op.op_som then Some Ir.t_som
@@ -110,7 +114,138 @@ let anchor_tag (op : int) : int option =
   else if Int.equal op Op.op_eodn then Some Ir.t_eodn
   else if Int.equal op Op.op_circ then Some Ir.t_circ
   else if Int.equal op Op.op_doll then Some Ir.t_doll
+  else if Int.equal op Op.op_circm then Some Ir.t_circm
+  else if Int.equal op Op.op_dollm then Some Ir.t_dollm
   else None
+
+(* ---------- Single-char repeat decode (fast-design.md §2) ----------
+
+   Decode a repeat opcode OP_STAR..OP_NOTPOSUPTOI (33-84) at bytecode
+   offset [p] into (ir_tag, reptype, lmin, lmax, char_off). Mirrors the
+   interpreter dispatch pcre2_match.c:1188-1257 (positive) and 1542-1611
+   (NOT); interpreter.ml:1718-1806. [fidx] is the position within a
+   13-opcode family (STAR MINSTAR PLUS MINPLUS QUERY MINQUERY UPTO MINUPTO
+   EXACT POSSTAR POSPLUS POSQUERY POSUPTO), identical across the four
+   families. UPTO/MINUPTO/EXACT/POSUPTO (fidx 6,7,8,12) carry an IMM2 count
+   before the char; the rest have the char immediately after the opcode. *)
+
+let is_char_repeat (op : int) : bool =
+  op >= Op.op_star && op <= Op.op_notposuptoi
+
+(* Returns (ir_tag, caseless, fidx) for a char-repeat opcode. *)
+let rep_kind (op : int) : int * bool * int =
+  if op >= Op.op_star && op <= Op.op_posupto then
+    (* 33..45 caseful positive *)
+    (Ir.t_rep, false, op - Op.op_star)
+  else if op >= Op.op_stari && op <= Op.op_posuptoi then
+    (* 46..58 caseless positive *)
+    (Ir.t_repi, true, op - Op.op_stari)
+  else if op >= Op.op_notstar && op <= Op.op_notposupto then
+    (* 59..71 caseful NOT *)
+    (Ir.t_notrep, false, op - Op.op_notstar)
+  else
+    (* 72..84 caseless NOT *)
+    (Ir.t_notrepi, true, op - Op.op_notstari)
+
+(* (reptype, lmin, lmax) for a family index and (already-read) count. *)
+let rep_bounds (fidx : int) (count : int) : int * int * int =
+  match fidx with
+  | 0 -> (Ir.reptype_max, 0, Ir.rep_inf) (* STAR *)
+  | 1 -> (Ir.reptype_min, 0, Ir.rep_inf) (* MINSTAR *)
+  | 2 -> (Ir.reptype_max, 1, Ir.rep_inf) (* PLUS *)
+  | 3 -> (Ir.reptype_min, 1, Ir.rep_inf) (* MINPLUS *)
+  | 4 -> (Ir.reptype_max, 0, 1) (* QUERY *)
+  | 5 -> (Ir.reptype_min, 0, 1) (* MINQUERY *)
+  | 6 -> (Ir.reptype_max, 0, count) (* UPTO *)
+  | 7 -> (Ir.reptype_min, 0, count) (* MINUPTO *)
+  | 8 -> (Ir.reptype_min, count, count) (* EXACT — reptype unread (lmin=lmax) *)
+  | 9 -> (Ir.reptype_pos, 0, Ir.rep_inf) (* POSSTAR *)
+  | 10 -> (Ir.reptype_pos, 1, Ir.rep_inf) (* POSPLUS *)
+  | 11 -> (Ir.reptype_pos, 0, 1) (* POSQUERY *)
+  | _ -> (Ir.reptype_pos, 0, count) (* POSUPTO (fidx 12) *)
+
+(* fidx that carry an IMM2 count before the char (UPTO/MINUPTO/EXACT/POSUPTO). *)
+let rep_has_count (fidx : int) : bool =
+  Int.equal fidx 6 || Int.equal fidx 7 || Int.equal fidx 8 || Int.equal fidx 12
+
+(* ---------- optimized_cbracket analysis (pcre2_jit_compile.c:404) ----------
+
+   Port of the JIT's [optimized_cbracket] flag (allocated at :14266, memset
+   to 1 at :14272, cleared at :1145/1159/1173/1184). A capturing bracket is
+   "optimized" (bit stays 1) unless it is reached by a back reference
+   (OP_REF/OP_REFI), a possessive capture (OP_CBRAPOS/OP_SCBRAPOS), a
+   conditional numbered reference (OP_CREF), or a duplicate-name reference
+   (OP_DNREF/OP_DNREFI/OP_DNCREF). An optimized capture never has its
+   ovector slots read mid-match, so [compile_group] may use the slot itself
+   as the in-progress start scratch and save/restore just the 2 slots on
+   backtrack (fast-design.md §3 minimal-save). In THIS chunk's subset every
+   referencing opcode is itself out of scope (chunks F/J/K/G), so all
+   captures come out optimized — but the analysis is written in full so
+   those chunks only need to widen the referencing lowering, not this gate.
+
+   [top_bracket = 0] short-circuits (no captures to analyse). *)
+let optimized_cbracket (re : C.re) : bool array =
+  let src = re.C.code in
+  let top = re.C.top_bracket in
+  let opt = Array.make (top + 1) true in
+  let limit = Bytes.length src in
+  let byte p = Char.code (Bytes.get src p) in
+  let mark n = if n >= 0 && n <= top then opt.(n) <- false in
+  (* Byte length of the opcode item at [p] (op_lengths + the variable-length
+     exceptions), to advance this linear analysis walk. Mirrors the extra
+     byte-count logic of pcre2_printint.c / debug_printer.ml. *)
+  let code_len p =
+    let op = byte p in
+    if Int.equal op Op.op_xclass then C.get src (p + 1)
+    else if Int.equal op Op.op_callout_str then
+      C.get src (p + 1 + (2 * Limits.link_size))
+    else if
+      Int.equal op Op.op_mark || Int.equal op Op.op_prune_arg
+      || Int.equal op Op.op_skip_arg || Int.equal op Op.op_then_arg
+      || Int.equal op Op.op_commit_arg
+    then Op.op_lengths.(op) + byte (p + 1)
+    else if op >= Op.op_typestar && op <= Op.op_typeposupto then (
+      (* A type repeat whose type is \p/\P carries 2 extra property bytes
+         (debug_printer.ml:373-385). The type byte follows the IMM2 count for
+         TYPEUPTO/TYPEMINUPTO/TYPEEXACT/TYPEPOSUPTO (family indices 6,7,8,12),
+         else the opcode. *)
+      let fidx = op - Op.op_typestar in
+      let type_off =
+        if rep_has_count fidx then p + 1 + Limits.imm2_size else p + 1
+      in
+      let t = byte type_off in
+      Op.op_lengths.(op)
+      + (if Int.equal t Op.op_prop || Int.equal t Op.op_notprop then 2 else 0))
+    else Op.op_lengths.(op)
+  in
+  let rec go p =
+    (* Defensive: a length miscalculation must never index out of bounds. A
+       conservative early stop only leaves captures optimized (they decline at
+       their referencing opcode during the lowering walk). *)
+    if p < 0 || p + 1 > limit then ()
+    else
+      let op = byte p in
+      if Int.equal op Op.op_end then ()
+      else (
+        (if Int.equal op Op.op_ref || Int.equal op Op.op_refi
+            || Int.equal op Op.op_cref then mark (C.get2 src (p + 1))
+         else if Int.equal op Op.op_cbrapos || Int.equal op Op.op_scbrapos then
+           mark (C.get2 src (p + 1 + Limits.link_size))
+         else if
+           Int.equal op Op.op_dnref || Int.equal op Op.op_dnrefi
+           || Int.equal op Op.op_dncref
+         then
+           let count = C.get2 src (p + 1 + Limits.imm2_size) in
+           let slot0 = C.get2 src (p + 1) * re.C.name_entry_size in
+           for k = 0 to count - 1 do
+             mark (C.get2 re.C.name_table (slot0 + (k * re.C.name_entry_size)))
+           done);
+        let w = code_len p in
+        if w < 1 then () (* defensive: never advance backwards *)
+        else (go [@tailcall]) (p + w))
+  in
+  if top > 0 then go 0;
+  opt
 
 let compile (re : C.re) : (Ir.t, string) result =
   (* Compile-level gates BEFORE the walk (fast-design.md §6, task spec). *)
@@ -118,7 +253,6 @@ let compile (re : C.re) : (Ir.t, string) result =
     Error "fast: UTF mode (chunk I)"
   else if not (Int.equal (re.C.overall_options land Opt.ucp) 0) then
     Error "fast: UCP mode (chunk I)"
-  else if re.C.top_bracket > 0 then Error "fast: capturing groups (chunk D)"
   else if not (Int.equal (re.C.overall_options land Opt.firstline) 0) then
     (* PCRE2_FIRSTLINE constrains an unanchored match to the first line. The
        C enforces this partly through the start-of-match scans' shortened
@@ -156,13 +290,45 @@ let compile (re : C.re) : (Ir.t, string) result =
     let here () : int = !n in
     let set (i : int) (v : int) : unit = !buf.(i) <- v in
     let lit = Buffer.create 32 in
+    let opt_cbracket = optimized_cbracket re in
 
-    (* [compile_group bra_off]: lower the OP_BRA...OP_KET group starting at
-       [bra_off]; returns the bytecode offset just past its KET. Native
-       choice-point lowering per fast-design.md §3. *)
+    (* [compile_group bra_off]: lower a group (OP_BRA / OP_CBRA / OP_SCBRA
+       ... OP_KET) starting at [bra_off]; returns the bytecode offset just
+       past its KET. Native choice-point lowering per fast-design.md §3.
+
+       Non-capturing OP_BRA lowers bra_loop-style (the LAST branch has no
+       choice point; it runs in the enclosing frame — interpreter.ml
+       bra_loop): the runner's rdepth-0 special case still ticks the
+       whole-pattern wrapper's last branch (grouploop at the top level).
+       OP_CBRA/OP_SCBRA lower grouploop-style: EVERY branch (including the
+       last/only one) gets an ALT choice point, and the last ALT's handler
+       is a t_fail so backtracking out of the exhausted group propagates
+       NOMATCH — this reproduces grouploop's per-branch RMATCH tick
+       (interpreter.ml:2434-2444 / grouploop 6635-6657), which a capturing
+       group performs even for its final branch. *)
     let rec compile_group (bra_off : int) : int =
       let op = byte bra_off in
-      if not (Int.equal op Op.op_bra) then raise (Unsupported (reason_of_op op));
+      let is_capture = Int.equal op Op.op_cbra || Int.equal op Op.op_scbra in
+      (* grouploop lowering (ALT for every branch + t_fail) applies to
+         capturing brackets; OP_BRA keeps bra_loop lowering. *)
+      let grouploop = is_capture in
+      if not (Int.equal op Op.op_bra || is_capture) then
+        raise (Unsupported (reason_of_op op));
+      let ovbase =
+        if is_capture then (
+          let num = C.get2 src (bra_off + 1 + Limits.link_size) in
+          (* optimized_cbracket gate: a referenced capture would need its
+             ovector slot to survive as a completed value mid-match, so the
+             direct-slot scratch used by CAP_START/CAP_END is invalid —
+             decline (the referencing opcode is itself out of subset). *)
+          if not opt_cbracket.(num) then
+            raise (Unsupported "fast: referenced capture (chunk F/J/K)");
+          2 * num)
+        else -1
+      in
+      if is_capture then (
+        push Ir.t_cap_start;
+        push ovbase);
       push Ir.t_bra;
       (* Collect branch-body start offsets by following the BRA/ALT link
          chain, and the trailing KET offset (mirrors the interpreter's
@@ -176,7 +342,8 @@ let compile (re : C.re) : (Ir.t, string) result =
       in
       let branch_offs, ket_off = collect bra_off [] in
       let ket_op = byte ket_off in
-      (* A KETRMAX/KETRMIN/KETRPOS bracket is a repeated group (chunk D). *)
+      (* A KETRMAX/KETRMIN/KETRPOS bracket is a repeated group (chunk D
+         declines these; SCBRA/SBRA only ever appear with such a ket). *)
       if not (Int.equal ket_op Op.op_ket) then
         raise (Unsupported (reason_of_op ket_op));
       let nbr = List.length branch_offs in
@@ -190,9 +357,10 @@ let compile (re : C.re) : (Ir.t, string) result =
         (fun i b_off ->
           let entry = here () in
           if !prev_cp >= 0 then set !prev_cp entry;
-          if i < nbr - 1 then (
-            (* Non-last branch: emit its choice point, body, then a jump to
-               the group KET. *)
+          if i < nbr - 1 || grouploop then (
+            (* A branch that records a choice point (every non-last branch,
+               plus a grouploop group's last branch): emit its ALT, body,
+               then a jump to the group KET. *)
             push Ir.t_alt;
             let cp_operand = here () in
             push 0 (* handler placeholder, resolved at next branch entry *);
@@ -203,12 +371,23 @@ let compile (re : C.re) : (Ir.t, string) result =
             push 0 (* target placeholder, resolved after the KET *);
             jmp_fixups := j :: !jmp_fixups)
           else (
-            (* Last branch: no choice point, no jump — flows into the KET. *)
+            (* bra_loop last branch: no choice point, no jump — flows into
+               the KET at the enclosing frame's depth. *)
             prev_cp := -1;
             ignore (compile_branch b_off : int)))
         branch_offs;
+      if grouploop then (
+        (* The last ALT's handler resolves to a t_fail: backtracking out of
+           the exhausted grouploop group propagates NOMATCH (no tick). *)
+        let fail_pc = here () in
+        push Ir.t_fail;
+        if !prev_cp >= 0 then set !prev_cp fail_pc;
+        prev_cp := -1);
       let ket_ir = here () in
-      push Ir.t_ket;
+      if is_capture then (
+        push Ir.t_cap_end;
+        push ovbase)
+      else push Ir.t_ket;
       List.iter (fun j -> set j ket_ir) !jmp_fixups;
       ket_off + Op.op_lengths.(ket_op)
     (* [compile_branch p0]: lower one branch body; stops at (without
@@ -221,6 +400,28 @@ let compile (re : C.re) : (Ir.t, string) result =
         let op = byte !p in
         if Int.equal op Op.op_alt || (op >= Op.op_ket && op <= Op.op_ketrpos)
         then running := false
+        else if is_char_repeat op then (
+          (* Single-char repeat superinstruction (fast-design.md §2; the
+             OP_STAR..OP_NOTPOSUPTOI arms interpreter.ml:1718-1806). Operands
+             pre-decoded: reptype/lmin/lmax and the char (caseless carries
+             the fcc fold-pair, exactly as repeatchar_tail's Loc =
+             mb->fcc[Lc], pcre2_match.c:1393). *)
+          let ir_tag, caseless, fidx = rep_kind op in
+          let count =
+            if rep_has_count fidx then C.get2 src (!p + 1) else 0
+          in
+          let reptype, lmin, lmax = rep_bounds fidx count in
+          let char_off =
+            if rep_has_count fidx then !p + 1 + Limits.imm2_size else !p + 1
+          in
+          let c1 = byte char_off in
+          push ir_tag;
+          push reptype;
+          push lmin;
+          push lmax;
+          push c1;
+          if caseless then push (Chartables.fcc c1);
+          p := !p + Op.op_lengths.(op))
         else if Int.equal op Op.op_char then (
           (* pcre2_jit_compile.c:7479 (byte_sequence_compare) — fuse
              consecutive caseful OP_CHARs into one CHAR_RUN over the literal
@@ -254,7 +455,10 @@ let compile (re : C.re) : (Ir.t, string) result =
           push Ir.t_chari;
           push (byte (!p + 1));
           p := !p + Op.op_lengths.(Op.op_chari))
-        else if Int.equal op Op.op_bra then p := compile_group !p
+        else if
+          Int.equal op Op.op_bra || Int.equal op Op.op_cbra
+          || Int.equal op Op.op_scbra
+        then p := compile_group !p
         else
           match anchor_tag op with
           | Some tag ->

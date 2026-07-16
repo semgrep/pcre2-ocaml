@@ -89,27 +89,19 @@ let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
     E.exec_result =
   let o = R.exec re ~subject ~offset ~options:(Opt.of_int32 options) in
   if o.R.orc > 0 then
-    E.Match { ovector = [| o.R.ostart; o.R.oend |]; mark = None; start_char = o.R.ostart }
+    (* [ovec] holds the pcre2 rc pairs (Engine.exec_full's shape): the whole
+       match + captures up to the high-water group; consumers pad the rest. *)
+    E.Match { ovector = o.R.ovec; mark = None; start_char = o.R.ostart }
   else if Int.equal o.R.orc Errors.error_nomatch then E.No_match { mark = None }
   else if Int.equal o.R.orc Errors.error_partial then
     E.Partial { start = o.R.ostart; mark = None }
   else E.Error { code = o.R.orc; start_char = 0 }
 
-let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
-    (((int * int) array * (string * int) array) option, int) result =
-  let o = R.exec re ~subject ~offset ~options:(Opt.of_int32 options) in
-  if o.R.orc > 0 then
-    (* top_bracket = 0 in this subset: a single ovector pair, no name table. *)
-    Ok (Some ([| (o.R.ostart, o.R.oend) |], [||]))
-  else if Int.equal o.R.orc Errors.error_nomatch
-          || Int.equal o.R.orc Errors.error_partial
-  then Ok None
-  else Error o.R.orc
-
-(* top_bracket = 0 in this subset -> no named groups. Built from the pinned
-   [Compile.re] (Engine.t is abstract at the seam, so we cannot delegate to
-   Engine.info/Engine.capture_groups): identical fields to Engine.info /
-   Engine.capture_groups (engine.ml:59-90). *)
+(* Named groups: (name, group_number) in PCRE2 name-table order. Built from
+   the pinned [Compile.re] (Engine.t is abstract at the seam, so we cannot
+   delegate to Engine.capture_groups): identical to Engine.capture_groups
+   (engine.ml:59-90). Now that captures are supported the table is non-empty
+   whenever the pattern uses (?<name>...). *)
 let capture_groups (re : t) : (string * int) array =
   let r = re.Ir.re in
   Array.init r.C.name_count (fun i ->
@@ -117,12 +109,29 @@ let capture_groups (re : t) : (string * int) array =
       let number = C.get2 r.C.name_table base in
       let start = base + Pcre2_engine.Limits.imm2_size in
       let len = ref 0 in
-      while
-        not (Char.equal (Bytes.get r.C.name_table (start + !len)) '\000')
-      do
+      while not (Char.equal (Bytes.get r.C.name_table (start + !len)) '\000') do
         incr len
       done;
       (Bytes.sub_string r.C.name_table start !len, number))
+
+let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
+    (((int * int) array * (string * int) array) option, int) result =
+  let o = R.exec re ~subject ~offset ~options:(Opt.of_int32 options) in
+  if o.R.orc > 0 then (
+    (* Pad [ovec] (2*rc slots) up to top_bracket+1 pairs with (-1,-1), exactly
+       Engine.exec_captures (engine.ml:200-211). *)
+    let n = re.Ir.re.C.top_bracket + 1 in
+    let len = Array.length o.R.ovec in
+    let pairs =
+      Array.init n (fun i ->
+          if (2 * i) + 1 < len then (o.R.ovec.((2 * i)), o.R.ovec.((2 * i) + 1))
+          else (-1, -1))
+    in
+    Ok (Some (pairs, capture_groups re)))
+  else if Int.equal o.R.orc Errors.error_nomatch
+          || Int.equal o.R.orc Errors.error_partial
+  then Ok None
+  else Error o.R.orc
 
 let info (re : t) : E.info =
   let r = re.Ir.re in

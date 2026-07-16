@@ -65,6 +65,36 @@ following the tag. Widths are `Ir.arity`:
 | 10 | `EODN` | — | 1 | `\Z` (end, or newline at end) |
 | 11 | `CIRC` | — | 1 | `^` (non-multiline) |
 | 12 | `DOLL` | — | 1 | `$` (non-multiline) |
+| 13 | `CIRCM` | — | 1 | `^` multiline (OP_CIRCM); runner mirrors interpreter.ml:3108-3124 via `Newline.was_newline` |
+| 14 | `DOLLM` | — | 1 | `$` multiline (OP_DOLLM); interpreter.ml:3126-3161 via `Newline.is_newline` |
+| 15 | `FAIL` | — | 1 | grouploop exhausted: propagate backtrack (no tick). A last-branch ALT's handler; forward flow JMPs over it |
+| 16 | `CAP_START` | `ovbase` | 2 | open capture N (`ovbase = 2N`): push a CAP cleanup record, set `ovector[ovbase]` to the current position |
+| 17 | `CAP_END` | `ovbase` | 2 | close capture N (the group's ket): set `ovector[ovbase+1]` to the current position |
+| 18 | `REP` | `reptype; lmin; lmax; c` | 5 | caseful single-char repeat |
+| 19 | `REPI` | `reptype; lmin; lmax; c1; c2` | 6 | caseless single-char repeat (`c2 = fcc(c1)`) |
+| 20 | `NOTREP` | `reptype; lmin; lmax; c` | 5 | caseful negated-char repeat (match `≠ c`) |
+| 21 | `NOTREPI` | `reptype; lmin; lmax; c1; c2` | 6 | caseless negated-char repeat (match `∉ {c1,c2}`) |
+
+**Chunk D additions.** `CIRCM`/`DOLLM` are the multiline anchors (their arms
+carry no operands; runtime semantics only). `CAP_START`/`CAP_END` bracket a
+capturing group; the group's *ket* IS the `CAP_END` (the branch `JMP`s target
+it), so a capturing group emits no separate `KET`. `FAIL` marks a
+grouploop group's exhaustion.
+
+**Repeat superinstructions** (`REP`/`REPI`/`NOTREP`/`NOTREPI`). The 13 C
+opcode families (STAR MINSTAR PLUS MINPLUS QUERY MINQUERY UPTO MINUPTO EXACT
+POSSTAR POSPLUS POSQUERY POSUPTO) × {caseful, caseless} × {plain, NOT}
+(OP_STAR..OP_NOTPOSUPTOI, 33-84) collapse to FOUR tags, distinguished only by
+case-ness and NOT-ness; the family collapses into the pre-decoded operands
+`reptype` (0 min / 1 max / 2 pos), `lmin`, `lmax` (= `Ir.rep_inf` =
+`0xFFFFFFFF` for STAR/PLUS, matching interpreter.ml `uint32_max`), and the
+char pool: `c` (caseful) or the `c1`/`c2` fold-pair (caseless, `c2 = fcc(c1)`;
+NOT variants test `∉`). `Ir.dump` shows `REP <ty> {min,max} "c"` (or
+`"c1/c2"`). EXACT is `lmin = lmax` with `reptype` unread.
+`Ir_compile.rep_kind`/`rep_bounds` decode the opcode; the char follows the
+opcode (offset +1) or the IMM2 count (offset +1+IMM2 for UPTO/MINUPTO/EXACT/
+POSUPTO). Type repeats OP_TYPESTAR..OP_TYPEPOSUPTO (85-97) and class repeats
+OP_CRSTAR.. stay declined (chunk E).
 
 `BRA`/`KET` are emitted as no-op markers so the IR mirrors the bytecode structure (readable
 dumps, jump targets land on real heads); the runner (chunk C2) advances past them. Simple
@@ -90,7 +120,8 @@ C2+)"`.
 `Ir_compile.compile : Compile.re -> (Ir.t, string) result` walks `re.code` (mirroring
 debug_printer.ml's opcode walk; LINK_SIZE = 2 via `Compile.get`). Compile-level gates run
 BEFORE the walk: UTF/UCP option bits → `"fast: UTF mode (chunk I)"` / `"... UCP mode ..."`;
-`top_bracket > 0` → `"fast: capturing groups (chunk D)"`. The first out-of-subset opcode
+`PCRE2_FIRSTLINE` → `"... (chunk L)"`. (Chunk D removed the `top_bracket > 0`
+gate — capturing groups are now lowered.) The first out-of-subset opcode
 yields `Error "fast: <construct> (chunk X)"` (taxonomy §6).
 
 ## §3 Runner and save records (choice-point IR landed in C1; runner in C2)
@@ -136,21 +167,56 @@ single-branch group emits just `BRA … KET` (no choice point).
   under bounds-proof comments. Cold instructions go out-of-line (icache; global `-inline`
   regressed in M10).
 
-**Save-record layout (landed in chunk C2, `save_stack.ml`).** A record is a fixed
-`record_width = 3` ints, pushed at each `ALT` (and popped on backtrack), low index first:
+**Save-record layout (chunk C2 + chunk D, `save_stack.ml`).** Records are now
+VARIABLE width. The discriminator `kind` is the record's TOP slot (highest
+index) so `backtrack` reads it at `data.(sp-1)` and derives the record base
+without knowing the type in advance; each kind has a fixed width. Low index
+first:
 
-| slot | field | meaning |
-|---|---|---|
-| 0 | `handler` | IR index to resume at on backtrack (= the `ALT`'s `next`) |
-| 1 | `eptr` | subject position to restore |
-| 2 | `rdepth` | virtual frame depth to restore (§4 shadow accounting) |
+| kind | width | layout | pushed at | on backtrack |
+|---|---|---|---|---|
+| `KIND_ALT` | 4 | `handler; eptr; rdepth; KIND_ALT` | each `ALT` | resume the next alternative at `handler` (restore `eptr`/`rdepth`) |
+| `KIND_CAP` | 4 | `ovbase; old_start; old_end; KIND_CAP` | each `CAP_START` | restore `ovector[ovbase]`/`[ovbase+1]`, then keep popping |
+| `KIND_REP_MAX` | 5 | `rep_pc; try_pos; floor; rdepth; KIND_REP_MAX` | greedy repeat with extra chars | retry the continuation at `try_pos` (decrement to `floor`) |
+| `KIND_REP_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REP_MIN` | minimizing repeat with `lmin<lmax` | match one more char at `eptr`, retry the continuation |
 
-`match_call_count`, `hitend`, `start_used_ptr` are NOT saved — the first is monotonic
-(never restored), the second monotonic within an attempt, the third constant per attempt.
-`sp` (the stack top, an int count) is a runner tail-call parameter; push/pop are explicit
-`ss.data.(sp+k)` index arithmetic inlined at the `ALT`/backtrack sites. The stack resets to
-`sp = 0` per attempt (write-before-read; no clearing). Backtracking with `sp = 0` returns
-`MATCH_NOMATCH` (the C's RRETURN unwinding to frame 0).
+`match_call_count`, `hitend`, `start_used_ptr` are NOT saved (monotonic /
+constant per attempt). `sp` is a runner tail-call parameter; push/pop are
+explicit index arithmetic. The stack resets to `sp = 0` per attempt.
+Backtracking with `sp = 0` returns `MATCH_NOMATCH`.
+
+**Capture save sets (chunk D — the minimal-save design).** A single global
+`mb.ovector` (size `2*(top_bracket+1)`, reused across execs, group slots reset
+to UNSET per attempt) holds the whole match at `[0,1]` and group N at
+`[2N,2N+1]`. Rather than a full-ovector copy at every choice point, each
+capturing bracket cleans up ITSELF locally (mirroring the JIT's per-cbracket
+entry-save / exhaustion-restore, `pcre2_jit_compile.c:11045-11054` /
+`13443-13452`): `CAP_START N` pushes a `KIND_CAP` record saving group N's two
+slots and sets `ovector[2N]` to the current position; `CAP_END N` sets
+`ovector[2N+1]`; on backtracking PAST the entry the `KIND_CAP` record restores
+both slots and keeps popping. So a branch that can write group k's ovector
+saves/restores exactly those two slots — computed at IR-compile time (one
+`CAP_START`/`CAP_END` pair per capturing bracket), never a wide per-choice-
+point copy. `ALT`/repeat choice points therefore save NO ovector slots; the
+enclosing group's cleanup already rolls back everything a failed branch wrote
+(verified: `(?:(a)x|ay)` on "ay" gives group 1 unset, matching the interp).
+`rc` (the pcre2 pair count) is recomputed at END as `highest set group + 1`
+(= the interpreter's `end_offset_top/2 + 1`), not tracked incrementally.
+
+**`optimized_cbracket` (`pcre2_jit_compile.c:404`, cleared `:1145-1184`).**
+`Ir_compile.optimized_cbracket` ports the JIT flag: a capture is "optimized"
+(its ovector slot may double as the in-progress start scratch, as `CAP_START`
+does) UNLESS reached by `OP_REF`/`OP_REFI` (`:1145`), `OP_CREF` (`:1173`),
+`OP_DNREF`/`OP_DNREFI`/`OP_DNCREF` (`:1180-1186`), or `OP_CBRAPOS`/
+`OP_SCBRAPOS` (`:1159`). A linear analysis walk over `re.code` (with a
+byte-length helper covering the variable-length opcodes — XCLASS, CALLOUT_STR,
+arg-verbs, and type-repeat-of-`\p`) clears the bit for referenced groups; a
+non-optimized capture is declined at `CAP_START` (`"fast: referenced capture
+(chunk F/J/K)"`). In this chunk's subset every referencing opcode is itself
+out of scope, so ALL captures come out optimized — chunks F/J/K widen the
+referencing lowering and add the private-scratch path, flipping bits off
+without changing this gate. The walk is written to never index out of bounds
+(a conservative early stop only leaves captures optimized).
 
 **Scratch policy (chunk C2).** `save_stack.ml` retains ONE module-level `int array` across
 execs, guarded by its OWN `Atomic.t busy` flag (NOT Frames' scratch slot); a concurrent exec
@@ -197,14 +263,36 @@ child frame. `grouploop`'s single/last branch ticks (the top level "can't optimi
 | `BRA`, single-branch, `d = 0` (top-level group) | 1 (rdepth 1) | 1 | frame 1 |
 | `BRA`, single-branch, `d >= 1` (nested group) | 0 | `d` | none |
 | `ALT` (any non-last branch entry) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
-| backtrack pop → handler is non-`ALT`, saved `d = 0` (top-level last branch) | 1 (rdepth 1) | 1 | frame 1 |
-| backtrack pop → handler is `ALT`, or saved `d >= 1` | 0 | saved `d` | none |
-| `JMP`, `KET`, `CHAR_RUN`, `CHARI`, `SOD`/`SOM`/`EOD`/`EODN`/`CIRC`/`DOLL`, `END` | 0 | unchanged | none |
+| backtrack pop `KIND_ALT` → handler non-`ALT`/`FAIL`, saved `d = 0` (top-level last branch) | 1 (rdepth 1) | 1 | frame 1 |
+| backtrack pop `KIND_ALT` → handler is `ALT`/`FAIL`, or saved `d >= 1` | 0 | saved `d` | none |
+| `JMP`, `KET`, `CHAR_RUN`, `CHARI`, `SOD`/`SOM`/`EOD`/`EODN`/`CIRC`/`DOLL`/`CIRCM`/`DOLLM`, `END` | 0 | unchanged | none |
+| `CAP_START`, `CAP_END`, `FAIL` | 0 | unchanged | none |
+| repeat min-loop / greedy scan (per char consumed) | 0 | unchanged | none |
+| `REP`/`REPI`/`NOTREP`/`NOTREPI` EXACT (`lmin=lmax`) or possessive | 0 | unchanged | none |
+| minimize repeat, `lmin<lmax`: first continuation try (push `KIND_REP_MIN`) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| backtrack pop `KIND_REP_MIN`: extend one char + retry (`count<lmax`, matches) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| backtrack pop `KIND_REP_MIN`: `count>=lmax` / end / mismatch | 0 | — | none (pop, propagate) |
+| maximize repeat, greedy end `> floor`: first continuation try (push `KIND_REP_MAX`) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| maximize repeat, greedy end `= floor`: continuation in place | 0 | `d` | none |
+| backtrack pop `KIND_REP_MAX`: `try_pos > floor` (give back one) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| backtrack pop `KIND_REP_MAX`: `try_pos = floor` (min position, in place) | 0 | `d` | none (pop) |
 
-The only `grouploop` group in this subset is the whole-pattern outer `BRA` (dispatched at
-rdepth 0 — nested groups are always entered from a child branch, rdepth `>= 1`). Its last
-branch is reached either by falling through the `BRA` (single-branch) or via the preceding
-`ALT`'s handler landing on a non-`ALT` head with saved `d = 0`; both tick (rows 3 and 6).
+The whole-pattern outer `BRA` (dispatched at rdepth 0) is `grouploop` at the
+top level; nested `OP_BRA` is `bra_loop` (rdepth `>= 1`, no THEN in chunk D).
+Its last branch is reached either by falling through the `BRA` (single-branch)
+or via the preceding `ALT`'s handler landing on a non-`ALT`/`FAIL` head with
+saved `d = 0`; both tick.
+
+**Capturing groups (chunk D) are `grouploop`, so their LAST branch ticks too.**
+`OP_CBRA`/`OP_SCBRA` (interpreter.ml:2434-2444 → `grouploop`) record a
+backtracking point for EVERY branch, including the final one, unlike a nested
+`bra_loop` `OP_BRA` whose last branch runs in the enclosing frame. The IR
+mirrors this by emitting an `ALT` choice point for every branch of a capturing
+group and pointing the LAST `ALT`'s handler at a `FAIL` (so exhaustion
+propagates NOMATCH with no tick). Thus every capturing-group branch ticks at
+`d+1` via its `ALT` (the `ALT` rows), and the `FAIL` head is only reached with
+saved `d >= 1` (captures nest inside the wrapper), never triggering the
+top-level `d = 0` tick. `CAP_START`/`CAP_END` themselves never tick.
 
 **Start-of-match scan is required for tick parity (chunk C2, not deferred).** A skipped
 attempt does ZERO ticks, so a naive bump-along that runs attempts the interpreter's

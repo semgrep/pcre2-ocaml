@@ -31,8 +31,32 @@ let t_eodn = 10 (* [t_eodn]               — \Z (end, or newline at end) *)
 let t_circ = 11 (* [t_circ]               — ^ (non-multiline) *)
 let t_doll = 12 (* [t_doll]               — $ (non-multiline) *)
 
+(* Chunk D additions (fast-design.md §2). *)
+let t_circm = 13 (* [t_circm]              — ^ multiline (OP_CIRCM) *)
+let t_dollm = 14 (* [t_dollm]              — $ multiline (OP_DOLLM) *)
+let t_fail = 15 (* [t_fail]               — grouploop exhausted: backtrack *)
+let t_cap_start = 16 (* [t_cap_start; ovbase]  — open capture N (ovbase = 2N) *)
+let t_cap_end = 17 (* [t_cap_end; ovbase]    — close capture N (the group KET) *)
+
+(* Single-char repeat superinstructions. reptype ∈ {0=min,1=max,2=pos};
+   lmin/lmax pre-decoded (lmax = [rep_inf] for STAR/PLUS); the char pool is
+   inline in the operands (caseless carries the fold-pair c1/c2). *)
+let t_rep = 18 (* [t_rep;    reptype; lmin; lmax; c]      — caseful char rep *)
+let t_repi = 19 (* [t_repi;   reptype; lmin; lmax; c1; c2] — caseless char rep *)
+let t_notrep = 20 (* [t_notrep; reptype; lmin; lmax; c]      — caseful NOT rep *)
+let t_notrepi = 21 (* [t_notrepi;reptype; lmin; lmax; c1; c2] — caseless NOT rep *)
+
+(* Repeat type constants (mirror interpreter.ml:106-108 reptype min/max/pos). *)
+let reptype_min = 0
+let reptype_max = 1
+let reptype_pos = 2
+
+(* [lmax] sentinel for an unbounded repeat (STAR/PLUS/POSSTAR/POSPLUS):
+   0xFFFFFFFF, exactly the interpreter's uint32_max (interpreter.ml:115). *)
+let rep_inf = 0xFFFFFFFF
+
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 12
+let max_tag = 21
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -52,6 +76,15 @@ let arity =
     1 (* t_eodn *);
     1 (* t_circ *);
     1 (* t_doll *);
+    1 (* t_circm *);
+    1 (* t_dollm *);
+    1 (* t_fail *);
+    2 (* t_cap_start: ovbase *);
+    2 (* t_cap_end: ovbase *);
+    5 (* t_rep: reptype, lmin, lmax, c *);
+    6 (* t_repi: reptype, lmin, lmax, c1, c2 *);
+    5 (* t_notrep: reptype, lmin, lmax, c *);
+    6 (* t_notrepi: reptype, lmin, lmax, c1, c2 *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -71,6 +104,15 @@ let tag_name =
     "EODN";
     "CIRC";
     "DOLL";
+    "CIRCM";
+    "DOLLM";
+    "FAIL";
+    "CAP_START";
+    "CAP_END";
+    "REP";
+    "REPI";
+    "NOTREP";
+    "NOTREPI";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -101,6 +143,20 @@ let alt_next (ir : t) (pc : int) : int = ir.code.(pc + 1)
 
 (* [t_jmp] operand — absolute IR index of the enclosing group's KET. *)
 let jmp_target (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* [t_cap_start] / [t_cap_end] operand — the ovector base index 2N of the
+   captured group (its slots are [ovbase], [ovbase+1]). *)
+let cap_ovbase (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* Repeat operands. reptype/lmin/lmax are common to all four repeat tags;
+   [rep_c1]/[rep_c2] are the char (caseful) or fold-pair (caseless). *)
+let rep_reptype (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let rep_lmin (ir : t) (pc : int) : int = ir.code.(pc + 2)
+let rep_lmax (ir : t) (pc : int) : int = ir.code.(pc + 3)
+let rep_c1 (ir : t) (pc : int) : int = ir.code.(pc + 4)
+
+(* Only [t_repi]/[t_notrepi] carry a second (other-case) char at offset 5. *)
+let rep_c2 (ir : t) (pc : int) : int = ir.code.(pc + 5)
 
 (* ---------- Text dump (fast-design.md §2) ----------
    Stable, debug_printer.ml-style listing for golden tests: one line per
@@ -135,6 +191,33 @@ let render (ir : t) (pc : int) (t : int) : string =
     Buffer.contents buf)
   else if Int.equal t t_alt then Printf.sprintf "ALT next=%d" (alt_next ir pc)
   else if Int.equal t t_jmp then Printf.sprintf "JMP %d" (jmp_target ir pc)
+  else if Int.equal t t_cap_start then
+    Printf.sprintf "CAP_START ovbase=%d" (cap_ovbase ir pc)
+  else if Int.equal t t_cap_end then
+    Printf.sprintf "CAP_END ovbase=%d" (cap_ovbase ir pc)
+  else if
+    Int.equal t t_rep || Int.equal t t_repi || Int.equal t t_notrep
+    || Int.equal t t_notrepi
+  then (
+    let ty = rep_reptype ir pc in
+    let tystr =
+      if Int.equal ty reptype_min then "min"
+      else if Int.equal ty reptype_max then "max"
+      else "pos"
+    in
+    let lmax = rep_lmax ir pc in
+    let lmaxstr = if Int.equal lmax rep_inf then "inf" else string_of_int lmax in
+    let buf = Buffer.create 24 in
+    Buffer.add_string buf tag_name.(t);
+    Buffer.add_char buf ' ';
+    Buffer.add_string buf tystr;
+    Buffer.add_string buf (Printf.sprintf " {%d,%s} \"" (rep_lmin ir pc) lmaxstr);
+    add_escaped buf (rep_c1 ir pc);
+    if Int.equal t t_repi || Int.equal t t_notrepi then (
+      Buffer.add_char buf '/';
+      add_escaped buf (rep_c2 ir pc));
+    Buffer.add_char buf '"';
+    Buffer.contents buf)
   else tag_name.(t)
 
 let dump (ppf : Format.formatter) (ir : t) : unit =

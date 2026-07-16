@@ -201,6 +201,67 @@ let goldens : (string * string) list =
           " 10 KET";
           " 11 END";
         ] );
+    (* Chunk D: a capturing group lowers grouploop-style (EVERY branch gets a
+       choice point; the last ALT points to a FAIL). CAP_START opens the
+       capture, CAP_END is its ket. *)
+    ( "(a)",
+      g
+        [
+          "  0 BRA";
+          "  1 CAP_START ovbase=2";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 12";
+          " 11 FAIL";
+          " 12 CAP_END ovbase=2";
+          " 14 KET";
+          " 15 END";
+        ] );
+    ( "(a|b)",
+      g
+        [
+          "  0 BRA";
+          "  1 CAP_START ovbase=2";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 19";
+          " 11 ALT next=18";
+          " 13 CHAR_RUN \"b\"";
+          " 16 JMP 19";
+          " 18 FAIL";
+          " 19 CAP_END ovbase=2";
+          " 21 KET";
+          " 22 END";
+        ] );
+    (* Char-repeat superinstructions (auto-possessified / minimizing forms). *)
+    ("a*", g [ "  0 BRA"; "  1 REP pos {0,inf} \"a\""; "  6 KET"; "  7 END" ]);
+    ("a+?", g [ "  0 BRA"; "  1 REP min {1,inf} \"a\""; "  6 KET"; "  7 END" ]);
+    (* {2,4} decomposes into an EXACT(2) then a POSUPTO(0,2). *)
+    ( "a{2,4}",
+      g
+        [
+          "  0 BRA";
+          "  1 REP min {2,2} \"a\"";
+          "  6 REP pos {0,2} \"a\"";
+          " 11 KET";
+          " 12 END";
+        ] );
+    (* Caseless repeat carries the fcc fold-pair. *)
+    ( "(?i)a*",
+      g [ "  0 BRA"; "  1 REPI pos {0,inf} \"a/A\""; "  7 KET"; "  8 END" ] );
+    (* Multiline anchors. *)
+    ( "(?m)^a$",
+      g
+        [
+          "  0 BRA";
+          "  1 CIRCM";
+          "  2 CHAR_RUN \"a\"";
+          "  5 DOLLM";
+          "  6 KET";
+          "  7 END";
+        ] );
   ]
 
 let golden_tests =
@@ -225,11 +286,14 @@ let unsupported_reason (pat : string) : string =
 let unsupported_cases : (string * string * string) list =
   [
     (* (label, pattern, expected reason) *)
-    ("capture group", "(abc)", "fast: capturing groups (chunk D)");
     ("character class", "[abc]", "fast: OP_CLASS (chunk E)");
-    (* A backreference needs a capturing group, so the top_bracket gate
-       (chunk D) fires before the OP_REF walk reason (chunk F). *)
-    ("backreference", "(a)\\1", "fast: capturing groups (chunk D)");
+    (* A back-referenced capture is declined at CAP_START by the
+       optimized_cbracket gate (chunk F/J/K): its ovector slot cannot be used
+       as the in-progress start scratch. *)
+    ("referenced capture", "(a)\\1", "fast: referenced capture (chunk F/J/K)");
+    ("optional group", "(a)?b", "fast: OP_BRAZERO (chunk D)");
+    ("repeated group", "(a)+", "fast: repeated group (KETRMAX) (chunk D)");
+    ("type repeat", "\\d+", "fast: type repeat (chunk E)");
     ("UTF mode", "(*UTF)abc", "fast: UTF mode (chunk I)");
     ("verb", "a(*FAIL)", "fast: verb (chunk H)");
   ]
@@ -263,6 +327,22 @@ let supported_patterns =
     "a(?:b(?:c|d)e|f)g";
     "aXb(?:c|d)";
     "(?:)";
+    (* Chunk D: captures + char repeats + multiline anchors. *)
+    "(a)";
+    "(a|b)";
+    "(a)(b)";
+    "((a)(b))";
+    "(a)b|c";
+    "(?:(a)|b)c";
+    "a*";
+    "a+?";
+    "a{2,4}";
+    "(?i)a*";
+    "a*b";
+    "(a*)b";
+    "(?m)^a$";
+    "(a)(b)(c)(d)";
+    "x(a+)x";
   ]
 
 let verify_ok = function
@@ -376,23 +456,46 @@ let sweep_patterns =
     "(?i)HELLO";
     "^(?:a|b)$";
     "\\Ga|\\Gb";
-    (* unsupported (declined; verify not invoked) *)
+    (* Chunk D: captures, char repeats, multiline anchors. *)
     "(abc)";
-    "[a-z]";
+    "(a)(b)(c)";
+    "((a)(b))";
+    "(a|b)c";
+    "(?:(a)x|ay)";
+    "a*";
     "a+";
+    "a?";
+    "a*?";
+    "a+?";
+    "a??";
+    "a{2,4}";
+    "a{3}";
+    "a{2,}";
+    "(?i)a*";
+    "[^a]*x";  (* [^a] compiles to OP_NOT, so this is a supported NOTREP *)
+    "a*b";
+    "(a*)b";
+    "(a+)(b+)";
+    "(?m)^abc$";
+    "(?m)^(a|b)$";
+    "a{2,4}b";
+    "(a)b|c";
+    (* unsupported (declined; verify not invoked) *)
+    "[a-z]";
     "a.b";
     "\\d+";
     "(a)\\1";
     "(?=x)";
     "(?!x)";
     "(?<=x)";
-    "a{2,3}";
     "(*UTF)a";
     "\\p{L}";
-    "(?m)^a";
     "a\\b";
     "\\Kabc";
     "(?>ab)";
+    "(a)?b";
+    "(a)+";
+    "\\p{Common}{3}(())";
   ]
 
 let sweep_tests =
@@ -435,10 +538,20 @@ let o_endanchored = 0x20000000l
 let o_bad = 0x00000100l (* PCRE2_FIRSTLINE — not a valid MATCH option -> -34 *)
 
 (* A comparable normal form of an exec_result (mark is always None in this
-   subset, so it is not compared; startchar is folded in for Match/Partial). *)
+   subset, so it is not compared; startchar is folded in for Match/Partial).
+   The WHOLE ovector is compared (rc pair count = its length / 2) so capture
+   values / rc high-water divergences are caught, not just the overall span. *)
 let norm : E.exec_result -> string = function
   | E.Match { ovector; start_char; _ } ->
-      Printf.sprintf "M[%d,%d]@%d" ovector.(0) ovector.(1) start_char
+      let b = Buffer.create 32 in
+      Buffer.add_string b (Printf.sprintf "M@%d[" start_char);
+      Array.iteri
+        (fun i x ->
+          if i > 0 then Buffer.add_char b ',';
+          Buffer.add_string b (string_of_int x))
+        ovector;
+      Buffer.add_char b ']';
+      Buffer.contents b
   | E.No_match _ -> "NM"
   | E.Partial { start; _ } -> Printf.sprintf "P%d" start
   | E.Error { code; _ } -> Printf.sprintf "E%d" code
@@ -510,6 +623,60 @@ let parity_cases : (string * string * int * int32) list =
     ("abc", "ab", 5, 0l);
     ("abc", "abc", -1, 0l);
     ("abc", "abc", 0, o_bad);
+    (* --- Chunk D: captures --- *)
+    ("(a)", "a", 0, 0l);
+    ("(a)(b)", "ab", 0, 0l);
+    ("((a)(b))", "ab", 0, 0l);
+    (* alternation clobbers group 1, restored on backtrack (unset in result) *)
+    ("(?:(a)x|ay)", "ay", 0, 0l);
+    ("(?:a(b)y|abz)(c)", "abzc", 0, 0l);
+    (* unset trailing group + rc high-water *)
+    ("(?:(a)|(b))c", "bc", 0, 0l);
+    ("(a)b|c", "c", 0, 0l);
+    ("(a)b|c", "ab", 0, 0l);
+    (* nested + adjacent captures, rc = 5 *)
+    ("(a)(b)(c)(d)", "abcd", 0, 0l);
+    (* caseless capture *)
+    ("(?i)(a)b", "Ab", 0, 0l);
+    (* capture around a repeat *)
+    ("(a*)b", "aaab", 0, 0l);
+    ("(a*)ab", "aaab", 0, 0l);
+    ("x(a+)x", "xaaax", 0, 0l);
+    (* --- Chunk D: char repeats at boundaries --- *)
+    ("a*", "aaa", 0, 0l);
+    ("a*", "", 0, 0l);
+    ("a*b", "aab", 0, 0l);
+    ("a+", "aaa", 0, 0l);
+    ("a+", "", 0, 0l);
+    ("a+?b", "aaab", 0, 0l);
+    ("a*?b", "aaab", 0, 0l);
+    ("a??b", "ab", 0, 0l);
+    ("a{2,4}", "aaaaa", 0, 0l); (* EXACT + POSUPTO *)
+    ("a{2,4}", "a", 0, 0l);
+    ("a{3}", "aaaa", 0, 0l);
+    ("a{2,}", "aaaa", 0, 0l);
+    ("ab*c", "abbbc", 0, 0l);
+    ("ab*c", "ac", 0, 0l);
+    (* NOT variants (negated char repeats) *)
+    ("[^a]*b", "xyzb", 0, 0l);
+    ("[^a]+b", "b", 0, 0l);
+    ("(?i)[^a]*z", "XYz", 0, 0l);
+    (* empty-capable repeat matching empty *)
+    ("a*", "b", 0, 0l);
+    (* possessive-vs-following backtrack boundary *)
+    ("a*a", "aaa", 0, 0l);
+    (* PARTIAL interplay with repeats *)
+    ("a{3}", "aa", 0, o_partial_hard);
+    ("a{3}", "aa", 0, o_partial_soft);
+    ("xa+", "xaa", 0, o_partial_soft);
+    ("a+b", "aaa", 0, o_partial_hard);
+    (* --- Chunk D: multiline anchors --- *)
+    ("(?m)^b", "a\nb", 0, 0l);
+    ("(?m)b$", "b\na", 0, 0l);
+    ("(?m)^a$", "x\na\ny", 0, 0l);
+    ("(?m)^", "a\nb", 1, 0l);
+    ("(?m)^a", "a", 0, o_notbol);
+    ("(?m)a$", "a", 0, o_noteol);
   ]
 
 let parity_tests =
@@ -542,8 +709,8 @@ let parity_tests =
    needs 7 ticks (frame 0 + 6 branch entries), so N <= 6 => -47, N >= 7 =>
    Match. Both engines are pinned. *)
 let limit_match_boundary_test =
-  let run_both n subj =
-    let pat = Printf.sprintf "(*LIMIT_MATCH=%d)a|b|c|d|e|f" n in
+  let run_both pat_body n subj =
+    let pat = Printf.sprintf "(*LIMIT_MATCH=%d)%s" n pat_body in
     match (F.compile pat 0l, E.compile pat 0l) with
     | Ok fre, Ok ere ->
         (norm (F.exec_full fre subj 0 0l), norm (E.exec_full ere subj 0 0l))
@@ -552,18 +719,29 @@ let limit_match_boundary_test =
   [
     Alcotest.test_case "LIMIT_MATCH boundary (fast == interp)" `Quick (fun () ->
         (* below the boundary: both hit the match limit *)
-        let f6, e6 = run_both 6 "f" in
+        let f6, e6 = run_both "a|b|c|d|e|f" 6 "f" in
         Alcotest.(check string) "N=6 interp is MATCHLIMIT" "E-47" e6;
         Alcotest.(check string) "N=6 fast == interp" e6 f6;
         (* at the boundary: both complete the match *)
-        let f7, e7 = run_both 7 "f" in
-        Alcotest.(check string) "N=7 interp matches" "M[0,1]@0" e7;
+        let f7, e7 = run_both "a|b|c|d|e|f" 7 "f" in
+        Alcotest.(check string) "N=7 interp matches" "M@0[0,1]" e7;
         Alcotest.(check string) "N=7 fast == interp" e7 f7;
         (* a non-matching subject: the start bitmap skips every attempt on
            both sides, so neither ticks -> both NOMATCH regardless of N *)
-        let f1z, e1z = run_both 1 "z" in
+        let f1z, e1z = run_both "a|b|c|d|e|f" 1 "z" in
         Alcotest.(check string) "N=1/z interp NOMATCH" "NM" e1z;
         Alcotest.(check string) "N=1/z fast == interp" e1z f1z);
+    Alcotest.test_case "LIMIT_MATCH boundary, greedy repeat (fast == interp)"
+      `Quick (fun () ->
+        (* [a*ab] on "aaaaab": the greedy a* over-eats, then backs off one 'a'
+           at a time (each retry a tick). Boundary N=4 on both engines: the
+           frame-0 tick + the group branch + the give-back attempts. *)
+        let f3, e3 = run_both "a*ab" 3 "aaaaab" in
+        Alcotest.(check string) "N=3 interp is MATCHLIMIT" "E-47" e3;
+        Alcotest.(check string) "N=3 fast == interp" e3 f3;
+        let f4, e4 = run_both "a*ab" 4 "aaaaab" in
+        Alcotest.(check string) "N=4 interp matches" "M@0[0,6]" e4;
+        Alcotest.(check string) "N=4 fast == interp" e4 f4);
   ]
 
 (* ---------- 7. alloc pins ----------
@@ -614,6 +792,30 @@ let alloc_tests =
                   %.1f words/exec"
                  delta)
               true (delta < 60.));
+    (* A capture + repeat pattern with heavy backtracking must still allocate
+       O(1) per failing attempt (the CAP cleanup and REP records live in the
+       reused save stack; the ovector is the reused scratch). *)
+    Alcotest.test_case "alloc: O(1) per ~50k failing capture+repeat attempts"
+      `Slow (fun () ->
+        match F.compile "(a+)(b+)Z" 0l with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            let subject = String.make 50_000 'a' in
+            (match F.exec re subject 0 0l with
+            | Ok None -> ()
+            | _ -> Alcotest.fail "expected no match (warm-up)");
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            (match r with
+            | Ok None -> ()
+            | _ -> Alcotest.fail "expected no match");
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for ~50k capture+repeat \
+                  attempts, measured %.0f words"
+                 delta)
+              true (delta < 1000.));
   ]
 
 (* ---------- 8. ulimit-free stack-safety smoke ----------

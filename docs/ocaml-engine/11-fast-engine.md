@@ -54,8 +54,24 @@ interpreter is its differential oracle. Approved plan:
   (first_cu/start_bits/startline/minlength/req_cu, uncached) had to land here (not chunk L)
   for LIMIT tick parity + the anchored-gate partial correctness (§4); `PCRE2_FIRSTLINE`
   declined at compile ("chunk L").
-- [ ] **D — Captures + char repeats** — CBRA/SCBRA/CBRAPOS/CLOSE + ovector saves +
-  optimized_cbracket (`:404,1145-1184`); repeat superinstructions + detect_repeat (`:1699`).
+- [x] **D — Captures + char repeats** — CBRA/SCBRA grouploop lowering (ALT per
+  branch + FAIL) + CAP_START/CAP_END ovector writes + per-cbracket cleanup
+  records (KIND_CAP) + optimized_cbracket analysis (`:404,1145-1184`, all
+  captures optimized in-subset); four repeat superinstructions REP/REPI/NOTREP/
+  NOTREPI (OP_STAR..OP_NOTPOSUPTOI, min/max/pos loops, KIND_REP_MIN/MAX records)
+  with §4 tick parity; multiline anchors CIRCM/DOLLM. Ratchet 493 → 701;
+  fuzz fast-vs-interp clean over 300k cases. **Declined** (precise reasons):
+  OP_CBRAPOS/OP_SCBRAPOS/OP_BRAPOS/OP_SBRAPOS (possessive brackets → chunk G),
+  OP_SBRA (non-capturing empty-check bracket; only ever appears with a repeated
+  ket → chunk D repeated-group decline), OP_CLOSE (before ACCEPT → chunk H),
+  repeated groups KETRMAX/KETRMIN/KETRPOS + OP_BRAZERO/OP_SKIPZERO (optional /
+  quantified groups → chunk D-adjacent, need the empty-string loop check), a
+  back-referenced/conditional/recursed capture (its referencing opcode is out
+  of subset → chunk F/J/K). **detect_repeat (`:1699-1850`) NOT ported** — it
+  normalises repeated identical GROUPS (walks brackets: `OP_BRA`+`OP_KETRMAX`
+  etc.), which are declined here (group repeats are out of subset), so its
+  recognised bytecode shapes never occur for single-char repeats. It belongs to
+  the chunk that admits group repeats.
 - [ ] **E — Classes/types** — CLASS/NCLASS bitmap, XCLASS (via `Xclass`), type
   singles+repeats; charpos loops (`:11831-12022`).
 - [ ] **F — Backreferences** — REF/REFI/DNREF/DNREFI + ref repeats.

@@ -21,6 +21,7 @@ let check (ir : Ir.t) : (unit, string) result =
   let code = ir.Ir.code in
   let len = Array.length code in
   let litlen = String.length ir.Ir.lit in
+  let top_bracket = ir.Ir.re.Pcre2_engine.Compile.top_bracket in
   if Int.equal len 0 then Error "fast-verify: empty IR (no END)"
   else
     (* Pass 1: linear head walk — validate tags + operand widths, record
@@ -81,6 +82,37 @@ let check (ir : Ir.t) : (unit, string) result =
                          "fast-verify: CHAR_RUN at pc %d references lit \
                           [%d,%d) outside pool of %d"
                          pc off (off + l) litlen)
+                  else Ok ())
+                else if Int.equal t Ir.t_cap_start || Int.equal t Ir.t_cap_end
+                then (
+                  (* ovbase = 2N, 1 <= N <= top_bracket. *)
+                  let ovb = code.(pc + 1) in
+                  if ovb < 2 || not (Int.equal (ovb land 1) 0)
+                     || ovb / 2 > top_bracket
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: %s at pc %d ovbase %d out of range (top \
+                          bracket %d)"
+                         Ir.tag_name.(t) pc ovb top_bracket)
+                  else Ok ())
+                else if
+                  Int.equal t Ir.t_rep || Int.equal t Ir.t_repi
+                  || Int.equal t Ir.t_notrep || Int.equal t Ir.t_notrepi
+                then (
+                  let reptype = code.(pc + 1) in
+                  let lmin = code.(pc + 2) and lmax = code.(pc + 3) in
+                  let c1 = code.(pc + 4) in
+                  let two = Int.equal t Ir.t_repi || Int.equal t Ir.t_notrepi in
+                  let c2ok = (not two) || (code.(pc + 5) >= 0 && code.(pc + 5) < 256) in
+                  if reptype < 0 || reptype > 2 || lmin < 0 || lmax < lmin
+                     || c1 < 0 || c1 > 255 || not c2ok
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: %s at pc %d has inconsistent operands \
+                          (reptype=%d min=%d max=%d)"
+                         Ir.tag_name.(t) pc reptype lmin lmax)
                   else Ok ())
                 else Ok ()
               in

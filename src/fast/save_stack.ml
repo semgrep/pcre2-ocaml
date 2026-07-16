@@ -8,11 +8,28 @@
    loads/stores at its ALT and backtrack sites — this module only owns the
    array, its growth, and the cross-exec scratch reuse.
 
-   Save-record layout (fast-design.md §3), 3 ints, low index first:
-     slot 0: handler   — IR index to resume at on backtrack (the ALT's
-                         [next], i.e. the entry of the next alternative)
-     slot 1: eptr      — subject position to restore
-     slot 2: rdepth    — virtual frame depth to restore (§4 shadow accounting)
+   Save-record layout (fast-design.md §3). Records are VARIABLE width; the
+   discriminator [kind] is the TOP slot (highest index) so [backtrack] can
+   read it at [data.(sp-1)] and derive the record base without knowing the
+   type in advance. Each kind has a fixed width; low index first:
+
+     KIND_ALT     (width 4): [handler; eptr; rdepth; KIND_ALT]
+        handler — IR index to resume at (the ALT's [next]); eptr/rdepth the
+        subject position and virtual frame depth to restore (§4).
+     KIND_CAP     (width 4): [ovbase; old_start; old_end; KIND_CAP]
+        a capture cleanup: on backtrack restore ovector[ovbase],[ovbase+1]
+        to the values saved at CAP_START, then keep popping. Mirrors the
+        JIT's optimized cbracket entry-save / exhaustion-restore
+        (pcre2_jit_compile.c:11045-11054 / 13443-13452).
+     KIND_REP_MAX (width 5): [rep_pc; try_pos; floor; rdepth; KIND_REP_MAX]
+        a greedy single-char repeat: on backtrack retry the continuation at
+        [try_pos] (decrementing down to [floor]); rep_pc re-derives the
+        continuation pc. Mirrors repeatchar's RM26/RM28 (interpreter.ml
+        :3800-3809 / 7192-7243).
+     KIND_REP_MIN (width 5): [rep_pc; count; eptr; rdepth; KIND_REP_MIN]
+        a minimizing single-char repeat: on backtrack match one more char at
+        [eptr] (count from [count] up to lmax) and retry. Mirrors RM25/RM27
+        (interpreter.ml:3758 / 7155-7234).
 
    Scratch reuse mirrors Frames' scratch pattern (frames.ml:282-403) with its
    OWN [busy] flag — it does NOT share Frames' scratch slot. A single
@@ -22,8 +39,19 @@
    [scratch_max_retained_ints]) drops a pathologically grown array so it does
    not stay pinned forever. *)
 
-(* fast-design.md §3 — one save record is [handler; eptr; rdepth]. *)
-let record_width = 3
+(* fast-design.md §3 — record kinds (the TOP slot of each record) and their
+   fixed widths (tag + operands, low index first). *)
+let kind_alt = 0
+let kind_cap = 1
+let kind_rep_max = 2
+let kind_rep_min = 3
+let width_alt = 4
+let width_cap = 4
+let width_rep_max = 5
+let width_rep_min = 5
+
+(* Widest record — the runner reserves this much headroom on a push. *)
+let max_record_width = 5
 
 (* Initial capacity in ints (~85 records); grows geometrically. *)
 let initial_ints = 256
