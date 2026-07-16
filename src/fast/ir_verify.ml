@@ -49,6 +49,18 @@ let check (ir : Ir.t) : (unit, string) result =
     || (op >= Pcre2_engine.Opcodes.op_anynl
        && op <= Pcre2_engine.Opcodes.op_vspace)
   in
+  (* Chunk I — a char operand (t_rep etc.) is a code UNIT (0..255) in non-UTF,
+     but a code POINT (0..0x10FFFF) in UTF; the char is only ever compared, never
+     used as an array index, so the bound is a fidelity check, not a safety one. *)
+  let utf =
+    not
+      (Int.equal
+         (ir.Ir.re.Pcre2_engine.Compile.overall_options
+         land Pcre2_engine.Options.utf)
+         0)
+  in
+  let cp_max = if utf then 0x10FFFF else 255 in
+  let cp_ok (c : int) : bool = c >= 0 && c <= cp_max in
   if Int.equal len 0 then Error "fast-verify: empty IR (no END)"
   else
     (* Pass 1: linear head walk — validate tags + operand widths, record
@@ -248,9 +260,9 @@ let check (ir : Ir.t) : (unit, string) result =
                   let lmin = code.(pc + 2) and lmax = code.(pc + 3) in
                   let c1 = code.(pc + 4) in
                   let two = Int.equal t Ir.t_repi || Int.equal t Ir.t_notrepi in
-                  let c2ok = (not two) || (code.(pc + 5) >= 0 && code.(pc + 5) < 256) in
+                  let c2ok = (not two) || cp_ok code.(pc + 5) in
                   if reptype < 0 || reptype > 2 || lmin < 0 || lmax < lmin
-                     || c1 < 0 || c1 > 255 || not c2ok
+                     || not (cp_ok c1) || not c2ok
                   then
                     Error
                       (Printf.sprintf
@@ -284,13 +296,30 @@ let check (ir : Ir.t) : (unit, string) result =
                           re.code (%d bytes)"
                          pc off codelen)
                   else Ok ())
+                else if Int.equal t Ir.t_xclass then (
+                  (* [data_off]: the flag code unit of an OP_XCLASS item inside
+                     re.code. The item list is XCL_END-terminated and its reads
+                     are in bounds by the complete-program invariant (as the
+                     interpreter's OP_XCLASS arm relies on); we require only the
+                     flag byte to be in bounds. *)
+                  let off = code.(pc + 1) in
+                  if off < 0 || off >= codelen then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: XCLASS at pc %d data offset %d outside \
+                          re.code (%d bytes)"
+                         pc off codelen)
+                  else Ok ())
                 else if Int.equal t Ir.t_type_rep || Int.equal t Ir.t_class_rep
+                        || Int.equal t Ir.t_xclass_rep
                 then (
                   let reptype = code.(pc + 1) in
                   let lmin = code.(pc + 2) and lmax = code.(pc + 3) in
                   let payload = code.(pc + 4) in
                   let payload_ok =
                     if Int.equal t Ir.t_type_rep then type_op_ok payload
+                    else if Int.equal t Ir.t_xclass_rep then
+                      payload >= 0 && payload < codelen
                     else map_off_ok payload
                   in
                   if reptype < 0 || reptype > 2 || lmin < 0 || lmax < lmin

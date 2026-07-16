@@ -107,7 +107,11 @@ let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
   else if Int.equal o.R.orc Errors.error_nomatch then E.No_match { mark }
   else if Int.equal o.R.orc Errors.error_partial then
     E.Partial { start = o.R.ostart; mark }
-  else E.Error { code = o.R.orc; start_char = 0 }
+  else
+    (* Chunk I — a UTF validity error (-3..-23) / BADUTFOFFSET (-36) carries the
+       absolute error offset in [ostart] (the C's match_data->startchar,
+       pcre2_match.c:6897/7719); other errors leave it 0. *)
+    E.Error { code = o.R.orc; start_char = o.R.ostart }
 
 (* Named groups: (name, group_number) in PCRE2 name-table order. Built from
    the pinned [Compile.re] (Engine.t is abstract at the seam, so we cannot

@@ -1,0 +1,11 @@
+# fuzz-diff repro (differential: pure engine vs C oracle)
+# seed=1546530560 case=2474 kind=exec
+# reason: partial ovector [2;2] vs [1;2]
+# pattern (ascii): (*LIMIT_MATCH=2000)\\??\\B[\\P{Xan}]{4}
+# compile: options=0x00000000 extra=0x00000000 newline=0 bsr=0
+# exec: subject="EF" offset=0 mopts=0x00000020
+# engine: rc=-2 ov=[2;2] mark=<none> sc=2
+# oracle: rc=-2 ov=[2;2] mark=<none> sc=2
+/28 2a 4c 49 4d 49 54 5f 4d 41 54 43 48 3d 32 30 30 30 29 5c 3f 3f 5c 42 5b 5c 50 7b 58 61 6e 7d 5d 7b 34 7d/hex
+    \x45\x46\=offset=0,mark,startchar,partial_hard
+

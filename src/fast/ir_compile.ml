@@ -18,6 +18,8 @@ module Op = Pcre2_engine.Opcodes
 module Opt = Pcre2_engine.Options
 module Limits = Pcre2_engine.Limits
 module Chartables = Pcre2_engine.Chartables
+module Utf = Pcre2_engine.Utf
+module Ucd = Pcre2_engine.Ucd
 
 (* Signals the first unsupported construct; caught at the top of [compile]
    and turned into [Error]. Compile-phase only — never crosses the runner
@@ -39,23 +41,17 @@ let reason_of_op (op : int) : string =
        (OP_*_UCP_WORD_BOUNDARY) use Unicode properties even without UTF; the
        non-UCP \b / \B (OP_WORD_BOUNDARY / OP_NOT_WORD_BOUNDARY) are handled in
        [compile_branch]. *)
-  else if Int.equal op Op.op_not_ucp_word_boundary then named "\\B (ucp)" "I"
-  else if Int.equal op Op.op_ucp_word_boundary then named "\\b (ucp)" "I"
-  else if Int.equal op Op.op_prop then named "\\p" "I"
-  else if Int.equal op Op.op_notprop then named "\\P" "I"
-  else if Int.equal op Op.op_extuni then named "\\X" "I"
+  else if Int.equal op Op.op_not_ucp_word_boundary then named "\\B (ucp)" "I2"
+  else if Int.equal op Op.op_ucp_word_boundary then named "\\b (ucp)" "I2"
+  else if Int.equal op Op.op_prop then named "\\p" "I2"
+  else if Int.equal op Op.op_notprop then named "\\P" "I2"
+  else if Int.equal op Op.op_extuni then named "\\X" "I2"
     (* Class / ref repeat quantifiers OP_CRSTAR..OP_CRPOSRANGE: a class repeat
        is consumed inline after its OP_CLASS/OP_NCLASS in [compile_branch]; a
        standalone CR* here can only follow an (out-of-subset) OP_REF (chunk
        F). *)
   else if op >= Op.op_crstar && op <= Op.op_crposrange then
     named "ref repeat" "F"
-    (* OP_XCLASS: in non-UTF/non-UCP the compiler only emits OP_XCLASS for a
-       class containing a Unicode property (\p/\P) — see compile.ml:2199-2281,
-       where xclass=true implies xclass_has_prop=true (wide chars > 255 cannot
-       occur non-UTF). Matching it needs the property machinery, so it is
-       declined to chunk I rather than ported. *)
-  else if Int.equal op Op.op_xclass then named "OP_XCLASS (\\p in class)" "I"
     (* Back references (chunk F). *)
   else if Int.equal op Op.op_ref then named "OP_REF" "F"
   else if Int.equal op Op.op_refi then named "OP_REFI" "F"
@@ -243,6 +239,14 @@ let optimized_cbracket (re : C.re) : bool array =
   let limit = Bytes.length src in
   let byte p = Char.code (Bytes.get src p) in
   let mark n = if n >= 0 && n <= top then opt.(n) <- false in
+  let utf = not (Int.equal (re.C.overall_options land Opt.utf) 0) in
+  (* Chunk I — extra code units of the UTF-8 char whose lead byte is at [q]. *)
+  let char_extra q =
+    if utf then
+      let c = byte q in
+      if c >= 0xc0 then Utf.get_extralen c else 0
+    else 0
+  in
   (* Byte length of the opcode item at [p] (op_lengths + the variable-length
      exceptions), to advance this linear analysis walk. Mirrors the extra
      byte-count logic of pcre2_printint.c / debug_printer.ml. *)
@@ -256,6 +260,18 @@ let optimized_cbracket (re : C.re) : bool array =
       || Int.equal op Op.op_skip_arg || Int.equal op Op.op_then_arg
       || Int.equal op Op.op_commit_arg
     then Op.op_lengths.(op) + byte (p + 1)
+    else if
+      Int.equal op Op.op_char || Int.equal op Op.op_chari
+      || Int.equal op Op.op_not || Int.equal op Op.op_noti
+    then
+      (* Chunk I — a single char opcode embeds a 1..4-code-unit UTF-8 char. *)
+      Op.op_lengths.(op) + char_extra (p + 1)
+    else if is_char_repeat op then (
+      (* Chunk I — a single-char repeat embeds a char after the opcode, or
+         after the IMM2 count for the UPTO/MINUPTO/EXACT/POSUPTO forms. *)
+      let _, _, fidx = rep_kind op in
+      let char_off = if rep_has_count fidx then p + 1 + Limits.imm2_size else p + 1 in
+      Op.op_lengths.(op) + char_extra char_off)
     else if op >= Op.op_typestar && op <= Op.op_typeposupto then (
       (* A type repeat whose type is \p/\P carries 2 extra property bytes
          (debug_printer.ml:373-385). The type byte follows the IMM2 count for
@@ -300,11 +316,22 @@ let optimized_cbracket (re : C.re) : bool array =
   opt
 
 let compile (re : C.re) : (Ir.t, string) result =
+  (* Chunk I — UTF-8 mode is now lowered (multi-byte CHAR/CHARI/classes/types/
+     repeats via the char-aware walk below and the runner's UTF arms). UCP mode
+     (property predicates, multi-case sets, \X grapheme clusters) and
+     PCRE2_MATCH_INVALID_UTF (fragment carry-on) are deferred to chunk I2. *)
+  let utf = not (Int.equal (re.C.overall_options land Opt.utf) 0) in
   (* Compile-level gates BEFORE the walk (fast-design.md §6, task spec). *)
-  if not (Int.equal (re.C.overall_options land Opt.utf) 0) then
-    Error "fast: UTF mode (chunk I)"
-  else if not (Int.equal (re.C.overall_options land Opt.ucp) 0) then
-    Error "fast: UCP mode (chunk I)"
+  if not (Int.equal (re.C.overall_options land Opt.ucp) 0) then
+    Error "fast: UCP mode (chunk I2)"
+  else if
+    not (Int.equal (re.C.overall_options land Opt.match_invalid_utf) 0)
+  then
+    (* PCRE2_MATCH_INVALID_UTF forces the fragmented-matching driver
+       (pcre2_match.c:7650-7699, interpreter.ml:9451-9506) with NOTBOL/NOTEOL
+       per fragment. Deferred to chunk I2; the non-invalid UTF check (validate
+       or error) is landed in [exec]. *)
+    Error "fast: PCRE2_MATCH_INVALID_UTF (chunk I2)"
   else if not (Int.equal (re.C.overall_options land Opt.firstline) 0) then
     (* PCRE2_FIRSTLINE constrains an unanchored match to the first line. The
        C enforces this partly through the start-of-match scans' shortened
@@ -320,6 +347,18 @@ let compile (re : C.re) : (Ir.t, string) result =
        opcode at [p] (pcre2_intmodedep.h:108-109; debug_printer.ml uses the
        same read for Bra/Alt/Ket links). *)
     let link (p : int) : int = C.get src (p + 1) in
+    (* Chunk I — the number of EXTRA code units of the UTF-8 character whose
+       lead byte is at [q] (0 when the byte is a single code unit, or in
+       non-UTF mode). Mirrors debug_printer.print_char's advance and
+       pcre2_intmodedep.h:288-291 GET_EXTRALEN: a char-embedding opcode
+       (OP_CHAR/CHARI/NOT/NOTI and the OP_STAR..OP_NOTPOSUPTOI repeats) then
+       advances by [Op.op_lengths.(op) + char_extra <char-offset>]. *)
+    let char_extra (q : int) : int =
+      if utf then
+        let c = byte q in
+        if c >= 0xc0 then Utf.get_extralen c else 0
+      else 0
+    in
 
     (* Growable int buffer for the flat IR stream (fast-design.md §2). *)
     let buf = ref (Array.make 128 0) in
@@ -748,25 +787,39 @@ let compile (re : C.re) : (Ir.t, string) result =
           let char_off =
             if rep_has_count fidx then !p + 1 + Limits.imm2_size else !p + 1
           in
-          let c1 = byte char_off in
+          (* Chunk I — in UTF the char is a code point (1-4 code units);
+             decode it and, for a caseless repeat, fold via Ucd.othercase when
+             > 127 (repeatchar_wide's Ucd.othercase fc, pcre2_match.c:1289-1294 /
+             interpreter.ml:3571) else the fcc table (repeatchar_tail's
+             mb->fcc[Lc], pcre2_match.c:1393). *)
+          let c0 = byte char_off in
+          let c1 = if utf && c0 >= 0xc0 then Utf.getutf8_bytes c0 src char_off else c0 in
           push ir_tag;
           push reptype;
           push lmin;
           push lmax;
           push c1;
-          if caseless then push (Chartables.fcc c1);
-          p := !p + Op.op_lengths.(op))
+          if caseless then
+            push (if utf && c1 > 127 then Ucd.othercase c1 else Chartables.fcc c1);
+          p := !p + Op.op_lengths.(op) + char_extra char_off)
         else if Int.equal op Op.op_char then (
           (* pcre2_jit_compile.c:7479 (byte_sequence_compare) — fuse
              consecutive caseful OP_CHARs into one CHAR_RUN over the literal
              pool. Non-UTF: each OP_CHAR item is [opcode; one code unit]
              (OP_lengths[OP_CHAR] = 2), so each contributes one byte to
              [lit] and CHAR_RUN's byte length = bytes added. *)
+          (* Chunk I — in UTF each OP_CHAR item is [opcode; 1..4 UTF-8 bytes];
+             append ALL of the char's code units to [lit] (a caseful UTF-8 run
+             is a byte-exact compare — pcre2_match.c:1007-1010 compares unit by
+             unit) and advance past the whole item (1 + char length). *)
           let off = Buffer.length lit in
           let q = ref !p in
           while Int.equal (byte !q) Op.op_char do
-            Buffer.add_char lit (Bytes.get src (!q + 1));
-            q := !q + Op.op_lengths.(Op.op_char)
+            let clen = 1 + char_extra (!q + 1) in
+            for b = 0 to clen - 1 do
+              Buffer.add_char lit (Bytes.get src (!q + 1 + b))
+            done;
+            q := !q + 1 + clen
           done;
           let len = Buffer.length lit - off in
           push Ir.t_char_run;
@@ -786,9 +839,15 @@ let compile (re : C.re) : (Ir.t, string) result =
              chunk-M optimization citing those lines. The runner folds case
              with Chartables exactly as the interpreter's non-UTF CHARI arm
              (pcre2_match.c:1097-1103). *)
+          (* Chunk I — store the CODE POINT (not a raw code unit): in UTF a
+             pattern char > 127 folds via Ucd.othercase in the runner arm
+             (pcre2_match.c:1061-1072), while a char < 128 still uses the fast
+             lcc table. Non-UTF: the code point equals the single code unit. *)
+          let c0 = byte (!p + 1) in
+          let fc = if utf && c0 >= 0xc0 then Utf.getutf8_bytes c0 src (!p + 1) else c0 in
           push Ir.t_chari;
-          push (byte (!p + 1));
-          p := !p + Op.op_lengths.(Op.op_chari))
+          push fc;
+          p := !p + Op.op_lengths.(Op.op_chari) + char_extra (!p + 1))
         else if
           Int.equal op Op.op_bra || Int.equal op Op.op_cbra
           || Int.equal op Op.op_scbra || Int.equal op Op.op_sbra
@@ -803,7 +862,10 @@ let compile (re : C.re) : (Ir.t, string) result =
         else if Int.equal op Op.op_reverse then (
           (* OP_REVERSE (pcre2_match.c:5793-5819) — the fixed lookbehind
              back-step at the start of a lookbehind branch. GET2(code,p+1) =
-             number of code units. *)
+             number of CHARACTERS. In UTF the back-step is a char-wise backward
+             walk (BACKCHAR), not [eptr - number]; deferred to chunk I2. *)
+          if utf then
+            raise (Unsupported "fast: lookbehind (OP_REVERSE) in UTF (chunk I2)");
           push Ir.t_reverse;
           push (C.get2 src (!p + 1));
           p := !p + Op.op_lengths.(op))
@@ -811,6 +873,8 @@ let compile (re : C.re) : (Ir.t, string) result =
           (* OP_VREVERSE (pcre2_match.c:5834-5883) — the variable lookbehind
              back-step. GET2(p+1) = Lmin, GET2(p+1+IMM2) = Lmax; the branch body
              follows at p + 1 + 2*IMM2. *)
+          if utf then
+            raise (Unsupported "fast: lookbehind (OP_VREVERSE) in UTF (chunk I2)");
           push Ir.t_vreverse;
           push (C.get2 src (!p + 1));
           push (C.get2 src (!p + 1 + Limits.imm2_size));
@@ -863,14 +927,18 @@ let compile (re : C.re) : (Ir.t, string) result =
              creates no choice point and no tick, identical to the single arm
              (repeatnotchar's Lmin==Lmax continue, pcre2_match.c:1483-1485). *)
           let caseless = Int.equal op Op.op_noti in
-          let c1 = byte (!p + 1) in
+          (* Chunk I — decode the code point; caseless fold via Ucd.othercase
+             (> 127, UTF) else the fcc table (pcre2_match.c:1129-1136/1660). *)
+          let c0 = byte (!p + 1) in
+          let c1 = if utf && c0 >= 0xc0 then Utf.getutf8_bytes c0 src (!p + 1) else c0 in
           push (if caseless then Ir.t_notrepi else Ir.t_notrep);
           push Ir.reptype_min (* unread when lmin=lmax *);
           push 1;
           push 1;
           push c1;
-          if caseless then push (Chartables.fcc c1);
-          p := !p + Op.op_lengths.(op))
+          if caseless then
+            push (if utf && c1 > 127 then Ucd.othercase c1 else Chartables.fcc c1);
+          p := !p + Op.op_lengths.(op) + char_extra (!p + 1))
         else if Int.equal op Op.op_class || Int.equal op Op.op_nclass then (
           (* OP_CLASS / OP_NCLASS (pcre2_match.c:1933-1972). In non-UTF every
              code unit is 0..255, so both opcodes reduce to the 32-byte bitmap
@@ -893,6 +961,29 @@ let compile (re : C.re) : (Ir.t, string) result =
             push Ir.t_class;
             push map_off;
             p := after))
+        else if Int.equal op Op.op_xclass then (
+          (* OP_XCLASS (pcre2_match.c:2175-2224): an extended class with wide
+             chars, ranges, and/or \p properties. Matched by the self-contained
+             Pcre2_engine.Xclass.xclass against the class DATA offset (the flag
+             code unit = OP_XCLASS + 1 + LINK_SIZE). The item is GET-length
+             prefixed; a following OP_CR* quantifier folds into a t_xclass_rep
+             (pcre2_match.c:2181-2210), otherwise a single t_xclass. Lowered in
+             UTF and non-UTF alike (Xclass is code-unit-width agnostic). *)
+          let data_off = !p + 1 + Limits.link_size in
+          let after = !p + C.get src (!p + 1) (* past the whole XCLASS item *) in
+          let nx = byte after in
+          if is_cr_op nx then (
+            let reptype, lmin, lmax, crlen = cr_bounds src after in
+            push Ir.t_xclass_rep;
+            push reptype;
+            push lmin;
+            push lmax;
+            push data_off;
+            p := after + crlen)
+          else (
+            push Ir.t_xclass;
+            push data_off;
+            p := after))
         else if op >= Op.op_typestar && op <= Op.op_typeposupto then (
           (* Character-type repeat OP_TYPESTAR..OP_TYPEPOSUPTO
              (pcre2_match.c:2651-2701). The type opcode follows the optional
@@ -907,6 +998,21 @@ let compile (re : C.re) : (Ir.t, string) result =
           let tp = byte type_off in
           if not (is_supported_type tp) then
             raise (Unsupported (reason_of_op tp));
+          (* Chunk I — \R (OP_ANYNL) has multi-byte members (NEL U+0085, LS/PS)
+             in UTF; its variable-length give-back is deferred to chunk I2.
+             OP_ALLANY ((?s). ) must step by CHARACTERS in UTF (unlike the bulk
+             byte scan the runner uses); its repeat is deferred to chunk I2 too.
+             OP_ANYBYTE (\C) stays a one-code-unit bulk scan (correct in UTF). *)
+          if utf && Int.equal tp Op.op_anynl then
+            raise (Unsupported "fast: \\R (OP_ANYNL) in UTF (chunk I2)");
+          if utf && Int.equal tp Op.op_allany then
+            raise (Unsupported "fast: (?s). repeat (OP_ALLANY) in UTF (chunk I2)");
+          (* OP_ANYBYTE (\C) repeat: its min-loop skips SCHECK_PARTIAL
+             (pcre2_match.c:3041-3044, unlike OP_ALLANY), a partial-match
+             subtlety deferred to chunk I2. The single \C (op_single_type) is
+             fine. *)
+          if utf && Int.equal tp Op.op_anybyte then
+            raise (Unsupported "fast: \\C repeat (OP_ANYBYTE) in UTF (chunk I2)");
           push Ir.t_type_rep;
           push reptype;
           push lmin;
@@ -918,6 +1024,8 @@ let compile (re : C.re) : (Ir.t, string) result =
              \D \d \S \s \W \w / . (OP_ANY) / \C (OP_ALLANY) / \R (OP_ANYNL) /
              \h \H \v \V single arms). One code unit consumed; no choice
              point, no tick. *)
+          if utf && Int.equal op Op.op_anynl then
+            raise (Unsupported "fast: \\R (OP_ANYNL) in UTF (chunk I2)");
           push Ir.t_type;
           push op;
           p := !p + Op.op_lengths.(op))
@@ -945,6 +1053,14 @@ let compile (re : C.re) : (Ir.t, string) result =
           let caseless =
             Int.equal op Op.op_refi || Int.equal op Op.op_dnrefi
           in
+          (* Chunk I — a caseless backreference in UTF folds code points via
+             Ucd.othercase / the caseless sets and consumes a variable number of
+             code units (a captured char and its other case can differ in byte
+             length, e.g. U+023A / U+2C65); the fast match_ref is byte-based.
+             Deferred to chunk I2. Caseful refs are a byte-exact compare (fine
+             in UTF). *)
+          if utf && caseless then
+            raise (Unsupported "fast: caseless backreference in UTF (chunk I2)");
           let is_dn = Int.equal op Op.op_dnref || Int.equal op Op.op_dnrefi in
           let ci = if caseless then 1 else 0 in
           (* REF: GET2(code, p+1) = group number; DNREF: GET2(code, p+1) = name

@@ -177,6 +177,16 @@ let t_accept = 55 (* [t_accept]          — OP_ACCEPT (end the whole match) *)
    start is already in ovector[ovbase]). *)
 let t_close = 56 (* [t_close; ovbase; referenced] *)
 
+(* Chunk I (fast-design.md §2, task spec) — OP_XCLASS: an extended class that
+   may contain code points above 255, ranges, and/or Unicode properties
+   (pcre2_match.c:2175-2224). Matched by the shared, self-contained
+   Pcre2_engine.Xclass.xclass helper against the class DATA offset [data_off]
+   (the flag code unit inside re.code = OP_XCLASS position + 1 + LINK_SIZE).
+   [t_xclass] is a lone class (lmin=lmax=1, no choice point); [t_xclass_rep]
+   carries an OP_CR* quantifier (reuses the REP machinery via rk_xclass). *)
+let t_xclass = 57 (* [t_xclass; data_off]                          *)
+let t_xclass_rep = 58 (* [t_xclass_rep; reptype; lmin; lmax; data_off] *)
+
 (* Sentinel [g] for a repeated group whose bracket is OP_BRA (bra_loop, C's
    P == NULL): NO empty-string check (the C short-circuits it, and OP_BRA can
    never match empty), so no [t_group_start] and no [mb.group_start] slot. *)
@@ -192,7 +202,7 @@ let reptype_pos = 2
 let rep_inf = 0xFFFFFFFF
 
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 56
+let max_tag = 58
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -256,6 +266,8 @@ let arity =
     2 (* t_then: mark_off *);
     1 (* t_accept *);
     3 (* t_close: ovbase, referenced *);
+    2 (* t_xclass: data_off *);
+    5 (* t_xclass_rep: reptype, lmin, lmax, data_off *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -319,6 +331,8 @@ let tag_name =
     "THEN";
     "ACCEPT";
     "CLOSE";
+    "XCLASS";
+    "XCLASS_REP";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -423,6 +437,12 @@ let class_map_off (ir : t) (pc : int) : int = ir.code.(pc + 1)
 let wordbound_want (ir : t) (pc : int) : int = ir.code.(pc + 1)
 let rep_type_op (ir : t) (pc : int) : int = ir.code.(pc + 4)
 let rep_map_off (ir : t) (pc : int) : int = ir.code.(pc + 4)
+
+(* Chunk I (fast-design.md §2) — XCLASS data offset: for a lone [t_xclass] it
+   is operand 1; for [t_xclass_rep] it follows the reptype/lmin/lmax at
+   operand 4. *)
+let xclass_data (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let rep_xclass_data (ir : t) (pc : int) : int = ir.code.(pc + 4)
 
 (* Chunk F operands (fast-design.md §2/§3). [t_ref] carries [ovbase; caseless]
    at pc+1/pc+2; [t_ref_rep] the reptype/lmin/lmax triple (rep_reptype/rep_lmin/
@@ -611,6 +631,8 @@ let render (ir : t) (pc : int) (t : int) : string =
     Printf.sprintf "TYPE %s" Op.op_names.(type_op ir pc)
   else if Int.equal t t_class then
     Printf.sprintf "CLASS map=%d" (class_map_off ir pc)
+  else if Int.equal t t_xclass then
+    Printf.sprintf "XCLASS data=%d" (xclass_data ir pc)
   else if Int.equal t t_wordbound then
     Printf.sprintf "WORDBOUND %s"
       (if Int.equal (wordbound_want ir pc) 1 then "\\b" else "\\B")
@@ -636,6 +658,17 @@ let render (ir : t) (pc : int) (t : int) : string =
     let lmaxstr = if Int.equal lmax rep_inf then "inf" else string_of_int lmax in
     Printf.sprintf "CLASS_REP %s {%d,%s} map=%d" tystr (rep_lmin ir pc) lmaxstr
       (rep_map_off ir pc))
+  else if Int.equal t t_xclass_rep then (
+    let ty = rep_reptype ir pc in
+    let tystr =
+      if Int.equal ty reptype_min then "min"
+      else if Int.equal ty reptype_max then "max"
+      else "pos"
+    in
+    let lmax = rep_lmax ir pc in
+    let lmaxstr = if Int.equal lmax rep_inf then "inf" else string_of_int lmax in
+    Printf.sprintf "XCLASS_REP %s {%d,%s} data=%d" tystr (rep_lmin ir pc) lmaxstr
+      (rep_xclass_data ir pc))
   else if
     Int.equal t t_rep || Int.equal t t_repi || Int.equal t t_notrep
     || Int.equal t t_notrepi

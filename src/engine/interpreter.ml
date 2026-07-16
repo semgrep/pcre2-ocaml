@@ -462,23 +462,14 @@ let hspace_byte = Char_predicates.hspace_byte
 
 let vspace_byte = Char_predicates.vspace_byte
 
-(* pcre2_internal.h:416-431 — HSPACE_CASES: the byte cases plus
-   HSPACE_MULTIBYTE_CASES, for the UTF repeat loops that switch on a
-   decoded character. *)
-let hspace_char (c : int) : bool =
-  match c with
-  | 0x09 | 0x20 | 0xa0 | 0x1680 | 0x180e | 0x2000 | 0x2001 | 0x2002 | 0x2003
-  | 0x2004 | 0x2005 | 0x2006 | 0x2007 | 0x2008 | 0x2009 | 0x200a | 0x202f
-  | 0x205f | 0x3000 ->
-      true
-  | _ -> false
+(* pcre2_internal.h:416-431 — HSPACE_CASES / pcre2_internal.h:433-449 —
+   VSPACE_CASES: the byte cases plus the MULTIBYTE_CASES, for the UTF arms that
+   switch on a decoded character. Extracted to Char_predicates so the
+   interpreter and the M11 fast engine share one definition (no behavior
+   change — the bodies are identical). *)
+let hspace_char = Char_predicates.hspace_char
 
-(* pcre2_internal.h:433-449 — VSPACE_CASES: the byte cases plus
-   VSPACE_MULTIBYTE_CASES (U+2028 LS, U+2029 PS). *)
-let vspace_char (c : int) : bool =
-  match c with
-  | 0x0a | 0x0b | 0x0c | 0x0d | 0x85 | 0x2028 | 0x2029 -> true
-  | _ -> false
+let vspace_char = Char_predicates.vspace_char
 
 (* pcre2_match.c:2576-2583 (= 2903-2916, 3723-3736, 4311-4319) — the
    PT_CLIST scan: cp = PRIV(ucd_caseless_sets) + <property value>;

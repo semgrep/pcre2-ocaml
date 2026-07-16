@@ -21,3 +21,23 @@ let vspace_byte (c : int) : bool =
   || Int.equal c Newline.char_ff
   || Int.equal c Newline.char_cr
   || Int.equal c Newline.char_nel
+
+(* pcre2_internal.h:416-431 — HSPACE_CASES: the byte cases plus
+   HSPACE_MULTIBYTE_CASES, for the UTF single/repeat arms that switch on a
+   DECODED code point (\h / \H in UTF mode). Extracted here so the interpreter
+   and the M11 fast engine share one definition (no behavior change — the body
+   is identical to the interpreter's former hspace_char). *)
+let hspace_char (c : int) : bool =
+  match c with
+  | 0x09 | 0x20 | 0xa0 | 0x1680 | 0x180e | 0x2000 | 0x2001 | 0x2002 | 0x2003
+  | 0x2004 | 0x2005 | 0x2006 | 0x2007 | 0x2008 | 0x2009 | 0x200a | 0x202f
+  | 0x205f | 0x3000 ->
+      true
+  | _ -> false
+
+(* pcre2_internal.h:433-449 — VSPACE_CASES: the byte cases plus
+   VSPACE_MULTIBYTE_CASES (U+2028 LS, U+2029 PS). *)
+let vspace_char (c : int) : bool =
+  match c with
+  | 0x0a | 0x0b | 0x0c | 0x0d | 0x85 | 0x2028 | 0x2029 -> true
+  | _ -> false

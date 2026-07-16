@@ -749,17 +749,24 @@ let unsupported_cases : (string * string * string) list =
     ( "repeated atomic group",
       "(?>a)+",
       "fast: repeated atomic group / assertion (chunk G+)" );
-    (* Chunk E declines: a \p property in a class compiles to OP_XCLASS, which
-       needs the property machinery (chunk I); \p / \X singles and repeats and
-       the UCP word boundary are likewise chunk I. *)
-    ("prop in class (XCLASS)", "[\\p{L}]", "fast: OP_XCLASS (\\p in class) (chunk I)");
-    ("prop", "\\p{L}", "fast: \\p (chunk I)");
-    ("prop type repeat", "\\p{L}+", "fast: \\p (chunk I)");
-    ("extuni", "\\X", "fast: \\X (chunk I)");
-    (* The UCP verb turns on UCP mode, caught by the compile-level gate before
-       the UCP word-boundary opcode is even reached. *)
-    ("ucp mode", "(*UCP)\\ba", "fast: UCP mode (chunk I)");
-    ("UTF mode", "(*UTF)abc", "fast: UTF mode (chunk I)");
+    (* Chunk I supports UTF mode and OP_XCLASS (wide chars, ranges AND \p
+       properties, via the self-contained Xclass helper), so "[\\p{L}]" and
+       "(*UTF)abc" are now ACCEPTED. Still deferred to chunk I2: STANDALONE
+       \p / \P (OP_PROP/OP_NOTPROP) and their repeats, \X (OP_EXTUNI), UCP mode
+       (property predicates / multi-case sets / UCP word boundary), and
+       PCRE2_MATCH_INVALID_UTF (fragment carry-on). *)
+    ("prop", "\\p{L}", "fast: \\p (chunk I2)");
+    ("prop type repeat", "\\p{L}+", "fast: \\p (chunk I2)");
+    ("extuni", "\\X", "fast: \\X (chunk I2)");
+    (* The UCP verb turns on UCP mode, caught by the compile-level gate. *)
+    ("ucp mode", "(*UCP)\\ba", "fast: UCP mode (chunk I2)");
+    (* A caseless backreference in UTF folds code points (variable byte
+       lengths); deferred to chunk I2. *)
+    ("caseless backref in UTF", "(*UTF)(?i)(\\x{23a})\\1", "fast: caseless backreference in UTF (chunk I2)");
+    (* \R in UTF (multi-byte NEL/LS/PS) and UTF lookbehind (char-wise
+       REVERSE) are deferred to chunk I2. *)
+    ("R repeat in UTF", "(*UTF)\\R+", "fast: \\R (OP_ANYNL) in UTF (chunk I2)");
+    ("lookbehind in UTF", "(*UTF)(?<=a)b", "fast: lookbehind (OP_REVERSE) in UTF (chunk I2)");
     (* Chunk H supports MARK/PRUNE/SKIP/THEN/COMMIT (+_ARG), FAIL, ACCEPT and
        OP_CLOSE (so "a(*FAIL)", "(*MARK:x)a", "a(*PRUNE)b", "a(*ACCEPT)", and
        ( *THEN) with atomic positive assertions, are now ACCEPTED). Two
@@ -823,6 +830,16 @@ let supported_patterns =
     "(?m)^a$";
     "(a)(b)(c)(d)";
     "x(a+)x";
+    (* Chunk I: UTF mode + XCLASS (wide chars / ranges / \p in a class). *)
+    "(*UTF)abc";
+    "(*UTF)\\x{100}\\x{1000}\\x{10000}";
+    "(*UTF).\\C[a-z]";
+    "(*UTF)\\x{100}+";
+    "(*UTF)[\\x{100}-\\x{200}]+";
+    "[\\p{L}]";
+    "(*UTF)[\\p{Nd}\\x{100}-\\x{200}]*";
+    "(*UTF)(?i)\\x{c9}";
+    "(*UTF)\\b\\w+\\B";
     (* Chunk D2: quantified + optional groups. *)
     "(a)+";
     "(a)*";
@@ -1226,6 +1243,54 @@ let norm : E.exec_result -> string = function
 
 let parity_cases : (string * string * int * int32) list =
   [
+    (* ---------- Chunk I: UTF-8 parity spot-checks ----------
+       Subjects are raw UTF-8 byte strings: é = C3 A9, Ⱥ = C8 BA, ⱥ = E2 B1 A5,
+       Ā = C4 80, α = CE B1, Α = CE 91, € = E2 82 AC (U+20AC),
+       em-space = E2 80 83 (U+2003), 😀 = F0 9F 98 80 (U+1F600). *)
+    (* multi-byte literal (byte-exact caseful run), 2/3/4-byte *)
+    ("(*UTF)caf\\x{e9}", "caf\xc3\xa9", 0, 0l);
+    ("(*UTF)\\x{20ac}", "\xe2\x82\xac", 0, 0l);
+    ("(*UTF)\\x{1f600}x", "\xf0\x9f\x98\x80x", 0, 0l);
+    ("(*UTF)b", "\xc3\xa9b", 0, 0l) (* match past a 2-byte char *);
+    (* dot over code points (not a byte) *)
+    ("(*UTF)a.b", "a\xc3\xa9b", 0, 0l);
+    ("(*UTF)a.b", "a\xe2\x82\xacb", 0, 0l);
+    (* caseless code-point fold > 127 (Greek Α/α, Latin É/é) *)
+    ("(*UTF)(?i)\\x{391}", "\xce\xb1", 0, 0l);
+    ("(*UTF)(?i)\\x{c9}", "\xc3\xa9", 0, 0l);
+    ("(*UTF)(?i)\\x{23a}", "\xe2\xb1\xa5", 0, 0l) (* Ⱥ matches ⱥ *);
+    (* single negated char over a multi-byte char *)
+    ("(*UTF)[^x]", "\xc3\xa9", 0, 0l);
+    ("(*UTF)(?i)[^\\x{391}]", "\xce\xb1", 0, 0l) (* caseless NOT: no match *);
+    (* class with wide range / bitmap; NCLASS matches > 255 *)
+    ("(*UTF)[\\x{100}-\\x{200}]", "\xc4\x80", 0, 0l);
+    ("(*UTF)[a-z]", "\xc3\xa9", 0, 0l) (* wide char not in <256 class *);
+    ("(*UTF)[^a]", "\xc3\xa9", 0, 0l) (* NCLASS matches wide char *);
+    (* XCLASS: wide range + \p property in a class *)
+    ("(*UTF)[\\p{L}]+", "ab\xce\xb1\xce\xb2!", 0, 0l);
+    ("(*UTF)[\\x{100}-\\x{2000}]+", "\xc4\x80\xce\xb1\xe2\x80\x80", 0, 0l);
+    (* ASCII types (non-UCP): \d \w step whole chars, wide char is not word *)
+    ("(*UTF)\\w+", "ab\xc3\xa9", 0, 0l);
+    ("(*UTF)\\d+", "12\xc3\xa9", 0, 0l);
+    (* \h horizontal space multibyte (U+2003) *)
+    ("(*UTF)\\h", "\xe2\x80\x83", 0, 0l);
+    ("(*UTF)\\H", "\xe2\x80\x83", 0, 0l) (* em-space is \h, not \H: no match *);
+    (* repeats over code points: greedy give-back one CHARACTER at a time *)
+    ("(*UTF)\\x{100}+", "\xc4\x80\xc4\x80\xc4\x80", 0, 0l);
+    ("(*UTF)\\x{100}{2,}x", "\xc4\x80\xc4\x80\xc4\x80x", 0, 0l);
+    ("(*UTF).*b", "\xc3\xa9\xe2\x82\xac b", 0, 0l);
+    ("(*UTF)[\\x{100}-\\x{300}]*\\x{101}", "\xc4\x80\xc4\x81", 0, 0l);
+    ("(*UTF)(?i)\\x{c9}+", "\xc3\xa9\xc3\x89\xc3\xa9", 0, 0l);
+    (* word boundary over multi-byte chars (non-UCP: wide char not a word char) *)
+    ("(*UTF)\\bab\\b", "\xc3\xa9ab\xc3\xa9", 0, 0l);
+    ("(*UTF)a\\Bb", "a\xc3\xa9b", 0, 0l) (* not adjacent -> a\Bb won't match here *);
+    (* anchors with multi-byte content *)
+    ("(*UTF)^\\x{100}$", "\xc4\x80", 0, 0l);
+    ("(*UTF)\\x{100}\\z", "x\xc4\x80", 0, 0l);
+    (* offset mid-character -> BADUTFOFFSET (both engines) *)
+    ("(*UTF)a", "\xc3\xa9", 1, 0l);
+    (* partial over a multi-byte tail *)
+    ("(*UTF)\\x{100}\\x{101}", "\xc4\x80", 0, o_partial_soft);
     (* literal match / miss at various offsets *)
     ("abc", "abc", 0, 0l);
     ("abc", "xabc", 0, 0l);
@@ -1793,6 +1858,57 @@ let limit_match_boundary_test =
             ("\\w+\\d", "abc1"); (* type-repeat over a mixed run *)
             ("\\R+x", "\r\n\nx"); (* \R repeat give-back over CRLF *)
           ]);
+    (* Chunk I: XCLASS-repeat tick parity. The XCLASS maxbt RMATCHes FIRST and
+       gives back one CHARACTER per tick down to and INCLUDING the floor
+       (pcre2_match.c:2278-2288, RM101 — exactly the CLASS RM24/:2143 shape,
+       NOT the char/type floor-in-place one), so the two engines must trip -47
+       at the SAME N. Every subject below forces the maximizing scan to give
+       back all the way to the floor (the continuation fails at every
+       position), pinning the floor tick; UTF entries give back over
+       multi-byte characters (BACKCHAR). *)
+    Alcotest.test_case "LIMIT_MATCH sweep, XCLASS repeat (fast == interp)"
+      `Quick (fun () ->
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 40 do
+              let f, e = run_both body n subj in
+              Alcotest.(check string)
+                (Printf.sprintf "fast == interp for /%s/ on %S at N=%d" body subj
+                   n)
+                e f
+            done)
+          [
+            (* Entry design notes. (1) \A pins ONE attempt, so the divergent
+               tick is the BINDING one — match_call_count resets per attempt
+               (pcre2_match.c:7506), so an unanchored pattern's earlier
+               higher-tick attempts would mask a last-attempt divergence.
+               (2) Every subject keeps the req_cu ('9', or the 0x80 tail of a
+               multi-byte char) present — otherwise the tail_opts req_cu scan
+               skips the attempt entirely (zero ticks in BOTH engines) and the
+               sweep pins nothing. (3) ( *NO_AUTO_POSSESS) keeps the greedy
+               repeats true maximizers — the follower is outside the class, so
+               auto-possession would otherwise remove the give-back path
+               entirely (a possessive repeat never backtracks). *)
+            (* floor-exact bounded repeat: the min loop eats everything, the
+               greedy scan adds nothing (pmax == floor), and the floor RMATCH
+               itself — the C's RM101-first tick — matches '9'. A
+               floor-in-place mislowering completes one N earlier. *)
+            ("(*NO_AUTO_POSSESS)\\A[\\p{L}]{2,5}9", "aa9");
+            ("(*UTF)(*NO_AUTO_POSSESS)\\A[\\p{L}]{2,5}9", "\xce\xb1\xce\xb29");
+            (* pmax == floor == 0: the scan matches nothing, '9' at the floor *)
+            ("(*NO_AUTO_POSSESS)\\A[\\p{L}]*9", "9aaa");
+            (* greedy give-back all the way DOWN TO the floor (each give-back
+               AND the floor try one tick, then NOMATCH) — pins the
+               backtrack_rep_max tag-58 floor tick *)
+            ("(*NO_AUTO_POSSESS)\\A[\\p{L}]*9", "aaa!9");
+            ( "(*UTF)(*NO_AUTO_POSSESS)\\A[\\x{100}-\\x{200}]*\\x{300}",
+              "\xc4\x80\xc4\x80!\xcc\x80" );
+            (* UTF give-back over 2-byte chars, matching mid-way (BACKCHAR) *)
+            ( "(*UTF)(*NO_AUTO_POSSESS)\\A[\\x{100}-\\x{200}]*\\x{101}",
+              "\xc4\x80\xc4\x80\xc4\x81" );
+            (* lazy XCLASS repeat: extend one char per tick (RM100) *)
+            ("(*UTF)\\A[\\p{L}]*?9", "\xce\xb1\xce\xb19");
+          ]);
     (* Chunk F: ref-repeat tick parity. A greedy ref repeat over-eats then gives
        back one COPY per RMATCH (RM21) down to and including the floor
        (pcre2_match.c:5154-5162); a lazy one extends by one copy per RMATCH
@@ -2039,6 +2155,44 @@ let alloc_tests =
               (Printf.sprintf
                  "expected O(1) minor allocation for lazy \\R extension over \
                   ~50k CRLF pairs, measured %.0f words"
+                 delta)
+              true (delta < 1000.));
+    (* Chunk I: the UTF greedy give-back path. An anchored maximizing char
+       repeat over ~50k TWO-BYTE characters (U+0100 = C4 80) whose continuation
+       fails everywhere: one attempt, greedy scan to the end, then ~50k
+       give-back steps — each stores the previous CHARACTER boundary via the
+       allocation-free [backchar_sub] (rep_giveback) and re-runs the
+       continuation. Must stay O(1) minor allocation (§8 — an int-ref per
+       BACKCHAR would measure ~150k words here). NO_AUTO_POSSESS keeps the
+       repeat a true STAR (the compiler would otherwise auto-possessify
+       \x{100}* before 'x', skipping the give-back path entirely); \A pins a
+       single attempt. *)
+    Alcotest.test_case "alloc: O(1) UTF give-back over ~50k 2-byte chars" `Slow
+      (fun () ->
+        let o_no_auto_possess = 0x00004000l (* PCRE2_NO_AUTO_POSSESS *) in
+        match F.compile "(*UTF)\\A\\x{100}*x" o_no_auto_possess with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            let b = Buffer.create (2 * 50_000) in
+            for _ = 1 to 50_000 do
+              Buffer.add_string b "\xc4\x80"
+            done;
+            let subject = Buffer.contents b in
+            let expect_nomatch r =
+              match r with
+              | Ok None -> ()
+              | Ok (Some _) -> Alcotest.fail "unexpected match"
+              | Error c -> Alcotest.failf "unexpected error %d" c
+            in
+            expect_nomatch (F.exec re subject 0 0l) (* warm-up *);
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            expect_nomatch r;
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for the UTF give-back over \
+                  ~50k 2-byte chars, measured %.0f words"
                  delta)
               true (delta < 1000.));
   ]

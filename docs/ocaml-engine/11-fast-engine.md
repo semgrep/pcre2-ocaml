@@ -178,8 +178,34 @@ interpreter is its differential oracle. Approved plan:
   NON-ATOMIC positive assertion (OP_ASSERT_NA/ASSERTBACK_NA) in a pattern that
   also contains ( *THEN) (a NA assertion has no KIND_ONCE boundary, so a THEN
   reaching it cannot be contained).
-- [ ] **I — UTF/UCP** — runner UTF decode, per-exec validation, PROP/NOTPROP, caseless via
-  `Ucd.othercase`, `\X`, MATCH_INVALID_UTF fragments.
+- [x] **I — UTF-8 mode** (I1 landed) — the UTF compile gate is removed; per-exec UTF
+  validation (BADUTFOFFSET, the -3..-23 UTF error passthrough, max_lookbehind
+  back-up to `mb.check_subject`, non-invalid path); UTF-aware IR walk (multi-byte
+  OP_CHAR/CHARI/NOT/repeats). Runner UTF arms: CHAR_RUN (byte-exact, walk only),
+  CHARI (`Ucd.othercase` fold > 127), single NOT/NOTI, single character types
+  (`\d\w\s` ASCII code-point-guarded, `\h\v` via `Char_predicates.hspace_char/
+  vspace_char`, `.` / OP_ALLANY / OP_ANYBYTE), CLASS/NCLASS (a code point > 255
+  matches only OP_NCLASS, read at `map_off-1`), **OP_XCLASS** (single + repeat, via
+  the self-contained `Pcre2_engine.Xclass.xclass` — wide chars, ranges AND `\p`
+  properties, in UTF and non-UTF alike — this also unlocked non-UTF `\p`-in-class),
+  word boundary (BACKCHAR'd previous char, `check_subject` floor), anchors (UTF
+  newlines threaded through `Newline.is_newline/was_newline`), char/ctype/class/
+  xclass/`\h`/`\v` repeats (char-step forward, one-CHARACTER-at-a-time BACKCHAR
+  give-back), dot repeats; bump-along / STARTLINE ACROSSCHAR char-stepping;
+  first_cu/req_cu/start_bits/minlength unchanged (already scalar, UTF-correct).
+  Conformance `--driver=fast` testinput4 9→253, testinput5 32→183, testinput10
+  11→24, zero failures; fuzz fast-vs-interp clean over 500k+ cases (multiple
+  seeds). **Declined to chunk I2:** UCP mode (OP_PROP/OP_NOTPROP/OP_EXTUNI/UCP
+  word boundary — property predicates, `\X` grapheme clusters, multi-case
+  `caseless_sets`); PCRE2_MATCH_INVALID_UTF (fragment carry-on); caseless
+  backreferences in UTF (`Ucd.othercase`/caseset fold with variable byte length);
+  UTF lookbehind (char-wise OP_REVERSE/OP_VREVERSE); `\R` (OP_ANYNL) in UTF —
+  BOTH single and repeated (multi-byte NEL/LS/PS members + variable give-back);
+  OP_ALLANY / OP_ANYBYTE repeats in UTF (char-step / no-SCHECK partial
+  subtleties).
+- [ ] **I2 — UCP + UTF remainder** — PROP/NOTPROP/EXTUNI/UCP word boundary,
+  caseless via `Ucd.othercase`/caseset, caseless backrefs, UTF lookbehind, `\R`
+  in UTF, ALLANY/ANYBYTE repeats in UTF, MATCH_INVALID_UTF fragments.
 - [ ] **J — Conditionals** — COND/SCOND + CREF/DNCREF/RREF/DNRREF/FALSE/TRUE.
 - [ ] **K — Recursion + script-run + callout no-ops** — full parity reached; no
   `Unsupported` remains for in-scope patterns.

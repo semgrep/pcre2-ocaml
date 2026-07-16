@@ -113,6 +113,8 @@ following the tag. Widths are `Ir.arity`:
 | 54 | `THEN` | `mark_off` | 2 | `OP_THEN`/`OP_THEN_ARG`: push a KIND_VERB (`vt_then`); fires `MATCH_THEN`, passing back this opcode's IR pc (`verb_then_pc`) for the enclosing alternation's KIND_ALT scope check |
 | 55 | `ACCEPT` | — | 1 | `OP_ACCEPT`: end the whole match (shares the END recording; ENDANCHORED-and-not-at-end is a DIRECT NOMATCH return, pcre2_match.c:916) |
 | 56 | `CLOSE` | `ovbase; referenced` | 3 | `OP_CLOSE` before an ACCEPT: close capture N, pushing a KIND_CAP so it rolls back if ACCEPT then backtracks. `referenced=1` reads the start from `mb.cap_start[ovbase]`, else ovector[ovbase] already holds it |
+| 57 | `XCLASS` | `data_off` | 2 | one `OP_XCLASS` test (chunk I): match one code point via `Pcre2_engine.Xclass.xclass` against the class data offset `data_off` (the flag code unit in `re.code` = OP_XCLASS position + 1 + LINK_SIZE). Wide chars, ranges, `\p` properties; UTF and non-UTF |
+| 58 | `XCLASS_REP` | `reptype; lmin; lmax; data_off` | 5 | `OP_XCLASS` + an `OP_CR*` quantifier (chunk I): routes through the shared REP machinery as `rk_xclass` (`rep_map_off` holds `data_off`) |
 
 **Chunk H additions — backtracking control verbs, FAIL, ACCEPT, CLOSE.** Eight
 new tags (49-56) and one save kind (KIND_VERB 13). Verbs turn backtracking into
@@ -420,6 +422,72 @@ give-back (`rep_greedy_done` / `backtrack_rep_max`) is tick-identical to the
 interpreter. (The JIT never had a tick-parity obligation; this is the same
 differential-contract decision recorded for detect_repeat.)
 
+**Chunk I additions — UTF-8 mode (I1).** The UTF compile gate is removed; the
+IR walk (`ir_compile.ml`) becomes UTF-aware via `char_extra` (a char-embedding
+opcode — OP_CHAR/CHARI/NOT/NOTI and the OP_STAR..OP_NOTPOSUPTOI repeats —
+advances `Op.op_lengths.(op) + GET_EXTRALEN` in UTF; the `optimized_cbracket`
+analysis walk uses the same), and CHARI/NOT/repeat chars are stored as CODE
+POINTS (folded via `Ucd.othercase` when > 127, else the fcc table). Two new tags
+(57 `XCLASS`, 58 `XCLASS_REP`) lower `OP_XCLASS` through the self-contained
+`Pcre2_engine.Xclass.xclass` (which handles wide chars, ranges and `\p`
+properties for any code-unit width) — this also removed the non-UTF
+`\p`-in-class decline. `mb` gains `utf` and `check_subject`.
+
+Runner semantics per char-consuming arm branch on `mb.utf` (the non-UTF path is
+byte-identical to before, so a predictable branch, no allocation): `CHAR_RUN`
+stays a byte-exact compare (a caseful UTF-8 run is byte-equal — the walk fix
+alone suffices); `CHARI` reads the subject char and tests it against the pattern
+code point or its `Ucd.othercase` (< 128 keeps the fast lcc table); single types
+decode a code point (`\d\w\s` guard `cp <= 255` — the C's CHMAX_255 — since a
+code point > 255 is not in an ASCII ctype class without UCP; `\h\v` use
+`Char_predicates.hspace_char/vspace_char`; `.` / OP_ALLANY step one character,
+OP_ANYBYTE stays one code unit); `CLASS`/`CLASS_REP` decode a code point and, for
+`cp > 255`, match iff the opcode byte at `map_off-1` is `OP_NCLASS`
+(interpreter.ml:4463-4468 — the E-era CLASS/NCLASS collapse revisited); repeats
+(char / ctype / class / xclass / `\h` / `\v`) step one character forward and give
+back one CHARACTER at a time (BACKCHAR — `rep_giveback`, tick-identical to the
+C's RM34/RM203 BACKCHAR); the word-boundary previous char is BACKCHAR'd and the
+floor is `mb.check_subject`; anchors thread `mb.utf` into
+`Newline.is_newline/was_newline` (NEL/LS/PS); bump-along / STARTLINE step by
+CHARACTERS (`across_char`, the ACROSSCHAR of pcre2_match.c:7326/7561).
+
+`first_cu`/`req_cu`/`start_bits`/`minlength` are UNCHANGED: `first_cu`/`req_cu`
+are code UNITS (memchr on a byte is UTF-safe — a first code unit is either ASCII
+or a lead byte, both char-boundary-aligned), and the interpreter's only
+UTF/UCP-divergent branch (`first_cu2` via `Ucd.othercase`, pcre2_match.c:7101) is
+UCP-only (dead here), so the existing fcc setup already matches the interpreter
+for UTF.
+
+**Per-exec UTF validation (I1, `utf_check` in runner.ml).** Mirrors the
+NON-invalid branch of pcre2_match.c:6807-6905 / interpreter.ml:9677-9781: the
+first code unit must be a character start (else BADUTFOFFSET at offset > 0, or an
+isolated-0x80 error at 0); then back up `max_lookbehind` CHARACTERS to
+`check_subject` and `Valid_utf.valid_utf` the span, returning the UTF error code
+(-3..-23) with its absolute offset (carried in the outcome's `ostart`, mapped to
+`Engine.Error start_char` at the seam). `PCRE2_NO_UTF_CHECK` skips it
+(`check_subject = 0`), exactly as the C.
+
+**Declined to chunk I2 (precise compile-time declines).** UCP mode
+(OP_PROP/OP_NOTPROP/OP_EXTUNI/UCP word boundary), `PCRE2_MATCH_INVALID_UTF`
+(fragment carry-on), caseless backreferences in UTF (variable-byte-length
+`Ucd.othercase`/caseset fold), UTF lookbehind (char-wise OP_REVERSE/OP_VREVERSE),
+`\R` (OP_ANYNL) in UTF — BOTH the single test and its repeats (multi-byte
+NEL/LS/PS members; variable-length give-back), OP_ALLANY / OP_ANYBYTE repeats in
+UTF (char-step / no-SCHECK partial subtleties). Each is a first-opcode
+`Unsupported "... (chunk I2)"`, so accepted patterns are never mis-lowered;
+verified by conformance `--driver=fast --failures` (empty) and fuzz
+fast-vs-interp (0 divergences, 500k+ cases). §3 (save records) and §4 (tick
+sites) gain NO new rows or save kinds from chunk I: every UTF arm ticks at the
+same site as its non-UTF twin (repeats reuse the existing REP_MIN/REP_MAX rows;
+the char-wise BACKCHAR give-back ticks once per CHARACTER exactly as the C's
+RM203/RM34/RM201/RM101), and the NEW `XCLASS_REP` — identical in UTF and
+non-UTF — takes the CLASS maxbt row: the floor position is a ticked RMATCH
+(RM101, pcre2_match.c:2278-2288 ≡ CLASS's RM24/:2143), routed through
+`rep_greedy_done_class` and the class-like branch of `backtrack_rep_max` (tags
+31 AND 58) — the same §4 tick-parity requirement recorded for CLASS in chunk E.
+The §3 "snapshot completeness proof" chunk-K revisit flag is untouched (chunk I
+adds no recursion / subroutine re-entry).
+
 `Ir.dump : Format.formatter -> Ir.t -> unit` prints one `%3d TAG operands` line per head
 (debug_printer.ml style); `CHAR_RUN`/`CHARI` show the escaped literal, `ALT` shows
 `next=<pc>`, `JMP` shows the target pc. Used for golden tests (`test/fast/fast_tests.ml`).
@@ -437,8 +505,10 @@ differential-contract decision recorded for detect_repeat.)
 
 `Ir_compile.compile : Compile.re -> (Ir.t, string) result` walks `re.code` (mirroring
 debug_printer.ml's opcode walk; LINK_SIZE = 2 via `Compile.get`). Compile-level gates run
-BEFORE the walk: UTF/UCP option bits → `"fast: UTF mode (chunk I)"` / `"... UCP mode ..."`;
-`PCRE2_FIRSTLINE` → `"... (chunk L)"`. (Chunk D removed the `top_bracket > 0`
+BEFORE the walk: `PCRE2_UCP` → `"fast: UCP mode (chunk I2)"`,
+`PCRE2_MATCH_INVALID_UTF` → `"... (chunk I2)"`, `PCRE2_FIRSTLINE` → `"... (chunk
+L)"` (chunk I removed the `PCRE2_UTF` gate — UTF mode is now lowered by the
+UTF-aware walk + runner UTF arms). (Chunk D removed the `top_bracket > 0`
 gate — capturing groups are now lowered.) The first out-of-subset opcode
 yields `Error "fast: <construct> (chunk X)"` (taxonomy §6).
 
