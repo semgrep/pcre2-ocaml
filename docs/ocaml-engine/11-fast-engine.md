@@ -40,9 +40,17 @@ interpreter is its differential oracle. Approved plan:
   `fast_baseline_counts.sexp`; `fast-design.md` v0; rules/agents/skills amendments; fix
   verify-skill `--smoke`→`--quick` drift. (Deviation: the fuzz `--mode fast-vs-interp`
   plumbing moved to chunk C, where the fast engine first executes matches.)
-- [ ] **C — IR + verifier + runner core** — CHAR/CHARI, CHAR_RUN fusion
-  (`pcre2_jit_compile.c:7479`), BRA/KET, ALT save records, simple anchors, END; fused loop +
-  save_stack + shadow limits + naive bump-along; IR goldens, runner units, fast alloc pins.
+- [x] **C1 — IR + IR compiler + static verifier** — 13-tag IR (fast-design.md §2 table):
+  CHAR_RUN fusion (`pcre2_jit_compile.c:7479`; CHARI deliberately unfused — conservative
+  simplification, the JIT does fuse single-bit-othercase runs, candidate for chunk M),
+  BRA/KET markers, ALT choice points + JMP (n-1 lowering, §3), simple anchors, END;
+  compile-level UTF/UCP/top_bracket gates; `Ir.dump` goldens (17) + unsupported-reason +
+  corrupt-IR verifier tests + sweep (46 cases, test/fast/). Seam unchanged (runner is C2).
+- [ ] **C2 — save stack + fused runner + seam wiring** — save_stack (scratch reuse, §3
+  records), the fused tail-loop runner over the C1 subset, shadow limit accounting (§4),
+  naive bump-along driver, `t` becomes the IR record, always-on cheap verifier subset in
+  `Fast.compile`; fuzz `--mode fast-vs-interp`; runner units + fast alloc pins;
+  `--driver=fast` ratchet rises past 307.
 - [ ] **D — Captures + char repeats** — CBRA/SCBRA/CBRAPOS/CLOSE + ovector saves +
   optimized_cbracket (`:404,1145-1184`); repeat superinstructions + detect_repeat (`:1699`).
 - [ ] **E — Classes/types** — CLASS/NCLASS bitmap, XCLASS (via `Xclass`), type

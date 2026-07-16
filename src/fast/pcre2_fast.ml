@@ -11,6 +11,18 @@
 
 module E = Pcre2_engine.Engine
 
+(** {1 Unstable internals — exposed for tests only (M11 chunk C1)}
+
+    [Ir], [Ir_compile] and [Ir_verify] are the fast engine's IR, its compiler
+    and its static verifier. They are NOT part of the public seam and may
+    change without notice; only [test/fast] should reference them. The seam's
+    public functions/types below are unchanged (chunk C1 adds no runner, so
+    [compile] still yields [Unsupported] for every pattern). *)
+
+module Ir = Ir
+module Ir_compile = Ir_compile
+module Ir_verify = Ir_verify
+
 type t = |
 
 type compile_error =

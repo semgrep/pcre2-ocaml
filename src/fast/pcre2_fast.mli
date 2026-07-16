@@ -8,6 +8,23 @@
    accepts, observable behavior is identical to [Pcre2_engine.Engine]
    (same rc/ovector/mark/startchar, same limit trip points). *)
 
+(** {1 Unstable internals — exposed for tests only (M11 chunk C1)}
+
+    [Ir], [Ir_compile] and [Ir_verify] are the fast engine's IR, its compiler
+    and its static verifier, surfaced so [test/fast] can drive them directly
+    (the wrapped library otherwise hides them behind this entry module). They
+    are NOT part of the stable seam and may change without notice. *)
+
+module Ir = Ir
+
+module Ir_compile : sig
+  val compile : Pcre2_engine.Compile.re -> (Ir.t, string) result
+end
+
+module Ir_verify : sig
+  val check : Ir.t -> (unit, string) result
+end
+
 type t
 (** A pattern compiled for the fast engine. *)
 

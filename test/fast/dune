@@ -1,0 +1,20 @@
+; White-box suite for the fast engine's IR, IR compiler and static verifier
+; (M11 chunk C1, docs/ocaml-engine/11-fast-engine.md). Drives the unstable
+; internals re-exported from Pcre2_fast (Ir / Ir_compile / Ir_verify). Runs
+; on @runtest; the @pure-tests alias mirrors test/dune's for libpcre2-free
+; runs.
+
+(test
+ (name fast_tests)
+ (package pcre2-dev)
+ (libraries pcre2.fast pcre2.engine pcre2.matcher alcotest))
+
+(rule
+ (alias pure-tests)
+ (action
+  (run ./fast_tests.exe)))
+
+(env
+ (dev
+  (flags
+   (:standard -w -27))))
