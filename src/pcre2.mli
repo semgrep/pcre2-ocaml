@@ -1,7 +1,7 @@
-type match_ [@@deriving show, eq]
+type match_ = Pcre2_matcher.Match.match_ [@@deriving show, eq]
 (** An individual match, either of a whole pattern or of a capture group. *)
 
-type captures [@@deriving show, eq]
+type captures = Pcre2_matcher.Match.captures [@@deriving show, eq]
 (** A set comprising an entire match alongside any matches for capture groups *)
 
 (** The kinds of error which may occur during compilation of the pattern *)
@@ -165,7 +165,7 @@ type compile_error = {
 [@@deriving show, eq]
 
 (** Errors which may occur during matching of a pattern *)
-type match_error =
+type match_error = Pcre2_matcher.Error.match_error =
   (* Error codes for UTF-8 validity checks. See man 3 pcre2unicode. *)
   | UTF8_ERR1
       (** The string ends with a truncated UTF-8 character; 1 byte is missing.
