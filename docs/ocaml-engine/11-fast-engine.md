@@ -276,13 +276,38 @@ interpreter is its differential oracle. Approved plan:
   KIND_ONCE re-push); +56 units. Deferred with rationale: recursion -> K1b (RECURSELOOP
   needs faithful last_used_ptr tracking; wrong -52 = wrong answer), \K -> K2 (scope gap:
   never chunk-assigned), (*ACCEPT)-in-assertion + (*THEN)+NA -> K2.
-- [ ] **K1b — recursion** — OP_RECURSE all forms + last_used_ptr infrastructure +
-  RECURSELOOP (-52) parity + fat recursion save record (full ovector/group_start/
-  cap_start/mark/current_recurse/once_base — plan in fast-design §3) + RREF un-FALSE
-  for recursion-containing patterns + snapshot-proof re-establishment (~161 units).
+- [x] **K1b — recursion** — OP_RECURSE all forms ((?R)/(?0), (?n), (?&name),
+  (?P>name), relative (?+1)/(?-1), mutual/self) + last_used_ptr infrastructure
+  (approach (a): faithful tracking gated on has_recurse — the NOMATCH-RRETURN
+  transition via the `bt` wrapper with C-EXACT per-arm failure positions
+  (char-run de-fuse + char_run_cfail post-increment, rep_fail_pos per repeat
+  family, read-first singles, ref partial Feptr=end_subject); the MATCH-return
+  kets NASSERT_MATCH/COND_ASSERT_MATCH/KETRPOS; group-exhaustion FAIL heads with
+  the FAIL vs FAIL_NASSERT split (negative-assertion exhaustion is the C's
+  same-frame goto, NO record) + the KIND_RECURSE-pop call_eptr record + the
+  verb-path boundary records (KIND_ONCE entry_eptr — the record gained a slot,
+  width 2n+3 — KIND_POS iter_start, KIND_NASSERT SKIP_ARG-escape eptr_enter;
+  the C's RRETURN(rrc) from those frames, :5408/:5529/:5315/:5574; the nassert
+  COMMIT/SKIP/PRUNE containment is a same-frame goto, NO record); the
+  in-line OP_END/positive-assert-ket/word-boundary sites — fast-design §4)
+  + RECURSELOOP (-52) parity WITH and WITHOUT
+  DISABLE_RECURSELOOP_CHECK + FAT recursion save record (KIND_RECURSE /
+  KIND_RECURSE_RET snapshot the full ovector/group_start/cap_start + mark +
+  current_recurse/once_base/recurse_base) + captures-don't-escape + backtrack
+  into/past a completed recursion + shared-ket subroutine return (CBRA/SCBRA
+  CAP_END + whole-pattern KET) + ( *ACCEPT)-in-recursion commit + verb
+  containment (verb_current_recurse) + RREF/DNRREF un-FALSE + snapshot-proof
+  re-establishment (§3). New IR tags RECURSE/COND_RREF/COND_DNRREF/FAIL_NASSERT
+  (70-73), save
+  kinds KIND_RECURSE/KIND_RECURSE_RET (15-16). Ratchet +140 units (testinput1/2/
+  4/5). Fuzz fast-vs-interp clean over 700k+ recursion-inclusive cases (8 seeds).
+  **Declined (K1b-residual):** OP_RECURSE into a POSSESSIVE capture
+  (OP_CBRAPOS/OP_SCBRAPOS — the OP_KETRPOS ket-return + skipped KIND_POS
+  boundary; ~18 units).
 - [ ] **K2 — \K + H+ cleanups** — OP_SET_SOM (\K, ~36 units), (*ACCEPT) inside all
-  4 assertion kinds (~13), (*THEN) with non-atomic assertions. After K2 the decline
-  list reads exactly {PCRE2_FIRSTLINE (chunk L)}.
+  4 assertion kinds (~13), (*THEN) with non-atomic assertions, and OP_RECURSE
+  into a possessive capture (K1b-residual). After K2 the decline list reads
+  exactly {PCRE2_FIRSTLINE (chunk L)}.
 - [ ] **L — JIT start-opts** — scan_prefix + range skip table (`:5592,6159-6330`),
   first_cu/req_cu scalar ports, startline/start_bits/minlength.
 - [ ] **M — Early-fail + tuning** — detect_early_fail watermarks (`:1292`, types `:232`);

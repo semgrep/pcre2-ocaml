@@ -306,6 +306,65 @@ let optimized_cbracket (re : C.re) : bool array =
   if top > 0 then go 0;
   opt
 
+(* Chunk K1b — does the pattern contain OP_RECURSE (a subroutine call)? Walks the
+   bytecode opcode-by-opcode (the same length-aware walk as [optimized_cbracket],
+   robust against operand bytes that happen to equal an opcode value). When true,
+   the IR compiler forces the whole-pattern OP_BRA to GROUPLOOP lowering (so a
+   (?R)/(?0) into it ticks per branch like the C's RM11, §4) and the runner
+   tracks mb.last_used_ptr for the RECURSELOOP check (fast-design.md §3/§4). *)
+let contains_recurse (re : C.re) : bool =
+  let src = re.C.code in
+  let limit = Bytes.length src in
+  let byte p = Char.code (Bytes.get src p) in
+  let utf = not (Int.equal (re.C.overall_options land Opt.utf) 0) in
+  let char_extra q =
+    if utf then
+      let c = byte q in
+      if c >= 0xc0 then Utf.get_extralen c else 0
+    else 0
+  in
+  let code_len p =
+    let op = byte p in
+    if Int.equal op Op.op_xclass then C.get src (p + 1)
+    else if Int.equal op Op.op_callout_str then
+      C.get src (p + 1 + (2 * Limits.link_size))
+    else if
+      Int.equal op Op.op_mark || Int.equal op Op.op_prune_arg
+      || Int.equal op Op.op_skip_arg || Int.equal op Op.op_then_arg
+      || Int.equal op Op.op_commit_arg
+    then Op.op_lengths.(op) + byte (p + 1)
+    else if
+      Int.equal op Op.op_char || Int.equal op Op.op_chari
+      || Int.equal op Op.op_not || Int.equal op Op.op_noti
+    then Op.op_lengths.(op) + char_extra (p + 1)
+    else if is_char_repeat op then (
+      let _, _, fidx = rep_kind op in
+      let char_off =
+        if rep_has_count fidx then p + 1 + Limits.imm2_size else p + 1
+      in
+      Op.op_lengths.(op) + char_extra char_off)
+    else if op >= Op.op_typestar && op <= Op.op_typeposupto then (
+      let fidx = op - Op.op_typestar in
+      let type_off =
+        if rep_has_count fidx then p + 1 + Limits.imm2_size else p + 1
+      in
+      let t = byte type_off in
+      Op.op_lengths.(op)
+      + (if Int.equal t Op.op_prop || Int.equal t Op.op_notprop then 2 else 0))
+    else Op.op_lengths.(op)
+  in
+  let rec go p =
+    if p < 0 || p + 1 > limit then false
+    else
+      let op = byte p in
+      if Int.equal op Op.op_end then false
+      else if Int.equal op Op.op_recurse then true
+      else
+        let w = code_len p in
+        if w < 1 then false else (go [@tailcall]) (p + w)
+  in
+  go 0
+
 let compile (re : C.re) : (Ir.t, string) result =
   (* Chunk I — UTF-8 mode is lowered (multi-byte CHAR/CHARI/classes/types/
      repeats via the char-aware walk below and the runner's UTF arms). Chunk I2
@@ -374,6 +433,19 @@ let compile (re : C.re) : (Ir.t, string) result =
        bra_loop optimization (last branch runs in the enclosing frame, no THEN
        check). *)
     let hasthen = not (Int.equal (re.C.flags land C.hasthen) 0) in
+    (* Chunk K1b — pattern recursion. [has_recurse] forces the whole-pattern
+       OP_BRA to GROUPLOOP so a (?R)/(?0) into it ticks per branch (the C's RM11,
+       §4) and the runner tracks last_used_ptr; [bracket_ir] records each
+       recursion-callable group's (bytecode bra_off -> IR first-branch entry pc)
+       so a t_recurse can jump into a body compiled anywhere (forward or back);
+       [recurse_fixups] holds each t_recurse's (entry-operand slot, target bra_off)
+       to resolve after the whole walk. *)
+    let has_recurse = contains_recurse re in
+    let bracket_ir = ref [] in
+    let recurse_fixups = ref [] in
+    let record_bracket (bra_off : int) (entry_pc : int) : unit =
+      bracket_ir := (bra_off, entry_pc) :: !bracket_ir
+    in
     (* Chunk H (fast-design.md §3): THEN scope boundary per ALT [pc]. Recorded as
        (alt_pc, then_end) at each ALT-handler patch; then_end = the handler when
        the ALT belongs to a >= 2-branch alternation, else -1 (so a ( *THEN) never
@@ -429,7 +501,16 @@ let compile (re : C.re) : (Ir.t, string) result =
          (capturing) and OP_SBRA (empty-checking non-capturing); OP_BRA keeps
          bra_loop lowering UNLESS the pattern has ( *THEN), which forces grouploop
          at all depths (chunk H, interpreter.ml:2419-2425 / pcre2_match.c:5350). *)
-      let grouploop = is_capture || is_sbra || (is_bra && hasthen) in
+      (* Chunk K1b — the whole-pattern OP_BRA (bra_off 0) is forced GROUPLOOP
+         when the pattern has recursion so a (?R)/(?0) into it ticks per branch
+         (the C's RM11), matching the interpreter. Tick-neutral for normal
+         execution: group 0 runs at rdepth 0 where the runner already ticks the
+         last branch (grouploop-at-top-level, whether the lowering is bra_loop or
+         grouploop). *)
+      let grouploop =
+        is_capture || is_sbra
+        || (is_bra && (hasthen || (has_recurse && Int.equal bra_off 0)))
+      in
       (* optimized_cbracket gate (pcre2_jit_compile.c:404,1145-1184): a capture
          whose optimized bit is CLEAR is reached by a reference — OP_REF/OP_REFI
          (chunk F), OP_CREF/OP_DNCREF (conditionals, chunk J), OP_DNREF/OP_DNREFI
@@ -486,6 +567,13 @@ let compile (re : C.re) : (Ir.t, string) result =
       if is_capture then (
         push (if referenced then Ir.t_cap_start_ref else Ir.t_cap_start);
         push ovbase);
+      (* Chunk K1b — record this bracket's recursion ENTRY = its t_bra (the
+         first-branch head). A (?N) call jumps here, SKIPPING the t_cap_start /
+         t_group_start above: a recursion of group N does not set group N's own
+         capture (captures do not escape) nor its repeat empty-check start (the
+         recursion returns at the ket before the repeat). Recorded for every
+         group so a forward call resolves after the walk. *)
+      record_bracket bra_off (here ());
       push Ir.t_bra;
       let nbr = List.length branch_offs in
       (* End-of-branch jumps to fix up to the KET once its index is known. *)
@@ -685,9 +773,14 @@ let compile (re : C.re) : (Ir.t, string) result =
         branch_offs;
       (* The last ALT's handler resolves to a FAIL: exhausting the branches
          propagates NOMATCH (positive: the assertion fails; negative: the FAIL's
-         backtrack reaches the KIND_NASSERT record = SUCCESS). *)
+         backtrack reaches the KIND_NASSERT record = SUCCESS). Chunk K1b — a
+         NEGATIVE assertion's exhaustion is the C's same-frame ASSERT_NOT_FAILED
+         goto (pcre2_match.c:5561-5564 -> :5582, NO RRETURN), so its FAIL must
+         not record last_used_ptr (t_fail_nassert); the atomic-group / positive-
+         assertion exhaustion is RRETURN(MATCH_NOMATCH) from the frame at entry
+         (:5410/:5531), so t_fail (which records via bt) is exact for those. *)
       let fail_pc = here () in
-      push Ir.t_fail;
+      push (if neg then Ir.t_fail_nassert else Ir.t_fail);
       if !prev_cp >= 0 then patch_alt !prev_cp fail_pc multibranch;
       (* Convergence instruction the branch JMPs target. *)
       let conv_ir = here () in
@@ -923,9 +1016,15 @@ let compile (re : C.re) : (Ir.t, string) result =
       let is_cref = Int.equal cond_op Op.op_cref in
       let is_dncref = Int.equal cond_op Op.op_dncref in
       let is_true = Int.equal cond_op Op.op_true in
+      (* Chunk K1b — OP_RREF/OP_DNRREF (recursion tests) are no longer always
+         false: (?(R))/(?(Rn))/(?(R&name)) test mb.current_recurse (COND_RREF /
+         COND_DNRREF, pcre2_match.c:5645-5666). For a pattern WITHOUT recursion
+         current_recurse is always -1, so the tests are still always false —
+         behaviour-identical to the chunk-J COND_FALSE. *)
+      let is_rref = Int.equal cond_op Op.op_rref in
+      let is_dnrref = Int.equal cond_op Op.op_dnrref in
       let is_false =
         Int.equal cond_op Op.op_false || Int.equal cond_op Op.op_fail
-        || Int.equal cond_op Op.op_rref || Int.equal cond_op Op.op_dnrref
       in
       (* An assertion condition is exactly one of the four atomic kinds (a
          non-atomic ( *napla:)/( *naplb:) condition is compile error 162, so it
@@ -942,8 +1041,11 @@ let compile (re : C.re) : (Ir.t, string) result =
         || Int.equal cond_op Op.op_assertback
         || Int.equal cond_op Op.op_assertback_not
       in
-      if not (is_cref || is_dncref || is_true || is_false || is_assert) then
-        raise (Unsupported (reason_of_op cond_op));
+      if
+        not
+          (is_cref || is_dncref || is_true || is_false || is_rref || is_dnrref
+         || is_assert)
+      then raise (Unsupported (reason_of_op cond_op));
       let positive =
         Int.equal cond_op Op.op_assert || Int.equal cond_op Op.op_assertback
       in
@@ -1032,9 +1134,12 @@ let compile (re : C.re) : (Ir.t, string) result =
         in
         branches cond_op_off;
         (* Exhausting the branches (last ALT handler = FAIL) backtracks to the
-           KIND_NASSERT boundary -> backtrack_nassert -> cont = nomatch_target. *)
+           KIND_NASSERT boundary -> backtrack_nassert -> cont = nomatch_target.
+           Chunk K1b — the C's condition-assertion exhaustion is a same-frame
+           `condition = !Lpositive; break` (pcre2_match.c:5729-5734, NO RRETURN),
+           so this FAIL must not record last_used_ptr (t_fail_nassert). *)
         let fail_pc = here () in
-        push Ir.t_fail;
+        push Ir.t_fail_nassert;
         if !prev_cp >= 0 then patch_alt !prev_cp fail_pc multibranch;
         (* conv: a matching assertion branch commits + jumps to match_target. *)
         let conv_pc = here () in
@@ -1073,6 +1178,21 @@ let compile (re : C.re) : (Ir.t, string) result =
            push 0)
          else if is_dncref then (
            push Ir.t_cond_dncref;
+           push (C.get2 src (cond_op_off + 1) * re.C.name_entry_size);
+           push (C.get2 src (cond_op_off + 1 + Limits.imm2_size));
+           no_operand := here ();
+           push 0)
+         else if is_rref then (
+           (* OP_RREF (chunk K1b, pcre2_match.c:5645-5651): number = GET2(p+1)
+              (RREF_ANY = 0xffff for (?(R)); else the group number for (?(Rn))). *)
+           push Ir.t_cond_rref;
+           push (C.get2 src (cond_op_off + 1));
+           no_operand := here ();
+           push 0)
+         else if is_dnrref then (
+           (* OP_DNRREF (chunk K1b, pcre2_match.c:5653-5666): the name-table list
+              GET2(p+1) (first slot) x count GET2(p+1+IMM2). *)
+           push Ir.t_cond_dnrref;
            push (C.get2 src (cond_op_off + 1) * re.C.name_entry_size);
            push (C.get2 src (cond_op_off + 1 + Limits.imm2_size));
            no_operand := here ();
@@ -1151,20 +1271,43 @@ let compile (re : C.re) : (Ir.t, string) result =
              append ALL of the char's code units to [lit] (a caseful UTF-8 run
              is a byte-exact compare — pcre2_match.c:1007-1010 compares unit by
              unit) and advance past the whole item (1 + char length). *)
-          let off = Buffer.length lit in
-          let q = ref !p in
-          while Int.equal (byte !q) Op.op_char do
-            let clen = 1 + char_extra (!q + 1) in
-            for b = 0 to clen - 1 do
-              Buffer.add_char lit (Bytes.get src (!q + 1 + b))
+          (* Chunk K1b — when the pattern has recursion the runner tracks
+             mb.last_used_ptr for the RECURSELOOP check (fast-design.md §3/§4).
+             A FUSED run that mismatches at its j-th unit leaves the fast eptr at
+             the run START, whereas the C's per-OP_CHAR frame advances Feptr to
+             the mismatch and records it in last_used_ptr (pcre2_match.c:6470).
+             To keep last_used_ptr byte-identical, has_recurse patterns emit ONE
+             CHAR_RUN per character (tick-neutral — chars create no choice point),
+             so a mismatch's fast eptr equals the C's Feptr. *)
+          if has_recurse then (
+            let q = ref !p in
+            while Int.equal (byte !q) Op.op_char do
+              let off = Buffer.length lit in
+              let clen = 1 + char_extra (!q + 1) in
+              for b = 0 to clen - 1 do
+                Buffer.add_char lit (Bytes.get src (!q + 1 + b))
+              done;
+              push Ir.t_char_run;
+              push off;
+              push clen;
+              q := !q + 1 + clen
             done;
-            q := !q + 1 + clen
-          done;
-          let len = Buffer.length lit - off in
-          push Ir.t_char_run;
-          push off;
-          push len;
-          p := !q)
+            p := !q)
+          else (
+            let off = Buffer.length lit in
+            let q = ref !p in
+            while Int.equal (byte !q) Op.op_char do
+              let clen = 1 + char_extra (!q + 1) in
+              for b = 0 to clen - 1 do
+                Buffer.add_char lit (Bytes.get src (!q + 1 + b))
+              done;
+              q := !q + 1 + clen
+            done;
+            let len = Buffer.length lit - off in
+            push Ir.t_char_run;
+            push off;
+            push len;
+            p := !q))
         else if Int.equal op Op.op_chari then (
           (* OP_CHARI: one CHARI instruction per code unit — a DELIBERATE
              conservative simplification, not JIT parity: the vendored JIT
@@ -1203,6 +1346,25 @@ let compile (re : C.re) : (Ir.t, string) result =
         else if Int.equal op Op.op_script_run then
           (* Script run (the sr / script_run verb) — chunk K, compile_script_run. *)
           p := compile_script_run !p
+        else if Int.equal op Op.op_recurse then (
+          (* OP_RECURSE (chunk K1b, pcre2_match.c:5427-5497). GET(code, p+1) is the
+             offset (from start_code) to the recursed bracket; number = 0 for the
+             whole pattern (bracode == start_code) else GET2(bracode, 1+LINK_SIZE).
+             Emit t_recurse with a placeholder entry_pc, resolved to the target
+             bracket's recorded IR t_bra after the whole walk (forward calls). A
+             target that is not a plain CBRA/SCBRA/whole-pattern bracket (e.g. a
+             possessive OP_CBRAPOS capture) is declined at fixup time. *)
+          let bracode = link !p in
+          let number =
+            if Int.equal bracode 0 then 0
+            else C.get2 src (bracode + 1 + Limits.link_size)
+          in
+          push Ir.t_recurse;
+          push number;
+          let entry_slot = here () in
+          push 0 (* entry_pc placeholder, resolved after the walk *);
+          recurse_fixups := (entry_slot, bracode) :: !recurse_fixups;
+          p := !p + Op.op_lengths.(op))
         else if Int.equal op Op.op_reverse then (
           (* OP_REVERSE (pcre2_match.c:5793-5819) — the fixed lookbehind
              back-step at the start of a lookbehind branch. GET2(code,p+1) =
@@ -1571,10 +1733,11 @@ let compile (re : C.re) : (Ir.t, string) result =
           push Ir.t_fail;
           p := !p + Op.op_lengths.(op))
         else if Int.equal op Op.op_accept then (
-          (* OP_ACCEPT (pcre2_match.c:846-940) — end the whole match. (In a
-             recursion the C fishes captures back to the OP_RECURSE frame;
-             recursion is out of subset, so OP_ACCEPT here is always the
-             fall-through-to-END form.) *)
+          (* OP_ACCEPT (pcre2_match.c:846-940) — end the whole match, OR (chunk
+             K1b) commit-and-return the innermost recursion: the runner's tag-55
+             arm dispatches on mb.current_recurse — inside a recursion it takes
+             accept_recurse_return (the C's find-the-recursion + F = P,
+             :847-872), otherwise the fall-through-to-END whole-match form. *)
           push Ir.t_accept;
           p := !p + Op.op_lengths.(op))
         else if Int.equal op Op.op_close then (
@@ -1620,6 +1783,19 @@ let compile (re : C.re) : (Ir.t, string) result =
       if not (Int.equal end_op Op.op_end) then
         raise (Unsupported (reason_of_op end_op));
       push Ir.t_end;
+      (* Chunk K1b — resolve each t_recurse's entry_pc from its target bracket's
+         recorded IR t_bra (a call may be FORWARD, so this is done after the whole
+         walk). A target that was never recorded (not a plain CBRA/SCBRA/whole-
+         pattern bracket — e.g. a possessive OP_CBRAPOS/OP_SCBRAPOS capture, whose
+         KETRPOS ket-return protocol is out of this subset) declines the pattern. *)
+      List.iter
+        (fun (entry_slot, bracode) ->
+          match List.assoc_opt bracode !bracket_ir with
+          | Some entry_pc -> set entry_slot entry_pc
+          | None ->
+              raise
+                (Unsupported "fast: OP_RECURSE into possessive capture (K1b)"))
+        !recurse_fixups;
       (* Chunk H — build the THEN scope boundary array from the recorded ALT
          patches (default -1 for every non-ALT index) and the KIND_ONCE subtype
          array from the recorded t_once positions (default 0 = atomic group). *)
@@ -1634,6 +1810,7 @@ let compile (re : C.re) : (Ir.t, string) result =
         n_groups = !n_groups;
         alt_then_end;
         once_subtype;
+        has_recurse;
       }
     with
     | ir -> Ok ir

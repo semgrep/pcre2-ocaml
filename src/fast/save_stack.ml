@@ -87,19 +87,24 @@ let kind_ref_min = 7
 let kind_ref_max = 8
 
 (* Chunk G additions (fast-design.md §3) — lookaround and atomic groups.
-     KIND_ONCE (VARIABLE width 2*oveccount): the atomic-group / atomic-assertion
-        boundary. Layout [ov_snapshot(2*oveccount-2); prev_once_base; KIND_ONCE].
-        Pushed by [t_once]; snapshots the group ovector slots [2, 2*oveccount)
-        and the enclosing [mb.once_base]. On backtrack (the atomic construct is
-        backtracked PAST): restore the ovector snapshot + [mb.once_base], then
-        keep popping (propagate NOMATCH). This reproduces the C frame arena's
-        "abandon-and-restore-wholesale" of everything an atomic group did
+     KIND_ONCE (VARIABLE width 2*oveccount+3): the atomic-group / atomic-assertion
+        boundary. Layout [ov_snapshot(2*oveccount-2); prev_once_base; saved_mark;
+        entry_eptr; subtype; KIND_ONCE]. Pushed by [t_once]; snapshots the group
+        ovector slots [2, 2*oveccount), the enclosing [mb.once_base], the entry
+        mark and (chunk K1b) the entry eptr. On backtrack (the atomic construct
+        is backtracked PAST): restore the ovector snapshot + [mb.once_base] +
+        mark, then keep popping (propagate NOMATCH). This reproduces the C frame
+        arena's "abandon-and-restore-wholesale" of everything an atomic group did
         (pcre2_match.c:6023-6031 Fback_frame; the ovector/eptr of P are restored
-        because P is a distinct frame). The width is not fixed here — the runner
-        computes 2*mb.oveccount (fast-design.md §3).
-     KIND_NASSERT (VARIABLE width 2*oveccount+3): the negative-assertion
+        because P is a distinct frame). [entry_eptr] is recorded into
+        last_used_ptr when a VERB code passes the boundary (the C's RRETURN(rrc)
+        from the construct's frame, pcre2_match.c:5408/:5529 — chunk K1b, §4);
+        [subtype] selects THEN containment (pos-assert) vs escape (group). The
+        width is not fixed here — the runner computes 2*mb.oveccount + 3
+        (fast-design.md §3).
+     KIND_NASSERT (VARIABLE width 2*oveccount+4): the negative-assertion
         boundary. Layout [ov_snapshot(2*oveccount-2); prev_once_base; cont;
-        eptr_enter; rdepth_enter; KIND_NASSERT]. Pushed by [t_nassert]. On
+        eptr_enter; rdepth_enter; saved_mark; KIND_NASSERT]. Pushed by [t_nassert]. On
         backtrack (ALL branches failed = the negative assertion SUCCEEDS,
         pcre2_match.c:5578-5584 ASSERT_NOT_FAILED): restore the snapshot +
         [mb.once_base], continue at [cont] with eptr/rdepth = the entry values.
@@ -117,9 +122,9 @@ let kind_once = 9
 let kind_nassert = 10
 let kind_vreverse = 11
 
-(* KIND_POS (VARIABLE width 2*oveccount+4): the possessive-bracket boundary
+(* KIND_POS (VARIABLE width 2*oveccount+5): the possessive-bracket boundary
    (fast-design.md §3). Layout [ov_snapshot(2*oveccount-2); prev_once_base;
-   iter_start; matched_once; zero_allowed; entry_rdepth; KIND_POS]. Pushed by
+   iter_start; matched_once; zero_allowed; entry_rdepth; saved_mark; KIND_POS]. Pushed by
    [t_possess]; carries the KIND_ONCE snapshot + the per-loop state the
    greedy-atomic repeat needs (the iteration start for the empty-match check,
    whether an iteration ever matched, whether zero iterations are allowed, and
@@ -160,6 +165,38 @@ let kind_verb = 13
    5177-5182) and retry the continuation at the new end. [ref_pc] re-derives
    ovbase/caseless/lmin/cont via setup_ref_rep. *)
 let kind_ref_max2 = 14
+
+(* Chunk K1b (fast-design.md §3) — pattern recursion.
+     KIND_RECURSE (FAT, VARIABLE width): the subroutine-call boundary, the
+       wholesale-frame answer to the §3 snapshot proof (a recursion jumps INTO a
+       group without executing its entry, so the group_start/cap_start arrays
+       could be stale). Pushed by [t_recurse]. Layout (low first):
+         [ov_snapshot(2*oveccount-2); group_start_snapshot(n_groups);
+          cap_start_snapshot(2*oveccount); prev_once_base; prev_current_recurse;
+          prev_recurse_base; saved_mark; number; call_eptr; recurse_last_used;
+          cont_pc; KIND_RECURSE]
+       width = 2*(2*oveccount) - 2 + n_groups + 9. On backtrack PAST (the whole
+       recursion failed): restore ALL snapshots + mb.once_base/current_recurse/
+       recurse_base/mark, then keep popping (the C frame arena discarding the
+       recursion's frames wholesale, pcre2_match.c:6470 RRETURN past OP_RECURSE).
+       [mb.recurse_base] points at each open KIND_RECURSE's base (a chain via
+       [prev_recurse_base]) for the RECURSELOOP walk (pcre2_match.c:5438-5453).
+     KIND_RECURSE_RET (VARIABLE width): pushed at a recursion RETURN (the ket
+       detecting mb.current_recurse == number) to make backtracking INTO the
+       completed recursion body restore its state. The RETURN restores the WHOLE
+       arrays (ovector + group_start + cap_start) to the pre-call snapshot going
+       FORWARD (captures do not escape, and the enclosing construct's
+       group_start/cap_start must be reinstated — the recursion re-entered a group
+       without executing the enclosing entry); this record saves the POST-body
+       arrays so a later backtrack into the body re-establishes them. Layout:
+       [ov_body(2*oveccount-2); group_start_body(n_groups);
+        cap_start_body(2*oveccount); number; my_recurse_base; KIND_RECURSE_RET],
+       width = 2*(2*oveccount) - 2 + n_groups + 3. On backtrack: restore the
+       arrays + mb.current_recurse = number + mb.recurse_base = my_recurse_base,
+       then keep popping (into the body). *)
+let kind_recurse = 15
+let kind_recurse_ret = 16
+
 let width_ref_max2 = 6
 let width_verb = 5
 let width_vreverse = 6

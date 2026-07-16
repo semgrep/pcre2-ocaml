@@ -126,6 +126,62 @@ following the tag. Widths are `Ir.arity`:
 | 67 | `COND_ASSERT_MATCH` | `match_target` | 2 | an assertion-condition branch matched (chunk J, condition = Lpositive; the ket memcpy :5934-5948): COMMIT (truncate the assertion's choice points, CONVERT the KIND_NASSERT boundary to a KIND_ONCE so a later backtrack PAST the conditional rolls back the snapshot rather than re-taking the nomatch branch), captures persist (already in the shared ovector), restore `eptr`/`rdepth` to the conditional entry, jump to `match_target`. `match_target`/`nomatch_target` = the yes/no branch heads chosen by the assertion's positivity. No tick |
 | 68 | `SCOND_DESCEND` | — | 1 | the OP_SCOND descend (chunk J, RM35 :5772-5776): a repeated conditional that might match empty descends one virtual frame per iteration so the empty-string loop check has the iteration start. One tick (like a single-branch grouploop entry), no choice point |
 | 69 | `SCRIPT_RUN_END` | `g` | 2 | the OP_SCRIPT_RUN ket (chunk K, pcre2_match.c:6045-6051 / interpreter.ml:2882-2897): a script-run branch matched — apply the script-checking rules (`Script_run.script_run`) to the matched span `[group_start.(g), eptr)`; on failure backtrack, else continue at the current (advanced) eptr. Non-atomic (the body's choice points stay live). No tick |
+| 70 | `RECURSE` | `number; entry_pc` | 3 | pattern recursion / subroutine call (chunk K1b, OP_RECURSE pcre2_match.c:5427-5497). RECURSELOOP check (if already recursing), push the FAT KIND_RECURSE boundary (§3) + set `mb.current_recurse = number` / `mb.recurse_base`, then jump to the recursed group's first-branch `entry_pc` (resolved at IR-compile time; grouploop, so its branch ALTs tick per branch = RM11, §4). The group's ket (`CAP_END`/`CAP_END_REF`, or the whole-pattern `KET`) RETURNS when it sees `current_recurse == number`. `entry_pc` = the group's `t_bra` (SKIPS `t_cap_start`/`t_group_start`: a recursion sets neither the group's own capture nor its repeat empty-check). No tick in this arm |
+| 71 | `COND_RREF` | `number; no_target` | 3 | recursion-test condition `(?(R))`/`(?(Rn))` (chunk K1b, OP_RREF :5645-5651): TRUE iff `current_recurse >= 0` AND (`number = rref_any` (0xffff) or `number = current_recurse`); FALSE jumps to `no_target`. Un-FALSEs the chunk-J COND_FALSE for recursion (for a non-recursive pattern `current_recurse = -1`, still always false). No tick |
+| 72 | `COND_DNRREF` | `slot_base; count; no_target` | 4 | dup-named recursion test `(?(R&name))` (chunk K1b, OP_DNRREF :5653-5666): TRUE iff `current_recurse >= 0` AND any group in the name list `[slot_base, slot_base+count*entry)` equals `current_recurse` (`dnrref_test`). No tick |
+| 73 | `FAIL_NASSERT` | — | 1 | a NEGATIVE assertion's / assertion CONDITION's branch exhaustion (chunk K1b): as `FAIL` but WITHOUT the last_used_ptr record — the C's exhaustion there is a same-frame transfer with no RRETURN (ASSERT_NOT_FAILED pcre2_match.c:5561-5564 → :5582; `condition = !Lpositive; break` :5729-5734), unlike every other FAIL head (§4). Emitted by `compile_lookaround` (neg) and `compile_cond` (assertion condition) |
+
+**Chunk K1b additions — pattern recursion (OP_RECURSE).** Four new tags (70
+`RECURSE`, 71 `COND_RREF`, 72 `COND_DNRREF`, 73 `FAIL_NASSERT` — the
+no-last_used-record negative-assertion exhaustion, §4) and two new save kinds
+(KIND_RECURSE 15, KIND_RECURSE_RET 16, §3). This is the FAT-record answer to the §3 snapshot
+proof's recursion revisit (a subroutine call jumps INTO a group's IR without
+executing the enclosing construct's entry, so `group_start`/`cap_start` — and the
+captures — could be stale). Design notes:
+
+- **All forms lower to `RECURSE`.** `(?R)`/`(?0)` = whole-pattern group 0
+  (`number = 0`, `entry_pc = 0`); `(?n)`/`(?&name)`/`(?P>name)`/`\g<n>`/relative
+  `(?+1)`/`(?-1)` = the numbered/named CBRA/SCBRA. The IR compiler records each
+  group's bytecode `bra_off → IR t_bra pc` and resolves each `RECURSE`'s
+  `entry_pc` AFTER the whole walk (forward calls into a not-yet-emitted group,
+  incl. a `(?(DEFINE)…)` body — which is lowered even though its condition is
+  false, so a call can reach it). A call into a POSSESSIVE capture
+  (OP_CBRAPOS/OP_SCBRAPOS) is DECLINED (`"fast: OP_RECURSE into possessive
+  capture (K1b)"`) — its OP_KETRPOS ket-return + the KIND_POS boundary the entry
+  skips are out of subset (~18 conformance units, a precise decline).
+- **The FAT record and captures-don't-escape.** At the call KIND_RECURSE
+  snapshots the WHOLE `ovector` + `group_start` + `cap_start` + `mark` +
+  enclosing `once_base`/`current_recurse`/`recurse_base` + the call eptr +
+  `last_used_ptr` + the return pc. At the RETURN (the ket sees
+  `current_recurse == number`, pcre2_match.c:6065-6074) the runner restores the
+  ovector + group_start + cap_start to the PRE-CALL snapshot going FORWARD
+  (captures do NOT escape a recursion — the group-3-unset conformance behaviour)
+  and pushes a KIND_RECURSE_RET saving the POST-body arrays so a later backtrack
+  INTO the body re-establishes them. Restoring group_start/cap_start at the
+  return (not just ovector) is REQUIRED: the recursion re-entered a group whose
+  `GROUP_START`/`CAP_START_REF` may have clobbered a slot the ENCLOSING
+  construct's ket later reads (the fuzz-caught `(?*()c(?R)|…)` shape — a recursion
+  inside a non-atomic assertion whose `group_start` the outer `ASSERT_END`
+  reads).
+- **Whole-pattern group-0 return.** The group-0 ket is the whole-pattern
+  `t_ket` immediately before `END`; when `current_recurse == 0` it RETURNS
+  (pcre2_match.c:5964-5984) rather than reaching END. Group 0 is forced GROUPLOOP
+  when the pattern has recursion so a `(?R)` into it ticks per branch (RM11) —
+  tick-neutral for normal execution (group 0 runs at rdepth 0 where the runner
+  already ticks the last branch).
+- **( \*ACCEPT) inside a recursion** (pcre2_match.c:847-872) COMMITS the recursion
+  (the C's `F = P`): restore the pre-call arrays + boundary state, truncate the
+  save stack to the FAT record's base, continue past the call — NOT the
+  whole-match end. Outside a recursion `( *ACCEPT)` is the ordinary match end.
+- **Verbs inside a recursion are CONTAINED** (pcre2_match.c:5481-5488). A firing
+  verb records `mb.verb_current_recurse = mb.current_recurse` (its dispatch-time
+  value — all of the continuation's recursion records have restored it by the
+  time its KIND_VERB pops); at the FAT KIND_RECURSE boundary in `backtrack_code`,
+  a verb whose `verb_current_recurse == number` makes the WHOLE recursion NOMATCH
+  (RRETURN(NOMATCH)), while a verb from OUTSIDE passes through. THEN scoping
+  within a recursion branch's alternation is the existing KIND_ALT `then_end`
+  check (the RM11 THEN case = the grouploop one).
+- **RECURSELOOP (-52)** — see §3 (`last_used_ptr` resolution) and §4.
 
 **Chunk K additions — script runs, callout no-ops, and the G+ repeated-atomic
 cleanup.** One new tag (69 `SCRIPT_RUN_END`), NO new save kind. Design notes:
@@ -162,13 +218,11 @@ cleanup.** One new tag (69 `SCRIPT_RUN_END`), NO new save kind. Design notes:
   path (the compiler lowers `(?=X)*`/`(?=X)+` to BRAZERO + a NON-repeating
   assertion, so it rides the existing chunk-G assertion lowering via the BRAZERO
   handler routing OP_ASSERT*/OP_ONCE/OP_SCRIPT_RUN to their compilers).
-- **Still declined after chunk K's script-run/callout/G+ work:** OP_RECURSE
-  (recursion — a focused follow-on: the fat recursion save record, current_recurse
-  threading, the shared-ket subroutine return, RREF un-FALSE-ing, verb/THEN
-  interaction, and the RECURSELOOP loop check which needs `last_used_ptr` tracking
-  the fast runner deliberately omits), `( *ACCEPT)` inside an assertion (H+ —
-  MATCH_ACCEPT propagation to the assertion boundary through nested boundaries),
-  `( *THEN)` with a non-atomic assertion (H+), `\K` (C2+), and PCRE2_FIRSTLINE (L).
+- **Still declined after chunk K1b's recursion work:** OP_RECURSE into a
+  POSSESSIVE capture (the OP_KETRPOS ket-return, K1b-residual), `( *ACCEPT)`
+  inside an assertion (K2 — MATCH_ACCEPT propagation to the assertion boundary
+  through nested boundaries), `( *THEN)` with a non-atomic assertion (K2),
+  `\K` (K2), and PCRE2_FIRSTLINE (L).
 
 **Chunk H additions — backtracking control verbs, FAIL, ACCEPT, CLOSE.** Eight
 new tags (49-56) and one save kind (KIND_VERB 13). Verbs turn backtracking into
@@ -412,15 +466,27 @@ Script runs read `group_start.(g)` only at `SCRIPT_RUN_END`, also dominated by
 the entry `t_group_start`. Neither construct is a subroutine call, so no
 inside-position becomes reachable without its entry.
 
-**Chunk K (recursion) STILL MUST revisit this proof** (recursion is deferred to a
-focused follow-on pass — see §2's chunk-K decline note): a subroutine call
-`(?N)`/`(?R)` can jump to an IR position inside a construct without executing its
-entry, making inside-positions reachable with stale `group_start`/`cap_start`
-state, so the recursion pass must either widen the snapshot or give the recursion
-save record its own save/restore of these arrays (the plan: a FAT recursion
-record snapshotting the full ovector + `group_start` + `cap_start` + `mark` +
-`current_recurse` + `once_base`, restored on the subroutine return and on
-backtrack-past — recursion is cold, a fat record is fine).
+**Chunk K1b re-established this proof for recursion (RESOLVED).** A subroutine
+call `(?N)`/`(?R)` jumps to an IR position inside a group without executing the
+ENCLOSING construct's entry, so its `GROUP_START`/`CAP_START_REF` can clobber a
+`group_start`/`cap_start` slot that the enclosing construct's ket later reads —
+breaking the original proof's "every read is dominated by a fresh write"
+argument (the read is no longer dominated: the recursion's write intervened
+between the enclosing write and the enclosing read). The revisit's plan is
+implemented as the FAT KIND_RECURSE record: at the call it snapshots the WHOLE
+`ovector` + `group_start` + `cap_start` (+ `mark`/`current_recurse`/`once_base`/
+`recurse_base`), and BOTH the recursion RETURN (going forward — captures don't
+escape) AND backtrack-past restore all three arrays to the pre-call state; a
+KIND_RECURSE_RET saves the post-body arrays so a backtrack INTO the completed
+body re-establishes them. So after a recursion, every `group_start`/`cap_start`
+slot is EITHER the pre-call value (forward / backtrack-past) or the body value
+(backtrack-into), never a stale mix — the enclosing read is again dominated by
+the correct write. Proof completeness for the arrays now rests on the FAT
+snapshot, not on read-site domination; the fuzz-caught `(?*()c(?R)|(*:x))` shape
+(a recursion inside a non-atomic assertion whose `group_start` the outer
+`ASSERT_END` reads) is the witness the array restore fixed. Recursion is cold, so
+the O(oveccount + n_groups)-int snapshot cost is acceptable (alloc-pinned:
+module-level helpers, no boxing).
 
 Design notes:
 
@@ -610,12 +676,12 @@ runner arms:
   per-fragment `hitend`/`match_partial` resets. `mb.startchar` carries the
   C's match_data->startchar for error returns.
 
-The §3 "snapshot completeness proof" chunk-K revisit flag is untouched: chunk
-I2 adds no recursion / subroutine re-entry, and the new arms read NEITHER
-`mb.group_start` nor `mb.cap_start` (PROP/EXTUNI consume subject characters
-only; KIND_REF_MAX2 re-derives its state from the IR + ovector like
-KIND_REF_MIN), so the proof's read-site enumeration is unchanged — the real
-revisit remains chunk K.
+The §3 "snapshot completeness proof" was not affected by chunk I2 (it adds no
+recursion / subroutine re-entry, and its new arms read NEITHER `mb.group_start`
+nor `mb.cap_start`); chunk K1b's recursion is the one that re-entered groups
+without the enclosing entry and re-established the proof with the FAT
+KIND_RECURSE array snapshot (see the "Chunk K1b re-established this proof"
+paragraph above).
 
 **Chunk J additions — conditional groups OP_COND / OP_SCOND.** Six new tags
 (63-68, above), NO new save kind. A conditional `(?(cond)yes|no)` (or a
@@ -699,11 +765,12 @@ gate runs BEFORE the walk: `PCRE2_FIRSTLINE` → `"... (chunk L)"` (chunk I remo
 the `PCRE2_UTF` gate, chunk I2 removed the `PCRE2_UCP` and
 `PCRE2_MATCH_INVALID_UTF` gates; chunk D removed the `top_bracket > 0` one).
 The first out-of-subset opcode yields `Error "fast: <construct> (chunk X)"`
-(taxonomy §6) — chunk K lowered script runs, callout no-ops and the G+
-repeated-atomic-group cleanup, so the remaining decline reasons are `OP_RECURSE`
-(recursion — a focused follow-on pass, see the chunk-K decline note above),
-`( *ACCEPT)` inside an assertion and `( *THEN)` with a non-atomic assertion (H+),
-`\K` (C2+), and `PCRE2_FIRSTLINE` (L).
+(taxonomy §6) — chunk K1b lowered OP_RECURSE in all forms, so the remaining
+decline reasons are OP_RECURSE into a POSSESSIVE capture (`"fast: OP_RECURSE
+into possessive capture (K1b)"`, resolved at fixup time when a call's target
+bracket was not recorded as a plain CBRA/SCBRA/whole-pattern bracket),
+`( *ACCEPT)` inside an assertion and `( *THEN)` with a non-atomic assertion (K2),
+`\K` (K2), and `PCRE2_FIRSTLINE` (L).
 
 ## §3 Runner and save records (choice-point IR landed in C1; runner in C2)
 
@@ -766,15 +833,18 @@ first:
 | `KIND_REF_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REF_MIN` | minimizing ref repeat with `lmin<lmax` (RM20) | match one more copy at `eptr` (`count` up to Lmax), retry the continuation; `rep_pc` re-derives ovbase/caseless/Lmax/cont |
 | `KIND_REF_MAX` | 6 | `cont; try_pos; flength; lstart; rdepth; KIND_REF_MAX` | maximizing ref repeat, samelengths (RM21) | give back one copy (`try_pos` −= `flength`, down to and INCLUDING `lstart`), retry the continuation; below `lstart` → NOMATCH |
 | `KIND_REF_MAX2` | 6 | `ref_pc; lmax_cur; try_eptr; lstart; rdepth; KIND_REF_MAX2` | maximizing ref repeat, DIFFERING lengths (RM22, chunk I2 — caseless UTF only, pcre2_match.c:5164-5184) | `try_eptr = lstart` → NOMATCH; else `lmax_cur--`, re-scan `lmax_cur − lmin` copies forward from `lstart` (match_ref known to succeed, rc discarded like the C's (void)), retry the continuation at the new end (tick) |
-| `KIND_ONCE` | `2*oveccount+2` | `ov_snapshot[2,2n); prev_once_base; saved_mark; subtype; KIND_ONCE` | each `ONCE` (atomic group / atomic positive assertion) | restore the snapshot + `mb.once_base` + `mb.mark`, then keep popping. `subtype` (chunk H) = 0 atomic group / 1 pos-assert, read only by `backtrack_code` (THEN escape vs contain) |
+| `KIND_ONCE` | `2*oveccount+3` | `ov_snapshot[2,2n); prev_once_base; saved_mark; entry_eptr; subtype; KIND_ONCE` | each `ONCE` (atomic group / atomic positive assertion) | restore the snapshot + `mb.once_base` + `mb.mark`, then keep popping. `entry_eptr` (chunk K1b) is recorded into last_used_ptr when a VERB code passes the boundary (the C's RRETURN(rrc) from the construct's frame, :5408/:5529 — §4); `subtype` (chunk H) = 0 atomic group / 1 pos-assert, read only by `backtrack_code` (THEN escape vs contain) |
 | `KIND_NASSERT` | `2*oveccount+4` | `ov_snapshot; prev_once_base; cont; eptr_enter; rdepth_enter; saved_mark; KIND_NASSERT` | each `NASSERT` (negative assertion) OR `COND_ASSERT` (assertion condition, chunk J — `cont = nomatch_target`) | ALL branches failed = SUCCESS / the condition's !Lpositive branch: restore snapshot + `mb.once_base` + entry `mb.mark`, continue at `cont` with the entry eptr/rdepth |
 | `KIND_VREVERSE` | 6 | `body_pc; cur_lmax; lmin; cur_eptr; rdepth; KIND_VREVERSE` | each `VREVERSE` (RM37) | `if cur_lmax<=lmin` NOMATCH, else give up one back-step (`cur_lmax--`, `cur_eptr++`) and retry the branch body |
 | `KIND_POS` | `2*oveccount+5` | `ov_snapshot; prev_once_base; iter_start; matched_once; zero_allowed; entry_rdepth; saved_mark; KIND_POS` | each `POSSESS` (possessive bracket) | backtrack PAST the group: restore snapshot + `mb.once_base` + `mb.mark`, keep popping (as `KIND_ONCE`); the extra slots are read only on the forward loop |
 | `KIND_VERB` | 5 | `vtype; aux; eptr; old_mark; KIND_VERB` | each `MARK`/`COMMIT`/`PRUNE`/`SKIP`/`SKIP_ARG`/`THEN` (chunk H) | revert `mb.mark` = `old_mark`; MARK keeps backtracking (and catches a name-matching `MATCH_SKIP_ARG` → `MATCH_SKIP`); every other `vtype` FIRES its verb code into `backtrack_code` |
+| `KIND_RECURSE` | `2*(2n)-2 + n_groups + 9` | `ov_snapshot[2,2n); group_start_snap[0,n_groups); cap_start_snap[0,2n); prev_once_base; prev_current_recurse; prev_recurse_base; saved_mark; number; call_eptr; recurse_last_used; cont_pc; KIND_RECURSE` | each `RECURSE` (chunk K1b) | backtrack PAST (the whole recursion failed): restore ALL arrays + `once_base`/`current_recurse`/`recurse_base`/`mark`, keep popping. `mb.recurse_base` chains open records (via `prev_recurse_base`) for the RECURSELOOP walk (pcre2_match.c:5438-5453). In `backtrack_code` a verb with `verb_current_recurse == number` NOMATCHes the recursion (contained), else passes through |
+| `KIND_RECURSE_RET` | `2*(2n)-2 + n_groups + 3` | `ov_body[2,2n); group_start_body[0,n_groups); cap_start_body[0,2n); number; my_recurse_base; KIND_RECURSE_RET` | each recursion RETURN (the ket saw `current_recurse == number`; chunk K1b) | backtrack INTO the completed body: restore the POST-body arrays + `current_recurse = number` + `recurse_base = my_recurse_base`, keep popping (the body's records retry its branches) |
 
-`KIND_ONCE` / `KIND_NASSERT` / `KIND_POS` are VARIABLE-width (the group-ovector
-snapshot size depends on `oveccount`); `backtrack` derives the width from
-`mb.oveccount`. The single `mb.once_base` int is the save-stack base of the
+`KIND_ONCE` / `KIND_NASSERT` / `KIND_POS` / `KIND_RECURSE` / `KIND_RECURSE_RET`
+are VARIABLE-width (the snapshot size depends on `oveccount`, and the two
+recursion kinds also on `n_groups`); `backtrack` derives the width from
+`mb.oveccount`/`mb.n_groups`. The single `mb.once_base` int is the save-stack base of the
 innermost open atomic construct (or -1), maintained as a balanced stack by those
 boundary records so the atomic COMMIT can find the boundary without a
 `run`/`backtrack` parameter (the hot mainline signature is unchanged).
@@ -787,9 +857,11 @@ COMMIT/SKIP/PRUNE/THEN → `cont`, SKIP_ARG escapes) are shared with the negativ
 assertion unchanged. The ONLY new action is `COND_ASSERT_MATCH` (a matching
 assertion branch): it COMMITS by truncating to the boundary and CONVERTING the
 `KIND_NASSERT` (width `2*oveccount+4`) IN PLACE to a `KIND_ONCE` (width
-`2*oveccount+2`) — the `ov_snapshot`/`prev_once_base` prefix is identical, so it
-rewrites the tail (`saved_mark; once_group; KIND_ONCE`) and drops `sp` to
-`base + 2*oveccount + 2`. After the conversion a later backtrack PAST the whole
+`2*oveccount+3`, chunk K1b) — the `ov_snapshot`/`prev_once_base` prefix is
+identical AND the NASSERT's `eptr_enter` slot is exactly the ONCE's
+`entry_eptr` slot, so it rewrites the tail (`saved_mark; <eptr kept>;
+once_group; KIND_ONCE`) and drops `sp` to `base + 2*oveccount + 3`. After the
+conversion a later backtrack PAST the whole
 conditional hits the `KIND_ONCE` (roll back the snapshot + propagate NOMATCH),
 NOT the `KIND_NASSERT` (which would wrongly re-take the nomatch branch). The
 condition assertion's captures PERSIST (the shared ovector already holds them;
@@ -856,13 +928,15 @@ exactly as the chunk-G "snapshot completeness proof" required the ovector to be
 snapshotted — the KIND_ONCE / KIND_NASSERT / KIND_POS boundary records ALSO
 snapshot the entry `mb.mark` and restore it on backtrack-past (or, for a matched
 negative-assertion branch, at `t_nassert_match`). `mb.mark` is observable at END
-and via nothing else; `mb.group_start`/`mb.cap_start` stay OUT of the snapshot
-per the original proof, but a possessive CAPTURE now maintains `mb.cap_start`
-across its iterations (written at `POSSESS`/`KETRPOS`) so an `OP_CLOSE` at an
-inner ( *ACCEPT) reads the CURRENT iteration's start rather than the last
-committed one. **Chunk K (recursion) must still revisit the snapshot** for
-subroutine re-entry, and should note that the mark/`cap_start` additions here are
-subject to the same reasoning.
+and via nothing else; `mb.group_start`/`mb.cap_start` stay OUT of the atomic
+boundary snapshots (the original read-site-domination proof), but a possessive
+CAPTURE maintains `mb.cap_start` across its iterations (written at
+`POSSESS`/`KETRPOS`) so an `OP_CLOSE` at an inner ( *ACCEPT) reads the CURRENT
+iteration's start rather than the last committed one. **Chunk K1b's recursion is
+the exception:** its FAT KIND_RECURSE / KIND_RECURSE_RET records DO snapshot
+`mb.group_start`/`mb.cap_start` (and `mb.mark`), because a subroutine call
+re-enters a group without the enclosing entry — see the "Chunk K1b re-established
+this proof" paragraph in the snapshot-completeness proof above.
 
 **Capture save sets (chunk D — the minimal-save design).** A single global
 `mb.ovector` (size `2*(top_bracket+1)`, reused across execs, group slots reset
@@ -1025,6 +1099,10 @@ child frame. `grouploop`'s single/last branch ticks (the top level "can't optimi
 | `COND_ASSERT_MATCH` (commit, restore to entry `d`) | 0 | `d` | none |
 | backtrack pop `KIND_NASSERT` (cond nomatch → `cont` at entry `d`) | 0 | `d` | none (pop) |
 | `SCOND_DESCEND` (RM35, one per repeated-conditional iteration) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
+| `RECURSE` (push KIND_RECURSE, jump to the group's grouploop entry) | 0 (the entry's branch ALT ticks — RM11 per branch) | `d` at the arm | none at the arm |
+| `RECURSE` RECURSELOOP (-52) direct return / recursion RETURN (`recurse_return`, ( \*ACCEPT)) | 0 | `d` | none |
+| `COND_RREF` / `COND_DNRREF` (inline recursion-test, branch pick) | 0 | `d` | none |
+| backtrack pop `KIND_RECURSE` (past) / `KIND_RECURSE_RET` (into body) | 0 | — | none |
 
 The whole-pattern outer `BRA` (dispatched at rdepth 0) is `grouploop` at the
 top level; nested `OP_BRA` is `bra_loop` (rdepth `>= 1`, no THEN in chunk D).
@@ -1174,6 +1252,144 @@ break). Verified by the fuzz `--mode fast-vs-interp` `LIMIT_MATCH=2000`
 differential (0 divergences, conditionals generated by the fuzzer) and the
 conditional `LIMIT_MATCH` N-sweep.
 
+**Recursion (chunk K1b) ticks at the RM11 branch sites; the boundary/return
+dispatch in place.** `RECURSE` itself does NOT tick (the C's OP_RECURSE dispatches
+in the current frame); it jumps to the recursed group's first-branch entry, whose
+grouploop ALT ticks a child frame PER BRANCH — exactly the C's per-branch
+RMATCH(RM11) (pcre2_match.c:5468). The recursion RETURN (`recurse_return` at the
+ket / ( \*ACCEPT)) and the RECURSELOOP -52 return dispatch in place (no tick — the
+C `continue`s in the same frame). Backtracking INTO a completed recursion
+(KIND_RECURSE_RET) and PAST it (KIND_RECURSE) are pure state restores (no tick,
+like the other boundary records); the body's own ALT/repeat records tick when
+their branches re-run. So a recursion's tick count is the sum of its branch
+attempts (RM11) at each nesting level, matching the interpreter's GF_RECURSE frame
+counts. Because group 0 is forced grouploop when the pattern recurses, a `(?R)`
+into it ticks per branch identically to the interpreter (tick-neutral for normal
+group-0 execution, §2). The RECURSELOOP-check input `mb.last_used_ptr` (§3
+resolution) is the only recursion-specific limit-adjacent state; it does not add
+ticks. Verified by the fuzz `--mode fast-vs-interp` differential over 700k+
+recursion-inclusive cases across 8 seeds (incl. `PCRE2_DISABLE_RECURSELOOP_CHECK`)
+and the recursion `LIMIT_MATCH` N-sweep (incl. the -52 → -47 flip under
+DISABLE_RECURSELOOP_CHECK).
+
+**`last_used_ptr` resolution (the K1a deferral blocker) — approach (a), faithful
+tracking.** The C's RECURSELOOP check (pcre2_match.c:5447) compares
+`mb->last_used_ptr` (the rightmost subject position any completed sub-match
+reached, a monotone max updated at every RRETURN, pcre2_match.c:6470) against the
+enclosing same-group recursion's snapshot. The fast engine tracks it FAITHFULLY,
+gated on a per-pattern `has_recurse` flag (only recursive patterns read it, so
+non-recursive matches pay nothing):
+- NOMATCH RRETURNs (the RETURN_SWITCH, 6470) map to the forward-to-backtrack
+  transition: `bt` (the wrapper at every `run → backtrack` site) records
+  `max(last_used, C-exact failure Feptr)`. The C's Feptr at a failing arm's
+  RRETURN is ARM-SPECIFIC — most consuming arms READ the subject character
+  before testing (so a mismatch records the POST-READ position), some test in
+  place, and OP_CHAR compares unit-wise with a post-increment. The fast failure
+  sites pass the exact per-arm value:
+  * `CHAR_RUN` (de-fused to one char for `has_recurse` — tick-neutral): unit
+    mismatch at unit k → p+k+1 (`*Fecode++ != UCHAR21INC(Feptr)` :1009 /
+    `Fecode[1] != *Feptr++` :1022); length shortage/end → p (`char_run_cfail`,
+    a cold failure-path rescan gated on has_recurse).
+  * `CHARI`: only the UTF wide-pattern-char subcase reads first (GETCHARINC,
+    :1069-1071) → p+len; the other three subcases test in place → p.
+  * Single types / CLASS / XCLASS / PROP: GETCHARINCTEST before the test
+    (:2305-2470/:1986-2014/:2221/:2486) → p+len (p+1 non-UTF); OP_ANY's newline
+    rejection precedes the read (:948) → p; ends → p.
+  * Repeat min/minimize unit mismatches (`rep_fail_pos`, min/minimize flag):
+    caseful 1-unit char INCTEST → p+1 (:1472/:1489); caseless char and UTF
+    wide-char memcmp test in place → p (:1402-1413/:1296-1308); negated char:
+    UTF → p+len, non-UTF caseful → p+1, non-UTF caseless repeat → p
+    (:1640-1804), with `{1,1}` = the SINGLE OP_NOT/NOTI (reads first, :1144/
+    :1169 → p+1; EXACT-1 never compiles — a `{1}` folds to the bare opcode);
+    ctype: UTF → p+len, non-UTF MIN loop tests in place → p (:3414-3437) but
+    the non-UTF MINIMIZE loop reads first (`fc = *Feptr++` :3975) → p+1;
+    class/xclass/prop/hspace/vspace → p+len; \R → p+len after the read
+    (:3054/:3310); OP_ANY newline → p; count exhaustion (`Lmin++ >= Lmax`
+    RRETURN) → the current extend position.
+  * Backrefs: a partial-length copy sets `Feptr = mb->end_subject` before the
+    RRETURN (:5050/:5084/:5108) → record end_subject; a plain mismatch → p.
+- MATCH-class RRETURNs also pass through RETURN_SWITCH but do NOT reach `bt`
+  (the fast engine handles them in-line), so each fast MATCH-return site records
+  explicitly: the negative-assertion ket (`NASSERT_MATCH`; RRETURN(MATCH_MATCH),
+  6042-6043 — the body's reach, recorded BEFORE the RM4 arm converts it to a
+  NOMATCH at the entry position), the conditional-assertion ket
+  (`COND_ASSERT_MATCH`; RRETURN(MATCH_MATCH), 5947 — before eptr is put back to
+  the conditional entry), and the possessive iteration commit (`t_ketrpos`;
+  RRETURN(MATCH_KETRPOS), 6092-6097, before the outer-level empty test — a
+  possessive group coexists with recursion whenever the call does not target the
+  possessive capture itself, and an in-recursion empty iteration's recorded
+  reach shifts the -52 depth). MATCH_ACCEPT from OP_ASSERT_ACCEPT (:838 updates
+  explicitly) is N/A — `( *ACCEPT)` inside an assertion is declined (K2).
+- Group-exhaustion RRETURNs (a parent frame RRETURNing NOMATCH at its entry
+  position): grouploop / positive-assertion / atomic-group / script-run
+  exhaustion (:5410/:5531) map to the `FAIL` head (tag 15, routed through `bt`
+  with the ALT-restored entry eptr — also OP_FAIL's own RRETURN :6360); the
+  RECURSION exhaustion and the verb pass-through/containment at OP_RECURSE
+  (:5487/:5493/:5495) map to the KIND_RECURSE pops (record the stored
+  call_eptr; the NOMATCH pop is usually pre-recorded by the recursed group's
+  FAIL head, but the verb path DISCARDS choice points, so the pop record is
+  load-bearing there). The NEGATIVE-assertion / assertion-CONDITION exhaustion
+  is the C's SAME-FRAME transfer with NO RRETURN (ASSERT_NOT_FAILED
+  :5561-5564 → :5582; `condition = !Lpositive; break` :5729-5734), so their
+  trailing FAIL is the distinct `FAIL_NASSERT` (tag 73) which does NOT record —
+  recording the entry there OVER-approximates for a negative lookbehind whose
+  branches fail below entry.
+- The in-line special sites the C updates explicitly: `record_match` (OP_END,
+  929), the positive-assertion kets (`ASSERT_END` for both the atomic and NA
+  kinds, 6000/6014 — the assertion's reached eptr before eptr is put back), and
+  the word-boundary next-char probe (`nextptr`, 6314).
+- NOT sites (no update in the C, none here): the recursion return itself
+  (6065-6074 `continue`, no RRETURN), ASSERT_NOT_FAILED (5582), OP_ALT/KET
+  forward flow, SCHECK_PARTIAL, and the same-frame `break`s (BRAZERO/KETRMAX/
+  KETRMIN NOMATCH resumes = the KIND_CONT pops).
+- Parent-frame records on the VERB path (`backtrack_code`): a verb code passing
+  a boundary is an RRETURN(rrc) FROM that construct's frame in the C, recording
+  the frame's Feptr — and unlike a NOMATCH unwind, the verb path DISCARDS choice
+  points without their constructs failing, so these records are NOT subsumed
+  when the verb fired inside a LOOKBEHIND body (rewound below the entries).
+  Recorded: `KIND_ONCE` pops (the stored `entry_eptr`; :5408 RM2 for atomic
+  groups, :5529 RM3 for positive assertions — also covers the THEN-contained
+  pos-assert, whose committed-body exhaustion is RRETURN(MATCH_NOMATCH) at the
+  entry, :5531; LOAD-BEARING and mutation-tested — a verb inside a lookbehind
+  body fires below this entry), `KIND_RECURSE` pops (call_eptr; :5487/:5493 —
+  load-bearing on the verb path, which discards the FAIL head), `KIND_POS` pops
+  (the stored `iter_start` = the RM8 frame's copy-backed Feptr; :5315 — kept
+  C-exact 1:1 though PROVABLY subsumed: a verb passing KIND_POS either fired
+  directly in the body, whose fire-prerequisite NOMATCH already recorded
+  ≥ verb-position ≥ iter_start, or inside an inner rewound boundary whose own
+  entry record ≥ iter_start lands first on the pass-up chain), and the
+  `KIND_NASSERT` SKIP_ARG ESCAPE (`eptr_enter`; the RM4 `default:
+  RRETURN(rrc)`, :5574 — kept C-exact; observing it needs a doubly-nested
+  still-open recursion, no compact witness). NOT recorded (same-frame transfers
+  in the C, no RRETURN): the `KIND_NASSERT` COMMIT/SKIP/PRUNE containment
+  (:5567-5571 `goto ASSERT_NOT_FAILED`) and THEN-as-NOMATCH (:5561-5564), and
+  the `KIND_ALT` discards — an ALT's saved eptr ≤ the nearest recorded boundary
+  entry above it on the pass-up chain (spine monotonicity), so the C's
+  branch-frame records add no new maximum once the boundary records land.
+- PROVABLY-SUBSUMED C records the fast engine deliberately omits: the
+  below-floor RRETURNs of the class/xclass maxbt (:2287) and ref maximize
+  (:5186) fire at floor−1/floor−len AFTER a ticked floor try whose failure
+  already recorded ≥ floor; parent-frame records during NOMATCH unwinds
+  (e.g. a committed atomic group's exhaustion RRETURN at its entry,
+  :5410-via-once_adjust) are ≤ the failure records already present — on a
+  NOMATCH unwind every downstream construct FAILED and recorded ≥ its own
+  spine position q ≥ the parent's entry (the per-arm table above).
+This confines the update to the C's actual sites, and it LAGS exactly as the C
+does (it never over-counts a live-spine position that has not yet "returned"),
+so the -52 decision is byte-identical. Confirmed:
+`(?R)`/`(?R)b`/`((?2)+)((?1)){`/`(?(R)a*(?1)|((?R))b)` all give -52 on both
+engines, -47 on both under DISABLE_RECURSELOOP_CHECK; the assertion-MATCH sites
+are pinned by the reviewer witnesses `((?(R)(?(?=aa)(?1))|(?1)))` and
+`((?(R)(?:(?!aa)b|(?1))|(?1)))` on "aa"; the FAIL split by
+`(?(R)(?<!xyz)(?R)|(?=a)abc(?R))` on "abc" (mutation: FAIL_NASSERT recording
+like FAIL diverges at N=5-6); the consuming-arm table by the
+`(?(R)(?<!…)(?R)|ab(?R))` family over chars/classes/ctypes/backrefs (mutation:
+without `char_run_cfail` the plain char witness diverges at N=4-5); the
+verb-path boundary records by the `(?(R)(?!(?<=(*PRUNE)xq))(?R)|(?=a)ab(?R))`
+family (PRUNE/COMMIT/SKIP through a lookbehind's KIND_ONCE, contained at the
+nassert; mutation: with the KIND_ONCE verb-path record disabled these diverge
+at N=7-10) — all in the recursion LIMIT_MATCH N-sweep.
+
 **Start-of-match scan is required for tick parity (chunk C2, not deferred).** A skipped
 attempt does ZERO ticks, so a naive bump-along that runs attempts the interpreter's
 first_cu/start_bits/startline/minlength/req_cu scans skip would trip `(*LIMIT_MATCH=N)`
@@ -1204,11 +1420,12 @@ first; the conformance diff does not depend on scan strategy).
 
 `Unsupported of string` — the string names the construct (stable prefix for skip-report
 grouping), e.g. `"fast: IR compiler not yet implemented (chunk C, 11-fast-engine.md)"`,
-`"fast: OP_RECURSE (chunk K)"`. Coverage only widens (baseline ratchet
-`fast_baseline_counts.sexp`); chunk K lowered script runs, callout no-ops and the
-G+ repeated-atomic-group cleanup, leaving `OP_RECURSE` (recursion), the two H+
-assertion combinations, `\K` (C2+) and PCRE2_FIRSTLINE (L) as the residual
-decline reasons.
+`"fast: OP_RECURSE into possessive capture (K1b)"`. Coverage only widens (baseline
+ratchet `fast_baseline_counts.sexp`); chunk K1b lowered OP_RECURSE in all forms,
+leaving OP_RECURSE into a POSSESSIVE capture (K1b-residual), the two K2
+assertion combinations (`( *ACCEPT)` inside an assertion, `( *THEN)` with a
+non-atomic assertion), `\K` (K2) and PCRE2_FIRSTLINE (L) as the residual decline
+reasons.
 
 ## §7 Testing hooks
 

@@ -1,0 +1,11 @@
+# fuzz-diff repro (differential: pure engine vs C oracle)
+# seed=424242 case=10402 kind=exec
+# reason: ovector [0;2;1;2;1;1;1;2;2;2;-1;-1] vs [0;2;2;2;1;1;1;2;2;2;-1;-1]
+# pattern (ascii): (*LIMIT_MATCH=2000)\\W(()((?=(*SKIP))(?|(?0)()){,2}|(\\1))){1}
+# compile: options=0x00000000 extra=0x00000000 newline=0 bsr=0
+# exec: subject="--" offset=0 mopts=0x00000000
+# engine: rc=5 ov=[0;2;1;2;1;1;1;2;2;2;-1;-1] mark=<none> sc=0
+# oracle: rc=5 ov=[0;2;1;2;1;1;1;2;2;2;-1;-1] mark=<none> sc=0
+/28 2a 4c 49 4d 49 54 5f 4d 41 54 43 48 3d 32 30 30 30 29 5c 57 28 28 29 28 28 3f 3d 28 2a 53 4b 49 50 29 29 28 3f 7c 28 3f 30 29 28 29 29 7b 2c 32 7d 7c 28 5c 31 29 29 29 7b 31 7d/hex
+    \x2d\x2d\=offset=0,mark,startchar
+

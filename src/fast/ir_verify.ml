@@ -578,6 +578,50 @@ let check (ir : Ir.t) : (unit, string) result =
                           head"
                          Ir.tag_name.(t) pc tgt)
                   else Ok ())
+                else if Int.equal t Ir.t_recurse then (
+                  (* [number; entry_pc]: entry_pc is the recursed group's
+                     first-branch head (a valid instruction head). *)
+                  let entry = code.(pc + 2) in
+                  if entry < 0 || entry >= len || not is_head.(entry) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: RECURSE at pc %d entry %d not an \
+                          instruction head"
+                         pc entry)
+                  else Ok ())
+                else if Int.equal t Ir.t_cond_rref then (
+                  (* [number; no_target]: no_target a valid head. *)
+                  let no_target = code.(pc + 2) in
+                  if no_target < 0 || no_target >= len || not is_head.(no_target)
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: COND_RREF at pc %d no_target %d not an \
+                          instruction head"
+                         pc no_target)
+                  else Ok ())
+                else if Int.equal t Ir.t_cond_dnrref then (
+                  (* [slot_base; count; no_target]: the name-table span must be
+                     inside the table (dnrref_test reads GET2 there); no_target a
+                     valid head. *)
+                  let slot_base = code.(pc + 1) in
+                  let count = code.(pc + 2) in
+                  let no_target = code.(pc + 3) in
+                  let last_byte = slot_base + ((count - 1) * name_entry_size) + 1 in
+                  if count < 1 || slot_base < 0 || last_byte >= nt_len then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: COND_DNRREF at pc %d name-table span \
+                          [%d..%d) outside table of %d bytes (entry_size %d)"
+                         pc slot_base (last_byte + 1) nt_len name_entry_size)
+                  else if no_target < 0 || no_target >= len || not is_head.(no_target)
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: COND_DNRREF at pc %d no_target %d not an \
+                          instruction head"
+                         pc no_target)
+                  else Ok ())
                 else Ok ()
               in
               match step with

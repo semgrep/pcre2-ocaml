@@ -268,6 +268,48 @@ let t_scond_descend = 68 (* [t_scond_descend] *)
    chunk-G machinery and the script run needs no extra atomicity here. *)
 let t_script_run_end = 69 (* [t_script_run_end; g] — OP_SCRIPT_RUN ket *)
 
+(* Chunk K1b additions (fast-design.md §2/§3) — pattern recursion OP_RECURSE
+   (pcre2_match.c:5427-5497) and the recursion-condition tests OP_RREF/OP_DNRREF
+   (pcre2_match.c:5645-5666, un-FALSEd for recursion-containing patterns).
+
+   [t_recurse] is a subroutine call: [number] = the recursed group's number
+   (0 = whole-pattern (?R)/(?0)), [entry_pc] = the IR index of that group's
+   first-branch entry (its t_bra, resolved at IR-compile time even for forward
+   references). The recursion pushes a FAT KIND_RECURSE save record (the full
+   ovector + group_start + cap_start + mark + current_recurse + once_base
+   snapshot — the wholesale-frame answer, fast-design.md §3), sets
+   mb.current_recurse = number, and jumps to [entry_pc]; the recursed group's
+   ket (t_cap_end / t_cap_end_ref for CBRA/SCBRA, or the whole-pattern t_ket for
+   group 0) detects mb.current_recurse == number and RETURNS (restore the
+   snapshot's captures — captures do NOT escape a recursion — and continue past
+   the call at [pc + 3]). The continuation runs at the recursion body's rdepth
+   (the C's `continue` in the same frame, pcre2_match.c:6073). *)
+let t_recurse = 70 (* [t_recurse; number; entry_pc] *)
+
+(* [t_cond_rref] (OP_RREF, pcre2_match.c:5645-5651): a group-recursion test for a
+   conditional. TRUE iff we are inside a recursion (mb.current_recurse >= 0) AND
+   ([number] = RREF_ANY, i.e. (?(R)), or number == mb.current_recurse, (?(Rn))).
+   FALSE jumps to [no_target]. Un-FALSEs the chunk-J COND_FALSE for recursion. *)
+let t_cond_rref = 71 (* [t_cond_rref; number; no_target] *)
+
+(* [t_cond_dnrref] (OP_DNRREF, pcre2_match.c:5653-5666): a duplicate-named
+   recursion test ((?(R&name))). TRUE iff inside a recursion AND any group in the
+   name-table list [slot_base, slot_base+count*entry) equals mb.current_recurse.
+   FALSE jumps to [no_target]. *)
+let t_cond_dnrref = 72 (* [t_cond_dnrref; slot_base; count; no_target] *)
+
+(* [t_fail_nassert] (chunk K1b) — branch exhaustion of a NEGATIVE assertion
+   (OP_ASSERT_NOT/OP_ASSERTBACK_NOT) or an assertion CONDITION: identical to
+   [t_fail] (propagate a NOMATCH backtrack) EXCEPT it does NOT record
+   last_used_ptr. The C's exhaustion there is a SAME-FRAME transfer with no
+   RRETURN — ASSERT_NOT_FAILED (pcre2_match.c:5561-5564 -> :5582) and the
+   condition-assertion `condition = !Lpositive; break` (:5729-5734) — so the
+   assertion frame's entry Feptr is never recorded; every OTHER FAIL head
+   (grouploop group / positive-assertion / atomic-group / script-run exhaustion,
+   and the ( *FAIL) verb) corresponds to a C RRETURN(MATCH_NOMATCH) from the
+   frame at the FAIL's restored eptr (:5410/:5531/:6360) and keeps recording. *)
+let t_fail_nassert = 73 (* [t_fail_nassert] *)
+
 (* Sentinel [g] for a repeated group whose bracket is OP_BRA (bra_loop, C's
    P == NULL): NO empty-string check (the C short-circuits it, and OP_BRA can
    never match empty), so no [t_group_start] and no [mb.group_start] slot. *)
@@ -282,8 +324,13 @@ let reptype_pos = 2
    0xFFFFFFFF, exactly the interpreter's uint32_max (interpreter.ml:115). *)
 let rep_inf = 0xFFFFFFFF
 
+(* RREF_ANY for [t_cond_rref]'s [number] ((?(R)) — "in ANY recursion"); the same
+   0xffff the shared bytecode stores (pcre2_internal.h:1816 / Opcodes.rref_any),
+   which cannot collide with a real group number. *)
+let rref_any = 0xffff
+
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 69
+let max_tag = 73
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -360,6 +407,10 @@ let arity =
     2 (* t_cond_assert_match: match_target *);
     1 (* t_scond_descend *);
     2 (* t_script_run_end: g *);
+    3 (* t_recurse: number, entry_pc *);
+    3 (* t_cond_rref: number, no_target *);
+    4 (* t_cond_dnrref: slot_base, count, no_target *);
+    1 (* t_fail_nassert *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -436,6 +487,10 @@ let tag_name =
     "COND_ASSERT_MATCH";
     "SCOND_DESCEND";
     "SCRIPT_RUN_END";
+    "RECURSE";
+    "COND_RREF";
+    "COND_DNRREF";
+    "FAIL_NASSERT";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -471,6 +526,11 @@ type t = {
      of [code] (dump unchanged); the runner copies it into the KIND_ONCE record
      at push time. Non-t_once indices are unused (0). *)
   once_subtype : int array;
+  (* Chunk K1b — the pattern contains OP_RECURSE. When true the runner tracks
+     mb.last_used_ptr (the RECURSELOOP-check input, fast-design.md §3/§4); when
+     false last_used_ptr is never consulted (no COND_RREF/RECURSE reads it), so
+     the tracking is skipped for zero hot-loop cost on non-recursive patterns. *)
+  has_recurse : bool;
 }
 
 (* Chunk H — KIND_ONCE subtype values. *)
@@ -657,6 +717,23 @@ let cond_assert_match_target (ir : t) (pc : int) : int = ir.code.(pc + 1)
    mb.group_start.(g), written by the preceding t_group_start). *)
 let script_run_group (ir : t) (pc : int) : int = ir.code.(pc + 1)
 
+(* Chunk K1b operands (fast-design.md §2/§3). *)
+
+(* [t_recurse] — the recursed group's [number] and the IR [entry_pc] of its
+   first-branch body. *)
+let recurse_number (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let recurse_entry (ir : t) (pc : int) : int = ir.code.(pc + 2)
+
+(* [t_cond_rref] — the tested recursion [number] (or [rref_any]) and the FALSE
+   jump [no_target]. *)
+let cond_rref_number (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let cond_rref_no (ir : t) (pc : int) : int = ir.code.(pc + 2)
+
+(* [t_cond_dnrref] — the name-table [slot_base]/[count] and the FALSE jump. *)
+let cond_dnrref_slot_base (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let cond_dnrref_count (ir : t) (pc : int) : int = ir.code.(pc + 2)
+let cond_dnrref_no (ir : t) (pc : int) : int = ir.code.(pc + 3)
+
 (* ---------- Text dump (fast-design.md §2) ----------
    Stable, debug_printer.ml-style listing for golden tests: one line per
    instruction, [%3d TAG operands]. Printf/Format here is a debug path
@@ -773,6 +850,16 @@ let render (ir : t) (pc : int) (t : int) : string =
     Printf.sprintf "COND_ASSERT_MATCH match=%d" (cond_assert_match_target ir pc)
   else if Int.equal t t_script_run_end then
     Printf.sprintf "SCRIPT_RUN_END g=%d" (script_run_group ir pc)
+  else if Int.equal t t_recurse then
+    Printf.sprintf "RECURSE number=%d entry=%d" (recurse_number ir pc)
+      (recurse_entry ir pc)
+  else if Int.equal t t_cond_rref then
+    Printf.sprintf "COND_RREF number=%d no=%d" (cond_rref_number ir pc)
+      (cond_rref_no ir pc)
+  else if Int.equal t t_cond_dnrref then
+    Printf.sprintf "COND_DNRREF slot=%d count=%d no=%d"
+      (cond_dnrref_slot_base ir pc) (cond_dnrref_count ir pc)
+      (cond_dnrref_no ir pc)
   else if Int.equal t t_group_start then
     Printf.sprintf "GROUP_START g=%d" (group_start_id ir pc)
   else if Int.equal t t_brazero then

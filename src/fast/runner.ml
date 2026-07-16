@@ -228,6 +228,9 @@ type mb = {
   mutable rep_lmin : int;
   mutable rep_lmax : int;
   mutable rep_reptype : int; (* 0 min / 1 max / 2 pos *)
+  mutable rep_ci : bool; (* caseless (t_repi/t_notrepi) — the C's Fop >= OP_STARI
+                            loop selection, which decides the mismatch-Feptr
+                            semantics for last_used_ptr (chunk K1b) *)
   mutable rep_cont : int; (* continuation pc (past the repeat) *)
   mutable rep_floor : int; (* maximize: position after lmin (Lstart_eptr) *)
   (* Chunk E repeat scratch: the [rep_kind] discriminator selects the per-unit
@@ -307,9 +310,37 @@ type mb = {
   mutable verb_then_pc : int;
   mutable skip_arg_count : int;
   mutable ignore_skip_arg : int;
+  (* Chunk K1b — pattern recursion (fast-design.md §3). [has_recurse] gates all
+     last_used_ptr tracking (only recursive patterns read it, via the RECURSELOOP
+     check). [last_used_ptr] is the C's mb.last_used_ptr (pcre2_match.c:6470): the
+     rightmost subject position any completed sub-match reached, a monotone max
+     reset to start_match per attempt — tracked at every forward-to-backtrack
+     transition (a frame return), record_match (OP_END), the positive-assertion
+     kets and the word-boundary next-char probe. [current_recurse] is Fcurrent_
+     recurse (the group number of the recursion we are inside, or -1 =
+     RECURSE_UNSET); [recurse_base] chains the open KIND_RECURSE records for the
+     RECURSELOOP walk (pcre2_match.c:5438-5453); [verb_current_recurse] is
+     mb->verb_current_recurse (the recursion a firing backtracking verb was in,
+     pcre2_match.c:6369). [n_groups] mirrors Ir.n_groups (the group_start size),
+     needed to size the FAT record. *)
+  mutable has_recurse : bool;
+  mutable last_used_ptr : int;
+  mutable current_recurse : int;
+  mutable recurse_base : int;
+  mutable verb_current_recurse : int;
+  mutable n_groups : int;
+  (* PCRE2_DISABLE_RECURSELOOP_CHECK (a match option, Options
+     :87): when set the RECURSELOOP -52 check is suppressed and an infinite
+     recursion is instead caught by the match/heap limits (pcre2_match.c:5448). *)
+  mutable disable_recurseloop : bool;
   (* the backtracking save stack *)
   ss : Save_stack.t;
 }
+
+(* Chunk K1b — RECURSE_UNSET sentinel (the C's 0xffffffff): -1, distinct from
+   every real group number (>= 0), so [current_recurse >= 0] means "inside a
+   recursion" and the group-0 whole-pattern recursion (number 0) is included. *)
+let recurse_unset = -1
 
 let make_mb (ss : Save_stack.t) : mb =
   {
@@ -375,6 +406,7 @@ let make_mb (ss : Save_stack.t) : mb =
     rep_lmin = 0;
     rep_lmax = 0;
     rep_reptype = 0;
+    rep_ci = false;
     rep_cont = 0;
     rep_floor = 0;
     rep_kind = 0;
@@ -405,6 +437,13 @@ let make_mb (ss : Save_stack.t) : mb =
     verb_then_pc = 0;
     skip_arg_count = 0;
     ignore_skip_arg = 0;
+    has_recurse = false;
+    last_used_ptr = 0;
+    current_recurse = -1;
+    recurse_base = -1;
+    verb_current_recurse = -1;
+    n_groups = 0;
+    disable_recurseloop = false;
     ss;
   }
 
@@ -575,6 +614,29 @@ let rec char_run_cmp (mb : mb) (lit_pos : int) (lit_end : int) (eptr : int) : in
   then sig_backtrack
   else (char_run_cmp [@tailcall]) mb (lit_pos + 1) lit_end (eptr + 1)
 
+(* Chunk K1b — the C-exact last_used_ptr record position for a FAILED char run
+   (OP_CHAR, pcre2_match.c:995-1025). Called only for has_recurse patterns,
+   whose runs are DE-FUSED to ONE character (1..4 code units): a length
+   shortage (UTF: the whole char does not fit, the CHECK_PARTIAL branch
+   :1002-1006; non-UTF: end of subject :1017-1021) leaves Feptr at [eptr];
+   a unit mismatch at unit k RRETURNs AFTER the post-increment
+   (`*Fecode++ != UCHAR21INC(Feptr)` :1009 / `Fecode[1] != *Feptr++` :1022),
+   recording eptr + k + 1. Cold (failure path only); module-level (§9). *)
+let rec char_run_cfail_walk (mb : mb) (lp : int) (e : int) : int =
+  (* safe: the caller [char_run_cfail] excluded the length shortage, so a
+     mismatching unit exists before either bound: lp < |lit| and
+     e < end_subject <= |subject| at every probe. *)
+  if
+    Int.equal
+      (Char.code (String.unsafe_get mb.lit lp))
+      (Char.code (String.unsafe_get mb.subject e))
+  then (char_run_cfail_walk [@tailcall]) mb (lp + 1) (e + 1)
+  else e + 1
+
+let char_run_cfail (mb : mb) (lit_pos : int) (lit_end : int) (eptr : int) : int =
+  if lit_end - lit_pos > mb.end_subject - eptr then eptr
+  else char_run_cfail_walk mb lit_pos eptr
+
 (* ---------- Character-type / class predicates (chunk E) ---------- *)
 
 (* pcre2_match.c:1930 + 2014 — Lbyte_map[fc/8] & (1u << (fc&7)): probe the
@@ -675,24 +737,28 @@ let setup_rep (mb : mb) (pc : int) : unit =
     mb.rep_c1 <- code.(pc + 4);
     mb.rep_c2 <- code.(pc + 4);
     mb.rep_want <- true;
+    mb.rep_ci <- false;
     mb.rep_cont <- pc + 5)
   else if Int.equal tag 19 (* t_repi *) then (
     mb.rep_kind <- rk_char;
     mb.rep_c1 <- code.(pc + 4);
     mb.rep_c2 <- code.(pc + 5);
     mb.rep_want <- true;
+    mb.rep_ci <- true;
     mb.rep_cont <- pc + 6)
   else if Int.equal tag 20 (* t_notrep *) then (
     mb.rep_kind <- rk_char;
     mb.rep_c1 <- code.(pc + 4);
     mb.rep_c2 <- code.(pc + 4);
     mb.rep_want <- false;
+    mb.rep_ci <- false;
     mb.rep_cont <- pc + 5)
   else if Int.equal tag 21 (* t_notrepi *) then (
     mb.rep_kind <- rk_char;
     mb.rep_c1 <- code.(pc + 4);
     mb.rep_c2 <- code.(pc + 5);
     mb.rep_want <- false;
+    mb.rep_ci <- true;
     mb.rep_cont <- pc + 6)
   else if Int.equal tag 31 (* t_class_rep *) then (
     mb.rep_kind <- rk_class;
@@ -764,6 +830,53 @@ let setup_rep (mb : mb) (pc : int) : unit =
          differences; see the rk_anybyte note above). *)
       mb.rep_kind <- rk_anybyte
     else (* op_allany *) mb.rep_kind <- rk_allany)
+
+(* Chunk K1b — the C-exact last_used_ptr record position for a per-unit repeat
+   MISMATCH at [p] (end-of-subject failures record [p]: every C loop checks the
+   end BEFORE reading). The C's min and minimize loops leave Feptr differently
+   at their RRETURN(MATCH_NOMATCH) per family:
+   - rk_char POSITIVE (t_rep/t_repi): the caseless loops test before advancing
+     (UCHAR21TEST..Feptr++, pcre2_match.c:1402-1413/1429-1431) -> p; the caseful
+     UTF wide-char loops memcmp without advancing (:1296-1308/1320-1331) -> p;
+     the caseful 1-unit loops UCHAR21INCTEST -> p+1 (:1465-1472/1489).
+   - rk_char NEGATED (t_notrep/t_notrepi): UTF GETCHARINC -> p+len
+     (:1640-1648/1686-1687 caseless, :1782-1790/1826-1827 caseful); non-UTF
+     caseful *Feptr++ -> p+1 (:1797-1804/1844); non-UTF caseless tests before
+     advancing -> p (:1656-1663/1705-1706) EXCEPT lmin=lmax=1, which is the
+     SINGLE OP_NOT/OP_NOTI lowering (a {1} quantifier folds to the bare opcode,
+     so OP_NOTEXACT(I) 1 never compiles): the single arm reads first
+     (UCHAR21INC, :1144/:1169) -> p+1.
+   - rk_ctype (\d \s \w families): UTF GETCHARINC -> p+len (:3130-3250 min,
+     :3846-3847 minimize); non-UTF MIN loop tests without advancing -> p
+     (:3414-3437+), but the non-UTF MINIMIZE loop reads first (fc = *Feptr++,
+     :3975) -> p+1.
+   - rk_class (:1986/2006/2040/2063), rk_xclass (:2214-2222/2244-2245), rk_prop
+     (:2733-2758 min / RM208-RM214 minimize — GETCHARINCTEST in ALL modes),
+     rk_hspace/rk_vspace (:3080-3128 UTF, `switch( *Feptr++)` :3334-3412
+     non-UTF): all read first -> p + len (p+1 non-UTF).
+   rk_any / rk_anynl / rk_allany / rk_anybyte / rk_extuni have dedicated loops
+   (their sites pass the exact position directly). Gated on has_recurse (the
+   only reader of last_used_ptr); p < end_subject at every mismatch site, so
+   the cp_len read is safe. *)
+let rep_fail_pos (mb : mb) (p : int) (minimize : bool) : int =
+  if not mb.has_recurse then p
+  else
+    let k = mb.rep_kind in
+    if Int.equal k rk_char then
+      if mb.rep_want then
+        if mb.rep_ci then p
+        else if mb.utf && mb.rep_c1 > 127 then p (* wide-char memcmp *)
+        else p + 1
+      else if mb.utf then p + cp_len mb p
+      else if
+        mb.rep_ci
+        && not (Int.equal mb.rep_lmin 1 && Int.equal mb.rep_lmax 1)
+      then p
+      else p + 1
+    else if Int.equal k rk_ctype then
+      if mb.utf then p + cp_len mb p else if minimize then p + 1 else p
+    else (* class / xclass / prop / hspace / vspace: read-first *)
+      p + cp_len mb p
 
 (* True iff the repeat instruction at [rep_pc] is a \R (OP_ANYNL) type repeat.
    Used only on the (cold) greedy give-back path. *)
@@ -945,6 +1058,9 @@ let push_verb (mb : mb) (sp : int) (vtype : int) (aux : int) (eptr : int)
    The winning path's group slots are already in place; the result mark is
    mb.mark (read by [exec]). Returns MATCH_MATCH. *)
 let record_match (mb : mb) (sm : int) (eptr : int) : int =
+  (* pcre2_match.c:929 — OP_END updates last_used_ptr (the RECURSELOOP input);
+     gated on has_recurse (only recursive patterns read it). *)
+  if mb.has_recurse && eptr > mb.last_used_ptr then mb.last_used_ptr <- eptr;
   let s = sm - mb.start_subject in
   let e = eptr - mb.start_subject in
   mb.match_start <- s;
@@ -967,29 +1083,33 @@ let record_match (mb : mb) (sm : int) (eptr : int) : int =
    per-capture cleanup records (fast-design.md §3). *)
 
 (* Push a KIND_ONCE boundary at [sp]: snapshot ov[2, 2*oveccount) + the enclosing
-   [mb.once_base] + the entry [mb.mark] + the [subtype]; set [mb.once_base] = sp.
-   Returns the new sp. Cold (atomic entry only). Layout (fast-design.md §3,
-   chunk H): [ov_snapshot; prev_once_base; saved_mark; subtype; KIND_ONCE], width
-   2*oveccount + 2. [saved_mark] is the C's per-frame Fmark restore on
+   [mb.once_base] + the entry [mb.mark] + the entry [eptr] + the [subtype]; set
+   [mb.once_base] = sp. Returns the new sp. Cold (atomic entry only). Layout
+   (fast-design.md §3, chunk H; chunk K1b added entry_eptr): [ov_snapshot;
+   prev_once_base; saved_mark; entry_eptr; subtype; KIND_ONCE], width
+   2*oveccount + 3. [saved_mark] is the C's per-frame Fmark restore on
    backtrack-past (the atomic COMMIT truncates any MARK record inside);
-   [subtype] (Ir.once_group / once_pos_assert) tells [backtrack_code] whether a
-   ( *THEN) reaching this boundary escapes (atomic group) or is contained
-   (positive assertion). *)
-let push_once (mb : mb) (sp : int) (subtype : int) : int =
+   [entry_eptr] is the C frame's Feptr, recorded into last_used_ptr when a VERB
+   code passes this boundary (the RRETURN(rrc) from the construct's frame,
+   pcre2_match.c:5408/:5529 — chunk K1b, §4); [subtype] (Ir.once_group /
+   once_pos_assert) tells [backtrack_code] whether a ( *THEN) reaching this
+   boundary escapes (atomic group) or is contained (positive assertion). *)
+let push_once (mb : mb) (sp : int) (eptr : int) (subtype : int) : int =
   let ss = mb.ss in
   let nov = 2 * mb.oveccount in
-  let need = sp + nov + 2 in
+  let need = sp + nov + 3 in
   if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
   let d = ss.Save_stack.data in
   let ov = mb.ovector in
-  (* safe: [grow] ensured length >= sp + nov + 2; ov has 2*oveccount = nov slots. *)
+  (* safe: [grow] ensured length >= sp + nov + 3; ov has 2*oveccount = nov slots. *)
   for i = 2 to nov - 1 do
     Array.unsafe_set d (sp + i - 2) (Array.unsafe_get ov i)
   done;
   Array.unsafe_set d (sp + nov - 2) mb.once_base (* prev_once_base *);
   Array.unsafe_set d (sp + nov - 1) mb.mark (* saved_mark *);
-  Array.unsafe_set d (sp + nov) subtype;
-  Array.unsafe_set d (sp + nov + 1) Save_stack.kind_once;
+  Array.unsafe_set d (sp + nov) eptr (* entry_eptr *);
+  Array.unsafe_set d (sp + nov + 1) subtype;
+  Array.unsafe_set d (sp + nov + 2) Save_stack.kind_once;
   mb.once_base <- sp;
   need
 
@@ -1007,7 +1127,7 @@ let once_commit (mb : mb) : int =
   (* safe: [base] is a KIND_ONCE record base (set by push_once); base + nov - 2
      is its prev_once_base slot. *)
   mb.once_base <- Array.unsafe_get d (base + nov - 2);
-  base + nov + 2
+  base + nov + 3
 
 (* Push a KIND_NASSERT boundary at [sp]: snapshot ov[2, 2*oveccount) + the
    enclosing [mb.once_base] + the entry [cont]/[eptr]/[rdepth] + the entry
@@ -1066,6 +1186,132 @@ let push_pos (mb : mb) (sp : int) (eptr : int) (rdepth : int) (zero_allowed : in
   Array.unsafe_set d (sp + nov + 4) Save_stack.kind_pos;
   mb.once_base <- sp;
   need
+
+(* ---------- Pattern recursion (chunk K1b, §3) ---------- *)
+
+(* The array-snapshot size = the ov snapshot ([nov-2]) + the group_start snapshot
+   ([n_groups]) + the cap_start snapshot ([nov]). nov = 2*oveccount. Both the FAT
+   KIND_RECURSE and the KIND_RECURSE_RET records carry this whole-arrays prefix;
+   [recurse_tail_off] is where each record's fixed tail begins. *)
+let recurse_tail_off (mb : mb) : int =
+  (2 * (2 * mb.oveccount)) - 2 + mb.n_groups
+
+(* KIND_RECURSE total width (arrays prefix + 9 tail slots incl. the kind). *)
+let recurse_width (mb : mb) : int = recurse_tail_off mb + 9
+
+(* KIND_RECURSE_RET total width (arrays prefix + number + my_recurse_base + kind). *)
+let recurse_ret_width (mb : mb) : int = recurse_tail_off mb + 3
+
+(* Snapshot mb.{ovector[2,nov); group_start; cap_start} into [d] at [base]
+   (the arrays prefix shared by both recursion records). *)
+let snapshot_arrays (mb : mb) (d : int array) (base : int) : unit =
+  let nov = 2 * mb.oveccount in
+  let ng = mb.n_groups in
+  let ov = mb.ovector in
+  for i = 2 to nov - 1 do
+    Array.unsafe_set d (base + i - 2) (Array.unsafe_get ov i)
+  done;
+  let gbase = base + (nov - 2) in
+  let gs = mb.group_start in
+  for i = 0 to ng - 1 do
+    Array.unsafe_set d (gbase + i) (Array.unsafe_get gs i)
+  done;
+  let cbase = gbase + ng in
+  let cs = mb.cap_start in
+  for i = 0 to nov - 1 do
+    Array.unsafe_set d (cbase + i) (Array.unsafe_get cs i)
+  done
+
+(* Restore mb.{ovector[2,nov); group_start; cap_start} FROM [d] at [base]. The
+   whole-arrays restore is REQUIRED on a recursion return (not just backtrack):
+   the recursion re-entered its group's IR without executing the enclosing
+   construct's entry, so its GROUP_START/CAP_START_REF may have clobbered
+   group_start/cap_start slots the ENCLOSING construct's ket later reads (the C's
+   caller frame keeps its own eptr; here the shared arrays must be reinstated —
+   the fast-design.md §3 snapshot proof's recursion revisit). *)
+let restore_arrays (mb : mb) (d : int array) (base : int) : unit =
+  let nov = 2 * mb.oveccount in
+  let ng = mb.n_groups in
+  let ov = mb.ovector in
+  for i = 2 to nov - 1 do
+    Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+  done;
+  let gbase = base + (nov - 2) in
+  let gs = mb.group_start in
+  for i = 0 to ng - 1 do
+    Array.unsafe_set gs i (Array.unsafe_get d (gbase + i))
+  done;
+  let cbase = gbase + ng in
+  let cs = mb.cap_start in
+  for i = 0 to nov - 1 do
+    Array.unsafe_set cs i (Array.unsafe_get d (cbase + i))
+  done
+
+(* Push a FAT KIND_RECURSE record at [sp] (fast-design.md §3): snapshot the WHOLE
+   group ovector [2,nov), [mb.group_start] and [mb.cap_start] (the wholesale-frame
+   answer); plus the enclosing once_base / current_recurse / recurse_base, the
+   entry mark, the recursion [number], the call position [call_eptr], the
+   last_used_ptr snapshot (RECURSELOOP), and the [cont_pc]. Sets
+   mb.current_recurse = number, mb.recurse_base = sp. Cold. *)
+let push_recurse (mb : mb) (sp : int) (number : int) (call_eptr : int)
+    (cont_pc : int) : int =
+  let ss = mb.ss in
+  let need = sp + recurse_width mb in
+  if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+  let d = ss.Save_stack.data in
+  (* safe: [grow] ensured the whole record fits. *)
+  snapshot_arrays mb d sp;
+  let f = sp + recurse_tail_off mb in
+  Array.unsafe_set d f mb.once_base;
+  Array.unsafe_set d (f + 1) mb.current_recurse;
+  Array.unsafe_set d (f + 2) mb.recurse_base;
+  Array.unsafe_set d (f + 3) mb.mark;
+  Array.unsafe_set d (f + 4) number;
+  Array.unsafe_set d (f + 5) call_eptr;
+  Array.unsafe_set d (f + 6) mb.last_used_ptr;
+  Array.unsafe_set d (f + 7) cont_pc;
+  Array.unsafe_set d (f + 8) Save_stack.kind_recurse;
+  mb.recurse_base <- sp;
+  mb.current_recurse <- number;
+  need
+
+(* Restore mb.{arrays; once_base; current_recurse; recurse_base; mark} from the
+   FAT KIND_RECURSE record whose base is [b] (backtrack-past / verb-through /
+   RECURSELOOP-NOMATCH). *)
+let restore_recurse (mb : mb) (b : int) : unit =
+  let d = mb.ss.Save_stack.data in
+  restore_arrays mb d b;
+  let f = b + recurse_tail_off mb in
+  mb.once_base <- Array.unsafe_get d f;
+  mb.current_recurse <- Array.unsafe_get d (f + 1);
+  mb.recurse_base <- Array.unsafe_get d (f + 2);
+  mb.mark <- Array.unsafe_get d (f + 3)
+
+(* pcre2_match.c:5438-5453 — the RECURSELOOP walk. Called only when already in a
+   recursion (mb.current_recurse >= 0). Walk the chain of open KIND_RECURSE
+   records (mb.recurse_base, linked by [prev_recurse_base]) for the INNERMOST one
+   whose number == [number] (the C breaks at the first GF_RECURSE|number frame);
+   report a loop iff that recursion was dispatched at the SAME eptr AND
+   last_used_ptr is unchanged since (and the check is not disabled). *)
+(* Module-level walk (port-conventions.md §9 named hazard: a local [let rec]
+   here would allocate a closure per RECURSE — cold but on the recursion path,
+   caught by the alloc pin). Explicit state args; tail-recursive. *)
+let rec recurse_loop_walk (d : int array) (toff : int) (number : int)
+    (eptr : int) (last_used : int) (disabled : bool) (base : int) : bool =
+  if base < 0 then false
+  else
+    let f = base + toff in
+    if Int.equal (Array.unsafe_get d (f + 4)) number then
+      Int.equal eptr (Array.unsafe_get d (f + 5))
+      && Int.equal last_used (Array.unsafe_get d (f + 6))
+      && not disabled
+    else
+      (recurse_loop_walk [@tailcall]) d toff number eptr last_used disabled
+        (Array.unsafe_get d (f + 2))
+
+let recurse_loop_check (mb : mb) (number : int) (eptr : int) : bool =
+  recurse_loop_walk mb.ss.Save_stack.data (recurse_tail_off mb) number eptr
+    mb.last_used_ptr mb.disable_recurseloop mb.recurse_base
 
 (* ---------- Backreferences (chunk F, §2/§3) ---------- *)
 
@@ -1237,6 +1483,20 @@ let rec dncref_test (mb : mb) (remaining : int) (slot : int) : bool =
     if not (Int.equal (Array.unsafe_get mb.ovector ovbase) Frames.unset) then true
     else (dncref_test [@tailcall]) mb (remaining - 1) (slot + mb.name_entry_size)
 
+(* pcre2_match.c:5656-5664 (interpreter.ml dnrref_scan :6649-6660) — the
+   OP_DNRREF duplicate-name RECURSION test (chunk K1b): TRUE iff ANY of the
+   [remaining] groups in the name list (starting at byte offset [slot], each
+   entry beginning with the group NUMBER) equals mb.current_recurse. The caller
+   has already verified mb.current_recurse >= 0. *)
+let rec dnrref_test (mb : mb) (remaining : int) (slot : int) : bool =
+  if remaining <= 0 then false
+  else
+    (* Compile.get2 (safe Bytes.get); Ir_verify proved the list span is inside
+       name_table (COND_DNRREF is verified like COND_DNCREF). *)
+    let num = Compile.get2 mb.name_table slot in
+    if Int.equal num mb.current_recurse then true
+    else (dnrref_test [@tailcall]) mb (remaining - 1) (slot + mb.name_entry_size)
+
 (* [setup_ref_rep] decodes the ref-repeat instruction at [pc] into mb.ref_*
    (fast-design.md §2/§3). Called on the forward path (op_ref_repeat) and
    re-called on the RM20 backtrack (KIND_REF_MIN) to restore the fields a
@@ -1307,7 +1567,16 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       let len = code.(pc + 2) in
       let e = char_run_cmp mb lit_off (lit_off + len) eptr in
       if e >= 0 then (run [@tailcall]) mb (pc + 3) e sp rdepth mcc
-      else if e = sig_backtrack then (backtrack [@tailcall]) mb sp mcc
+      else if e = sig_backtrack then
+        (* Chunk K1b — a has_recurse run is DE-FUSED to one character, and the
+           C's OP_CHAR mismatch RRETURNs after the post-increment
+           (pcre2_match.c:1009/:1022): record eptr + k + 1 for a mismatch at
+           unit k, eptr for a length shortage (char_run_cfail). Non-recursive
+           patterns skip the rescan (bt does not record for them). *)
+        (bt [@tailcall]) mb
+          (if mb.has_recurse then char_run_cfail mb lit_off (lit_off + len) eptr
+           else eptr)
+          sp mcc
       else e (* PARTIAL — propagate *)
   | 2 ->
       (* CHARI (fast-design.md §2; non-UTF OP_CHARI arm,
@@ -1316,7 +1585,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       if eptr >= mb.end_subject then (
         (* pcre2_match.c:1035-1039 SCHECK_PARTIAL then NOMATCH. *)
         let r = scheck_partial mb eptr in
-        if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+        if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
       else
         let pch = code.(pc + 1) in
         if mb.utf && pch >= 128 then (
@@ -1329,7 +1598,12 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
           let e' = if c0 >= 0xc0 then eptr + 1 + Utf.get_extralen c0 else eptr + 1 in
           if Int.equal dc pch || Int.equal dc (Ucd.othercase pch) then
             (run [@tailcall]) mb (pc + 2) e' sp rdepth mcc
-          else (backtrack [@tailcall]) mb sp mcc)
+          else
+            (* Chunk K1b — this OP_CHARI subcase GETCHARINCs before the test
+               (pcre2_match.c:1069-1071), so the mismatch records the post-read
+               position e' (last_used_ptr); the other CHARI subcases test before
+               advancing (:1056-1058/:1084-1090/:1099-1101) and record eptr. *)
+            (bt [@tailcall]) mb e' sp mcc)
         else if mb.ucp && pch >= 128 then
           (* pcre2_match.c:1075-1092 (interpreter.ml:1579-1602) — UCP without
              UTF (chunk I2): one character per code unit; cc != fc && cc !=
@@ -1338,7 +1612,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
              end_subject <= String.length subject. *)
           let cc = Char.code (String.unsafe_get mb.subject eptr) in
           if (not (Int.equal cc pch)) && not (Int.equal cc (Ucd.othercase pch))
-          then (backtrack [@tailcall]) mb sp mcc
+          then (bt [@tailcall]) mb eptr sp mcc
           else (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc
         else
           (* pcre2_match.c:1097-1103 non-UTF (and UTF with pattern char < 128,
@@ -1346,7 +1620,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
              end_subject <= String.length subject. *)
           let cc = Char.code (String.unsafe_get mb.subject eptr) in
           if not (Int.equal (Chartables.lcc pch) (Chartables.lcc cc)) then
-            (backtrack [@tailcall]) mb sp mcc
+            (bt [@tailcall]) mb eptr sp mcc
           else (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc
   | 3 ->
       (* BRA (fast-design.md §2/§4; OP_BRA arm) — group entry. A group whose
@@ -1365,8 +1639,16 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
         else (run [@tailcall]) mb (pc + 1) eptr sp 1 mcc'
       else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
   | 4 ->
-      (* KET (fast-design.md §2) — structural group exit; continue past. *)
-      (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
+      (* KET (fast-design.md §2) — structural group exit; continue past. Chunk
+         K1b: the WHOLE-PATTERN ket (the one immediately before END) is the
+         group-0 recursion return point ((?R)/(?0), pcre2_match.c:5964-5984):
+         when mb.current_recurse = 0 it RETURNS to the (?R) continuation rather
+         than reaching END. current_recurse = 0 arises only inside a group-0
+         recursion, so normal matching (current_recurse = -1) falls straight
+         through. *)
+      if Int.equal mb.current_recurse 0 && Int.equal code.(pc + 1) 0 (* END *)
+      then (recurse_return [@tailcall]) mb eptr sp rdepth mcc
+      else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
   | 5 ->
       (* ALT (fast-design.md §2/§3/§4) — a choice point for a NON-LAST branch
          (bra_loop/grouploop record a backtracking point, RM1/RM2). Tick +
@@ -1399,12 +1681,12 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
   | 7 ->
       (* SOD \A (pcre2_match.c:6139-6142 / interpreter.ml:3082-3088). *)
       if not (Int.equal eptr mb.start_subject) then
-        (backtrack [@tailcall]) mb sp mcc
+        (bt [@tailcall]) mb eptr sp mcc
       else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
   | 8 ->
       (* SOM \G (pcre2_match.c:6243-6246 / interpreter.ml:3162-3173). *)
       if not (Int.equal eptr (mb.start_subject + mb.start_offset)) then
-        (backtrack [@tailcall]) mb sp mcc
+        (bt [@tailcall]) mb eptr sp mcc
       else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
   | 9 ->
       (* EOD \z (pcre2_match.c:6154-6163 / interpreter.ml:6334-6352). *)
@@ -1416,12 +1698,12 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       (* CIRC ^ non-multiline (pcre2_match.c:6133-6137 /
          interpreter.ml:3072-3080). *)
       if (not (Int.equal eptr mb.start_subject)) || mb.notbol then
-        (backtrack [@tailcall]) mb sp mcc
+        (bt [@tailcall]) mb eptr sp mcc
       else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
   | 12 ->
       (* DOLL $ non-multiline (pcre2_match.c:6147-6151 /
          interpreter.ml:3089-3097). *)
-      if mb.noteol then (backtrack [@tailcall]) mb sp mcc
+      if mb.noteol then (bt [@tailcall]) mb eptr sp mcc
       else if not mb.dollar_endonly then
         (assert_nl_or_eos [@tailcall]) mb pc eptr sp rdepth mcc
       else (op_eod [@tailcall]) mb pc eptr sp rdepth mcc
@@ -1429,12 +1711,12 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       (* OP_CIRCM ^ multiline (pcre2_match.c:6200-6211 /
          interpreter.ml:3108-3124). No tick (dispatched in place). *)
       if mb.notbol && Int.equal eptr mb.start_subject then
-        (backtrack [@tailcall]) mb sp mcc
+        (bt [@tailcall]) mb eptr sp mcc
       else if
         (not (Int.equal eptr mb.start_subject))
         && ((Int.equal eptr mb.end_subject && not mb.alt_circumflex)
            || not (was_newline_at mb eptr))
-      then (backtrack [@tailcall]) mb sp mcc
+      then (bt [@tailcall]) mb eptr sp mcc
       else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
   | 14 ->
       (* OP_DOLLM $ multiline (pcre2_match.c:6214-6239 /
@@ -1453,17 +1735,35 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
           then (
             mb.hitend <- true;
             if mb.partial > 1 then Errors.error_partial
-            else (backtrack [@tailcall]) mb sp mcc)
-          else (backtrack [@tailcall]) mb sp mcc
+            else (bt [@tailcall]) mb eptr sp mcc)
+          else (bt [@tailcall]) mb eptr sp mcc
         else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
-      else if mb.noteol then (backtrack [@tailcall]) mb sp mcc
+      else if mb.noteol then (bt [@tailcall]) mb eptr sp mcc
       else
         let r = scheck_partial mb eptr in
         if r < 0 then r else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
   | 15 ->
-      (* FAIL (fast-design.md §2/§3) — a grouploop group has exhausted its
-         branches: propagate NOMATCH (no tick). Only reachable via a last
-         ALT's handler on backtrack; forward flow JMPs over it to the KET. *)
+      (* FAIL (fast-design.md §2/§3) — a grouploop group / positive assertion /
+         atomic group / script run has exhausted its branches, or a ( *FAIL)
+         verb: propagate NOMATCH (no tick). Only reachable via a last ALT's
+         handler on backtrack (or, for OP_FAIL, forward flow); forward flow
+         otherwise JMPs over it to the KET. Routed through [bt]: the C's
+         counterpart at each of these sites is RRETURN(MATCH_NOMATCH) from the
+         frame whose Feptr = the ALT-restored eptr (grouploop pcre2_match.c:5410,
+         positive assertion :5531, OP_FAIL :6360), so RETURN_SWITCH (:6470)
+         records it in last_used_ptr. *)
+      (bt [@tailcall]) mb eptr sp mcc
+  | 73 ->
+      (* FAIL_NASSERT (chunk K1b) — a NEGATIVE assertion's / assertion
+         CONDITION's branch exhaustion: as FAIL but WITHOUT the last_used_ptr
+         record. The C's exhaustion there is a same-frame transfer with NO
+         RRETURN (ASSERT_NOT_FAILED, pcre2_match.c:5561-5564 -> :5582; the
+         condition-assertion `condition = !Lpositive; break`, :5729-5734), so
+         the assertion frame's entry Feptr is never recorded — recording it here
+         would OVER-approximate last_used_ptr for a negative LOOKBEHIND (whose
+         branches fail strictly below entry) and shift the RECURSELOOP -52
+         depth. The backtrack below reaches the KIND_NASSERT boundary =
+         assertion success / the nomatch branch. *)
       (backtrack [@tailcall]) mb sp mcc
   | 16 ->
       (* CAP_START (fast-design.md §3; optimized cbracket entry-save
@@ -1491,9 +1791,18 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          position. offset_top (the rc high-water) is recomputed at END. No
          tick (the C ket carries on at the same level). *)
       let ovb = code.(pc + 1) in
-      (* safe: ovb+1 < 2*oveccount = Array.length mb.ovector (Ir_verify). *)
-      Array.unsafe_set mb.ovector (ovb + 1) (eptr - mb.start_subject);
-      (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
+      (* Chunk K1b — when this capture's group N (= ovb/2) is the one currently
+         being recursed (mb.current_recurse == N), the ket is a recursion RETURN
+         (pcre2_match.c:6065-6074), NOT a capture write: group N does not capture
+         during its own recursion (the call entered at t_bra, skipping t_cap_start)
+         and the captures are restored to pre-call. current_recurse >= 1 only
+         inside such a recursion, so normal matching falls to the write. *)
+      if Int.equal mb.current_recurse (ovb lsr 1) then
+        (recurse_return [@tailcall]) mb eptr sp rdepth mcc
+      else (
+        (* safe: ovb+1 < 2*oveccount = Array.length mb.ovector (Ir_verify). *)
+        Array.unsafe_set mb.ovector (ovb + 1) (eptr - mb.start_subject);
+        (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc)
   | 18 | 19 | 20 | 21 | 30 | 31 ->
       (* Repeat superinstructions (fast-design.md §2/§4): char (18-21;
          repeatchar/repeatnotchar interpreter.ml:3549-4128), character type
@@ -1509,20 +1818,27 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          is class_min with lmin=lmax=1: one code unit, no choice point). *)
       if eptr >= mb.end_subject then (
         let r = scheck_partial mb eptr in
-        if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+        if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
       else if mb.utf then
         (* Chunk I — UTF: decode the code point; a code point > 255 matches only
            OP_NCLASS (interpreter.ml:4463-4468). safe: eptr < end_subject. *)
         let cp = cur_cp mb eptr in
         if class_cp_match mb code.(pc + 1) cp then
           (run [@tailcall]) mb (pc + 2) (eptr + cp_len mb eptr) sp rdepth mcc
-        else (backtrack [@tailcall]) mb sp mcc
+        else
+          (* Chunk K1b — the C's class loop GETCHARINCs before the bitmap test
+             (pcre2_match.c:1986-1992): a mismatch records the post-read
+             position (last_used_ptr). *)
+          (bt [@tailcall]) mb (eptr + cp_len mb eptr) sp mcc
       else
         (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
         let cc = Char.code (String.unsafe_get mb.subject eptr) in
         if class_bit_at mb code.(pc + 1) cc then
           (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc
-        else (backtrack [@tailcall]) mb sp mcc
+        else
+          (* Chunk K1b — fc = *Feptr++ before the test (pcre2_match.c:2006):
+             record eptr + 1. *)
+          (bt [@tailcall]) mb (eptr + 1) sp mcc
   | 57 ->
       (* XCLASS (chunk I; OP_XCLASS single, pcre2_match.c:2175-2224) — a lone
          extended class (lmin=lmax=1: one character, no choice point, no tick).
@@ -1530,13 +1846,16 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          against the class data offset (code.(pc+1)). *)
       if eptr >= mb.end_subject then (
         let r = scheck_partial mb eptr in
-        if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+        if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
       else
         (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
         let cp = cur_cp mb eptr in
         if Xclass.xclass cp mb.bytecode code.(pc + 1) mb.utf then
           (run [@tailcall]) mb (pc + 2) (eptr + cp_len mb eptr) sp rdepth mcc
-        else (backtrack [@tailcall]) mb sp mcc
+        else
+          (* Chunk K1b — GETCHARINCTEST before the xclass test
+             (pcre2_match.c:2221-2222): record the post-read position. *)
+          (bt [@tailcall]) mb (eptr + cp_len mb eptr) sp mcc
   | 58 ->
       (* XCLASS_REP (chunk I; OP_XCLASS + OP_CR* repeat) — routes through the
          shared repeat machinery (rk_xclass). *)
@@ -1551,7 +1870,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       if eptr >= mb.end_subject then (
         (* pcre2_match.c:2481-2485 — SCHECK_PARTIAL(), then no match. *)
         let r = scheck_partial mb eptr in
-        if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+        if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
       else
         (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
         let fc = cur_cp mb eptr in
@@ -1559,7 +1878,10 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
           Bool.equal
             (prop_test fc code.(pc + 2) code.(pc + 3))
             (Int.equal code.(pc + 1) 1)
-        then (backtrack [@tailcall]) mb sp mcc
+        then
+          (* Chunk K1b — GETCHARINCTEST before the property test
+             (pcre2_match.c:2486-2488): record the post-read position. *)
+          (bt [@tailcall]) mb (eptr + cp_len mb eptr) sp mcc
         else
           (run [@tailcall]) mb (pc + 4) (eptr + cp_len mb eptr) sp rdepth mcc
   | 60 | 62 ->
@@ -1573,7 +1895,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       if eptr >= mb.end_subject then (
         (* pcre2_match.c:2622-2626 — SCHECK_PARTIAL(), then no match. *)
         let r = scheck_partial mb eptr in
-        if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+        if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
       else
         (* pcre2_match.c:2627-2632 — GETCHARINCTEST + PRIV(extuni). *)
         let e' = extuni_at mb eptr in
@@ -1710,20 +2032,24 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          KIND_CAP restores the pair (so a re-entered earlier iteration sees the
          group unset until it re-closes). No tick. *)
       let ovb = code.(pc + 1) in
-      let ss = mb.ss in
-      let need = sp + Save_stack.width_cap in
-      if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
-      let d = ss.Save_stack.data in
-      let ov = mb.ovector in
-      (* safe: [grow] ensured length >= sp + width_cap; ovb, ovb+1 < 2*oveccount
-         and ovb < Array.length mb.cap_start. *)
-      Array.unsafe_set d sp ovb;
-      Array.unsafe_set d (sp + 1) (Array.unsafe_get ov ovb);
-      Array.unsafe_set d (sp + 2) (Array.unsafe_get ov (ovb + 1));
-      Array.unsafe_set d (sp + 3) Save_stack.kind_cap;
-      Array.unsafe_set ov ovb (Array.unsafe_get mb.cap_start ovb);
-      Array.unsafe_set ov (ovb + 1) (eptr - mb.start_subject);
-      (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_cap) rdepth mcc
+      (* Chunk K1b — as t_cap_end, a recursion return of this referenced group. *)
+      if Int.equal mb.current_recurse (ovb lsr 1) then
+        (recurse_return [@tailcall]) mb eptr sp rdepth mcc
+      else (
+        let ss = mb.ss in
+        let need = sp + Save_stack.width_cap in
+        if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+        let d = ss.Save_stack.data in
+        let ov = mb.ovector in
+        (* safe: [grow] ensured length >= sp + width_cap; ovb, ovb+1 < 2*oveccount
+           and ovb < Array.length mb.cap_start. *)
+        Array.unsafe_set d sp ovb;
+        Array.unsafe_set d (sp + 1) (Array.unsafe_get ov ovb);
+        Array.unsafe_set d (sp + 2) (Array.unsafe_get ov (ovb + 1));
+        Array.unsafe_set d (sp + 3) Save_stack.kind_cap;
+        Array.unsafe_set ov ovb (Array.unsafe_get mb.cap_start ovb);
+        Array.unsafe_set ov (ovb + 1) (eptr - mb.start_subject);
+        (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_cap) rdepth mcc)
   | 38 ->
       (* REVERSE (fast-design.md §2/§3; OP_REVERSE pcre2_match.c:5793-5819 /
          interpreter.ml:2632-2651) — fixed lookbehind step-back. In UTF the
@@ -1736,7 +2062,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       let number = code.(pc + 1) in
       if mb.utf then (op_reverse_utf [@tailcall]) mb pc number eptr sp rdepth mcc
       else if number > eptr - mb.start_subject then
-        (backtrack [@tailcall]) mb sp mcc
+        (bt [@tailcall]) mb eptr sp mcc
       else
         let e = eptr - number in
         if e < mb.start_used_ptr then mb.start_used_ptr <- e;
@@ -1753,7 +2079,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          Also the entry marker for atomic positive assertions (t_once precedes
          their t_group_start); its subtype (mb.once_subtype.(pc)) selects THEN
          containment vs escape at the boundary (chunk H). *)
-      let sp' = push_once mb sp (Array.unsafe_get mb.once_subtype pc) in
+      let sp' = push_once mb sp eptr (Array.unsafe_get mb.once_subtype pc) in
       (run [@tailcall]) mb (pc + 1) eptr sp' rdepth mcc
   | 41 ->
       (* ONCE_END (fast-design.md §3; OP_ONCE ket pcre2_match.c:6023-6031 /
@@ -1773,6 +2099,10 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          (the C's ket continues in the matching branch's frame). *)
       let atomic = code.(pc + 1) in
       let g = code.(pc + 2) in
+      (* pcre2_match.c:6000/6014 — the assertion's reached position [eptr] is
+         consulted before eptr is put back to the entry, raising last_used_ptr
+         (the RECURSELOOP input); gated on has_recurse. *)
+      if mb.has_recurse && eptr > mb.last_used_ptr then mb.last_used_ptr <- eptr;
       (* safe: g in [0, n_groups) (Ir_verify) indexes mb.group_start. *)
       let e = Array.unsafe_get mb.group_start g in
       if Int.equal atomic 1 then
@@ -1793,6 +2123,13 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          pcre2_match.c:5557-5559) — the assertion FAILS. Roll the group ovector
          back to the boundary snapshot, restore mb.once_base, then propagate the
          NOMATCH past the boundary (backtrack below it). No tick. *)
+      (* Chunk K1b — the C's negative-assertion ket is RRETURN(MATCH_MATCH)
+         (pcre2_match.c:6042-6043), so RETURN_SWITCH (:6470) records the body's
+         reached Feptr in last_used_ptr (the RECURSELOOP input) BEFORE the RM4
+         arm converts it to NOMATCH at the entry position — record it here (this
+         arm is the fast MATCH-return; the reach would otherwise be lost when
+         backtracking resumes below the boundary). Gated on has_recurse. *)
+      if mb.has_recurse && eptr > mb.last_used_ptr then mb.last_used_ptr <- eptr;
       let base = mb.once_base in
       let nov = 2 * mb.oveccount in
       let d = mb.ss.Save_stack.data in
@@ -1815,7 +2152,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       let g = code.(pc + 1) in
       (* safe: g in [0, n_groups) (Ir_verify). *)
       if not (Int.equal eptr (Array.unsafe_get mb.group_start g)) then
-        (backtrack [@tailcall]) mb sp mcc
+        (bt [@tailcall]) mb eptr sp mcc
       else (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
   | 46 ->
       (* POSSESS (fast-design.md §3; OP_BRAPOS/CBRAPOS/SBRAPOS/SCBRAPOS entry
@@ -1876,12 +2213,12 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
         && (mb.notempty
            || (mb.notempty_atstart
               && Int.equal sm (mb.start_subject + mb.start_offset)))
-      then (backtrack [@tailcall]) mb sp mcc
+      then (bt [@tailcall]) mb eptr sp mcc
       else if
         (* pcre2_match.c:897-917 — ENDANCHORED and not at end (op is OP_END
            here, so RRETURN(NOMATCH)). *)
         eptr < mb.end_subject && mb.endanchored
-      then (backtrack [@tailcall]) mb sp mcc
+      then (bt [@tailcall]) mb eptr sp mcc
       else
         (* pcre2_match.c:919-940 — record the whole match. The group slots are
            already in place (CAP_END wrote them; the winning path's high-water
@@ -1983,17 +2320,22 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
         (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_verb)
           (rdepth + 1) mcc')
   | 55 ->
-      (* OP_ACCEPT (pcre2_match.c:846-940, not in a recursion — recursion is out
-         of subset) — end the whole match with the current captures. Shares
-         op_end_tail's empty-match rejection; ENDANCHORED-and-not-at-end is a
-         DIRECT NOMATCH return (not a backtrack — pcre2_match.c:916). *)
+      (* OP_ACCEPT (pcre2_match.c:846-940) — chunk K1b: WITHIN a recursion
+         (mb.current_recurse >= 0) it is not the whole-match end but a recursion
+         RETURN that COMMITS the recursion (pcre2_match.c:847-872); otherwise it
+         ends the whole match with the current captures (shares op_end_tail's
+         empty-match rejection; ENDANCHORED-and-not-at-end is a DIRECT NOMATCH
+         return, pcre2_match.c:916). *)
+      if mb.current_recurse >= 0 then
+        (accept_recurse_return [@tailcall]) mb eptr rdepth mcc
+      else
       let sm = mb.attempt_start in
       if
         Int.equal eptr sm
         && (mb.notempty
            || (mb.notempty_atstart
               && Int.equal sm (mb.start_subject + mb.start_offset)))
-      then (backtrack [@tailcall]) mb sp mcc
+      then (bt [@tailcall]) mb eptr sp mcc
       else if eptr < mb.end_subject && mb.endanchored then match_nomatch
       else record_match mb sm eptr
   | 56 ->
@@ -2066,6 +2408,12 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          is CONVERTED to a KIND_ONCE so a later backtrack PAST the whole
          conditional rolls back the snapshot (rather than re-taking the nomatch
          branch). No tick (the C RRETURNs to the OP_COND frame). *)
+      (* Chunk K1b — the C's conditional-assertion ket is RRETURN(MATCH_MATCH)
+         (pcre2_match.c:5947), so RETURN_SWITCH (:6470) records the assertion
+         body's reached Feptr in last_used_ptr (the RECURSELOOP input) BEFORE
+         eptr is put back to the conditional entry — record it here (this arm
+         is the fast MATCH-return), gated on has_recurse. *)
+      if mb.has_recurse && eptr > mb.last_used_ptr then mb.last_used_ptr <- eptr;
       let match_target = code.(pc + 1) in
       let base = mb.once_base in
       let nov = 2 * mb.oveccount in
@@ -2077,17 +2425,19 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       let entry_eptr = Array.unsafe_get d (base + nov) in
       let entry_rdepth = Array.unsafe_get d (base + nov + 1) in
       let saved_mark = Array.unsafe_get d (base + nov + 2) in
-      (* Convert KIND_NASSERT (width nov+4) -> KIND_ONCE (width nov+2): the
+      (* Convert KIND_NASSERT (width nov+4) -> KIND_ONCE (width nov+3): the
          snapshot + prev_once_base slots are identical; rewrite the tail
-         (saved_mark, subtype = atomic group, kind) and truncate to the boundary.
-         mb.mark is KEPT (the mark set inside the matched assertion persists, the
-         C's P->mark = F->mark); the converted KIND_ONCE's saved_mark restores the
-         entry mark only if the conditional is later backtracked past. *)
+         (saved_mark at nov-1; the NASSERT's eptr_enter at nov is ALREADY the
+         KIND_ONCE entry_eptr slot — chunk K1b; subtype = atomic group; kind)
+         and truncate to the boundary. mb.mark is KEPT (the mark set inside the
+         matched assertion persists, the C's P->mark = F->mark); the converted
+         KIND_ONCE's saved_mark restores the entry mark only if the conditional
+         is later backtracked past. *)
       Array.unsafe_set d (base + nov - 1) saved_mark;
-      Array.unsafe_set d (base + nov) Ir.once_group;
-      Array.unsafe_set d (base + nov + 1) Save_stack.kind_once;
+      Array.unsafe_set d (base + nov + 1) Ir.once_group;
+      Array.unsafe_set d (base + nov + 2) Save_stack.kind_once;
       mb.once_base <- prev;
-      (run [@tailcall]) mb match_target entry_eptr (base + nov + 2) entry_rdepth
+      (run [@tailcall]) mb match_target entry_eptr (base + nov + 3) entry_rdepth
         mcc
   | 68 ->
       (* SCOND_DESCEND (fast-design.md §4; the OP_SCOND descend RM35
@@ -2113,11 +2463,60 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       let s = Array.unsafe_get mb.group_start g in
       if Script_run.script_run mb.subject s eptr mb.utf then
         (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
-      else (backtrack [@tailcall]) mb sp mcc
+      else (bt [@tailcall]) mb eptr sp mcc
+  | 70 ->
+      (* RECURSE (chunk K1b, fast-design.md §3; OP_RECURSE pcre2_match.c:5427-5497)
+         — the subroutine call. If already inside a recursion, run the RECURSELOOP
+         check (pcre2_match.c:5438-5453): repeating the SAME group at the SAME
+         eptr with last_used_ptr unchanged is PCRE2_ERROR_RECURSELOOP (a DIRECT
+         return, not a backtrack). Otherwise push the FAT KIND_RECURSE boundary
+         (snapshots + sets mb.current_recurse = number / mb.recurse_base) and jump
+         to the group's first-branch entry; its grouploop ALTs tick per branch =
+         the C's RM11 (§4). No tick in this arm (the branch ALT ticks). *)
+      let number = code.(pc + 1) in
+      let entry_pc = code.(pc + 2) in
+      if mb.current_recurse >= 0 && recurse_loop_check mb number eptr then
+        Errors.error_recurseloop
+      else
+        let sp' = push_recurse mb sp number eptr (pc + 3) in
+        (run [@tailcall]) mb entry_pc eptr sp' rdepth mcc
+  | 71 ->
+      (* COND_RREF (chunk K1b; OP_RREF pcre2_match.c:5645-5651) — recursion test
+         for a conditional: TRUE iff inside a recursion (mb.current_recurse >= 0)
+         AND (number = RREF_ANY or number = mb.current_recurse). TRUE falls through
+         to the yes-branch; FALSE jumps to [no_target]. No tick, no choice point. *)
+      let number = code.(pc + 1) in
+      if
+        mb.current_recurse >= 0
+        && (Int.equal number Ir.rref_any
+           || Int.equal number mb.current_recurse)
+      then (run [@tailcall]) mb (pc + 3) eptr sp rdepth mcc
+      else (run [@tailcall]) mb code.(pc + 2) eptr sp rdepth mcc
+  | 72 ->
+      (* COND_DNRREF (chunk K1b; OP_DNRREF pcre2_match.c:5653-5666) — duplicate-
+         named recursion test: TRUE iff inside a recursion AND any group in the
+         name list equals mb.current_recurse (dnrref_test). No tick. *)
+      if mb.current_recurse >= 0 && dnrref_test mb code.(pc + 2) code.(pc + 1)
+      then (run [@tailcall]) mb (pc + 4) eptr sp rdepth mcc
+      else (run [@tailcall]) mb code.(pc + 3) eptr sp rdepth mcc
   | _ ->
       (* Ir_verify rejects any other tag before the runner sees it; a compiled
          Ir.t cannot reach here (fast-design.md §2). *)
       Errors.error_internal
+
+and bt (mb : mb) (eptr : int) (sp : int) (mcc : int) : int =
+  (* Chunk K1b — the forward-to-backtrack transition IS the C's per-frame RRETURN
+     (pcre2_match.c:6470 RETURN_SWITCH): record the failing position [eptr] in
+     mb.last_used_ptr (the RECURSELOOP input, a monotone max), then hand off to
+     the ordinary [backtrack]. Gated on has_recurse — only recursive patterns
+     read last_used_ptr, so non-recursive matches pay one predictable branch on
+     the (already non-hottest) backtrack path. The deepest forward failure of an
+     unwind carries the largest eptr, so recording at these transitions matches
+     the C's max-over-RRETURNs exactly (the shallower chained returns add no new
+     maximum); char runs are de-fused for has_recurse patterns so a mismatch's
+     eptr equals the C's per-OP_CHAR Feptr. *)
+  if mb.has_recurse && eptr > mb.last_used_ptr then mb.last_used_ptr <- eptr;
+  (backtrack [@tailcall]) mb sp mcc
 
 and backtrack (mb : mb) (sp : int) (mcc : int) : int =
   (* fast-design.md §3 — pop the top save record and act on its KIND. An
@@ -2220,20 +2619,54 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
       let veptr = Array.unsafe_get d (base + 2) in
       mb.mark <- Array.unsafe_get d (base + 3);
       if Int.equal vtype vt_mark then (backtrack [@tailcall]) mb base mcc
-      else if Int.equal vtype vt_prune then
-        (backtrack_code [@tailcall]) mb base mcc match_prune
-      else if Int.equal vtype vt_commit then
-        (backtrack_code [@tailcall]) mb base mcc match_commit
-      else if Int.equal vtype vt_skip then (
-        mb.verb_skip_ptr <- veptr (* pass back current position, 6395 *);
-        (backtrack_code [@tailcall]) mb base mcc match_skip)
-      else if Int.equal vtype vt_skip_arg then (
-        mb.verb_skip_ptr <- aux (* pass back the skip name offset, 6422 *);
-        (backtrack_code [@tailcall]) mb base mcc match_skip_arg)
       else (
-        (* vt_then: pass back this THEN's IR pc (6432). *)
-        mb.verb_then_pc <- aux;
-        (backtrack_code [@tailcall]) mb base mcc match_then))
+        (* Chunk K1b — record the recursion the firing verb is in
+           (pcre2_match.c:6369): mb.current_recurse at the KIND_VERB pop equals
+           its value when the verb was DISPATCHED (all of the continuation's
+           recursion records, below-none/above-this, have restored it by now), so
+           it is mb->verb_current_recurse. Read at a KIND_RECURSE boundary to
+           decide whether the verb NOMATCHes the recursion (contained) or passes
+           through (pcre2_match.c:5481-5488). *)
+        mb.verb_current_recurse <- mb.current_recurse;
+        if Int.equal vtype vt_prune then
+          (backtrack_code [@tailcall]) mb base mcc match_prune
+        else if Int.equal vtype vt_commit then
+          (backtrack_code [@tailcall]) mb base mcc match_commit
+        else if Int.equal vtype vt_skip then (
+          mb.verb_skip_ptr <- veptr (* pass back current position, 6395 *);
+          (backtrack_code [@tailcall]) mb base mcc match_skip)
+        else if Int.equal vtype vt_skip_arg then (
+          mb.verb_skip_ptr <- aux (* pass back the skip name offset, 6422 *);
+          (backtrack_code [@tailcall]) mb base mcc match_skip_arg)
+        else (
+          (* vt_then: pass back this THEN's IR pc (6432). *)
+          mb.verb_then_pc <- aux;
+          (backtrack_code [@tailcall]) mb base mcc match_then)))
+    else if Int.equal kind Save_stack.kind_recurse then (
+      (* KIND_RECURSE — the recursion is backtracked PAST (all its branches
+         failed): restore the FAT snapshot + boundary state, then keep popping
+         (the C frame arena discarding the recursion's frames, pcre2_match.c:6470
+         RRETURN past OP_RECURSE). Chunk K1b — the C's branch exhaustion is
+         RRETURN(MATCH_NOMATCH) from the OP_RECURSE frame at the CALL position
+         (:5495): record call_eptr (usually already recorded by the recursed
+         group's FAIL head, but exact either way — last_used is a monotone max). *)
+      let base = sp - recurse_width mb in
+      let call_eptr = Array.unsafe_get d (base + recurse_tail_off mb + 5) in
+      if mb.has_recurse && call_eptr > mb.last_used_ptr then
+        mb.last_used_ptr <- call_eptr;
+      restore_recurse mb base;
+      (backtrack [@tailcall]) mb base mcc)
+    else if Int.equal kind Save_stack.kind_recurse_ret then (
+      (* KIND_RECURSE_RET — backtrack INTO a completed recursion body: restore the
+         POST-body arrays (ovector + group_start + cap_start) + mb.current_recurse
+         / recurse_base, then keep popping (the body's records retry its
+         branches). *)
+      let base = sp - recurse_ret_width mb in
+      let g = base + recurse_tail_off mb in
+      restore_arrays mb d base;
+      mb.current_recurse <- Array.unsafe_get d g;
+      mb.recurse_base <- Array.unsafe_get d (g + 1);
+      (backtrack [@tailcall]) mb base mcc)
     else
       (* KIND_CONT [target; eptr; rdepth; kind] (fast-design.md §3) — a
          chunk-D2 group choice point: resume at [target] with [eptr]/[rdepth]
@@ -2260,6 +2693,7 @@ and resume_alt (mb : mb) (base : int) (mcc : int) : int =
     Int.equal dsaved 0
     && (not (Int.equal code.(handler) 5 (* ALT *)))
     && (not (Int.equal code.(handler) 15 (* FAIL *)))
+    && (not (Int.equal code.(handler) 73 (* FAIL_NASSERT — as FAIL (chunk K1b) *)))
     && not
          (Int.equal code.(handler) 48 (* POSSESS_DONE — a loop break, not a
             ticked branch (chunk G); exclude so a dsaved=0 last-ALT handler
@@ -2272,6 +2706,66 @@ and resume_alt (mb : mb) (base : int) (mcc : int) : int =
     let mcc' = tick_child mb mcc 1 in
     if mcc' < 0 then mcc' else (run [@tailcall]) mb handler e base 1 mcc'
   else (run [@tailcall]) mb handler e base dsaved mcc
+
+(* Chunk K1b — a recursion RETURN (the recursed group's ket / an inner ( *ACCEPT)
+   detected mb.current_recurse == number, pcre2_match.c:6065-6074). The
+   recursion body's captures do NOT escape: restore the ovector to the pre-call
+   snapshot in the FAT record going FORWARD, but first push a KIND_RECURSE_RET
+   saving the POST-body ovector so a later backtrack INTO the body re-establishes
+   it (the C's body frames keep their own ovector below the returning frame).
+   Restore current_recurse / recurse_base to the enclosing values and continue
+   past the call ([cont_pc]) at the body's rdepth (the C's `continue` in the same
+   frame). mb.mark is KEPT (the recursion's mark persists — the C never restores
+   Fmark at the ket-return). No tick. *)
+and recurse_return (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) :
+    int =
+  let rb = mb.recurse_base in
+  let toff = recurse_tail_off mb in
+  let ss = mb.ss in
+  let f = rb + toff in
+  let number = ss.Save_stack.data.(f + 4) in
+  let cont_pc = ss.Save_stack.data.(f + 7) in
+  let prev_cr = ss.Save_stack.data.(f + 1) in
+  let prev_rb = ss.Save_stack.data.(f + 2) in
+  let need = sp + recurse_ret_width mb in
+  if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+  let d = ss.Save_stack.data in
+  (* Save the POST-body arrays (ovector + group_start + cap_start) for a
+     backtrack INTO the body; then restore the PRE-CALL arrays from the FAT
+     snapshot (preserved across the grow) — captures do not escape a recursion,
+     and the enclosing construct's group_start/cap_start must be reinstated. *)
+  snapshot_arrays mb d sp;
+  let g = sp + toff in
+  d.(g) <- number;
+  d.(g + 1) <- rb;
+  d.(g + 2) <- Save_stack.kind_recurse_ret;
+  restore_arrays mb d rb;
+  mb.current_recurse <- prev_cr;
+  mb.recurse_base <- prev_rb;
+  (run [@tailcall]) mb cont_pc eptr need rdepth mcc
+
+(* Chunk K1b — ( *ACCEPT) inside a recursion (pcre2_match.c:847-872): unlike the
+   ket-return this COMMITS the recursion (the C's F = P discards the body frames).
+   Restore the pre-call captures + boundary state (once_base / current_recurse /
+   recurse_base) from the FAT record, truncate the save stack to the FAT record's
+   base (discard the body's choice points AND the FAT record itself — the
+   recursion has no more alternatives), and continue past the call at [cont_pc]
+   with eptr = the ACCEPT position. mb.mark is KEPT (the C copies Fmark to P->mark,
+   :868). No empty/ENDANCHORED test (that is the fall-through top-level ACCEPT). *)
+and accept_recurse_return (mb : mb) (eptr : int) (rdepth : int) (mcc : int) : int
+    =
+  let rb = mb.recurse_base in
+  let d = mb.ss.Save_stack.data in
+  let f = rb + recurse_tail_off mb in
+  let cont_pc = d.(f + 7) in
+  (* Restore the pre-call arrays (ovector + group_start + cap_start) + once_base /
+     current_recurse / recurse_base; truncate to the FAT record base (discard the
+     body's choice points AND the record — the recursion has no more branches). *)
+  restore_arrays mb d rb;
+  mb.once_base <- d.(f + 0);
+  mb.current_recurse <- d.(f + 1);
+  mb.recurse_base <- d.(f + 2);
+  (run [@tailcall]) mb cont_pc eptr rb rdepth mcc
 
 (* Propagate a backtracking verb code [vcode] (MATCH_COMMIT..MATCH_THEN) up the
    save stack (chunk H, fast-design.md §3). Mirrors the C's RRETURN of a verb
@@ -2348,16 +2842,26 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
          i.e. converted to NOMATCH so backtracking continues BELOW the boundary
          (the assertion "fails"). *)
       let nov = 2 * mb.oveccount in
-      let base = sp - (nov + 2) in
+      let base = sp - (nov + 3) in
       let ov = mb.ovector in
       for i = 2 to nov - 1 do
         Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
       done;
       mb.once_base <- Array.unsafe_get d (base + nov - 2);
       mb.mark <- Array.unsafe_get d (base + nov - 1);
+      (* Chunk K1b — a verb code passing this boundary is an RRETURN(rrc) FROM
+         the construct's frame in the C (:5408 RM2 / :5529 RM3), so
+         RETURN_SWITCH (:6470) records the construct's ENTRY Feptr — which can
+         EXCEED the verb-fire position when the verb fired inside a LOOKBEHIND
+         body (rewound below entry). Record the stored entry_eptr; also for the
+         THEN-contained pos-assert case (its committed-body exhaustion is
+         RRETURN(MATCH_NOMATCH) at the entry, :5531). Gated on has_recurse. *)
+      let entry_eptr = Array.unsafe_get d (base + nov) in
+      if mb.has_recurse && entry_eptr > mb.last_used_ptr then
+        mb.last_used_ptr <- entry_eptr;
       if
         Int.equal vcode match_then
-        && Int.equal (Array.unsafe_get d (base + nov)) Ir.once_pos_assert
+        && Int.equal (Array.unsafe_get d (base + nov + 1)) Ir.once_pos_assert
       then (backtrack [@tailcall]) mb base mcc (* THEN contained: NOMATCH below *)
       else (backtrack_code [@tailcall]) mb base mcc vcode)
     else if Int.equal kind Save_stack.kind_pos then (
@@ -2372,6 +2876,12 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
       done;
       mb.once_base <- Array.unsafe_get d (base + nov - 2);
       mb.mark <- Array.unsafe_get d (base + nov + 3);
+      (* Chunk K1b — the RM8 pass-up RRETURN(rrc) (:5315) is executed by the
+         bracket frame whose Feptr = the CURRENT iteration start (the KETRPOS
+         frame copy-back, :6094-6096): record the stored iter_start. *)
+      let iter_start = Array.unsafe_get d (base + nov - 1) in
+      if mb.has_recurse && iter_start > mb.last_used_ptr then
+        mb.last_used_ptr <- iter_start;
       (backtrack_code [@tailcall]) mb base mcc vcode)
     else if Int.equal kind Save_stack.kind_nassert then
       if Int.equal vcode match_skip_arg then (
@@ -2388,13 +2898,24 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
         done;
         mb.once_base <- Array.unsafe_get d (base + nov - 2);
         mb.mark <- Array.unsafe_get d (base + nov + 2);
+        (* Chunk K1b — this escape IS an RRETURN from the assertion frame
+           (:5574), so it records the assertion's entry Feptr (stored as
+           eptr_enter at base + nov). *)
+        let entry_eptr = Array.unsafe_get d (base + nov) in
+        if mb.has_recurse && entry_eptr > mb.last_used_ptr then
+          mb.last_used_ptr <- entry_eptr;
         (backtrack_code [@tailcall]) mb base mcc vcode)
       else
         (* COMMIT/SKIP/PRUNE force the assertion to fail = the negative assertion
            SUCCEEDS (pcre2_match.c:5567-5571 RM4); THEN is treated as NOMATCH = no
            more branches = also SUCCESS (5561-5565 + ASSERT_NOT_FAILED). Each does
            the SUCCESS action (continue at cont with the entry eptr/rdepth),
-           consuming the code — identical to the all-branches-failed backtrack. *)
+           consuming the code — identical to the all-branches-failed backtrack.
+           Chunk K1b — NO last_used record here: both containment paths are
+           SAME-FRAME transfers in the C (the :5570 `goto ASSERT_NOT_FAILED` and
+           the :5563-5564 branch walk), with no RRETURN — recording the entry
+           would over-approximate (verified: the C never records the OP_ASSERT_NOT
+           frame's Feptr on containment). *)
         (backtrack_nassert [@tailcall]) mb sp mcc
     else if Int.equal kind Save_stack.kind_vreverse then
       (backtrack_code [@tailcall]) mb (sp - Save_stack.width_vreverse) mcc vcode
@@ -2408,6 +2929,38 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
       (backtrack_code [@tailcall]) mb (sp - Save_stack.width_ref_max) mcc vcode
     else if Int.equal kind Save_stack.kind_ref_max2 then
       (backtrack_code [@tailcall]) mb (sp - Save_stack.width_ref_max2) mcc vcode
+    else if Int.equal kind Save_stack.kind_recurse then (
+      (* KIND_RECURSE — a verb code reaching the recursion boundary
+         (pcre2_match.c:5481-5488). Restore the FAT snapshot + boundary state
+         (abandon the recursion's captures, the C's RRETURN past OP_RECURSE). A
+         verb that fired WITHIN this recursion (verb_current_recurse == number)
+         does NOT escape — it makes the whole recursion NOMATCH (RRETURN(NOMATCH),
+         5487): convert to a plain NOMATCH backtrack below the boundary. A verb
+         from OUTSIDE this recursion passes through unchanged (5493). *)
+      let base = sp - recurse_width mb in
+      let number = Array.unsafe_get d (base + recurse_tail_off mb + 4) in
+      (* Chunk K1b — both the contained (:5487) and pass-through (:5493) cases
+         are RRETURNs from the OP_RECURSE frame at the CALL position: record
+         call_eptr (the verb path DISCARDS the group's FAIL head, so this is
+         the only record of it here). *)
+      let call_eptr = Array.unsafe_get d (base + recurse_tail_off mb + 5) in
+      if mb.has_recurse && call_eptr > mb.last_used_ptr then
+        mb.last_used_ptr <- call_eptr;
+      restore_recurse mb base;
+      if Int.equal mb.verb_current_recurse number then
+        (backtrack [@tailcall]) mb base mcc
+      else (backtrack_code [@tailcall]) mb base mcc vcode)
+    else if Int.equal kind Save_stack.kind_recurse_ret then (
+      (* KIND_RECURSE_RET — a verb propagating past a COMPLETED recursion body:
+         restore the POST-body arrays + current_recurse/recurse_base (enter the
+         body context) then keep propagating; the body records + the FAT record
+         below revert its captures as the code passes through. *)
+      let base = sp - recurse_ret_width mb in
+      let g = base + recurse_tail_off mb in
+      restore_arrays mb d base;
+      mb.current_recurse <- Array.unsafe_get d g;
+      mb.recurse_base <- Array.unsafe_get d (g + 1);
+      (backtrack_code [@tailcall]) mb base mcc vcode)
     else
       (* KIND_CONT — a group choice point; discard and keep propagating. *)
       (backtrack_code [@tailcall]) mb (sp - Save_stack.width_cont) mcc vcode
@@ -2474,7 +3027,11 @@ and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
   let eptr = Array.unsafe_get d (base + 2) in
   let dd = Array.unsafe_get d (base + 3) in
   setup_rep mb rep_pc;
-  if count >= mb.rep_lmax then (backtrack [@tailcall]) mb base mcc
+  if count >= mb.rep_lmax then
+    (* Chunk K1b — the C's count exhaustion is `if (Lmin++ >= Lmax)
+       RRETURN(MATCH_NOMATCH)` (pcre2_match.c:1483/3967 etc.), an RRETURN from
+       the repeat frame at the current extend position: record [eptr]. *)
+    (bt [@tailcall]) mb eptr base mcc
   else
     let k = mb.rep_kind in
     if Int.equal k rk_any then
@@ -2487,7 +3044,7 @@ and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
          retry the continuation (tick). *)
       if eptr >= mb.end_subject then
         let r = scheck_partial mb eptr in
-        if r < 0 then r else (backtrack [@tailcall]) mb base mcc
+        if r < 0 then r else (bt [@tailcall]) mb eptr base mcc
       else
         let e' = extuni_at mb eptr in
         let r = if e' >= mb.end_subject then scheck_partial mb e' else 0 in
@@ -2501,7 +3058,7 @@ and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
             (run [@tailcall]) mb mb.rep_cont e' sp (dd + 1) mcc')
     else if eptr >= mb.end_subject then
       let r = scheck_partial mb eptr in
-      if r < 0 then r else (backtrack [@tailcall]) mb base mcc
+      if r < 0 then r else (bt [@tailcall]) mb eptr base mcc
     else if mb.utf then
       (* Chunk I — match one more CHARACTER: the UTF minimize resume (RM219,
          pcre2_match.c:3836-3959) GETCHARINCs a full character for EVERY type
@@ -2512,7 +3069,9 @@ and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
         if Int.equal k rk_allany || Int.equal k rk_anybyte then cp_len mb eptr
         else rep_unit_utf mb eptr
       in
-      if Int.equal l 0 then (backtrack [@tailcall]) mb base mcc
+      if Int.equal l 0 then
+        (* Chunk K1b — record the C-exact mismatch position (minimize=true). *)
+        (bt [@tailcall]) mb (rep_fail_pos mb eptr true) base mcc
       else
         let mcc' = tick_child mb mcc (dd + 1) in
         if mcc' < 0 then mcc'
@@ -2520,7 +3079,9 @@ and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
           Array.unsafe_set d (base + 1) (count + 1);
           Array.unsafe_set d (base + 2) (eptr + l);
           (run [@tailcall]) mb mb.rep_cont (eptr + l) sp (dd + 1) mcc')
-    else if not (rep_unit_matches mb eptr) then (backtrack [@tailcall]) mb base mcc
+    else if not (rep_unit_matches mb eptr) then
+      (* Chunk K1b — record the C-exact mismatch position (minimize=true). *)
+      (bt [@tailcall]) mb (rep_fail_pos mb eptr true) base mcc
     else
       let mcc' = tick_child mb mcc (dd + 1) in
       if mcc' < 0 then mcc'
@@ -2536,8 +3097,11 @@ and rep_bt_min_any (mb : mb) (base : int) (count : int) (eptr : int) (dd : int)
   let d = mb.ss.Save_stack.data in
   if eptr >= mb.end_subject then
     let r = scheck_partial mb eptr in
-    if r < 0 then r else (backtrack [@tailcall]) mb base mcc
-  else if is_newline_at mb eptr then (backtrack [@tailcall]) mb base mcc
+    if r < 0 then r else (bt [@tailcall]) mb eptr base mcc
+  else if is_newline_at mb eptr then
+    (* Chunk K1b — the newline rejection precedes the read
+       (pcre2_match.c:3973-3974): record [eptr] unmoved. *)
+    (bt [@tailcall]) mb eptr base mcc
   else
     let hit =
       mb.partial <> 0
@@ -2567,7 +3131,7 @@ and rep_bt_min_anynl (mb : mb) (base : int) (count : int) (eptr : int)
     (dd : int) (mcc : int) : int =
   if eptr >= mb.end_subject then
     let r = scheck_partial mb eptr in
-    if r < 0 then r else (backtrack [@tailcall]) mb base mcc
+    if r < 0 then r else (bt [@tailcall]) mb eptr base mcc
   else
     (* safe: eptr < mb.end_subject <= String.length mb.subject. Branches are
        inlined per case, exactly like the forward loop [rep_min_anynl] — no
@@ -2590,9 +3154,14 @@ and rep_bt_min_anynl (mb : mb) (base : int) (count : int) (eptr : int)
       || Int.equal fc Newline.char_nel
       || Int.equal fc 0x2028 || Int.equal fc 0x2029
     then
-      if mb.bsr_anycrlf then (backtrack [@tailcall]) mb base mcc
+      if mb.bsr_anycrlf then
+        (* Chunk K1b — the read precedes the ANYCRLF rejection
+           (pcre2_match.c:3866-3886 / :3994-4014): record the post-read [e]. *)
+        (bt [@tailcall]) mb e base mcc
       else (rep_bt_min_anynl_step [@tailcall]) mb base count e dd mcc
-    else (backtrack [@tailcall]) mb base mcc
+    else
+      (* Chunk K1b — default rejection after the read: record [e]. *)
+      (bt [@tailcall]) mb e base mcc
 
 (* Shared epilogue of [rep_bt_min_anynl]: one more \R sequence matched, ending
    at [e'] — tick, bump the record's count/eptr, retry the continuation
@@ -2622,10 +3191,11 @@ and op_single_ref (mb : mb) (cont : int) (ovbase : int) (caseless : bool)
   let rrc = match_ref mb ovbase caseless eptr in
   if not (Int.equal rrc 0) then
     (* pcre2_match.c:5050-5052 — if rrc > 0 (partial): Feptr = end_subject;
-       then CHECK_PARTIAL; then NOMATCH. *)
+       then CHECK_PARTIAL; then NOMATCH. Chunk K1b — the RRETURN records that
+       moved Feptr (end_subject on a partial-length copy, else unmoved). *)
     let feptr = if rrc > 0 then mb.end_subject else eptr in
     let rc = if feptr >= mb.end_subject then scheck_partial mb feptr else 0 in
-    if rc < 0 then rc else (backtrack [@tailcall]) mb sp mcc
+    if rc < 0 then rc else (bt [@tailcall]) mb feptr sp mcc
   else (run [@tailcall]) mb cont (eptr + mb.ref_length) sp rdepth mcc
 
 (* pcre2_match.c:5021-5074 — REF_REPEAT + the ref_repeat_head decision
@@ -2659,10 +3229,11 @@ and ref_min (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
   if i <= mb.ref_lmin then
     let rrc = match_ref mb mb.ref_ovbase mb.ref_caseless eptr in
     if not (Int.equal rrc 0) then
-      (* pcre2_match.c:5082-5087 — partial handling then NOMATCH. *)
+      (* pcre2_match.c:5082-5087 — partial handling then NOMATCH. Chunk K1b —
+         record the moved Feptr (end_subject on a partial copy, else unmoved). *)
       let feptr = if rrc > 0 then mb.end_subject else eptr in
       let rc = if feptr >= mb.end_subject then scheck_partial mb feptr else 0 in
-      if rc < 0 then rc else (backtrack [@tailcall]) mb sp mcc
+      if rc < 0 then rc else (bt [@tailcall]) mb feptr sp mcc
     else (ref_min [@tailcall]) mb (i + 1) (eptr + mb.ref_length) sp rdepth mcc
   else if Int.equal mb.ref_lmin mb.ref_lmax then
     (* pcre2_match.c:5093 — min == max: done, continue. *)
@@ -2783,15 +3354,18 @@ and backtrack_ref_min (mb : mb) (sp : int) (mcc : int) : int =
   let eptr = Array.unsafe_get d (base + 2) in
   let dd = Array.unsafe_get d (base + 3) in
   setup_ref_rep mb rep_pc;
-  if count >= mb.ref_lmax then (backtrack [@tailcall]) mb base mcc
-    (* pcre2_match.c:5104 — Lmin++ >= Lmax: NOMATCH. *)
+  if count >= mb.ref_lmax then
+    (* pcre2_match.c:5104 — Lmin++ >= Lmax: RRETURN(MATCH_NOMATCH) from the
+       repeat frame at the current extend position (chunk K1b: record it). *)
+    (bt [@tailcall]) mb eptr base mcc
   else
     let rrc = match_ref mb mb.ref_ovbase mb.ref_caseless eptr in
     if not (Int.equal rrc 0) then
-      (* pcre2_match.c:5106-5111 — partial handling then NOMATCH. *)
+      (* pcre2_match.c:5106-5111 — partial handling then NOMATCH. Chunk K1b —
+         record the moved Feptr (end_subject on a partial copy, else unmoved). *)
       let feptr = if rrc > 0 then mb.end_subject else eptr in
       let rc = if feptr >= mb.end_subject then scheck_partial mb feptr else 0 in
-      if rc < 0 then rc else (backtrack [@tailcall]) mb base mcc
+      if rc < 0 then rc else (bt [@tailcall]) mb feptr base mcc
     else
       let mcc' = tick_child mb mcc (dd + 1) in
       if mcc' < 0 then mcc'
@@ -2863,13 +3437,15 @@ and backtrack_ref_max2 (mb : mb) (sp : int) (mcc : int) : int =
    record (as in the C, where backtracking past OP_ONCE lands in P's frame). *)
 and backtrack_once (mb : mb) (sp : int) (mcc : int) : int =
   let nov = 2 * mb.oveccount in
-  let base = sp - (nov + 2) in
+  let base = sp - (nov + 3) in
   let d = mb.ss.Save_stack.data in
   let ov = mb.ovector in
   (* safe: [base] is a KIND_ONCE record base; its snapshot occupies
      [base, base + nov - 2), prev_once_base at base + nov - 2 and saved_mark at
-     base + nov - 1 (subtype at base + nov, unread on NOMATCH backtrack). ov has
-     nov slots. *)
+     base + nov - 1 (entry_eptr at base + nov and subtype at base + nov + 1,
+     unread on a NOMATCH backtrack: the C's exhaustion RRETURN at the entry is
+     subsumed — every downstream construct recorded >= its own spine position
+     >= this entry when it failed, §4). ov has nov slots. *)
   for i = 2 to nov - 1 do
     Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
   done;
@@ -2914,7 +3490,7 @@ and op_reverse_utf (mb : mb) (pc : int) (number : int) (eptr : int) (sp : int)
      mb->check_subject, else Feptr--; BACKCHAR(Feptr). Then the shared tail
      (5815-5818): lower start_used_ptr and continue. *)
   if number > 0 then
-    if eptr <= mb.check_subject then (backtrack [@tailcall]) mb sp mcc
+    if eptr <= mb.check_subject then (bt [@tailcall]) mb eptr sp mcc
     else
       (* eptr - 1 >= check_subject >= 0 (guard above); backchar_sub clamps. *)
       (op_reverse_utf [@tailcall]) mb pc (number - 1)
@@ -2942,7 +3518,7 @@ and op_vreverse (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     let available =
       if diff > 65535 then 65535 else if diff > 0 then diff else 0
     in
-    if lmin > available then (backtrack [@tailcall]) mb sp mcc
+    if lmin > available then (bt [@tailcall]) mb eptr sp mcc
       (* pcre2_match.c:5866 — too close to the start for even the minimum. *)
     else
       let cur_lmax = if lmax > available then available else lmax in
@@ -2970,7 +3546,7 @@ and op_vreverse_utf (mb : mb) (body_pc : int) (lmin : int) (lmax : int)
      legitimately walks below check_subject on valid UTF). *)
   if i < lmax then
     if Int.equal eptr mb.start_subject then
-      if i < lmin then (backtrack [@tailcall]) mb sp mcc
+      if i < lmin then (bt [@tailcall]) mb eptr sp mcc
       else (vreverse_try [@tailcall]) mb body_pc i lmin eptr sp rdepth mcc
     else
       (* eptr - 1 >= start_subject = 0 (eptr <> start_subject above);
@@ -2983,7 +3559,7 @@ and op_vreverse_utf (mb : mb) (body_pc : int) (lmin : int) (lmax : int)
       then
         (* pin: the bounded walk landed on a continuation byte — the step
            cannot be completed (cap logic as above, eptr unchanged). *)
-        if i < lmin then (backtrack [@tailcall]) mb sp mcc
+        if i < lmin then (bt [@tailcall]) mb eptr sp mcc
         else (vreverse_try [@tailcall]) mb body_pc i lmin eptr sp rdepth mcc
       else
         (op_vreverse_utf [@tailcall]) mb body_pc lmin lmax (i + 1) p sp rdepth
@@ -3049,6 +3625,14 @@ and backtrack_vreverse (mb : mb) (sp : int) (mcc : int) : int =
    POSSESS_DONE (pc+3). Reset rdepth to the loop-level entry_rdepth. No tick (the
    next iteration's first ALT ticks). *)
 and op_ketrpos (mb : mb) (pc : int) (eptr : int) (mcc : int) : int =
+  (* Chunk K1b — the C's OP_KETRPOS is RRETURN(MATCH_KETRPOS)
+     (pcre2_match.c:6092-6097, BEFORE the empty test, which runs at the outer
+     level), so RETURN_SWITCH (:6470) records the iteration-end Feptr in
+     last_used_ptr. The fast loop-back/break stays in-line (no bt transition), so
+     record it here — a possessive group can coexist with recursion (only a
+     recursion INTO a possessive capture is declined) and the reach feeds the
+     RECURSELOOP check. Gated on has_recurse. *)
+  if mb.has_recurse && eptr > mb.last_used_ptr then mb.last_used_ptr <- eptr;
   let code = mb.code in
   let body_entry = code.(pc + 1) in
   let cap_ovbase = code.(pc + 2) in
@@ -3119,7 +3703,7 @@ and op_repeat (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
   else if Int.equal k rk_anybyte then
     (* Chunk I2 — \C min loop: one bound check, NO SCHECK_PARTIAL
        (pcre2_match.c:3041-3044, unlike OP_ALLANY). *)
-    if eptr > mb.end_subject - mb.rep_lmin then (backtrack [@tailcall]) mb sp mcc
+    if eptr > mb.end_subject - mb.rep_lmin then (bt [@tailcall]) mb eptr sp mcc
     else (rep_after_min [@tailcall]) mb (eptr + mb.rep_lmin) sp rdepth mcc
   else if Int.equal k rk_any then (rep_min_any [@tailcall]) mb 0 eptr sp rdepth mcc
   else if Int.equal k rk_anynl then
@@ -3134,7 +3718,7 @@ and op_repeat (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     && mb.rep_lmin > 0
     && (not mb.rep_want)
     && Int.equal mb.rep_ptype Opcodes.pt_any
-  then (backtrack [@tailcall]) mb sp mcc
+  then (bt [@tailcall]) mb eptr sp mcc
   else (rep_min_loop [@tailcall]) mb 0 eptr sp rdepth mcc
 
 (* True iff subject[eptr] satisfies the repeat's per-unit test, dispatching on
@@ -3211,13 +3795,16 @@ and rep_min_loop (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
   if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
   else if eptr >= mb.end_subject then
     let r = scheck_partial mb eptr in
-    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
+    if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc
   else if mb.utf then
-    (* Chunk I — step over one CHARACTER on a match. *)
+    (* Chunk I — step over one CHARACTER on a match. Chunk K1b — a mismatch
+       records the C-exact per-family position (rep_fail_pos, minimize=false). *)
     let l = rep_unit_utf mb eptr in
-    if Int.equal l 0 then (backtrack [@tailcall]) mb sp mcc
+    if Int.equal l 0 then
+      (bt [@tailcall]) mb (rep_fail_pos mb eptr false) sp mcc
     else (rep_min_loop [@tailcall]) mb (i + 1) (eptr + l) sp rdepth mcc
-  else if not (rep_unit_matches mb eptr) then (backtrack [@tailcall]) mb sp mcc
+  else if not (rep_unit_matches mb eptr) then
+    (bt [@tailcall]) mb (rep_fail_pos mb eptr false) sp mcc
   else (rep_min_loop [@tailcall]) mb (i + 1) (eptr + 1) sp rdepth mcc
 
 (* OP_ALLANY / OP_ANYBYTE min loop (pcre2_match.c:3280-3287): one bound check
@@ -3227,7 +3814,7 @@ and rep_min_allany (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) 
     int =
   if eptr > mb.end_subject - mb.rep_lmin then
     let r = scheck_partial mb eptr in
-    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
+    if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc
   else (rep_after_min [@tailcall]) mb (eptr + mb.rep_lmin) sp rdepth mcc
 
 (* OP_ANY min loop (pcre2_match.c:3258-3278): a newline stops the match; a CR
@@ -3237,8 +3824,8 @@ and rep_min_any (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
   if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
   else if eptr >= mb.end_subject then
     let r = scheck_partial mb eptr in
-    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
-  else if is_newline_at mb eptr then (backtrack [@tailcall]) mb sp mcc
+    if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc
+  else if is_newline_at mb eptr then (bt [@tailcall]) mb eptr sp mcc
   else
     let hit =
       mb.partial <> 0
@@ -3264,7 +3851,7 @@ and rep_min_anynl (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
   if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
   else if eptr >= mb.end_subject then
     let r = scheck_partial mb eptr in
-    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
+    if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc
   else
     (* safe: eptr < mb.end_subject <= String.length mb.subject. GETCHARINC in
        UTF (chunk I2); one code unit otherwise. *)
@@ -3286,9 +3873,15 @@ and rep_min_anynl (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
       || Int.equal fc Newline.char_nel
       || Int.equal fc 0x2028 || Int.equal fc 0x2029
     then
-      if mb.bsr_anycrlf then (backtrack [@tailcall]) mb sp mcc
+      if mb.bsr_anycrlf then
+        (* Chunk K1b — GETCHARINC precedes the ANYCRLF rejection
+           (pcre2_match.c:3054/3073): record the post-read [e]. *)
+        (bt [@tailcall]) mb e sp mcc
       else (rep_min_anynl [@tailcall]) mb (i + 1) e sp rdepth mcc
-    else (backtrack [@tailcall]) mb sp mcc
+    else
+      (* Chunk K1b — the default rejection follows the read
+         (pcre2_match.c:3054-3057 / `switch( *Feptr++)` :3310-3312): record [e]. *)
+      (bt [@tailcall]) mb e sp mcc
 
 (* OP_EXTUNI min loop (chunk I2; pcre2_match.c:2979-2996 / interpreter.ml
    typemin_extuni): ensure the minimum number of grapheme clusters are
@@ -3300,7 +3893,7 @@ and rep_min_extuni (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
   else if eptr >= mb.end_subject then
     (* pcre2_match.c:2983-2987 — SCHECK_PARTIAL(), then no match. *)
     let r = scheck_partial mb eptr in
-    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc
+    if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc
   else
     (* pcre2_match.c:2988-2993 — GETCHARINCTEST + PRIV(extuni). *)
     let e' = extuni_at mb eptr in
@@ -3543,7 +4136,7 @@ and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
     (rdepth : int) (mcc : int) : int =
   if Int.equal type_op Opcodes.op_any then (
     (* OP_ANY (pcre2_match.c:947-958 + op_allany tail 962-973). *)
-    if is_newline_at mb eptr then (backtrack [@tailcall]) mb sp mcc
+    if is_newline_at mb eptr then (bt [@tailcall]) mb eptr sp mcc
     else if
       mb.partial <> 0
       && Int.equal eptr (mb.end_subject - 1)
@@ -3557,7 +4150,7 @@ and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
       else (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc)
     else if eptr >= mb.end_subject then (
       let r = scheck_partial mb eptr in
-      if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+      if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
     else
       (* OP_ANY consumes one CHARACTER (multi-byte in UTF). *)
       (run [@tailcall]) mb (pc + 2)
@@ -3568,7 +4161,7 @@ and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
        point in UTF — NEL/LS/PS are multi-byte, chunk I2). *)
     if eptr >= mb.end_subject then (
       let r = scheck_partial mb eptr in
-      if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+      if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
     else
       (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
       let fc = if mb.utf then cur_cp mb eptr else Char.code (String.unsafe_get mb.subject eptr) in
@@ -3593,14 +4186,20 @@ and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
         || Int.equal fc Newline.char_nel
         || Int.equal fc 0x2028 || Int.equal fc 0x2029
       then
-        if mb.bsr_anycrlf then (backtrack [@tailcall]) mb sp mcc
+        if mb.bsr_anycrlf then
+          (* Chunk K1b — the ANYCRLF rejection comes after GETCHARINCTEST
+             (pcre2_match.c:2383/2406): record the post-read position [e]. *)
+          (bt [@tailcall]) mb e sp mcc
         else (run [@tailcall]) mb (pc + 2) e sp rdepth mcc
-      else (backtrack [@tailcall]) mb sp mcc)
+      else
+        (* Chunk K1b — the default rejection also follows the read
+           (pcre2_match.c:2383-2386): record [e]. *)
+        (bt [@tailcall]) mb e sp mcc)
   else if eptr >= mb.end_subject then (
     (* the simple 1-unit predicate types (\d \D \s \S \w \W / \h \H \v \V /
        OP_ALLANY / OP_ANYBYTE): SCHECK_PARTIAL at/past end, then NOMATCH. *)
     let r = scheck_partial mb eptr in
-    if r < 0 then r else (backtrack [@tailcall]) mb sp mcc)
+    if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
   else if mb.utf then
     (* Chunk I — decode the code point; predicate is code-point aware. OP_ANYBYTE
        (\C) consumes exactly ONE code unit even in UTF (interpreter.ml:1456-1470);
@@ -3609,13 +4208,20 @@ and op_single_type (mb : mb) (pc : int) (type_op : int) (eptr : int) (sp : int)
     if simple_type_match_cp type_op cp then
       let adv = if Int.equal type_op Opcodes.op_anybyte then 1 else cp_len mb eptr in
       (run [@tailcall]) mb (pc + 2) (eptr + adv) sp rdepth mcc
-    else (backtrack [@tailcall]) mb sp mcc
+    else
+      (* Chunk K1b — every single predicate type GETCHARINCTESTs before its
+         test (pcre2_match.c:2305-2470): a mismatch records the post-read
+         position (OP_ALLANY/OP_ANYBYTE never mismatch — end-only above). *)
+      (bt [@tailcall]) mb (eptr + cp_len mb eptr) sp mcc
   else
     (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
     let cc = Char.code (String.unsafe_get mb.subject eptr) in
     if simple_type_match type_op cc then
       (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc
-    else (backtrack [@tailcall]) mb sp mcc
+    else
+      (* Chunk K1b — GETCHARINCTEST non-UTF = fc = *Feptr++ (pcre2_match.c:
+         2311-2312 etc.): record eptr + 1. *)
+      (bt [@tailcall]) mb (eptr + 1) sp mcc
 
 (* WORDBOUND \b / \B, non-UCP (pcre2_match.c:6258-6333 /
    interpreter.ml:3181-3332). [want] = 1 for \b (OP_WORD_BOUNDARY: a boundary
@@ -3672,7 +4278,14 @@ and op_wordbound (mb : mb) (pc : int) (want : int) (eptr : int) (sp : int)
     let r = scheck_partial mb eptr in
     if r < 0 then r
     else (word_bound_test [@tailcall]) mb pc want prev_is_word false eptr sp rdepth mcc)
-  else
+  else (
+    (* pcre2_match.c:6304-6314 — the next-character probe consults subject[eptr],
+       so nextptr = FORWARDCHARTEST(eptr) (eptr + the char length in UTF, eptr+1
+       otherwise) raises last_used_ptr (the RECURSELOOP input); gated on
+       has_recurse. *)
+    if mb.has_recurse then (
+      let nextptr = if mb.utf then eptr + cp_len mb eptr else eptr + 1 in
+      if nextptr > mb.last_used_ptr then mb.last_used_ptr <- nextptr);
     (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
     let fc = if mb.utf then cur_cp mb eptr else Char.code (String.unsafe_get mb.subject eptr) in
     let cur_is_word =
@@ -3682,7 +4295,7 @@ and op_wordbound (mb : mb) (pc : int) (want : int) (eptr : int) (sp : int)
         && not (Int.equal (Chartables.ctypes fc land Chartables.ctype_word) 0)
     in
     (word_bound_test [@tailcall]) mb pc want prev_is_word cur_is_word eptr sp
-      rdepth mcc
+      rdepth mcc)
 
 and word_bound_test (mb : mb) (pc : int) (want : int) (prev_is_word : bool)
     (cur_is_word : bool) (eptr : int) (sp : int) (rdepth : int) (mcc : int) : int
@@ -3693,7 +4306,7 @@ and word_bound_test (mb : mb) (pc : int) (want : int) (prev_is_word : bool)
     if Int.equal (want land 1) 1 then Bool.equal cur_is_word prev_is_word
     else not (Bool.equal cur_is_word prev_is_word)
   in
-  if fail then (backtrack [@tailcall]) mb sp mcc
+  if fail then (bt [@tailcall]) mb eptr sp mcc
   else (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
 
 and op_eod (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
@@ -3701,7 +4314,7 @@ and op_eod (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
   (* pcre2_match.c:6154-6163 (interpreter.ml op_eod_tail) — end of subject:
      \z tests the TRUE end (mb->true_end_subject), not a fragment end (chunk
      I2; pcre2_match.c:6156). *)
-  if eptr < mb.true_end_subject then (backtrack [@tailcall]) mb sp mcc
+  if eptr < mb.true_end_subject then (bt [@tailcall]) mb eptr sp mcc
   else if mb.partial <> 0 then (
     mb.hitend <- true;
     if mb.partial > 1 then Errors.error_partial
@@ -3732,8 +4345,8 @@ and assert_nl_or_eos (mb : mb) (pc : int) (eptr : int) (sp : int)
     then (
       mb.hitend <- true;
       if mb.partial > 1 then Errors.error_partial
-      else (backtrack [@tailcall]) mb sp mcc)
-    else (backtrack [@tailcall]) mb sp mcc
+      else (bt [@tailcall]) mb eptr sp mcc)
+    else (bt [@tailcall]) mb eptr sp mcc
   else if mb.partial <> 0 then (
     mb.hitend <- true;
     if mb.partial > 1 then Errors.error_partial
@@ -3937,6 +4550,12 @@ and run_attempt (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
   else (
     mb.attempt_start <- start_match;
     mb.start_used_ptr <- start_match;
+    (* Chunk K1b — per-attempt recursion resets (pcre2_match.c:7500/651-655):
+       last_used_ptr = start_match (the RECURSELOOP input's monotone base);
+       not-in-a-recursion (current_recurse = RECURSE_UNSET, no open KIND_RECURSE). *)
+    mb.last_used_ptr <- start_match;
+    mb.current_recurse <- recurse_unset;
+    mb.recurse_base <- -1;
     mb.once_base <- -1 (* no open atomic construct at attempt start (chunk G) *);
     mb.skip_arg_count <- 0 (* pcre2_match.c:7513 — per-attempt SKIP_ARG count *);
     mb.mark <- Frames.unset (* frame-0 Fmark reset, pcre2_match.c:8603 site *);
@@ -4351,6 +4970,16 @@ let exec (ir : Ir.t) ~(subject : string) ~(offset : int) ~(options : int) :
         mb.verb_then_pc <- 0;
         mb.ignore_skip_arg <- 0;
         mb.skip_arg_count <- 0;
+        (* Chunk K1b — recursion state (fast-design.md §3). [has_recurse] gates
+           last_used_ptr tracking; [n_groups] sizes the FAT record's group_start
+           snapshot; [disable_recurseloop] is the PCRE2_DISABLE_RECURSELOOP_CHECK
+           match option (pcre2_match.c:5448). current_recurse/recurse_base reset
+           per attempt in run_attempt; verb_current_recurse reset defensively. *)
+        mb.has_recurse <- ir.Ir.has_recurse;
+        mb.n_groups <- ir.Ir.n_groups;
+        mb.verb_current_recurse <- -1;
+        mb.disable_recurseloop <-
+          not (Int.equal (options land Options.disable_recurseloop_check) 0);
         (* Chunk E: the shared compiler's bytecode (class bitmaps live here) and
            the \R newline convention. *)
         mb.bytecode <- re.Compile.code;
@@ -4624,7 +5253,11 @@ let () =
   assert (Int.equal Ir.t_cond_assert_match 67);
   assert (Int.equal Ir.t_scond_descend 68);
   assert (Int.equal Ir.t_script_run_end 69);
-  assert (Int.equal Ir.max_tag 69);
+  assert (Int.equal Ir.t_recurse 70);
+  assert (Int.equal Ir.t_cond_rref 71);
+  assert (Int.equal Ir.t_cond_dnrref 72);
+  assert (Int.equal Ir.t_fail_nassert 73);
+  assert (Int.equal Ir.max_tag 73);
   (* Save-record KIND / width constants the runner inlines as literals. *)
   assert (Int.equal Save_stack.kind_alt 0);
   assert (Int.equal Save_stack.kind_cap 1);
@@ -4641,5 +5274,7 @@ let () =
   assert (Int.equal Save_stack.kind_pos 12);
   assert (Int.equal Save_stack.kind_verb 13);
   assert (Int.equal Save_stack.kind_ref_max2 14);
+  assert (Int.equal Save_stack.kind_recurse 15);
+  assert (Int.equal Save_stack.kind_recurse_ret 16);
   (* Chunk H widened KIND_ALT to carry the THEN scope boundary. *)
   assert (Int.equal Save_stack.width_alt 5)

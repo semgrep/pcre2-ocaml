@@ -572,7 +572,7 @@ let goldens : (string * string) list =
           "  8 ALT next=15";
           " 10 CHAR_RUN \"b\"";
           " 13 JMP 16";
-          " 15 FAIL";
+          " 15 FAIL_NASSERT";
           " 16 NASSERT_MATCH";
           " 17 KET";
           " 18 END";
@@ -753,7 +753,7 @@ let j_goldens : (string * string) list =
           "  4 ALT next=11";
           "  6 CHAR_RUN \"a\"";
           "  9 JMP 12";
-          " 11 FAIL";
+          " 11 FAIL_NASSERT";
           " 12 COND_ASSERT_MATCH match=14";
           " 14 CHAR_RUN \"b\"";
           " 17 JMP 22";
@@ -773,7 +773,7 @@ let j_goldens : (string * string) list =
           "  4 ALT next=11";
           "  6 CHAR_RUN \"a\"";
           "  9 JMP 12";
-          " 11 FAIL";
+          " 11 FAIL_NASSERT";
           " 12 COND_ASSERT_MATCH match=19";
           " 14 CHAR_RUN \"b\"";
           " 17 JMP 22";
@@ -965,14 +965,20 @@ let unsupported_cases : (string * string * string) list =
        (the loop-back target is the t_once) so the atomic commit is per-iteration
        and the snapshot restores the pre-iteration state on give-back — so it is
        now ACCEPTED (parity pinned in parity_cases below). *)
-    (* Chunk K: OP_RECURSE (whole-pattern (?R), subroutine calls (?1)/(?&name),
-       mutual/self recursion) still declines — the recursion save record (fat
-       ovector + group_start + cap_start snapshot), current_recurse threading,
-       the shared-ket subroutine return and the RECURSELOOP loop check (which
-       needs last_used_ptr tracking the fast runner deliberately omits) are a
-       focused follow-on pass. *)
-    ( "whole-pattern recursion", "(?R)", "fast: OP_RECURSE (chunk K)" );
-    ( "subroutine recursion", "(a(?1)?b)", "fast: OP_RECURSE (chunk K)" );
+    (* Chunk K1b lowers OP_RECURSE in all forms (whole-pattern (?R)/(?0),
+       subroutine calls (?n)/(?&name)/(?P>name)/relative, mutual/self recursion,
+       (?(R)…)/(?(Rn)…)/(?(R&name)…) conditions, ( *ACCEPT)-in-recursion, verbs
+       and the RECURSELOOP -52 check via last_used_ptr) — the FAT KIND_RECURSE
+       record snapshots the whole ovector + group_start + cap_start + mark +
+       current_recurse + once_base, so "(?R)", "(a(?1)?b)", "(?(R)a|b)" etc. are
+       now ACCEPTED (parity pinned in parity_cases / the LIMIT_MATCH sweeps).
+       ONE recursion shape still declines: a call INTO a possessive capture
+       (OP_CBRAPOS/OP_SCBRAPOS, e.g. "(a)++(?1)b") — its OP_KETRPOS ket-return
+       protocol (bypassing the possessive commit + the KIND_POS boundary the
+       recursion entry skips) is out of this subset. *)
+    ( "recursion into possessive capture",
+      "(a)++(?1)b",
+      "fast: OP_RECURSE into possessive capture (K1b)" );
     (* Chunk I supports UTF mode and OP_XCLASS (wide chars, ranges AND \p
        properties, via the self-contained Xclass helper), so "[\\p{L}]" and
        "(*UTF)abc" are ACCEPTED. Chunk I2 lowered the rest of the chunk-I
@@ -1457,6 +1463,16 @@ let sweep_patterns =
     "(?!x)*ab";
     "(?<=x)+y";
     "(?>ab){2,4}c";
+    (* Chunk K1b: recursion — the compiled IR must always verify. *)
+    "\\(([^()]|(?R))*\\)";
+    "(a(b)|(c))(?1)";
+    "(?(DEFINE)(?<A>a))B(?1)C";
+    "(?P<L1>(?P<L2>0)(?P>L1)|(?P>L2))";
+    "(?(R)a+|(?R)b)";
+    "^((.)(?1)\\2|.)$";
+    "(?<=b(?1))(a)";
+    "(?:(?1)|B)(A(*ACCEPT)XX|C)D";
+    "(?+1)x([ab])";
   ]
 
 let sweep_tests =
@@ -3061,6 +3077,276 @@ let stack_safety_tests =
             | Error c -> Alcotest.failf "unexpected error %d" c));
   ]
 
+(* ---------- 9. Recursion (chunk K1b) parity vs the interpreter ----------
+
+   OP_RECURSE in all supported forms, compared byte-for-byte (rc/ovector/
+   start_char via [norm]) to the interpreter (the differential oracle); mark
+   parity is covered by the fuzz fast-vs-interp differential (which compares
+   exec_full whole). Captures-do-NOT-escape a recursion is pinned by the
+   ovector comparison (an inner group set only during a (?n) call must read
+   unset afterwards). *)
+let recurse_parity_cases : (string * string * int * int32) list =
+  [
+    (* whole-pattern (?R)/(?0): balanced-paren classics. *)
+    ("\\(([^()]|(?R))*\\)", "x(a(b(c)d)e)y", 0, 0l);
+    ("\\(([^()]|(?R))*\\)", "(a(b)c", 0, 0l) (* unbalanced -> NM *);
+    ("(?0)x|a", "a", 0, 0l);
+    (* subroutine (?n): captures do NOT escape (group 2/3 read unset after). *)
+    ("(a(b)|(c))(?1)", "abc", 0, 0l);
+    ("(a(b)|(c))(?1)", "cab", 0, 0l);
+    ("(a(?1)?b)", "aabb", 0, 0l) (* self-recursion *);
+    ("^(a)(?1)+ab", "aaaab", 0, 0l) (* recursion + greedy repeat *);
+    ("^(a)(?1)++ab", "aaaab", 0, 0l) (* recursion + possessive repeat *);
+    ("(a)(?2){2}(.)", "abccd", 0, 0l) (* forward subroutine (?2) *);
+    ("(?1)(a(b)|(c))", "abc", 0, 0l) (* forward whole-group call *);
+    (* named subroutine (?&name)/(?P>name)/DEFINE. *)
+    ("(?(DEFINE)(?<A>a))B(?1)C", "BAC", 0, 0l);
+    ("(?(DEFINE)((A)\\2))B(?1)C", "BAAC", 0, 0l);
+    ("(?<all>(?:(?:a(?&all))|(b))(c?))", "aabc", 0, 0l);
+    ("(?P<L1>(?P<L2>0)(?P>L1)|(?P>L2))", "00", 0, 0l);
+    ( "(?(DEFINE)(?<byte>2[0-4]\\d|25[0-5]|1\\d\\d|[1-9]?\\d))\\b(?&byte)(\\.(?&byte)){3}",
+      "192.168.1.1", 0, 0l );
+    (* relative (?+1)/(?-1). *)
+    ("(?+1)x([ab])", "xa", 0, 0l);
+    ("([ab])x(?-1)", "axb", 0, 0l);
+    (* recursion conditions (?(R)/(?(Rn). *)
+    ("(?(R)a+|(?R)b)", "aaaab", 0, 0l);
+    ("(?(R)a+|((?R))b)", "aaaab", 0, 0l);
+    ("((?(R)a+|(?1)b))", "aaab", 0, 0l);
+    ("((?(R1)a+|(?1)b))", "aaab", 0, 0l);
+    ("((?(R)a|(?1)))*", "aaa", 0, 0l);
+    (* recursion + backref (palindrome). *)
+    ("^((.)(?1)\\2|.)$", "abcba", 0, 0l);
+    ("^((.)(?1)\\2|.)$", "abca", 0, 0l) (* not a palindrome -> NM *);
+    ("^(?:((.)(?1)\\2|)|((.)(?3)\\4|.))$", "abccba", 0, 0l);
+    ("^(\\d+|\\((?1)([+*-])(?1)\\)|-(?1))$", "(1+(2*3))", 0, 0l) (* calc grammar *);
+    (* recursion + atomic / PRUNE inside a subroutine. *)
+    ("(?>(?&t)c|(?&t))(?(DEFINE)(?<t>a|b(*PRUNE)c))", "ac", 0, 0l);
+    ("(?>(a)|b)(?1)", "aa", 0, 0l) (* recursion into an atomic-wrapped group *);
+    (* recursion + lookbehind (recursion inside (?<=...)). *)
+    ("(a)(?<=b(?1))", "ba", 0, 0l);
+    ("(?<=b(?1))(a)", "ba", 0, 0l);
+    ("(?<X>a)(?<=b(?&X))", "ba", 0, 0l);
+    (* recursion + verbs: ( *F), ( *ACCEPT)-in-recursion, COMMIT. *)
+    ("(?:(?1)|B)(A(*F)|C)", "BC", 0, 0l);
+    ("^(?:(?1)|B)(A(*F)|C)", "BC", 0, 0l);
+    ("(?:(?1)|B)(A(*ACCEPT)XX|C)D", "BAD", 0, 0l) (* ( *ACCEPT) inside (?1) *);
+    ("(?:(?1)|B)(A(*ACCEPT)XX|C)D", "AAD", 0, 0l);
+    ("(?1)(A(*COMMIT)|B)D", "AD", 0, 0l);
+    (* branch reset + recursion. *)
+    ("^(?|(abc)|(def))(?1)", "abcabc", 0, 0l);
+    ("^(?|(abc)|(def))(?1)", "defabc", 0, 0l);
+    ("(?|(aaa)|(b))(?1)", "aaaaaa", 0, 0l);
+    ("^X(?5)(a)(?|(b)|(q))(c)(d)(Y)", "XYabcdY", 0, 0l);
+    (* the fuzz-caught adversarial snapshot shapes: a recursion re-enters a
+       group whose GROUP_START (an enclosing non-atomic assertion / repeated
+       group) would otherwise be clobbered — the group_start/cap_start restore
+       on the recursion return (fast-design.md §3). *)
+    ("(?*()c(?R)|(*:x))", "c", 0, 0l);
+    ("(a)(?1)()((((((\\1++))\\x85)+)|))", "aa", 0, 0l);
+    ("^(?&t)*+(?(DEFINE)(?<t>a))\\w$", "aaab", 0, 0l);
+    (* recursion inside a conditional / DEFINE with an optional wrapper. *)
+    ("(?(DEFINE)(a))?b(?1)", "ba", 0, 0l);
+    ("(a|)*(?1)b", "aaab", 0, 0l);
+    ("(?1)(?:(b)){0}", "b", 0, 0l);
+  ]
+
+let recurse_parity_tests =
+  List.map
+    (fun (pat, subj, off, opts) ->
+      Alcotest.test_case
+        (Printf.sprintf "recurse %S %S" pat subj)
+        `Quick
+        (fun () ->
+          match (F.compile pat 0l, E.compile pat 0l) with
+          | Ok fre, Ok ere ->
+              let f = norm (F.exec_full fre subj off opts) in
+              let e = norm (E.exec_full ere subj off opts) in
+              Alcotest.(check string)
+                (Printf.sprintf "fast vs interp for %S/%S" pat subj)
+                e f
+          | Error (F.Unsupported _), _ -> ()
+          | Error _, _ | _, Error _ ->
+              Alcotest.failf "compile mismatch for %S" pat))
+    recurse_parity_cases
+
+(* RECURSELOOP (-52): an infinite recursion (same group, same position, no
+   progress) must trip PCRE2_ERROR_RECURSELOOP on BOTH engines — the fast
+   engine's last_used_ptr tracking (fast-design.md §3) reproduces the C's check
+   (pcre2_match.c:5438-5453) exactly. Under PCRE2_DISABLE_RECURSELOOP_CHECK the
+   loop is instead caught by the match limit (-47), again identically. *)
+let recurseloop_tests =
+  let disable = 0x00040000l in
+  let both pat subj opts =
+    match (F.compile pat 0l, E.compile pat 0l) with
+    | Ok fre, Ok ere ->
+        (norm (F.exec_full fre subj 0 opts), norm (E.exec_full ere subj 0 opts))
+    | _ -> Alcotest.failf "compile failed for %S" pat
+  in
+  [
+    Alcotest.test_case "RECURSELOOP -52 (fast == interp)" `Quick (fun () ->
+        List.iter
+          (fun (pat, subj) ->
+            let f, e = both pat subj 0l in
+            Alcotest.(check string)
+              (Printf.sprintf "%S/%S interp = E-52" pat subj)
+              "E-52" e;
+            Alcotest.(check string)
+              (Printf.sprintf "%S/%S fast == interp" pat subj)
+              e f)
+          [
+            ("(?R)", "x");
+            ("(?R)b", "b");
+            ("(*NO_JIT)((?2)+)((?1)){", "abcd{");
+            ("(?(R)a*(?1)|((?R))b)", "aaaabcde");
+          ]);
+    Alcotest.test_case "DISABLE_RECURSELOOP_CHECK -> limit (fast == interp)"
+      `Quick (fun () ->
+        (* ( *LIMIT_MATCH=N) bounds the now-uncaught loop; both engines must trip
+           the SAME limit code (-47), and sweeping N pins tick parity too. *)
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 30 do
+              let pat = Printf.sprintf "(*LIMIT_MATCH=%d)%s" n body in
+              let f, e = both pat subj disable in
+              Alcotest.(check string)
+                (Printf.sprintf "%S/%S fast == interp N=%d" body subj n)
+                e f
+            done)
+          [ ("(?R)", "x"); ("(?R)b", "b"); ("(a|(?R))", "a") ]);
+    Alcotest.test_case "LIMIT_MATCH sweep, recursion (fast == interp)" `Quick
+      (fun () ->
+        (* Recursion tick parity: the (?R)/(?n) call enters at the group's
+           first branch (RM11 per branch, §4); the shared-ket return and the
+           backtrack into a completed recursion tick as the interpreter's
+           frames do. Sweep N across the boundary; both engines must agree at
+           every N (trip -47 below the boundary, same result at/above). *)
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 45 do
+              let pat = Printf.sprintf "(*LIMIT_MATCH=%d)%s" n body in
+              match (F.compile pat 0l, E.compile pat 0l) with
+              | Ok fre, Ok ere ->
+                  let f = norm (F.exec_full fre subj 0 0l) in
+                  let e = norm (E.exec_full ere subj 0 0l) in
+                  Alcotest.(check string)
+                    (Printf.sprintf "fast == interp for /%s/ on %S at N=%d" body
+                       subj n)
+                    e f
+              | _ -> Alcotest.failf "compile failed for %S" pat
+            done)
+          [
+            ("\\A(?:a(?R)|b)c", "aabc");
+            ("\\A(?:a(?R)|b)c", "aadc") (* fails deep in the recursion *);
+            ("\\A\\((?:[^()]|(?R))*\\)9", "(x(y)z)9");
+            ("\\A(a)(?1)*b9", "aaab9");
+            ("\\A((.)(?1)\\2|.)9", "aba9");
+            ("\\A(?(DEFINE)(?<t>a(?&t)?b))(?&t)9", "aabb9");
+            (* Reviewer witnesses: last_used_ptr must ALSO be recorded at the
+               conditional-assertion and negative-assertion MATCH-returns (the
+               C's RRETURN(MATCH_MATCH) kets, pcre2_match.c:5947/6042-6043,
+               through RETURN_SWITCH :6470) — the assertion body's forward reach
+               feeds the RECURSELOOP -52 depth, so dropping either update flips
+               the -52-vs--47 class across this sweep (mutation-tested: with the
+               NASSERT_MATCH/COND_ASSERT_MATCH updates disabled, these diverge
+               at N=5-8). *)
+            ("((?(R)(?(?=aa)(?1))|(?1)))", "aa");
+            ("((?(R)(?:(?!aa)b|(?1))|(?1)))", "aa");
+            (* Reviewer witness (round 3): a NEGATIVE assertion's branch
+               exhaustion must NOT record last_used_ptr — the C's
+               ASSERT_NOT_FAILED is a same-frame goto with no RRETURN
+               (pcre2_match.c:5561-5564 -> :5582), so the assertion-entry
+               position is never recorded, while every OTHER FAIL head (a
+               grouploop/positive-assertion/atomic exhaustion RRETURN,
+               :5410/:5531) is. The (?=a) lift sets last_used = 1 (the lookahead
+               ket record) so the lookbehind branch's below-entry mismatch
+               record (0 -> C:1) is absorbed, isolating the FAIL split: with
+               FAIL_NASSERT recording like FAIL, this diverges at N=5-6
+               (mutation-tested). *)
+            ("(?(R)(?<!xyz)(?R)|(?=a)abc(?R))", "abc");
+            (* Consuming-arm mismatch positions feed the same check: the C's
+               OP_CHAR mismatch RRETURNs AFTER the post-increment
+               (`Fecode[1] != *Feptr++`, pcre2_match.c:1022), so a de-fused
+               has_recurse char run records p+1 where the fast eptr stops at p
+               — without char_run_cfail this diverges at N=4-5 (the -52 fires
+               one recursion level early). The sibling shapes pin the per-family
+               table (rep_fail_pos): negative lookbehind over a char repeat
+               ({2}: caseful INCTEST p+1), a class ([a-c]: read-first p+1), a
+               ctype (\d\d: min-loop tests in place, p), and a single-type /
+               optional-type forward probe. *)
+            ("(?(R)(?<!xy)(?R)|ab(?R))", "ab");
+            ("(?(R)(?!xy)(?R)|ab(?R))", "ab");
+            ("(?(R)(?<!k{2})(?R)|ab(?R))", "ab");
+            ("(?(R)(?<![a-c])(?R)|ab(?R))", "ab");
+            ("(?(R)(?<!\\d\\d)(?R)|ab(?R))", "ab");
+            ("(?(R)(?=x)?(?R)|ab(?R))", "ab");
+            ("(?(R)\\d?(?R)|ab(?R))", "ab");
+            ("(?(R)[^x]?(?R)|ab(?R))", "abq");
+            ("(?(R)(?i)q?(?R)|ab(?R))", "ab");
+            ("(?(R)(?<!\\1x)(?R)|(a)b(?R))", "ab");
+            (* Reviewer witnesses (round 4): a VERB code passing a KIND_ONCE /
+               KIND_POS boundary is an RRETURN from that construct's frame in
+               the C (pcre2_match.c:5408 RM2 / :5529 RM3 / :5315 RM8), recording
+               the construct's ENTRY Feptr — which exceeds the verb-fire
+               position when the verb fired inside a LOOKBEHIND body. Here the
+               PRUNE/COMMIT/SKIP fires at position <= 1 inside (?<=...), passes
+               the lookbehind's KIND_ONCE (entry 2 recorded by the C), and is
+               CONTAINED at the enclosing (?! (a same-frame goto, NO record,
+               :5567-5571); the (?=a) lift sets last_used = 1 so the boundary
+               record is the -52-depth discriminator. Mutation-tested: with the
+               KIND_ONCE verb-path record disabled these diverge at N=7-10.
+               The atomic-group variant pins the RM2 record; the bounded
+               possessive-in-lookbehind variant exercises the KIND_POS record
+               (kept C-exact per :5315, though provably subsumed — a verb
+               passing KIND_POS either fired in-body, whose fire-prerequisite
+               already recorded >= iter_start, or inside an inner rewound
+               boundary whose own record >= iter_start); the SKIP:name variant
+               exercises the KIND_NASSERT SKIP_ARG escape (:5574, an RRETURN
+               that DOES record the nassert entry — kept C-exact; its
+               observability needs a doubly-nested still-open recursion, so no
+               compact mutation witness). *)
+            ("(?(R)(?!(?<=(*PRUNE)xq))(?R)|(?=a)ab(?R))", "ab");
+            ("(?(R)(?!(?<=(*COMMIT)xq))(?R)|(?=a)ab(?R))", "ab");
+            ("(?(R)(?!(?<=(*SKIP)xq))(?R)|(?=a)ab(?R))", "ab");
+            ("(?(R)(?!(?<=(?>(*PRUNE)x)q))(?R)|(?=a)ab(?R))", "ab");
+            ("(?(R)(?!(?<=(?:(*PRUNE)x){1,2}+q))(?R)|(?=a)ab(?R))", "ab");
+            ("(?(R)c(?<!(*SKIP:q)xw)(?R)|(?=a)ab(?R))", "abc");
+          ]);
+  ]
+
+(* Alloc pin for the recursion path: the FAT KIND_RECURSE / KIND_RECURSE_RET
+   records are O(oveccount + n_groups) int copies (module-level helpers, no
+   boxing). A deep balanced-paren recursion over a long subject must allocate
+   only O(1) minor words beyond the save-stack int array (which is reused). *)
+let recurse_alloc_tests =
+  [
+    Alcotest.test_case "alloc: O(1)/exec deep recursion" `Slow (fun () ->
+        (* Anchorless so (?R) recurses only the paren matcher (not ^/$). *)
+        match F.compile "\\((?:[^()]|(?R))*\\)" 0l with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            (* nested parentheses "((((...))))" ~400 deep. *)
+            let depth = 400 in
+            let subject = String.make depth '(' ^ String.make depth ')' in
+            let expect_match r =
+              match r with
+              | Ok (Some _) -> ()
+              | Ok None -> Alcotest.fail "unexpected non-match"
+              | Error c -> Alcotest.failf "unexpected error %d" c
+            in
+            expect_match (F.exec re subject 0 0l) (* warm-up: grow the stack *);
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            expect_match r;
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for a depth-%d recursion, \
+                  measured %.0f words"
+                 depth delta)
+              true (delta < 2000.));
+  ]
+
 let () =
   Alcotest.run "pcre2_fast_ir"
     [
@@ -3072,6 +3358,9 @@ let () =
       ("backref option parity", ref_options_tests);
       ("invalid-utf fragment parity", invalid_utf_tests);
       ("limit-match boundary", limit_match_boundary_test);
+      ("recursion parity", recurse_parity_tests);
+      ("recursion loop / limit", recurseloop_tests);
       ("alloc pins", alloc_tests);
+      ("recursion alloc pin", recurse_alloc_tests);
       ("stack safety", stack_safety_tests);
     ]
