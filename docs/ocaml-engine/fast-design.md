@@ -125,6 +125,50 @@ following the tag. Widths are `Ir.arity`:
 | 66 | `COND_ASSERT` | `nomatch_target` | 2 | assertion-condition ENTRY `(?(?=…)…)` (chunk J, :5701-5708): push a KIND_NASSERT boundary whose `cont = nomatch_target` (the branch taken when the assertion body does NOT match, condition = !Lpositive), set `mb.once_base`, fall into the body (grouploop-style ALT per branch = RM5 per branch). Exhausting the branches (FAIL) backtracks to the boundary → `backtrack_nassert` → `nomatch_target` |
 | 67 | `COND_ASSERT_MATCH` | `match_target` | 2 | an assertion-condition branch matched (chunk J, condition = Lpositive; the ket memcpy :5934-5948): COMMIT (truncate the assertion's choice points, CONVERT the KIND_NASSERT boundary to a KIND_ONCE so a later backtrack PAST the conditional rolls back the snapshot rather than re-taking the nomatch branch), captures persist (already in the shared ovector), restore `eptr`/`rdepth` to the conditional entry, jump to `match_target`. `match_target`/`nomatch_target` = the yes/no branch heads chosen by the assertion's positivity. No tick |
 | 68 | `SCOND_DESCEND` | — | 1 | the OP_SCOND descend (chunk J, RM35 :5772-5776): a repeated conditional that might match empty descends one virtual frame per iteration so the empty-string loop check has the iteration start. One tick (like a single-branch grouploop entry), no choice point |
+| 69 | `SCRIPT_RUN_END` | `g` | 2 | the OP_SCRIPT_RUN ket (chunk K, pcre2_match.c:6045-6051 / interpreter.ml:2882-2897): a script-run branch matched — apply the script-checking rules (`Script_run.script_run`) to the matched span `[group_start.(g), eptr)`; on failure backtrack, else continue at the current (advanced) eptr. Non-atomic (the body's choice points stay live). No tick |
+
+**Chunk K additions — script runs, callout no-ops, and the G+ repeated-atomic
+cleanup.** One new tag (69 `SCRIPT_RUN_END`), NO new save kind. Design notes:
+
+- **Callouts (`OP_CALLOUT`/`OP_CALLOUT_STR`) are pure no-ops.** This library
+  surfaces no callout function, so `do_callout` is always 0 in BOTH engines
+  (the `rrc > 0`/`rrc < 0` exits are unreachable, pcre2_match.c:283). The IR
+  compiler emits NO instruction for a callout — it just skips the item (length =
+  the fixed `op_lengths` for `OP_CALLOUT`, or `GET(code, p+1+2*LINK_SIZE)` for
+  the string-arg form, interpreter.ml:876-879). This covers standalone callouts,
+  `PCRE2_AUTO_CALLOUT` patterns, AND a callout inserted between `OP_COND` and its
+  condition (`compile_cond` steps `cond_op_off` past a leading callout, the C's
+  :5623-5638 skip), so `(?(?C1)(?=a)b|c)` and AUTO_CALLOUT conditionals lower.
+- **Script runs (`OP_SCRIPT_RUN`, the `sr`/`script_run` verb).** A NON-capturing,
+  NON-atomic group (GF_NOCAPTURE, grouploop) whose ket applies the script-checking
+  rules to the matched span. Lowered grouploop-style (ALT per branch + trailing
+  FAIL, tick parity = grouploop) with a `t_group_start g` at entry (records the
+  span start, and — for a repeated script run — the empty-check start) and a
+  `SCRIPT_RUN_END g` at the convergence point. A repeated script run
+  (`(*sr:X)+` = OP_SCRIPT_RUN … OP_KETRMAX) runs the ket script check FIRST then
+  the `KET_RMAX`/`KET_RMIN` repeat loop (the C's op_ket bracket switch then
+  op_ket_tail), the SAME `group_start.(g)` serving both. The `atomic_script_run`
+  verb is OP_SCRIPT_RUN wrapping OP_ONCE, so its atomic body rides chunk G's
+  machinery and the script run needs no extra atomicity.
+- **Repeated atomic group (G+ cleanup: `(?>X)+`/`(?>X)*` = Once … KetRmax).** The
+  chunk-G decline is lifted. The loop-back target of the `KET_RMAX`/`KET_RMIN` is
+  the `t_once` itself, so EACH iteration re-pushes a KIND_ONCE boundary (fresh
+  per-iteration snapshot). The atomic commit (`t_once_end`) truncates the
+  iteration's internal choice points but KEEPS the KIND_ONCE record, so a greedy
+  give-back that backtracks past an iteration hits its KIND_ONCE and restores the
+  pre-iteration snapshot — exactly the C's per-frame OP_ONCE re-dispatch under
+  KETRMAX. A `t_group_start` after the `t_once` records the iteration start for
+  the empty-string loop check. A repeated zero-width ASSERTION never reaches this
+  path (the compiler lowers `(?=X)*`/`(?=X)+` to BRAZERO + a NON-repeating
+  assertion, so it rides the existing chunk-G assertion lowering via the BRAZERO
+  handler routing OP_ASSERT*/OP_ONCE/OP_SCRIPT_RUN to their compilers).
+- **Still declined after chunk K's script-run/callout/G+ work:** OP_RECURSE
+  (recursion — a focused follow-on: the fat recursion save record, current_recurse
+  threading, the shared-ket subroutine return, RREF un-FALSE-ing, verb/THEN
+  interaction, and the RECURSELOOP loop check which needs `last_used_ptr` tracking
+  the fast runner deliberately omits), `( *ACCEPT)` inside an assertion (H+ —
+  MATCH_ACCEPT propagation to the assertion boundary through nested boundaries),
+  `( *THEN)` with a non-atomic assertion (H+), `\K` (C2+), and PCRE2_FIRSTLINE (L).
 
 **Chunk H additions — backtracking control verbs, FAIL, ACCEPT, CLOSE.** Eight
 new tags (49-56) and one save kind (KIND_VERB 13). Verbs turn backtracking into
@@ -353,11 +397,30 @@ through the construct's entry — and on every path that re-enters, the read is
 dominated by a fresh write (the entry `t_group_start` / `t_cap_start_ref`
 re-executes before any read). Stale values left by the truncation are therefore
 never observed; only the ovector (readable ANYWHERE via backrefs and at END)
-needs the snapshot. **Chunk K (recursion) MUST revisit this proof**: a
-subroutine call `(?N)`/`(?R)` can jump to an IR position inside a construct
-without executing its entry, making inside-positions reachable with stale
-`group_start`/`cap_start` state — chunk K either widens the snapshot or gives
-recursion frames their own save/restore of these arrays.
+needs the snapshot.
+
+**Chunk K's repeated atomic group (`(?>X)+`) preserves this proof.** Its
+`KET_RMAX`/`KET_RMIN` reads `group_start.(g)` for the empty-string loop check;
+the loop-back target is the iteration's `t_once`, and a `t_group_start g` follows
+it, so every read at the ket is dominated by that iteration's fresh write.
+`t_once_end` truncates the iteration's `KIND_GSTART` restore record, but that is
+sound precisely because the atomic commit makes an EARLIER iteration's branch
+unreachable (backtracking past an iteration hits its KIND_ONCE, not its
+branches), so a stale `group_start.(g)` is never re-read — the same reasoning as
+the original proof, now covering the per-iteration re-entry via the loop-back.
+Script runs read `group_start.(g)` only at `SCRIPT_RUN_END`, also dominated by
+the entry `t_group_start`. Neither construct is a subroutine call, so no
+inside-position becomes reachable without its entry.
+
+**Chunk K (recursion) STILL MUST revisit this proof** (recursion is deferred to a
+focused follow-on pass — see §2's chunk-K decline note): a subroutine call
+`(?N)`/`(?R)` can jump to an IR position inside a construct without executing its
+entry, making inside-positions reachable with stale `group_start`/`cap_start`
+state, so the recursion pass must either widen the snapshot or give the recursion
+save record its own save/restore of these arrays (the plan: a FAT recursion
+record snapshotting the full ovector + `group_start` + `cap_start` + `mark` +
+`current_recurse` + `once_base`, restored on the subroutine return and on
+backtrack-past — recursion is cold, a fat record is fine).
 
 Design notes:
 
@@ -636,10 +699,11 @@ gate runs BEFORE the walk: `PCRE2_FIRSTLINE` → `"... (chunk L)"` (chunk I remo
 the `PCRE2_UTF` gate, chunk I2 removed the `PCRE2_UCP` and
 `PCRE2_MATCH_INVALID_UTF` gates; chunk D removed the `top_bracket > 0` one).
 The first out-of-subset opcode yields `Error "fast: <construct> (chunk X)"`
-(taxonomy §6) — after J the remaining decline reasons are recursion /
-script-run / callouts (chunk K), `\K` (C2+), repeated atomic groups/assertions
-(G+), `( *ACCEPT)` inside an assertion and `( *THEN)` with a non-atomic
-assertion (H+), and `PCRE2_FIRSTLINE` (L).
+(taxonomy §6) — chunk K lowered script runs, callout no-ops and the G+
+repeated-atomic-group cleanup, so the remaining decline reasons are `OP_RECURSE`
+(recursion — a focused follow-on pass, see the chunk-K decline note above),
+`( *ACCEPT)` inside an assertion and `( *THEN)` with a non-atomic assertion (H+),
+`\K` (C2+), and `PCRE2_FIRSTLINE` (L).
 
 ## §3 Runner and save records (choice-point IR landed in C1; runner in C2)
 
@@ -1140,8 +1204,11 @@ first; the conformance diff does not depend on scan strategy).
 
 `Unsupported of string` — the string names the construct (stable prefix for skip-report
 grouping), e.g. `"fast: IR compiler not yet implemented (chunk C, 11-fast-engine.md)"`,
-later `"fast: OP_RECURSE (chunk K)"`. Coverage only widens (baseline ratchet
-`fast_baseline_counts.sexp`); chunk K removes the last in-scope reasons.
+`"fast: OP_RECURSE (chunk K)"`. Coverage only widens (baseline ratchet
+`fast_baseline_counts.sexp`); chunk K lowered script runs, callout no-ops and the
+G+ repeated-atomic-group cleanup, leaving `OP_RECURSE` (recursion), the two H+
+assertion combinations, `\K` (C2+) and PCRE2_FIRSTLINE (L) as the residual
+decline reasons.
 
 ## §7 Testing hooks
 

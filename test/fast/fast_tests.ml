@@ -959,13 +959,20 @@ let unsupported_cases : (string * string * string) list =
     (* Chunk G supports atomic groups (OP_ONCE), so a possessive ref repeat
        "(a)\\1++" (compiled as (?>\\1+)) is now ACCEPTED — no unsupported entry. *)
     (* Chunk G supports possessive groups (BRAPOS/CBRAPOS/... + KETRPOS +
-       BRAPOSZERO), so "(a)++", "(?:ab)++", "(a)*+" are now ACCEPTED. A REPEATED
-       atomic group / assertion (Once ... KetRmax, e.g. "(?>a)+") still declines
-       (the per-iteration atomic commit combined with a repeating ket is out of
-       subset). *)
-    ( "repeated atomic group",
-      "(?>a)+",
-      "fast: repeated atomic group / assertion (chunk G+)" );
+       BRAPOSZERO), so "(a)++", "(?:ab)++", "(a)*+" are now ACCEPTED. Chunk K's
+       G+ cleanup lowers a REPEATED atomic group (Once ... KetRmax, e.g.
+       "(?>a)+" / "(?>a|ab)*") — each iteration re-pushes the KIND_ONCE boundary
+       (the loop-back target is the t_once) so the atomic commit is per-iteration
+       and the snapshot restores the pre-iteration state on give-back — so it is
+       now ACCEPTED (parity pinned in parity_cases below). *)
+    (* Chunk K: OP_RECURSE (whole-pattern (?R), subroutine calls (?1)/(?&name),
+       mutual/self recursion) still declines — the recursion save record (fat
+       ovector + group_start + cap_start snapshot), current_recurse threading,
+       the shared-ket subroutine return and the RECURSELOOP loop check (which
+       needs last_used_ptr tracking the fast runner deliberately omits) are a
+       focused follow-on pass. *)
+    ( "whole-pattern recursion", "(?R)", "fast: OP_RECURSE (chunk K)" );
+    ( "subroutine recursion", "(a(?1)?b)", "fast: OP_RECURSE (chunk K)" );
     (* Chunk I supports UTF mode and OP_XCLASS (wide chars, ranges AND \p
        properties, via the self-contained Xclass helper), so "[\\p{L}]" and
        "(*UTF)abc" are ACCEPTED. Chunk I2 lowered the rest of the chunk-I
@@ -980,14 +987,12 @@ let unsupported_cases : (string * string * string) list =
        MATCH_ACCEPT propagation to the assertion boundary with capture fishing),
        and ( *THEN) in a pattern that also has a NON-ATOMIC positive assertion
        (no KIND_ONCE boundary to contain the THEN). *)
-    (* Chunk J supports conditionals, but a MANUAL callout inserted between
-       OP_COND and an assertion condition (pcre2_match.c:5623-5638) sits at the
-       condition-opcode position and must decline to chunk K (do_callout), not
-       fall into compile_cond's assertion lowering (whose link walk would read
-       the callout's payload as offsets). *)
-    ( "callout before condition assertion",
-      "(?(?C1)(?=a)b|c)",
-      "fast: OP_CALLOUT (chunk K)" );
+    (* Chunk K lowers OP_CALLOUT / OP_CALLOUT_STR as pure no-ops (this library
+       surfaces no callout function, so do_callout is always 0 in both engines)
+       and the OP_SCRIPT_RUN group (the sr / script_run verb, its ket applies the
+       script-checking rules to the matched span), so "a(?C1)b", AUTO_CALLOUT
+       patterns, a MANUAL callout before a condition assertion "(?(?C1)(?=a)b|c)",
+       "(*sr:\\d+)" and "(*asr:\\d+)" are now ACCEPTED (parity in parity_cases). *)
     ( "accept in assertion",
       "(?=a(*ACCEPT))",
       "fast: (*ACCEPT) inside assertion (chunk H+)" );
@@ -1187,6 +1192,20 @@ let supported_patterns =
     "\\V??(?=(*MARK:c))(*THEN)";
     "x(?=y)(*THEN)z|w";
     "(?>a(*THEN)b)c";
+    (* Chunk K (K1a): callout no-ops, script runs, repeated atomic groups /
+       assertions must be ACCEPTED (ir_of fails on decline — a regression
+       re-introducing an Unsupported here fails these cases, not just the
+       silently-skipping parity/sweep suites). *)
+    "a(?C1)b";
+    "(*sr:\\d+)";
+    "(*asr:\\d+)";
+    "(?(?C1)(?=a)b|c)";
+    "(?=a)*";
+    "(?!x)*";
+    "(?<=x)+";
+    "(?>ab){2,4}";
+    "(?>a)+";
+    "(?>a|ab)+c";
   ]
 
 let verify_ok = function
@@ -1417,6 +1436,27 @@ let sweep_patterns =
     "(?(?=a)b)*";
     "(?(?=a(*THEN)b)x|y)";
     "(a)(?(1)b(*THEN)c|d)";
+    (* Chunk K: callouts (no-ops), script runs, repeated atomic groups /
+       assertions. *)
+    "a(?C1)b";
+    "a(?C\"m\")b(?C2)c";
+    "(a)(?C1)(?(1)b|c)";
+    "(?(?C1)(?=a)b|c)";
+    "(*sr:\\d+)";
+    "(*sr:.*(*ACCEPT)ZZ)";
+    "^(*sr:A|)*BCD";
+    "(*asr:\\d+)";
+    "(?>a|ab)+c";
+    "(?>a)+";
+    "(?>a)*";
+    "(?>a?)*b";
+    "(?>a|ab)*?c";
+    "(?>(a)|(b))+";
+    "(?=a)*ab";
+    "(?=abc)+abc";
+    "(?!x)*ab";
+    "(?<=x)+y";
+    "(?>ab){2,4}c";
   ]
 
 let sweep_tests =
@@ -2215,6 +2255,36 @@ let parity_cases : (string * string * int * int32) list =
     ("(?(?=a)(*MARK:m)b|c)", "cc", 0, 0l);
     ("(a)?(?(1)(*MARK:y)b|c)", "ab", 0, 0l);
     ("(a)?(?(1)(*MARK:y)b|c)", "c", 0, 0l);
+    (* ---------- Chunk K: callouts (no-ops), script runs, repeated atomic
+       groups ---------- *)
+    (* Callouts are pure no-ops (do_callout is 0: no callout function surface). *)
+    ("a(?C1)b(?C2)c", "abc", 0, 0l);
+    ("a(?C\"x\")b", "ab", 0, 0l) (* string-arg callout *);
+    ("(a)(?C1)(?(1)b|c)", "ab", 0, 0l) (* callout before a condition *);
+    ("(?(?C1)(?=a)b|c)", "ab", 0, 0l) (* manual callout before condition assert *);
+    ("(?(?C1)(?=a)b|c)", "c", 0, 0l);
+    (* Script runs (the sr / script_run verb): non-atomic, ket span check. *)
+    ("(*sr:\\d+)x", "123x", 0, 0l);
+    ("(*sr:.*(*ACCEPT)ZZ)", "ab", 0, 0l) (* ( *ACCEPT) in a script run body *);
+    ("^(*sr:A|)*BCD", "AABCD", 0, 0l) (* repeated script run, empty-loop break *);
+    ("^(*sr:A|)*BCD", "BCD", 0, 0l);
+    ("(*asr:\\d+)", "42", 0, 0l) (* atomic script run = OP_SCRIPT_RUN + OP_ONCE *);
+    (* Repeated atomic groups (Once ... KetRmax / KetRmin): per-iteration atomic
+       commit + give-back with the KIND_ONCE snapshot. *)
+    ("(?>a|ab)+c", "abc", 0, 0l);
+    ("(?>a|ab)+c", "aabc", 0, 0l);
+    ("(?>a)+", "aaa", 0, 0l);
+    ("(?>a)*", "aaa", 0, 0l);
+    ("(?>a?)*b", "aaab", 0, 0l);
+    ("(?>a|ab)*?c", "abc", 0, 0l);
+    ("(?>(a)|(b))+", "ab", 0, 0l) (* captures inside a repeated atomic group *);
+    ("x(?>ab|a)+y", "xabay", 0, 0l);
+    (* Repeated assertions (BRAZERO + non-repeating assertion). *)
+    ("(?=a)*ab", "ab", 0, 0l);
+    ("(?=abc)+abc", "abc", 0, 0l);
+    ("(?!x)*ab", "ab", 0, 0l);
+    ("(?<=x)+y", "xy", 1, 0l);
+    ("(?>ab){2,4}c", "ababc", 0, 0l);
   ]
 
 let parity_tests =
@@ -2438,6 +2508,15 @@ let limit_match_boundary_test =
             ("(a)++b", "aaab"); (* possessive capture iterations *)
             ("(?:a?)*+b", "aab"); (* possessive with empty-match break *)
             ("(?:a+)++b", "aaab"); (* nested possessive *)
+            (* Chunk K: repeated atomic group (Once ... KetRmax): the
+               per-iteration RM7 loop-back + grouploop RM2 branch tick, with the
+               KIND_ONCE snapshot restore on greedy give-back. *)
+            ("(?>a|ab)+c", "ababab"); (* atomic commits per iteration, then fail *)
+            ("(?>a|ab)+c", "abababc"); (* ... then succeed *)
+            ("(?>a)+b", "aaaab"); (* greedy give-back over atomic iterations *)
+            ("(?>a|b)*c", "abab"); (* lazy/greedy repeated atomic, no match *)
+            ("(?>a?)*b", "aaab"); (* empty-iteration loop break *)
+            ("(*sr:a|b)+c", "abab"); (* repeated script run tick parity *)
           ]);
     (* Chunk I2: property / \X / \R-in-UTF / \C / UCP / caseless-UTF-ref tick
        parity. Property repeats take the char/type maxbt shape (floor tried IN

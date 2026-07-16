@@ -269,8 +269,20 @@ interpreter is its differential oracle. Approved plan:
   → 1142/640/596/407/43 (testinput1/2/4/5/10), zero failures; fuzz
   fast-vs-interp clean (163k+ conditional-inclusive comparisons). **Declined
   (unchanged reasons):** OP_RECURSE / OP_SCRIPT_RUN / callouts (chunk K).
-- [ ] **K — Recursion + script-run + callout no-ops** — full parity reached; no
-  `Unsupported` remains for in-scope patterns.
+- [x] **K1a — script runs + callouts + repeated atomics** — OP_SCRIPT_RUN
+  ((*sr:)/(*asr:), single+repeated), OP_CALLOUT/CALLOUT_STR no-op skips (incl. the
+  condition-position callout, C:5623-5638 — the J-era latent shape now lowers),
+  repeated atomic groups (?>X)+/* and BRAZERO-wrapped assertions (per-iteration
+  KIND_ONCE re-push); +56 units. Deferred with rationale: recursion -> K1b (RECURSELOOP
+  needs faithful last_used_ptr tracking; wrong -52 = wrong answer), \K -> K2 (scope gap:
+  never chunk-assigned), (*ACCEPT)-in-assertion + (*THEN)+NA -> K2.
+- [ ] **K1b — recursion** — OP_RECURSE all forms + last_used_ptr infrastructure +
+  RECURSELOOP (-52) parity + fat recursion save record (full ovector/group_start/
+  cap_start/mark/current_recurse/once_base — plan in fast-design §3) + RREF un-FALSE
+  for recursion-containing patterns + snapshot-proof re-establishment (~161 units).
+- [ ] **K2 — \K + H+ cleanups** — OP_SET_SOM (\K, ~36 units), (*ACCEPT) inside all
+  4 assertion kinds (~13), (*THEN) with non-atomic assertions. After K2 the decline
+  list reads exactly {PCRE2_FIRSTLINE (chunk L)}.
 - [ ] **L — JIT start-opts** — scan_prefix + range skip table (`:5592,6159-6330`),
   first_cu/req_cu scalar ports, startline/start_bits/minlength.
 - [ ] **M — Early-fail + tuning** — detect_early_fail watermarks (`:1292`, types `:232`);

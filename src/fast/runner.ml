@@ -37,6 +37,7 @@ module Xclass = Pcre2_engine.Xclass
 module Valid_utf = Pcre2_engine.Valid_utf
 module Extuni = Pcre2_engine.Extuni
 module Tables = Pcre2_engine.Tables
+module Script_run = Pcre2_engine.Script_run
 
 (* Chunk E — repeat-kind discriminators (fast-design.md §2/§4). [setup_rep]
    maps each REP superinstruction to one of these; the forward min/greedy
@@ -2097,6 +2098,22 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       let mcc' = tick_child mb mcc (rdepth + 1) in
       if mcc' < 0 then mcc'
       else (run [@tailcall]) mb (pc + 1) eptr sp (rdepth + 1) mcc'
+  | 69 ->
+      (* SCRIPT_RUN_END (fast-design.md §2/§3; the OP_SCRIPT_RUN ket
+         pcre2_match.c:6045-6051 / interpreter.ml:2882-2897) — a script-run
+         branch matched: apply the script-checking rules to the group's matched
+         span [group_start.(g), eptr). Feptr is the current position; P->eptr is
+         the entry, recorded in mb.group_start.(g) by the preceding
+         t_group_start. On failure backtrack (NOMATCH); else continue at the
+         current (advanced) eptr. Non-atomic: the body's choice points stay live
+         (a failed continuation re-enters the branches and re-checks the new
+         span). No tick (the C's ket continues in the matching branch's frame). *)
+      let g = code.(pc + 1) in
+      (* safe: g in [0, n_groups) (Ir_verify) indexes mb.group_start. *)
+      let s = Array.unsafe_get mb.group_start g in
+      if Script_run.script_run mb.subject s eptr mb.utf then
+        (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
+      else (backtrack [@tailcall]) mb sp mcc
   | _ ->
       (* Ir_verify rejects any other tag before the runner sees it; a compiled
          Ir.t cannot reach here (fast-design.md §2). *)
@@ -4606,7 +4623,8 @@ let () =
   assert (Int.equal Ir.t_cond_assert 66);
   assert (Int.equal Ir.t_cond_assert_match 67);
   assert (Int.equal Ir.t_scond_descend 68);
-  assert (Int.equal Ir.max_tag 68);
+  assert (Int.equal Ir.t_script_run_end 69);
+  assert (Int.equal Ir.max_tag 69);
   (* Save-record KIND / width constants the runner inlines as literals. *)
   assert (Int.equal Save_stack.kind_alt 0);
   assert (Int.equal Save_stack.kind_cap 1);

@@ -255,6 +255,19 @@ let t_cond_assert = 66 (* [t_cond_assert; nomatch_target] *)
 let t_cond_assert_match = 67 (* [t_cond_assert_match; match_target] *)
 let t_scond_descend = 68 (* [t_scond_descend] *)
 
+(* Chunk K additions (fast-design.md §2/§3) — script runs and recursion.
+
+   [t_script_run_end] is the OP_SCRIPT_RUN ket (pcre2_match.c:6045-6051 /
+   interpreter.ml:2882-2897). A script run (the sr / script_run verb) is a
+   non-capturing, NON-atomic group (GF_NOCAPTURE, grouploop) whose ket applies
+   the script-checking rules to the group's matched span [group_start.(g), eptr)
+   via Pcre2_engine.Script_run.script_run; on failure it backtracks, else it
+   continues at the current (advanced) eptr. The entry records the span start in
+   mb.group_start.(g) via a preceding [t_group_start]. The atomic_script_run
+   verb compiles as OP_SCRIPT_RUN wrapping OP_ONCE, so the atomic wrapper is the
+   chunk-G machinery and the script run needs no extra atomicity here. *)
+let t_script_run_end = 69 (* [t_script_run_end; g] — OP_SCRIPT_RUN ket *)
+
 (* Sentinel [g] for a repeated group whose bracket is OP_BRA (bra_loop, C's
    P == NULL): NO empty-string check (the C short-circuits it, and OP_BRA can
    never match empty), so no [t_group_start] and no [mb.group_start] slot. *)
@@ -270,7 +283,7 @@ let reptype_pos = 2
 let rep_inf = 0xFFFFFFFF
 
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 68
+let max_tag = 69
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -346,6 +359,7 @@ let arity =
     2 (* t_cond_assert: nomatch_target *);
     2 (* t_cond_assert_match: match_target *);
     1 (* t_scond_descend *);
+    2 (* t_script_run_end: g *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -421,6 +435,7 @@ let tag_name =
     "COND_ASSERT";
     "COND_ASSERT_MATCH";
     "SCOND_DESCEND";
+    "SCRIPT_RUN_END";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -638,6 +653,10 @@ let cond_assert_nomatch (ir : t) (pc : int) : int = ir.code.(pc + 1)
    body matches). *)
 let cond_assert_match_target (ir : t) (pc : int) : int = ir.code.(pc + 1)
 
+(* [t_script_run_end] — the script run's group id [g] (its span start lives in
+   mb.group_start.(g), written by the preceding t_group_start). *)
+let script_run_group (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
 (* ---------- Text dump (fast-design.md §2) ----------
    Stable, debug_printer.ml-style listing for golden tests: one line per
    instruction, [%3d TAG operands]. Printf/Format here is a debug path
@@ -752,6 +771,8 @@ let render (ir : t) (pc : int) (t : int) : string =
     Printf.sprintf "COND_ASSERT nomatch=%d" (cond_assert_nomatch ir pc)
   else if Int.equal t t_cond_assert_match then
     Printf.sprintf "COND_ASSERT_MATCH match=%d" (cond_assert_match_target ir pc)
+  else if Int.equal t t_script_run_end then
+    Printf.sprintf "SCRIPT_RUN_END g=%d" (script_run_group ir pc)
   else if Int.equal t t_group_start then
     Printf.sprintf "GROUP_START g=%d" (group_start_id ir pc)
   else if Int.equal t t_brazero then

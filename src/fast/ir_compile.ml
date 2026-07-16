@@ -599,14 +599,30 @@ let compile (re : C.re) : (Ir.t, string) result =
       in
       let branch_offs, ket_off = collect bra_off [] in
       let ket_op = byte ket_off in
-      (* A quantified atomic group/assertion attaches the repeat DIRECTLY to the
-         OP_ONCE/assertion via a repeating ket (e.g. "(?>a)+" is Once ... KetRmax,
-         combining the per-iteration atomic commit with the group-repeat loop).
-         That combination is out of this chunk's subset; decline it precisely
-         rather than mis-lower a non-OP_KET ket. *)
-      if not (Int.equal ket_op Op.op_ket) then
+      (* A quantified atomic group attaches the repeat DIRECTLY to the OP_ONCE
+         via a repeating ket (e.g. "(?>a)+" is Once … KetRmax, combining the
+         per-iteration atomic commit with the group-repeat loop, chunk G+). Each
+         iteration re-pushes the KIND_ONCE boundary (the loop-back target is the
+         t_once), so the atomic commit is per-iteration and the KIND_ONCE
+         snapshot restores the pre-iteration state when the greedy/lazy KET gives
+         an iteration back — exactly the C's per-frame OP_ONCE re-dispatch under
+         KETRMAX/KETRMIN. A zero-width ASSERTION is never given a repeating ket
+         by the compiler (its repeats become BRAZERO + a non-repeating
+         assertion), so only OP_ONCE reaches the repeating path; decline any
+         other non-OP_KET ket (KETRPOS possessive, or a defensive repeating
+         assertion). *)
+      let is_max = Int.equal ket_op Op.op_ketrmax in
+      let is_min = Int.equal ket_op Op.op_ketrmin in
+      let repeating = is_max || is_min in
+      if not (Int.equal ket_op Op.op_ket || (atomic_group && repeating)) then
         raise
           (Unsupported "fast: repeated atomic group / assertion (chunk G+)");
+      (* A repeated atomic group needs its own empty-check group id (the ket's
+         empty-string loop check, read at t_ket_rmax/t_ket_rmin against the
+         iteration start recorded by a t_group_start after the t_once). *)
+      let atomic_rep_group =
+        if atomic_group && repeating then fresh_group () else Ir.no_group
+      in
       (* Chunk H: a NON-ATOMIC positive assertion (OP_ASSERT_NA/ASSERTBACK_NA)
          has NO KIND_ONCE boundary, so a ( *THEN) escaping to (or inside) it
          cannot be contained. Decline it when the pattern contains ( *THEN)
@@ -622,11 +638,20 @@ let compile (re : C.re) : (Ir.t, string) result =
          the end-point check). *)
       let need_group = pos_atomic || pos_na || (neg && has_vreverse) in
       let group_id = if need_group then fresh_group () else Ir.no_group in
+      (* [entry_pc] is the loop-back target for a repeated atomic group: the
+         t_once itself, so each iteration re-snapshots (a fresh KIND_ONCE) and
+         re-records its start (t_group_start). *)
+      let entry_pc = here () in
       (* Entry markers. Record an atomic positive assertion's t_once pc so its
          KIND_ONCE boundary gets the pos-assert subtype (THEN containment). *)
       if atomic_group || pos_atomic then (
         if pos_atomic then once_assert_list := here () :: !once_assert_list;
         push Ir.t_once);
+      (* A repeated atomic group records its per-iteration start (empty check)
+         right after the t_once, so the loop-back re-records it. *)
+      if atomic_group && repeating then (
+        push Ir.t_group_start;
+        push atomic_rep_group);
       let nassert_cont_operand = ref (-1) in
       if neg then (
         push Ir.t_nassert;
@@ -666,7 +691,15 @@ let compile (re : C.re) : (Ir.t, string) result =
       if !prev_cp >= 0 then patch_alt !prev_cp fail_pc multibranch;
       (* Convergence instruction the branch JMPs target. *)
       let conv_ir = here () in
-      if atomic_group then push Ir.t_once_end
+      if atomic_group then (
+        push Ir.t_once_end;
+        (* A repeated atomic group commits the iteration (t_once_end) then runs
+           the repeating ket: greedy/lazy loop back to [entry_pc] (re-snapshot),
+           with the empty check against [atomic_rep_group]. *)
+        if repeating then (
+          push (if is_max then Ir.t_ket_rmax else Ir.t_ket_rmin);
+          push entry_pc;
+          push atomic_rep_group))
       else if pos_atomic || pos_na then (
         push Ir.t_assert_end;
         push (if pos_atomic then 1 else 0);
@@ -675,6 +708,80 @@ let compile (re : C.re) : (Ir.t, string) result =
         push Ir.t_nassert_match;
         (* the negative assertion's success continuation is right past here. *)
         set !nassert_cont_operand (here ()));
+      List.iter (fun j -> set j conv_ir) !jmp_fixups;
+      ket_off + Op.op_lengths.(ket_op)
+    (* [compile_script_run bra_off]: lower a script-run group OP_SCRIPT_RUN …
+       OP_KET (chunk K; pcre2_match.c:5391-5394 entry / 6045-6051 ket,
+       interpreter.ml:2346-2353,2882-2897). A script run (the sr / script_run
+       verb) is a NON-capturing, NON-atomic group (GF_NOCAPTURE, grouploop)
+       whose ket applies the script-checking rules to the matched span. Lower it
+       grouploop-style (an ALT choice point per branch + trailing FAIL, so tick
+       parity = grouploop, §4) with a [t_group_start g] at entry (records the
+       span start) and a [t_script_run_end g] at the convergence point (the
+       Script_run.script_run check + continue at the advanced eptr). The
+       atomic_script_run verb is OP_SCRIPT_RUN wrapping OP_ONCE, so the atomic
+       body is handled by compile_lookaround from compile_branch. *)
+    and compile_script_run (bra_off : int) : int =
+      let rec collect (p : int) (acc : int list) : int list * int =
+        let start = p + Op.op_lengths.(byte p) in
+        let nxt = p + link p in
+        if Int.equal (byte nxt) Op.op_alt then
+          (collect [@tailcall]) nxt (start :: acc)
+        else (List.rev (start :: acc), nxt)
+      in
+      let branch_offs, ket_off = collect bra_off [] in
+      let ket_op = byte ket_off in
+      (* A repeated script run (the sr verb quantified = OP_SCRIPT_RUN …
+         OP_KETRMAX/KETRMIN, pcre2_compile.c:7687-7691 rewrites the ket) runs the
+         iteration ket script check FIRST and then the group-repeat loop (the C's
+         op_ket bracket switch runs the script check, then op_ket_tail does the
+         KETRMAX/KETRMIN repeat — interpreter.ml:2882-2897 then the ket-repeat
+         path). The iteration start recorded in mb.group_start.(g) serves BOTH
+         the script-check span and the empty-string loop check. The possessive
+         OP_KETRPOS never closes an OP_SCRIPT_RUN directly (a possessive script
+         run wraps it in OP_BRAPOS), so only OP_KET/KETRMAX/KETRMIN occur. *)
+      let is_max = Int.equal ket_op Op.op_ketrmax in
+      let is_min = Int.equal ket_op Op.op_ketrmin in
+      let repeating = is_max || is_min in
+      if not (Int.equal ket_op Op.op_ket || repeating) then
+        raise (Unsupported (reason_of_op ket_op));
+      let group_id = fresh_group () in
+      (* [entry_pc] is the loop-back target for a repeating ket: the
+         t_group_start (re-records the iteration start each iteration). *)
+      let entry_pc = here () in
+      push Ir.t_group_start;
+      push group_id;
+      push Ir.t_bra;
+      let multibranch = List.length branch_offs >= 2 in
+      let jmp_fixups = ref [] in
+      let prev_cp = ref (-1) in
+      List.iter
+        (fun b_off ->
+          let entry = here () in
+          if !prev_cp >= 0 then patch_alt !prev_cp entry multibranch;
+          push Ir.t_alt;
+          let cp_operand = here () in
+          push 0 (* handler placeholder *);
+          prev_cp := cp_operand;
+          ignore (compile_branch b_off : int);
+          push Ir.t_jmp;
+          let j = here () in
+          push 0 (* target placeholder, resolved to the convergence point *);
+          jmp_fixups := j :: !jmp_fixups)
+        branch_offs;
+      let fail_pc = here () in
+      push Ir.t_fail;
+      if !prev_cp >= 0 then patch_alt !prev_cp fail_pc multibranch;
+      let conv_ir = here () in
+      push Ir.t_script_run_end;
+      push group_id;
+      (* A repeating script run runs the script check (t_script_run_end
+         continues at pc+2) then the repeat loop (t_ket_rmax/t_ket_rmin: the
+         empty-check group is [group_id], loops back to [entry_pc]). *)
+      if repeating then (
+        push (if is_max then Ir.t_ket_rmax else Ir.t_ket_rmin);
+        push entry_pc;
+        push group_id);
       List.iter (fun j -> set j conv_ir) !jmp_fixups;
       ket_off + Op.op_lengths.(ket_op)
     (* [compile_possess bra_off zero_allowed]: lower a possessive quantified
@@ -774,7 +881,20 @@ let compile (re : C.re) : (Ir.t, string) result =
     and compile_cond (bra_off : int) : int =
       let op = byte bra_off in
       let is_scond = Int.equal op Op.op_scond in
-      let cond_op_off = bra_off + 1 + Limits.link_size in
+      (* pcre2_match.c:5623-5638 — an auto- or manually-inserted callout may sit
+         between OP_COND and the condition; step past it so [cond_op_off] points
+         at the real condition (the interpreter's Fecode += length, adjusting
+         Flength, interpreter.ml:2462-2473). do_callout is a no-op here (chunk
+         K), so this is a pure skip. Enables `(?(?C1)…)` and AUTO_CALLOUT
+         conditionals. *)
+      let cond_op_off =
+        let base = bra_off + 1 + Limits.link_size in
+        let b0 = byte base in
+        if Int.equal b0 Op.op_callout then base + Op.op_lengths.(Op.op_callout)
+        else if Int.equal b0 Op.op_callout_str then
+          base + C.get src (base + 1 + (2 * Limits.link_size))
+        else base
+      in
       let cond_op = byte cond_op_off in
       (* Collect the branch structure: the first "branch" begins with the
          condition opcode; the (optional) no-branch follows an OP_ALT; find the
@@ -1078,9 +1198,11 @@ let compile (re : C.re) : (Ir.t, string) result =
           Int.equal op Op.op_once
           || (op >= Op.op_assert && op <= Op.op_assertback_na)
         then
-          (* Lookaround assertions + atomic groups (chunk G, compile_lookaround);
-             OP_SCRIPT_RUN (also >= OP_ONCE) is declined inside it. *)
+          (* Lookaround assertions + atomic groups (chunk G, compile_lookaround). *)
           p := compile_lookaround !p
+        else if Int.equal op Op.op_script_run then
+          (* Script run (the sr / script_run verb) — chunk K, compile_script_run. *)
+          p := compile_script_run !p
         else if Int.equal op Op.op_reverse then (
           (* OP_REVERSE (pcre2_match.c:5793-5819) — the fixed lookbehind
              back-step at the start of a lookbehind branch. GET2(code,p+1) =
@@ -1130,6 +1252,25 @@ let compile (re : C.re) : (Ir.t, string) result =
           let after =
             if Int.equal inner_op Op.op_cond || Int.equal inner_op Op.op_scond
             then compile_cond inner
+            else if Int.equal inner_op Op.op_script_run then
+              (* A repeated script run (the sr verb quantified) is
+                 OP_BRAZERO + OP_SCRIPT_RUN … OP_KETRMAX (chunk K). *)
+              compile_script_run inner
+            else if
+              Int.equal inner_op Op.op_once
+              || (inner_op >= Op.op_assert && inner_op <= Op.op_assertback_na)
+            then
+              (* A repeated assertion / atomic group under BRAZERO (chunk G+):
+                 a zero-width assertion repeated N+ times is one non-repeating
+                 assertion made optional by BRAZERO (`(?=x)*` = Brazero Assert
+                 … Ket; `(?=abc)+` = Assert … Ket Brazero Assert … Ket), and a
+                 `{n,m}` atomic group's optional tail copies (`(?>ab){2,4}`) are
+                 BRAZERO + a non-repeating OP_ONCE. compile_lookaround handles
+                 both the non-repeating body and (chunk K) the repeated atomic
+                 group (`(?>a)*` = Brazero Once … KetRmax: each iteration
+                 re-pushes the KIND_ONCE boundary, the loop-back target is the
+                 t_once). *)
+              compile_lookaround inner
             else compile_group inner
           in
           set skip_operand (here ());
@@ -1446,6 +1587,22 @@ let compile (re : C.re) : (Ir.t, string) result =
           push (2 * num);
           push (if opt_cbracket.(num) then 0 else 1);
           p := !p + Op.op_lengths.(op))
+        else if
+          Int.equal op Op.op_callout || Int.equal op Op.op_callout_str
+        then (
+          (* OP_CALLOUT / OP_CALLOUT_STR (chunk K; pcre2_match.c:254-334,
+             interpreter.ml do_callout_length :876-879). This library's API
+             surfaces no callout function, so do_callout always returns 0 (the
+             rrc > 0 / rrc < 0 exits are unreachable in BOTH engines) and a
+             callout is a pure NO-OP: emit no IR, just skip the item. Length =
+             the fixed op_lengths for OP_CALLOUT, or GET(code, p+1+2*LINK_SIZE)
+             for OP_CALLOUT_STR (the string-arg form). This also covers
+             PCRE2_AUTO_CALLOUT patterns (a callout between every item). *)
+          let len =
+            if Int.equal op Op.op_callout then Op.op_lengths.(Op.op_callout)
+            else C.get src (!p + 1 + (2 * Limits.link_size))
+          in
+          p := !p + len)
         else
           match anchor_tag op with
           | Some tag ->

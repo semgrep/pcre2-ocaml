@@ -148,14 +148,19 @@ let check (ir : Ir.t) : (unit, string) result =
                           instruction head"
                          pc ir.Ir.alt_then_end.(pc))
                   else Ok ())
-                else if Int.equal t Ir.t_group_start then (
+                else if
+                  Int.equal t Ir.t_group_start
+                  || Int.equal t Ir.t_script_run_end
+                then (
+                  (* GROUP_START / SCRIPT_RUN_END carry a valid [0, n_groups)
+                     group id at pc+1 (chunk K adds SCRIPT_RUN_END). *)
                   let g = code.(pc + 1) in
                   if g < 0 || g >= n_groups then
                     Error
                       (Printf.sprintf
-                         "fast-verify: GROUP_START at pc %d group id %d out of \
-                          range (n_groups %d)"
-                         pc g n_groups)
+                         "fast-verify: %s at pc %d group id %d out of range \
+                          (n_groups %d)"
+                         Ir.tag_name.(t) pc g n_groups)
                   else Ok ())
                 else if Int.equal t Ir.t_char_run then (
                   let off = code.(pc + 1) and l = code.(pc + 2) in
