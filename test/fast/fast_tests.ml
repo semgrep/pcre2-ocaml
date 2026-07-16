@@ -2390,6 +2390,33 @@ let parity_cases : (string * string * int * int32) list =
     ("(?1)(?:(b)){0}", "b", 0, 0l);
     ("^(X(*THEN)Y|AB){0}(?1)", "AB", 0, 0l);
     ("(a(*MARK:m)(*ACCEPT)){0}(?1)", "a", 0, 0l);
+    (* ---------- MATCH_ACCEPT (-999) escaping to the caller (regression
+       23309) ----------
+
+       A recursion entering a group COMPILED inside a lookaround executes
+       that group's ( *ACCEPT) as OP_ASSERT_ACCEPT (pcre2_match.c:837-840,
+       RRETURN(MATCH_ACCEPT)) with NO live assertion frame: OP_RECURSE passes
+       every non-NOMATCH rrc through (:5493), the driver's default arm
+       forwards it (:7573-7576, :7743-7745), and 10.44's pcre2_match returns
+       the RAW -999 — oracle-confirmed; both engines must surface E-999. *)
+    ("(*LIMIT_MATCH=2000)\\g<1>(?=(0{,2}(*ACCEPT)(()())))", "", 0, 0l);
+    ("(?1)(?=(a(*ACCEPT)))", "a", 0, 0l);
+    ("(?1)(?=(a(*ACCEPT)))", "ab", 0, 0l);
+    ("x(?1)(?=(a(*ACCEPT)))", "xa", 0, 0l);
+    (* negative lookaround / lookbehind lexical homes leak identically *)
+    ("(?1)(?!(a(*ACCEPT)))", "a", 0, 0l);
+    ("(?1)(?<=(a(*ACCEPT)))", "a", 0, 0l);
+    (* controls: the ACCEPT caught by its LIVE lexical assertion (normal
+       RM3/RM4 catch)... *)
+    ("(?=(a(*ACCEPT)))a", "a", 0, 0l);
+    ("(?!(a(*ACCEPT)))b", "b", 0, 0l);
+    (* ...a plain OP_ACCEPT inside a recursed non-assertion group (the
+       accept_recurse_return path, :847-872)... *)
+    ("(?1)x|(a(*ACCEPT)b)", "axq", 0, 0l);
+    ("(a(*ACCEPT))(?1)", "aa", 0, 0l);
+    (* ...and a LIVE outer assertion on the stack catching the recursion's
+       escaping MATCH_ACCEPT (the innermost-active-frame stop, :5520). *)
+    ("(?=(?1)z)(?=(a(*ACCEPT)))a", "a", 0, 0l);
   ]
 
 let parity_tests =
@@ -3281,6 +3308,43 @@ let invalid_utf_cases : (string * string * int * int32) list =
        so these must keep the generic decode path *)
     ("(?<=\\D{2,3})", "\xc0\xb5x", 0, 0l);
     ("(?<=[0-9]{2,3})", "\xc0\xb55", 0, 0l);
+    (* ---------- class-repeat give-back crossing a MID-CHARACTER floor
+       (regression 144922: \C leaves the next iteration's repeat start on a
+       continuation byte) ----------
+
+       The C's CLASS/XCLASS maximize give-back RMATCHes at EVERY position
+       including the final one at or BELOW Lstart_eptr (`if (Feptr-- <=
+       Lstart_eptr) break` compares the position it JUST tried,
+       pcre2_match.c:2114 / :2282): from a mid-character floor the BACKCHAR
+       walk lands BELOW the floor, and that below-floor position is still
+       tried (\C then matches a raw code unit BEHIND the group start — the
+       oracle's ov can even hold a capture with start > end). The pre-fix
+       fast class arm pooled that position with the floor-tried sentinel
+       (floor - 1) and popped without trying it -> NOMATCH. *)
+    ("(*LIMIT_MATCH=2000)(*script_run:[^BA]*\\C){3}()", "\xd0\xa1", 0, 0l);
+    ("(?:[^BA]*\\C){2}", "\xd0\xa1", 0, 0l);
+    ("(?:[^BA]*\\C){3}", "\xd0\xa1", 0, 0l);
+    (* 3-byte char: the walk crosses two continuation bytes *)
+    ("(?:[^BA]*\\C){3}", "\xe2\x82\xac", 0, 0l);
+    ("(?:[^BA]*\\C){4}", "\xe2\x82\xac", 0, 0l);
+    (* XCLASS (RM101, :2278-2288) — same loop shape as the class RM201 *)
+    ("(?:[\\x{100}-\\x{10ffff}]*\\C){2}", "\xd0\xa1", 0, 0l);
+    ("(?:[\\p{L}\\p{N}]*\\C){2}", "\xd0\xa1", 0, 0l);
+    (* CRRANGE-quantified class *)
+    ("(?:[^BA]{0,2}\\C){2}", "\xd0\xa1", 0, 0l);
+    (* capture inside: the below-floor walk leaves group 1 start > end *)
+    ("(?:([^BA]*)\\C){2}", "\xd0\xa1", 0, 0l);
+    (* atomic script run wrapper *)
+    ("(*atomic_script_run:[^BA]*\\C){3}()", "\xd0\xa1", 0, 0l);
+    (* controls: lazy (minimize loop — no give-back), possessive (no
+       backtracking), and a type repeat (\D: the char/type give-back
+       dispatches the final below-floor position IN PLACE, a different,
+       already-C-exact shape — pcre2_match.c:4707-4717) *)
+    ("(?:[^BA]*?\\C){2}", "\xd0\xa1", 0, 0l);
+    ("(?:[^BA]*+\\C){2}", "\xd0\xa1", 0, 0l);
+    ("(?:\\D*\\C){2}", "\xd0\xa1", 0, 0l);
+    (* boundary-floor control (no \C): the ordinary floor try + pop *)
+    ("(?:[^x]*y){2}", "ayby", 0, 0l);
   ]
 
 let invalid_utf_tests =

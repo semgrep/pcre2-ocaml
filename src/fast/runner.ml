@@ -85,6 +85,17 @@ let match_skip = -995
 let match_skip_arg = -994
 let match_then = -993
 
+(* pcre2_match.c:93 — MATCH_ACCEPT (interpreter.ml:95): an OP_ASSERT_ACCEPT's
+   RRETURN code. Normally caught by an enclosing assertion boundary
+   ([backtrack_accept]); when a RECURSION enters a group that was COMPILED
+   inside a lookaround (so its ( *ACCEPT) is OP_ASSERT_ACCEPT) and no assertion
+   frame is live, the C's MATCH_ACCEPT unwinds out of match() uncaught
+   (OP_RECURSE passes every non-NOMATCH rrc through, :5493; the driver's
+   default arm forwards it, :7573-7576 + :7743-7745) and pcre2_match returns
+   the RAW -999 to the caller — a 10.44 quirk the interpreter and the C oracle
+   both exhibit (regression 23309). *)
+let match_accept = -999
+
 (* KIND_VERB [vtype] discriminators (fast-design.md §3). vt_mark reverts the mark
    and catches a name-matching SKIP_ARG; the rest fire their verb code on a
    NOMATCH backtrack. _ARG mark-setting is NOT a separate vtype: the record
@@ -1109,7 +1120,17 @@ let rep_giveback (mb : mb) (rep_pc : int) (floor : int) (pos : int) : int =
     else if mb.utf then
       giveback_pos mb rep_pc floor (backchar_sub mb.subject (pos - 1))
     else giveback_pos mb rep_pc floor (pos - 1)
-  else pos - 1 (* class sentinel: pos = floor, store floor-1 (below floor) *)
+  else -1
+(* class sentinel (pos <= floor): the C's RM201/RM101/RM24 loops break AFTER
+   trying a position <= Lstart_eptr (`if (Feptr-- <= Lstart_eptr) break`,
+   pcre2_match.c:2114/:2282 — the compare is on the position JUST tried; non-UTF CLASS is the while->= form :2143-2148),
+   so the record's next-try slot gets an explicit out-of-band -1 -> pop.
+   NOT floor - 1: when the repeat's start sits MID-CHARACTER (\C left it on a
+   continuation byte), the pos > floor arm's BACKCHAR walk legitimately lands
+   BELOW floor — a position the C still RMATCHes (regression 144922: floor 1,
+   BACKCHAR from 2 lands at 0 = floor - 1, which a floor-1 sentinel would
+   silently swallow). Only reachable from the class/xclass sites (every other
+   caller guards pos > floor). *)
 
 (* ---------- Shadow limit tick (§4) ---------- *)
 
@@ -3346,7 +3367,12 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
    [conv_kind]/[target] (compile-time) name its action at a KIND_NASSERT. *)
 and backtrack_accept (mb : mb) (sp : int) (eptr : int) (rdepth : int) (mcc : int)
     (conv_kind : int) (target : int) : int =
-  if sp <= 0 then match_nomatch (* defensive: no enclosing assertion boundary *)
+  if sp <= 0 then match_accept
+    (* no enclosing assertion boundary (a recursion entered a group compiled
+       inside a lookaround): the C's MATCH_ACCEPT unwinds out of match()
+       uncaught and pcre2_match returns the raw -999 (see [match_accept];
+       regression 23309). NOT match_nomatch — the rc difference is
+       caller-visible. *)
   else
     let d = mb.ss.Save_stack.data in
     let nov = 2 * mb.oveccount in
@@ -3498,12 +3524,17 @@ and backtrack_rep_max (mb : mb) (sp : int) (mcc : int) : int =
     || Int.equal (Array.unsafe_get mb.code (rep_pc)) 58 (* t_xclass_rep *)
   then
     (* CLASS (pcre2_match.c:2143-2148, RM24/RM201) / XCLASS (:2278-2288,
-       RM101): [floor] is itself a ticked RMATCH; below floor -> NOMATCH. *)
-    if try_pos >= floor then (
+       RM101): EVERY position is a ticked RMATCH — including the final one at
+       or BELOW floor (the C's break compares the position it JUST tried,
+       `if (Feptr-- <= Lstart_eptr) break`, :2114/:2282/:2143-2148; a below-floor
+       position arises when the BACKCHAR walk crosses a mid-character floor
+       left by \C — regression 144922). [rep_giveback] stores -1 after that
+       final try; -1 -> pop. *)
+    if try_pos >= 0 then (
       let mcc' = tick_child mb mcc (dd + 1) in
       if mcc' < 0 then mcc'
       else (
-        (* one char (UTF) / code unit back; at try_pos = floor stores floor-1. *)
+        (* one char (UTF) / code unit back; at try_pos <= floor stores -1. *)
         Array.unsafe_set d (base + 1) (rep_giveback mb rep_pc floor try_pos);
         (run [@tailcall]) mb cont try_pos sp (dd + 1) mcc'))
     else (backtrack [@tailcall]) mb base mcc (* pop, propagate *)
@@ -3522,7 +3553,7 @@ and backtrack_rep_max (mb : mb) (sp : int) (mcc : int) : int =
        except a \C repeat in UTF (chunk I2), whose char-wise BACKCHAR
        give-back can land BELOW a mid-character floor — the C then dispatches
        at that below-floor Feptr (the `<=` loop-head break,
-       pcre2_match.c:4935-4940), so the continuation runs at [try_pos], not
+       pcre2_match.c:4707-4717), so the continuation runs at [try_pos], not
        [floor]. *)
     (run [@tailcall]) mb cont try_pos base dd mcc
 
@@ -4862,8 +4893,10 @@ and rep_greedy_done_class (mb : mb) (pmax : int) (sp : int) (rdepth : int)
       Array.unsafe_set d sp mb.rep_pc;
       Array.unsafe_set d (sp + 1)
         (rep_giveback mb mb.rep_pc mb.rep_floor pmax)
-        (* next give-back: one char (UTF) / code unit back; pmax = floor stores
-           floor-1 (below floor -> next backtrack pops) *);
+        (* next give-back: one char (UTF) / code unit back; pmax = floor
+           stores the -1 pop sentinel. The UTF step from pmax > floor may
+           land BELOW a mid-character floor (\C) — still a try, per the C's
+           RM201/RM101 loops (regression 144922). *);
       Array.unsafe_set d (sp + 2) mb.rep_floor;
       Array.unsafe_set d (sp + 3) rdepth;
       Array.unsafe_set d (sp + 4) Save_stack.kind_rep_max;
