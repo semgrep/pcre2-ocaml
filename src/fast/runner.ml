@@ -4255,6 +4255,18 @@ and op_repeat (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     (* M11 chunk N — register-localized non-UTF positive ctype min-count scan. *)
     (rep_min_ctype_w [@tailcall]) mb mb.subject mb.end_subject mb.rep_mask
       mb.rep_lmin 0 eptr sp rdepth mcc
+  else if
+    (* OP_NOT_WHITESPACE / OP_NOT_WORDCHAR mandatory min-count loop, UTF: the C
+       reads only the FIRST code unit and skips the rest with ACROSSCHAR, NOT
+       the lead byte's declared length (pcre2_match.c:3178-3228 /
+       interpreter.ml typemin_utf_neg_ctype). OP_NOT_DIGIT (ctype_digit) is
+       excluded — the C reads it with GETCHARINC, so it keeps rep_unit_utf's
+       extralen advance via [rep_min_loop]. *)
+    mb.utf && Int.equal k rk_ctype
+    && (not mb.rep_want)
+    && (Int.equal mb.rep_mask Chartables.ctype_word
+       || Int.equal mb.rep_mask Chartables.ctype_space)
+  then (rep_min_neg_ctype_utf [@tailcall]) mb 0 eptr sp rdepth mcc
   else (rep_min_loop [@tailcall]) mb 0 eptr sp rdepth mcc
 
 and rep_min_loop (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
@@ -4276,6 +4288,42 @@ and rep_min_loop (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
   else if not (rep_unit_matches mb eptr) then
     (bt [@tailcall]) mb (rep_fail_pos mb eptr false) sp mcc
   else (rep_min_loop [@tailcall]) mb (i + 1) (eptr + 1) sp rdepth mcc
+
+(* OP_NOT_WHITESPACE / OP_NOT_WORDCHAR mandatory min-count loop, UTF
+   (pcre2_match.c:3178-3194 / 3212-3228; interpreter.ml typemin_utf_neg_ctype
+   :5629-5656). DEVIATION from the generic [rep_min_loop], whose [rep_unit_utf]
+   advance is 1 + GET_EXTRALEN (the lead byte's declared length): these two
+   negative ctypes read ONLY the first code unit — cc = UCHAR21(Feptr); a lead
+   unit >= 128 is never of the type, so \W/\S matches — and then skip the rest
+   of the character with `Feptr++; ACROSSCHAR(Feptr < end_subject, ...)`
+   (Utf.forwardchartest, bounded by end_subject), NOT the declared length.
+   The two lengths differ only on invalid/truncated UTF, reachable when a
+   variable lookbehind (OP_VREVERSE) steps below mb.check_subject into a
+   previous MATCH_INVALID_UTF fragment's bytes (op_vreverse_utf floors at
+   start_subject): there the forward step MUST stay the inverse of the
+   backward BACKCHAR the VREVERSE used, else the branch cannot end at the
+   assertion entry position. OP_NOT_DIGIT is deliberately NOT routed here (the
+   C reads it with GETCHARINC, :3147-3156 — extralen), and the maximize
+   (:4667, GETCHARLEN) and minimize (:3943, GETCHARINC) loops keep the
+   extralen advance for all three, so ONLY this mandatory min loop deviates.
+   On the ctype mismatch the C's Feptr is unadvanced, so [bt] records [eptr]
+   (the C's RETURN_SWITCH last_used_ptr sees the unadvanced position). The
+   `Feptr++; ACROSSCHAR` step is the allocation-free [any_advance]
+   (skip_cont_bytes), NOT Utf.forwardchartest's per-call ref box (§8). *)
+and rep_min_neg_ctype_utf (mb : mb) (i : int) (eptr : int) (sp : int)
+    (rdepth : int) (mcc : int) : int =
+  if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
+  else if eptr >= mb.end_subject then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc
+  else
+    (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
+    let cc = Char.code (String.unsafe_get mb.subject eptr) in
+    if cc < 128 && not (Int.equal (Chartables.ctypes cc land mb.rep_mask) 0) then
+      (bt [@tailcall]) mb eptr sp mcc
+    else
+      (rep_min_neg_ctype_utf [@tailcall]) mb (i + 1) (any_advance mb eptr) sp
+        rdepth mcc
 
 (* OP_ALLANY / OP_ANYBYTE min loop (pcre2_match.c:3280-3287): one bound check
    for [lmin] code units. The scheck fires at the ORIGINAL eptr (not a

@@ -3208,6 +3208,54 @@ let invalid_utf_cases : (string * string * int * int32) list =
     (* partial matching at a mid-char \C + OP_ANY tail *)
     ("\\C{3}.{3}", "\xc9\x93\xe8\xaf\x8c\x64", 0, o_partial_soft);
     ("\\C{5}.{2}", "\xc9\x93\xe8\xaf\x8c\x64", 0, o_partial_hard);
+    (* ---------- OP_NOT_WORDCHAR / OP_NOT_WHITESPACE mandatory min-count loop
+       reading invalid UTF below check_subject via a variable lookbehind
+       (OP_VREVERSE) — regression 95312-2a0df42d ----------
+
+       In a non-first MATCH_INVALID_UTF fragment, mb.check_subject is the
+       fragment start, but OP_VREVERSE floors at start_subject, so a VARIABLE
+       lookbehind legitimately steps back over the PREVIOUS fragment's invalid
+       bytes. The mandatory min loop of \W{n,m} / \S{n,m} must then advance by
+       ACROSSCHAR — one code unit per malformed lead byte — NOT the lead byte's
+       declared GET_EXTRALEN length (pcre2_match.c:3178-3228 / interpreter.ml
+       typemin_utf_neg_ctype). 0xf6 is a truncated 4-byte lead, 0xe0 a
+       truncated 3-byte lead, 0x15/0x16 ASCII. The fast engine formerly read
+       0xf6 as 4 code units (GET_EXTRALEN), overshooting the assertion entry
+       and reporting NOMATCH where the interpreter reports an empty match. *)
+    (* the minimized repro pattern (both top-level branches) *)
+    ("(?<=(])|\\W{2,3})9?|((())(())((())))A", "\xf6\x15", 0, 0l);
+    (* the variable lookbehind in isolation: empty match at the fragment end *)
+    ("(?<=\\W{2,3})9?", "\xf6\x15", 0, 0l);
+    ("(?<=\\W{2,3})", "\xf6\x15", 0, 0l);
+    ("(?<=\\W{2,3})", "\xe0\x15", 0, 0l) (* 3-byte truncated lead *);
+    ("(?<=\\S{2,3})", "\xf6\x15", 0, 0l) (* OP_NOT_WHITESPACE variant *);
+    ("(?<=\\S{2,3})", "\xf6\x80", 0, 0l);
+    (* the lookbehind succeeds, then a forward literal continues the match *)
+    ("(?<=\\W{2,3})A", "\xf6\x15A", 0, 0l);
+    (* lazy / possessive / open-ended variable quantifiers *)
+    ("(?<=\\W{2,3}?)", "\xf6\x15", 0, 0l);
+    ("(?<=\\W{2,3}+)", "\xf6\x15", 0, 0l);
+    (* greedy extension: min part ACROSSCHAR, max part GETCHARLEN (extralen) *)
+    ("(?<=\\W{1,5})z", "\xf6\x15\x16z", 0, 0l);
+    (* nested variable + fixed lookbehind, and a trailing optional \d *)
+    ("(?<=\\W{2,3})(?<=\\W)", "\xf6\x15", 0, 0l);
+    ("(?<=\\W{2,3}\\d?)", "\xf6\x15", 0, 0l);
+    (* standalone continuation bytes reached below check_subject: ACROSSCHAR
+       folds a run of them into ONE malformed character *)
+    ("(?<=\\W{2,3})", "\x80\x80", 0, 0l);
+    (* forward \W repeat over a truncated multi-byte tail within a fragment *)
+    ("\\W{2,3}", "\xf6\x15\x16", 0, 0l);
+    (* NOMATCH controls — these MUST keep the GET_EXTRALEN reading (0xf6 = 4
+       code units) and so still fail:
+       - a fixed \W\W (OP_REVERSE) floors at check_subject, not start_subject *)
+    ("(?<=\\W\\W)", "\xf6\x15", 0, 0l);
+    (* - a capture wraps each \W as a SINGLE OP_NOT_WORDCHAR (GETCHARINCTEST) *)
+    ("(?<=(\\W){2,3})", "\xf6\x15", 0, 0l);
+    (* - OP_NOT_DIGIT (\D) reads with GETCHARINC (extralen), so it is NOT on
+         the ACROSSCHAR path *)
+    ("(?<=\\D{2,3})", "\xf6\x15", 0, 0l);
+    (* - a negated class [^0-9] is a CLASS/XCLASS read (extralen) *)
+    ("(?<=[^0-9]{2,3})", "\xf6\x15", 0, 0l);
   ]
 
 let invalid_utf_tests =
