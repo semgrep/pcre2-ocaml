@@ -398,7 +398,16 @@ interpreter is its differential oracle. Approved plan:
   (backtrack-tick / referenced-capture protocol overhead) — the fundamental
   fused-dispatch cost per tick vs the C's single-function register residency,
   the same class of residual M10 characterized for the interpreter.
-- [ ] **O — Gate close** — G11.1 + fuzz long run + plan-update marks the gate.
+- [x] **O — Gate close** — **GATE G11 MET/CLOSED 2026-07-17.**
+  G11.1 MET: conformance `--driver=fast` 3112/3112 in-scope units byte-identical to the
+  oracle, zero `Unsupported` reachable; chunk-O long fuzz clean at ~3M fast-vs-interp
+  comparisons across 4+ fresh seeds AFTER the three tail-hunt FIXes it surfaced
+  (95312 fragment×lookbehind advance; positive-ctype peek incl. a live overlong-UTF
+  divergence; below-floor give-back + raw MATCH_ACCEPT).
+  G11.2 MET: fast/oracle geomean 1.488 ≤ 1.5 (release, 5-rep medians ×3 runs) AND fast
+  strictly faster than the engine on all 12 benchmarks (compare.exe enforces both).
+  G11.3 MET: `dune build -p pcre2` dependency-free every commit; `git diff src/pcre2.mli`
+  empty for the whole milestone.
 
 ## Testing (added incrementally; see the approved plan's testing matrix)
 
