@@ -57,6 +57,14 @@ type datctl = {
   mutable d_control2 : int;
   mutable offset : int;
   mutable oveccount : int;
+  (* Match-context limits (MOD_CTM, pcre2test.c:684/706/718/759). pcre2test
+     stores these directly in a pcre2_match_context; the harness has no
+     match-context object, so it keeps them here and passes them as the
+     per-call ?match_limit/?depth_limit/?heap_limit engine-seam args. -1 =
+     unset (the build default is used at the seam). *)
+  mutable match_limit : int;
+  mutable depth_limit : int;
+  mutable heap_limit : int;
   (* copy/get requests in order of appearance *)
   mutable copy_numbers : int list;
   mutable copy_names : string list;
@@ -83,6 +91,9 @@ let new_datctl () =
     d_control2 = 0;
     offset = 0;
     oveccount = default_oveccount;
+    match_limit = -1;
+    depth_limit = -1;
+    heap_limit = -1;
     copy_numbers = [];
     copy_names = [];
     get_numbers = [];

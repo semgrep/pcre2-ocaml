@@ -47,8 +47,12 @@ type exec_result = {
 (* Identical shape to engine_driver.exec (same seam semantics; see the rc
    comment there). [F.t] is uninhabited until chunk C, so this body is
    compiler-checked dead code until the IR runner lands. *)
-let exec ?(options = 0) ~subject ~offset code : exec_result =
-  match F.exec_full code subject offset (Int32.of_int options) with
+let exec ?(options = 0) ?match_limit ?depth_limit ?heap_limit ~subject ~offset
+    code : exec_result =
+  match
+    F.exec_full ?match_limit ?depth_limit ?heap_limit code subject offset
+      (Int32.of_int options)
+  with
   | Pcre2_engine.Engine.Match { ovector; mark; start_char } ->
       let oveccount = (F.info code).Pcre2_engine.Engine.capture_count + 1 in
       let full = Array.make (2 * oveccount) (-1) in

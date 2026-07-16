@@ -180,6 +180,16 @@ Per-benchmark >2.0x requires explicit user sign-off if any residual.
   pgrep' ` (PID was 320787; it self-matches fuzz_diff in its cmdline).
 
 ### 2.4 Optional / deferred (user-visible decisions, not blockers)
+- Per-call match-context limits — **DONE (2026-07-16)**: `?match_limit`,
+  `?depth_limit`, `?heap_limit` are exposed on both engine seams
+  (`Engine.exec_full`/`exec_captures`, `Pcre2_fast.exec_full`/`exec_captures`)
+  and the public `Matcher` surface (`find`/`find_iter`/`captures`/
+  `captures_iter`); omitted = build default, bit-for-bit as before. The
+  pcre2test `match_limit`/`depth_limit`/`heap_limit`/`recursion_limit`
+  MOD_CTM modifiers are now honored (passed to the driver's `exec` as
+  per-call args; testinput2:1840 `/(?0)/ match_limit=100 -> error -47`
+  passes on all three drivers). `find_limits`/`find_limits_noheap`
+  (search-loop semantics) and `offset_limit` stay harness-skipped.
 - Harness `bincode`/`fullbincode` wiring to `Debug_printer` would convert
   ~117 testinput10 harness-skips into real coverage (dumps already match).
 - `max_varlookbehind` and `offset_limit` knobs: exist in the C contexts;

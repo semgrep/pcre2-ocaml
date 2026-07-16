@@ -26,12 +26,28 @@ type exec_result = {
   startchar : int;
 }
 
+(* 7 args (>5) => bytecode/native external pair. The three trailing limits are
+   the pcre2_match_context knobs (pcre2test MOD_CTM modifiers); -1 = unset, in
+   which case the stub passes a NULL match context (build default), exactly as
+   before this arg existed. *)
 external exec_raw :
-  code -> string -> int -> int -> int * int array * string option * int
-  = "oracle_test_exec"
+  code ->
+  string ->
+  int ->
+  int ->
+  int ->
+  int ->
+  int ->
+  int * int array * string option * int = "oracle_test_exec_byte"
+    "oracle_test_exec"
 
-let exec ?(options = 0) ~subject ~offset code : exec_result =
-  let rc, ovector, mark, startchar = exec_raw code subject offset options in
+let exec ?(options = 0) ?match_limit ?depth_limit ?heap_limit ~subject ~offset
+    code : exec_result =
+  let lim = function None -> -1 | Some v -> v in
+  let rc, ovector, mark, startchar =
+    exec_raw code subject offset options (lim match_limit) (lim depth_limit)
+      (lim heap_limit)
+  in
   { rc; ovector; mark; startchar }
 
 type info = {

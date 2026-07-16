@@ -1,7 +1,7 @@
 ; Conformance baseline: ((<file> <passed> <total-in-scope>) ...)
 ; Regenerate with: dune exec test/conformance/runner.exe -- --update-baseline
 ((testinput1 1290 1290)
- (testinput2 733 733)
+ (testinput2 734 734)
  (testinput4 617 617)
  (testinput5 418 418)
  (testinput8 0 0)

@@ -33,8 +33,12 @@ type exec_result = {
    oracle stub's pcre2_match_data_create_from_pattern shape) by padding
    with -1. rc = 0 (ovector too small) is never produced at this seam; the
    harness emulates pcre2test's finite match-data ovector on top. *)
-let exec ?(options = 0) ~subject ~offset code : exec_result =
-  match E.exec_full code subject offset (Int32.of_int options) with
+let exec ?(options = 0) ?match_limit ?depth_limit ?heap_limit ~subject ~offset
+    code : exec_result =
+  match
+    E.exec_full ?match_limit ?depth_limit ?heap_limit code subject offset
+      (Int32.of_int options)
+  with
   | E.Match { ovector; mark; start_char } ->
       let oveccount = (E.info code).E.capture_count + 1 in
       let full = Array.make (2 * oveccount) (-1) in

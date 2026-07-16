@@ -35,6 +35,9 @@ type act =
   | Set_bsr
   | Set_offset
   | Set_oveccount
+  | Set_match_limit (* MOD_CTM match_limit -> datctl.match_limit *)
+  | Set_depth_limit (* MOD_CTM depth_limit / recursion_limit -> depth_limit *)
+  | Set_heap_limit (* MOD_CTM heap_limit -> datctl.heap_limit *)
   | Nn_copy
   | Nn_get
   | Noop (* recognized; intentionally no effect (behavior already matches) *)
@@ -93,7 +96,7 @@ let modlist : entry array =
     e "copy" DAT NnT Nn_copy;
     e "copy_matched_subject" DAT (OptT Flags.copy_matched_subject) Apply;
     e "debug" PAT (CtlT 0x00022000) Skip;
-    e "depth_limit" CTM IntT Skip;
+    e "depth_limit" CTM IntT Set_depth_limit;
     e "dfa" DAT (CtlT 0x00000200) Skip;
     e "dfa_restart" DAT (OptT Flags.dfa_restart) Skip;
     e "dfa_shortest" DAT (OptT Flags.dfa_shortest) Skip;
@@ -118,7 +121,7 @@ let modlist : entry array =
     e "get" DAT NnT Nn_get;
     e "getall" DAT (CtlT Ctl.ctl_getall) Apply;
     e "global" PNDP (CtlT Ctl.ctl_global) Apply;
-    e "heap_limit" CTM IntT Skip;
+    e "heap_limit" CTM IntT Set_heap_limit;
     e "heapframes_size" PND (Ctl2T 0x20000000) Skip;
     e "hex" PAT (CtlT Ctl.ctl_hexpat) Apply;
     e "info" PAT (CtlT 0x00020000) Skip;
@@ -132,7 +135,7 @@ let modlist : entry array =
     e "locale" PAT (StrT 32) Skip;
     e "mark" PNDP (CtlT Ctl.ctl_mark) Apply;
     e "match_invalid_utf" PAT (OptT Flags.match_invalid_utf) Apply;
-    e "match_limit" CTM IntT Skip;
+    e "match_limit" CTM IntT Set_match_limit;
     e "match_line" CTC (OptT Flags.extra_match_line)
       (Extra Flags.extra_match_line);
     e "match_unset_backref" PAT (OptT Flags.match_unset_backref) Apply;
@@ -175,7 +178,9 @@ let modlist : entry array =
     e "push" PAT (CtlT 0x02000000) Skip;
     e "pushcopy" PAT (CtlT 0x04000000) Skip;
     e "pushtablescopy" PAT (CtlT 0x08000000) Skip;
-    e "recursion_limit" CTM IntT Skip;
+    (* recursion_limit is an obsolete synonym for depth_limit
+       (pcre2test.c:759). *)
+    e "recursion_limit" CTM IntT Set_depth_limit;
     e "regerror_buffsize" PAT IntT Skip;
     e "replace" PND (StrT 100) Skip;
     e "stackguard" PAT IntT Skip;
@@ -262,7 +267,11 @@ let check_modifier (m : entry) ~ctx ~(pctl : Ctl.patctl option)
         | (CtxDefpat | CtxPat), Some p -> Some (Tpctx p)
         | _ -> fail ())
     | CTM -> (
-        (* match-context fields are out of scope; validity still matters *)
+        (* pcre2test.c:3707-3709 — MOD_CTM fields live in the match context
+           (default_dat_context for CTX_DEFDAT, dat_context for CTX_DAT). The
+           harness has no match-context object, so the honored limits
+           (match/depth/heap, MOD_INT) are stored in the datctl and passed as
+           per-call engine-seam args; offset_limit stays Skip. *)
         match (ctx, dctl) with
         | (CtxDefdat | CtxDat), Some d -> Some (Tdat d)
         | _ -> fail ())
@@ -564,6 +573,9 @@ let decode ~ctx ~(pctl : Ctl.patctl option) ~(dctl : Ctl.datctl option)
                         (match (m.act, target) with
                         | Set_offset, Tdat d -> d.Ctl.offset <- v
                         | Set_oveccount, Tdat d -> d.Ctl.oveccount <- v
+                        | Set_match_limit, Tdat d -> d.Ctl.match_limit <- v
+                        | Set_depth_limit, Tdat d -> d.Ctl.depth_limit <- v
+                        | Set_heap_limit, Tdat d -> d.Ctl.heap_limit <- v
                         | Skip, _ -> skip ("modifier:" ^ m.name)
                         | _ -> ());
                         pp := j)

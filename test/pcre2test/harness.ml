@@ -5,8 +5,10 @@
    8-bit mode, interpreter matching only.
 
    Out-of-scope pcre2test features (JIT, DFA, POSIX, callouts, substitute,
-   info/debug output, limits, serialization, locales/tables, ...) are
-   RECOGNIZED and reported as unit skip reasons; see modifiers.ml. *)
+   info/debug output, find_limits/offset_limit, serialization,
+   locales/tables, ...) are RECOGNIZED and reported as unit skip reasons; see
+   modifiers.ml. The match/depth/heap_limit MOD_CTM modifiers ARE honored,
+   passed to the driver as per-call limit args. *)
 
 module Make (D : Driver.S) = struct
   type compiled = {
@@ -597,8 +599,14 @@ module Make (D : Driver.S) = struct
     let loop = ref true in
     while !loop do
       let res =
+        (* MOD_CTM match-context limits (modifiers.ml); -1 = unset -> None ->
+           build default at the engine seam (C's NULL/default mcontext). *)
+        let lim v = if v < 0 then None else Some v in
         D.exec
           ~options:(dat.Ctl.d_options lor !g_notempty)
+          ?match_limit:(lim dat.Ctl.match_limit)
+          ?depth_limit:(lim dat.Ctl.depth_limit)
+          ?heap_limit:(lim dat.Ctl.heap_limit)
           ~subject:!subj ~offset:!offset cp.code
       in
       let ov = res.D.ovector in

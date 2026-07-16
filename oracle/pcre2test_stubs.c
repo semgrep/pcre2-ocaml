@@ -148,7 +148,8 @@ CAMLprim value oracle_test_compile(value pattern, value voptions, value vnewline
  *   0 -> String_val(subject) handed to pcre2 directly, as the stub did
  *        before 13454e2. TIMING-ONLY -- see oracle_test_exec_nopad. */
 static value test_exec_common(value vcode, value subject, value voffset, value voptions,
-                              int use_slack) {
+                              int use_slack, long match_limit, long depth_limit,
+                              long heap_limit) {
         CAMLparam4(vcode, subject, voffset, voptions);
         CAMLlocal4(res, ovec_arr, mark_opt, mark_str);
 
@@ -169,9 +170,28 @@ static value test_exec_common(value vcode, value subject, value voffset, value v
         unsigned char *subj_buf =
             use_slack ? oracle_slack_dup((const unsigned char *)String_val(subject), subject_len)
                       : (unsigned char *)String_val(subject);
+
+        /* Per-call match-context limits (pcre2test MOD_CTM modifiers). Any
+         * limit >= 0 means "set"; build a context and apply the set ones
+         * (pcre2_context.c:435-452), else pass NULL exactly as before. */
+        pcre2_match_context *mcontext = NULL;
+        if (match_limit >= 0 || depth_limit >= 0 || heap_limit >= 0) {
+                mcontext = pcre2_match_context_create(NULL);
+                if (mcontext == NULL) {
+                        /* dev-only: abort on alloc failure, as oracle_slack_dup */
+                        fprintf(stderr, "test_exec_common: out of memory (match context)\n");
+                        abort();
+                }
+                if (match_limit >= 0) pcre2_set_match_limit(mcontext, (uint32_t)match_limit);
+                if (depth_limit >= 0) pcre2_set_depth_limit(mcontext, (uint32_t)depth_limit);
+                if (heap_limit >= 0) pcre2_set_heap_limit(mcontext, (uint32_t)heap_limit);
+        }
+
         int rc = pcre2_match(regex, (PCRE2_SPTR)subj_buf, subject_len,
-                             (PCRE2_SIZE)Long_val(voffset), (uint32_t)Long_val(voptions), md, NULL);
+                             (PCRE2_SIZE)Long_val(voffset), (uint32_t)Long_val(voptions), md,
+                             mcontext);
         if (use_slack) oracle_slack_free(subj_buf);
+        if (mcontext != NULL) pcre2_match_context_free(mcontext);
 
         ovec_arr = caml_alloc(2 * oveccount, 0);
         for (uint32_t i = 0; i < 2 * oveccount; i++) {
@@ -242,13 +262,24 @@ static value test_exec_common(value vcode, value subject, value voffset, value v
 }
 
 /* exec : code -> string -> int (offset) -> int (options)
+ *      -> int (match_limit) -> int (depth_limit) -> int (heap_limit)
  *      -> int (rc) * int array (ovector, unset = -1) * string option (mark)
  *      * int (startchar)
  * DEFAULT entry point (oracle/test_driver.ml): subject slack-padded, so the
  * fuzzer and the conformance runner always get the pinned reads-as-zero
- * overrun model. */
-CAMLprim value oracle_test_exec(value vcode, value subject, value voffset, value voptions) {
-        return test_exec_common(vcode, subject, voffset, voptions, /*use_slack=*/1);
+ * overrun model. The three trailing limits are the match-context knobs
+ * (-1 = unset -> NULL context, exactly the pre-limit behavior). 7 args (>5),
+ * so OCaml needs the bytecode/native external pair below. */
+CAMLprim value oracle_test_exec(value vcode, value subject, value voffset, value voptions,
+                                value vmatch_limit, value vdepth_limit, value vheap_limit) {
+        return test_exec_common(vcode, subject, voffset, voptions, /*use_slack=*/1,
+                                Long_val(vmatch_limit), Long_val(vdepth_limit),
+                                Long_val(vheap_limit));
+}
+
+CAMLprim value oracle_test_exec_byte(value *argv, int argn) {
+        (void)argn; /* fixed arity 7 */
+        return oracle_test_exec(argv[0], argv[1], argv[2], argv[3], argv[4], argv[5], argv[6]);
 }
 
 /* exec, UNPADDED subject -- TIMING ONLY. Same signature as oracle_test_exec.
@@ -272,7 +303,10 @@ CAMLprim value oracle_test_exec(value vcode, value subject, value voffset, value
  * writing a new external declaration. The mark-read guard (5c790c2) is in
  * test_exec_common and therefore applies here too. */
 CAMLprim value oracle_test_exec_nopad(value vcode, value subject, value voffset, value voptions) {
-        return test_exec_common(vcode, subject, voffset, voptions, /*use_slack=*/0);
+        /* Bench-only: keeps its 4-arg shape; forwards unset (-1) limits so it
+         * always uses the NULL/default match context. */
+        return test_exec_common(vcode, subject, voffset, voptions, /*use_slack=*/0,
+                                /*match_limit=*/-1, /*depth_limit=*/-1, /*heap_limit=*/-1);
 }
 
 /* info : code -> int (argoptions) * int (alloptions) * int (newline)

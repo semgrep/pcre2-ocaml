@@ -1139,7 +1139,11 @@ shadow state; there is no physical frame arena.
 - Order at a child tick (transcribes rmatch, interpreter.ml:1188-1267): (1) heap push/grow
   for frame `new_rdepth`, then (2) `mcc` vs `match_limit`, then (3) `new_rdepth` vs
   `match_limit_depth`.
-- Limits resolved as `min(re.limit_*, Limits.*)` per interpreter.ml:9825-9837.
+- Limits resolved as `min(re.limit_*, mcontext_*)` per interpreter.ml:9825-9837
+  (`Limits.resolve_limit`). Since 2026-07-16 the mcontext term arrives as the per-call
+  `?match_limit`/`?depth_limit`/`?heap_limit` args of `Runner.exec` (defaulting to the
+  build `Limits.*` when omitted, bit-for-bit as before); pcre2test's MOD_CTM modifiers reach
+  the fast driver through these seam args.
 
 **Tick-site table (IR instruction / event → ticks).** `d` = current `rdepth`. Derived from
 the OP_BRA/OP_ALT/OP_KET arms: only branch entries that the C rmatches (`grouploop` for the

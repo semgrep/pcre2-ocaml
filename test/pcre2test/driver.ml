@@ -25,7 +25,19 @@ module type S = sig
     startchar : int;
   }
 
-  val exec : ?options:int -> subject:string -> offset:int -> code -> exec_result
+  val exec :
+    ?options:int ->
+    ?match_limit:int ->
+    ?depth_limit:int ->
+    ?heap_limit:int ->
+    subject:string ->
+    offset:int ->
+    code ->
+    exec_result
+  (** [match_limit]/[depth_limit]/[heap_limit] are the pcre2_match_context
+      limit knobs (pcre2test's MOD_CTM modifiers, pcre2_set_*_limit). [None]
+      means the build default (no context / NULL mcontext, exactly C's
+      default). *)
 
   type info = {
     argoptions : int;
