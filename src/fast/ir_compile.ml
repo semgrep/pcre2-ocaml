@@ -34,14 +34,10 @@ exception Unsupported of string
    precise and stable for skip-report grouping. *)
 let reason_of_op (op : int) : string =
   let named name chunk = "fast: " ^ name ^ " (chunk " ^ chunk ^ ")" in
-  (* Simple-anchor variants and boundaries whose runtime semantics arrive
-     with the runner (chunk C2+). *)
-  if Int.equal op Op.op_set_som then named "\\K" "C2+"
-    (* Class / ref repeat quantifiers OP_CRSTAR..OP_CRPOSRANGE: a class repeat
-       is consumed inline after its OP_CLASS/OP_NCLASS in [compile_branch]; a
-       standalone CR* here can only follow an (out-of-subset) OP_REF (chunk
-       F). *)
-  else if op >= Op.op_crstar && op <= Op.op_crposrange then
+  (* Class / ref repeat quantifiers OP_CRSTAR..OP_CRPOSRANGE: a class repeat
+     is consumed inline after its OP_CLASS/OP_NCLASS in [compile_branch]; a
+     standalone CR* here can only follow an (out-of-subset) OP_REF (chunk F). *)
+  if op >= Op.op_crstar && op <= Op.op_crposrange then
     named "ref repeat" "F"
     (* Back references (chunk F). *)
   else if Int.equal op Op.op_ref then named "OP_REF" "F"
@@ -81,10 +77,8 @@ let reason_of_op (op : int) : string =
   else if op >= Op.op_cref && op <= Op.op_true then named "conditional ref" "J"
   else if Int.equal op Op.op_define then named "OP_DEFINE" "J"
     (* Backtracking control verbs (chunk H) are lowered in [compile_branch];
-       OP_ASSERT_ACCEPT (( *ACCEPT) inside an assertion — needs MATCH_ACCEPT
-       propagation to the assertion boundary with capture fishing) is declined. *)
-  else if Int.equal op Op.op_assert_accept then
-    named "(*ACCEPT) inside assertion" "H+"
+       chunk K2 lowers OP_ASSERT_ACCEPT (( *ACCEPT) inside an assertion) there too
+       via the enclosing-assertion accept context, so it no longer reaches here. *)
   else "fast: opcode " ^ string_of_int op ^ " (unclassified)"
 
 (* Anchor opcode -> IR tag; [None] otherwise. Chunk D adds the multiline
@@ -462,6 +456,47 @@ let compile (re : C.re) : (Ir.t, string) result =
        atomic groups), so the runner tags their KIND_ONCE boundary with the
        pos-assert subtype for THEN containment. *)
     let once_assert_list = ref [] in
+    (* Chunk K2 (fast-design.md §3): t_once pcs that are NON-ATOMIC positive
+       assertions (OP_ASSERT_NA/ASSERTBACK_NA). Their KIND_ONCE gets the
+       once_na_assert subtype: it contains ( *THEN) / handles ( *ACCEPT) like any
+       positive assertion, but does NOT set mb.once_base (non-atomic, re-enterable
+       body — see push_once). *)
+    let once_na_list = ref [] in
+    (* Chunk K2 (fast-design.md §3): ALT pcs of a NON-ATOMIC positive assertion's
+       branches. The C's assertion RM3 treats MATCH_THEN like MATCH_NOMATCH — it
+       tries the assertion's NEXT branch (pcre2_match.c:5529-5532), for a THEN
+       from ANYWHERE reaching the assertion (including its continuation, which for
+       a non-atomic assertion runs in the still-live body frame). Since a NA
+       assertion keeps its branches live, such a continuation THEN must retry them.
+       These ALTs therefore get [then_always] (convert THEN regardless of the
+       grouploop pc scope check), unlike an atomic assertion whose branches are
+       discarded at the commit. *)
+    let na_alt_pc_list = ref [] in
+    (* Chunk K2 (fast-design.md §3): the stack of enclosing lookaround-assertion
+       contexts for ( *ACCEPT) inside an assertion (OP_ASSERT_ACCEPT). Each entry
+       is (conv_kind, target-fixup-slots): conv_kind (Ir.accept_positive /
+       accept_negative / accept_cond) names the assertion's convergence action;
+       the fixup slots are the t_assert_accept target operands, patched to the
+       assertion's continuation (positive) or match_target (cond) once known. An
+       OP_ASSERT_ACCEPT reads the TOP context (its innermost enclosing lookaround,
+       matching the C's MATCH_ACCEPT propagation to the innermost assertion). *)
+    let accept_ctx : (int * int list ref) list ref = ref [] in
+    (* Enter an assertion's accept scope; returns its target-fixup list. *)
+    let accept_push (kind : int) : int list ref =
+      let fixups = ref [] in
+      accept_ctx := (kind, fixups) :: !accept_ctx;
+      fixups
+    in
+    (* Leave the innermost accept scope (its body branches are fully compiled),
+       WITHOUT patching — a ( *ACCEPT) in an OUTER construct's branch (e.g. a
+       conditional's yes/no branch, compiled after the condition assertion) must
+       NOT see this context. The fixups are patched to the target once known. *)
+    let accept_pop () : unit =
+      match !accept_ctx with _ :: rest -> accept_ctx := rest | [] -> ()
+    in
+    let accept_patch (fixups : int list ref) (target : int) : unit =
+      List.iter (fun slot -> set slot target) !fixups
+    in
     (* Chunk D2: fresh id per empty-check-tracked repeated group (grouploop
        bracket + KETRMAX/KETRMIN); indexes [mb.group_start] at run time
        (fast-design.md §3). OP_BRA repeats (bra_loop) get [Ir.no_group]. *)
@@ -711,13 +746,6 @@ let compile (re : C.re) : (Ir.t, string) result =
       let atomic_rep_group =
         if atomic_group && repeating then fresh_group () else Ir.no_group
       in
-      (* Chunk H: a NON-ATOMIC positive assertion (OP_ASSERT_NA/ASSERTBACK_NA)
-         has NO KIND_ONCE boundary, so a ( *THEN) escaping to (or inside) it
-         cannot be contained. Decline it when the pattern contains ( *THEN)
-         (safe — atomic positive assertions are handled by the KIND_ONCE
-         pos-assert subtype below). *)
-      if pos_na && hasthen then
-        raise (Unsupported "fast: (*THEN) with non-atomic assertion (chunk H+)");
       let has_vreverse =
         List.exists (fun b -> Int.equal (byte b) Op.op_vreverse) branch_offs
       in
@@ -731,10 +759,21 @@ let compile (re : C.re) : (Ir.t, string) result =
          re-records its start (t_group_start). *)
       let entry_pc = here () in
       (* Entry markers. Record an atomic positive assertion's t_once pc so its
-         KIND_ONCE boundary gets the pos-assert subtype (THEN containment). *)
-      if atomic_group || pos_atomic then (
-        if pos_atomic then once_assert_list := here () :: !once_assert_list;
-        push Ir.t_once);
+         KIND_ONCE boundary gets the pos-assert subtype (THEN containment). Chunk
+         K2 — a NON-ATOMIC positive assertion ALSO pushes a t_once (once_na_assert
+         subtype) so a ( *THEN) reaching it is contained and a ( *ACCEPT) inside it
+         finds a boundary; it does NOT set mb.once_base (push_once, keyed on the
+         subtype). This replaces the H-era ( *THEN)+NA decline. *)
+      (* [once_cont_slot] (chunk K2): the t_once's cont operand for a positive
+         assertion, patched to the assertion continuation after ASSERT_END; -1 for
+         an atomic group (unused — a ( *ACCEPT) walk passes through once_group). *)
+      let once_cont_slot = ref (-1) in
+      if atomic_group || pos_atomic || pos_na then (
+        if pos_atomic then once_assert_list := here () :: !once_assert_list
+        else if pos_na then once_na_list := here () :: !once_na_list;
+        push Ir.t_once;
+        once_cont_slot := here ();
+        push (-1) (* cont placeholder, patched (positive) or left -1 (group) *));
       (* A repeated atomic group records its per-iteration start (empty check)
          right after the t_once, so the loop-back re-records it. *)
       if atomic_group && repeating then (
@@ -750,6 +789,15 @@ let compile (re : C.re) : (Ir.t, string) result =
         push Ir.t_group_start;
         push group_id);
       push Ir.t_bra;
+      (* Chunk K2 — enter an assertion's accept context (a ( *ACCEPT) inside the
+         body commits THIS assertion). An atomic group (OP_ONCE) is NOT an
+         assertion, so it pushes no context. *)
+      let accept_fixups =
+        if pos_atomic || pos_na then accept_push Ir.accept_positive
+        else if neg then accept_push Ir.accept_negative
+        else ref []
+      in
+      let has_accept_ctx = pos_atomic || pos_na || neg in
       let multibranch = List.length branch_offs >= 2 in
       let jmp_fixups = ref [] in
       let prev_cp = ref (-1) in
@@ -759,6 +807,9 @@ let compile (re : C.re) : (Ir.t, string) result =
           if !prev_cp >= 0 then patch_alt !prev_cp entry multibranch;
           push Ir.t_alt;
           let cp_operand = here () in
+          (* Chunk K2 — a NA positive assertion's branch ALT always converts THEN
+             (the ALT pc = cp_operand - 1). *)
+          if pos_na then na_alt_pc_list := (cp_operand - 1) :: !na_alt_pc_list;
           push 0 (* handler placeholder *);
           prev_cp := cp_operand;
           ignore (compile_branch b_off : int);
@@ -796,11 +847,24 @@ let compile (re : C.re) : (Ir.t, string) result =
       else if pos_atomic || pos_na then (
         push Ir.t_assert_end;
         push (if pos_atomic then 1 else 0);
-        push group_id)
+        push group_id;
+        (* Chunk K2 — the assertion continuation is just past ASSERT_END (here()).
+           Store it in the t_once cont slot: a ( *ACCEPT) reaching THIS assertion's
+           KIND_ONCE boundary jumps there (the boundary's cont, whether this is the
+           ACCEPT's lexical assertion or an inner one). The compile-time accept
+           target is unused for positive boundaries (backtrack_accept reads the
+           boundary's cont), so patch the fixups to the same value defensively. *)
+        set !once_cont_slot (here ());
+        accept_patch accept_fixups (here ()))
       else (
         push Ir.t_nassert_match;
+        (* Chunk K2 — a ( *ACCEPT) in a NEGATIVE assertion fails the assertion
+           (NASSERT_MATCH); the target operand is unused (the runtime propagates
+           NOMATCH past the boundary), so patch it to 0. *)
+        accept_patch accept_fixups 0;
         (* the negative assertion's success continuation is right past here. *)
         set !nassert_cont_operand (here ()));
+      if has_accept_ctx then accept_pop ();
       List.iter (fun j -> set j conv_ir) !jmp_fixups;
       ket_off + Op.op_lengths.(ket_op)
     (* [compile_script_run bra_off]: lower a script-run group OP_SCRIPT_RUN …
@@ -902,6 +966,18 @@ let compile (re : C.re) : (Ir.t, string) result =
       let ovbase =
         if is_cap then 2 * C.get2 src (bra_off + 1 + Limits.link_size) else 0
       in
+      (* Chunk K2 — the recursion number for this possessive group: a capturing
+         OP_CBRAPOS/OP_SCBRAPOS is group N (= ovbase/2), the only recursion-callable
+         possessive; a non-capturing OP_BRAPOS/OP_SBRAPOS uses -1 (no group number
+         can equal -1, so mb.current_recurse never matches it — group 0, the whole
+         pattern, is never a possessive bracket). t_ketrpos/t_possess_done carry
+         it: during a recursion INTO the group the ket RETURNS (like a normal
+         recursion) and the branch exhaustion is a plain NOMATCH, bypassing the
+         possessive loop (pcre2_match.c:6056-6074 / :5495). -2 is used for a
+         non-capturing possessive: mb.current_recurse is only ever -1 (unset) or a
+         group number >= 0, so -2 never matches (a plain -1 sentinel would collide
+         with RECURSE_UNSET and misfire the recursion-return check). *)
+      let rec_number = if is_cap then ovbase lsr 1 else -2 in
       let rec collect (p : int) (acc : int list) : int list * int =
         let start = p + Op.op_lengths.(byte p) in
         let nxt = p + link p in
@@ -919,6 +995,13 @@ let compile (re : C.re) : (Ir.t, string) result =
       push ovbase;
       push (if zero_allowed then 1 else 0);
       let body_entry = here () in
+      (* Chunk K2 — record this possessive bracket's recursion ENTRY = its t_bra
+         (the first-branch head), so a (?N) call into an OP_CBRAPOS/OP_SCBRAPOS
+         capture resolves at fixup time (was declined K1b-residual). The recursion
+         jumps here SKIPPING t_possess (no KIND_POS boundary): the call runs the
+         branches grouploop-style (RM11) and returns at t_ketrpos, exactly as the
+         C runs `RMATCH(bracode + oplengths, RM11)` (pcre2_match.c:5468). *)
+      record_bracket bra_off body_entry;
       push Ir.t_bra;
       let multibranch = List.length branch_offs >= 2 in
       let jmp_fixups = ref [] in
@@ -942,10 +1025,12 @@ let compile (re : C.re) : (Ir.t, string) result =
       push Ir.t_ketrpos;
       push body_entry;
       push ovbase;
+      push rec_number;
       (* POSSESS_DONE: reached when the branches are exhausted (the last ALT's
          handler) or on an empty-match break (falls through from KETRPOS). *)
       let done_pc = here () in
       push Ir.t_possess_done;
+      push rec_number;
       if !prev_cp >= 0 then patch_alt !prev_cp done_pc multibranch;
       List.iter (fun j -> set j ketrpos_pc) !jmp_fixups;
       ket_off + Op.op_lengths.(ket_op)
@@ -1113,6 +1198,12 @@ let compile (re : C.re) : (Ir.t, string) result =
         in
         let jmp_fixups = ref [] in
         let prev_cp = ref (-1) in
+        (* Chunk K2 — a ( *ACCEPT) inside the assertion CONDITION body commits the
+           condition-assertion (COND_ASSERT_MATCH); the target is match_target
+           (patched once known). This context covers ONLY the condition branches —
+           it is popped before the yes/no branches, whose ( *ACCEPT) belongs to an
+           OUTER lookaround, not this condition. *)
+        let cond_fixups = accept_push Ir.accept_cond in
         let rec branches (p : int) : unit =
           let entry = here () in
           if !prev_cp >= 0 then patch_alt !prev_cp entry multibranch;
@@ -1147,6 +1238,11 @@ let compile (re : C.re) : (Ir.t, string) result =
         let match_slot = here () in
         push 0 (* match_target placeholder *);
         List.iter (fun j -> set j conv_pc) !jmp_fixups;
+        (* Chunk K2 — the condition assertion's accept scope ENDS here (before the
+           yes/no branches): pop it so a ( *ACCEPT) in a yes/no branch targets its
+           OUTER lookaround, not this condition. The fixups are patched to
+           match_target below (once the branch heads are known). *)
+        accept_pop ();
         (* Yes head (match_target for positive), no head (nomatch_target for
            positive). Each descends first for OP_SCOND. *)
         let yes_head = here () in
@@ -1166,6 +1262,9 @@ let compile (re : C.re) : (Ir.t, string) result =
         else push Ir.t_ket;
         set match_slot (if positive then yes_head else no_head);
         set nomatch_slot (if positive then no_head else yes_head);
+        (* Chunk K2 — patch the condition assertion's ( *ACCEPT) fixups to the
+           match_target (the condition is Lpositive, so the "matched" branch). *)
+        accept_patch cond_fixups (if positive then yes_head else no_head);
         set !yes_jmp ket_ir)
       else (
         (* Non-assertion condition: inline test. OP_SCOND descends once BEFORE
@@ -1219,6 +1318,26 @@ let compile (re : C.re) : (Ir.t, string) result =
            set !no_operand (if two_branch then no_ir else ket_ir));
         if two_branch then set !yes_jmp ket_ir);
       ket_off + Op.op_lengths.(ket_op)
+    (* [compile_bracketish inner]: lower whatever bracket begins at [inner]
+       (chunk K2 — the group behind an OP_SKIPZERO {0} block, and the shared
+       dispatch a wrapper like BRAZERO uses), routing to the right compiler by
+       the bracket opcode. Returns the bytecode offset past the group. *)
+    and compile_bracketish (inner : int) : int =
+      let inner_op = byte inner in
+      if Int.equal inner_op Op.op_cond || Int.equal inner_op Op.op_scond then
+        compile_cond inner
+      else if Int.equal inner_op Op.op_script_run then compile_script_run inner
+      else if
+        Int.equal inner_op Op.op_once
+        || (inner_op >= Op.op_assert && inner_op <= Op.op_assertback_na)
+      then compile_lookaround inner
+      else if
+        Int.equal inner_op Op.op_brapos || Int.equal inner_op Op.op_cbrapos
+        || Int.equal inner_op Op.op_sbrapos || Int.equal inner_op Op.op_scbrapos
+      then compile_possess inner false
+      else if Int.equal inner_op Op.op_braposzero then
+        compile_possess (inner + Op.op_lengths.(inner_op)) true
+      else compile_group inner
     (* [compile_branch p0]: lower one branch body; stops at (without
        consuming) the branch terminator (OP_ALT or an OP_KET family opcode)
        that closes the enclosing group; returns that terminator's offset. *)
@@ -1439,19 +1558,23 @@ let compile (re : C.re) : (Ir.t, string) result =
           p := after)
         else if Int.equal op Op.op_skipzero then (
           (* OP_SKIPZERO (pcre2_match.c:5242-5246) — a {0}-quantified group:
-             never entered, so emit no IR; just advance the bytecode pointer
-             past the whole (dead) group, exactly as the C does
-             (Fecode++; skip alts; += 1 + LINK_SIZE). Skipping the walk means
-             an unsupported construct INSIDE a {0} group cannot decline the
-             pattern — strictly safe, since the group is dead code. *)
-          let bra_off = !p + Op.op_lengths.(op) in
-          let rec find_ket (q : int) : int =
-            let nxt = q + link q in
-            if Int.equal (byte nxt) Op.op_alt then (find_ket [@tailcall]) nxt
-            else nxt
-          in
-          let ket_off = find_ket bra_off in
-          p := ket_off + Op.op_lengths.(byte ket_off))
+             forward flow SKIPS it, but chunk K2 COMPILES the group (behind a JMP)
+             so a recursion (?N)/(?&name) can call a group defined ONLY in a {0}
+             block — the "define a subroutine you only call" idiom
+             ("(?:(a...)){0}(?:(?1)|…)"). Emitting a JMP over the (dead-for-forward-
+             flow) group records its brackets for the recursion fixup and mirrors
+             the C, whose bytecode keeps the group so OP_RECURSE can jump into it
+             (the elide-entirely approach of chunks C-K1b never recorded it). No
+             unsupported opcode remains inside a {0} group after K2, so compiling
+             cannot decline. The JMP does not tick (the C's SKIPZERO is a same-frame
+             forward skip). *)
+          push Ir.t_jmp;
+          let j = here () in
+          push 0 (* skip target, patched past the compiled group *);
+          let inner = !p + Op.op_lengths.(op) in
+          let after = compile_bracketish inner in
+          set j (here ());
+          p := after)
         else if Int.equal op Op.op_not || Int.equal op Op.op_noti then (
           (* Single negated char (pcre2_match.c:1107-1174 non-UTF;
              interpreter.ml:1701-1717): "not this char", caseless via fcc for
@@ -1740,6 +1863,26 @@ let compile (re : C.re) : (Ir.t, string) result =
              :847-872), otherwise the fall-through-to-END whole-match form. *)
           push Ir.t_accept;
           p := !p + Op.op_lengths.(op))
+        else if Int.equal op Op.op_assert_accept then (
+          (* OP_ASSERT_ACCEPT (chunk K2, pcre2_match.c:832-840) — ( *ACCEPT)
+             inside a lookaround assertion: RRETURN(MATCH_ACCEPT) propagates to the
+             innermost enclosing assertion boundary (the TOP accept context) and
+             commits it there. Emit t_assert_accept with the context's conv_kind
+             and a placeholder target, patched by accept_pop to the assertion's
+             continuation (positive) / match_target (cond) once emitted. The
+             compiler ONLY produces OP_ASSERT_ACCEPT inside a lookaround, so the
+             context stack is non-empty; a defensive empty case declines. *)
+          (match !accept_ctx with
+          | (kind, fixups) :: _ ->
+              push Ir.t_assert_accept;
+              push kind;
+              let slot = here () in
+              push 0 (* target placeholder *);
+              fixups := slot :: !fixups
+          | [] ->
+              raise
+                (Unsupported "fast: (*ACCEPT) inside assertion (no context)"));
+          p := !p + Op.op_lengths.(op))
         else if Int.equal op Op.op_close then (
           (* OP_CLOSE (pcre2_match.c:809-829) — close an open capture before an
              OP_ACCEPT. GET2(p+1) = group number N. A referenced (non-optimized)
@@ -1766,6 +1909,12 @@ let compile (re : C.re) : (Ir.t, string) result =
             else C.get src (!p + 1 + (2 * Limits.link_size))
           in
           p := !p + len)
+        else if Int.equal op Op.op_set_som then (
+          (* OP_SET_SOM (chunk K2; \K, pcre2_match.c:6252-6255) — reset the
+             reported match start to the current position. The runner pushes a
+             KIND_SET_SOM save record and sets mb.start_match = eptr. *)
+          push Ir.t_set_som;
+          p := !p + Op.op_lengths.(op))
         else
           match anchor_tag op with
           | Some tag ->
@@ -1801,8 +1950,14 @@ let compile (re : C.re) : (Ir.t, string) result =
          array from the recorded t_once positions (default 0 = atomic group). *)
       let alt_then_end = Array.make !n (-1) in
       List.iter (fun (pc, v) -> alt_then_end.(pc) <- v) !alt_then_list;
+      (* Chunk K2 — a NON-ATOMIC positive assertion's branch ALTs always convert
+         THEN to the next branch (the C's RM3 tries the next branch for any
+         MATCH_THEN reaching the assertion). Applied AFTER alt_then_list so it
+         wins. *)
+      List.iter (fun pc -> alt_then_end.(pc) <- Ir.then_always) !na_alt_pc_list;
       let once_subtype = Array.make !n Ir.once_group in
       List.iter (fun pc -> once_subtype.(pc) <- Ir.once_pos_assert) !once_assert_list;
+      List.iter (fun pc -> once_subtype.(pc) <- Ir.once_na_assert) !once_na_list;
       {
         Ir.code = Array.sub !buf 0 !n;
         lit = Buffer.contents lit;

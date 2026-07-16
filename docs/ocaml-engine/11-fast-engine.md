@@ -304,10 +304,36 @@ interpreter is its differential oracle. Approved plan:
   **Declined (K1b-residual):** OP_RECURSE into a POSSESSIVE capture
   (OP_CBRAPOS/OP_SCBRAPOS — the OP_KETRPOS ket-return + skipped KIND_POS
   boundary; ~18 units).
-- [ ] **K2 — \K + H+ cleanups** — OP_SET_SOM (\K, ~36 units), (*ACCEPT) inside all
-  4 assertion kinds (~13), (*THEN) with non-atomic assertions, and OP_RECURSE
-  into a possessive capture (K1b-residual). After K2 the decline list reads
-  exactly {PCRE2_FIRSTLINE (chunk L)}.
+- [x] **K2 — \K + H+ cleanups** — OP_SET_SOM (\K) via a new `t_set_som` + the
+  KIND_SET_SOM restore record (the C's per-frame Fstart_match); every COMMITTING
+  boundary (KIND_ONCE / KIND_NASSERT / KIND_POS / the FAT KIND_RECURSE) now
+  snapshots `saved_start_match` (like saved_mark) so \K reverts on backtrack-past
+  a commit; `Match.start_char` = pcre2_get_startchar (the attempt start,
+  `ostartchar`), distinct from the \K-moved ovector[0]. (*ACCEPT) inside all 4
+  assertion kinds via `t_assert_accept` + a save-stack walk `backtrack_accept` to
+  the innermost ACTIVE assertion boundary (the C's MATCH_ACCEPT to the innermost
+  assertion RM3/RM4/RM5): a positive boundary commits + jumps to ITS OWN
+  continuation (stored in the KIND_ONCE `cont` slot, since an inner NA/atomic
+  assertion's boundary can linger past its success) + converts to once_group so a
+  re-fired ACCEPT passes through; a negative boundary fails (NASSERT_MATCH); a
+  condition boundary is COND_ASSERT_MATCH (mark/\K do NOT escape — RM5 skips
+  them, unlike a normal cond-assert match). (*THEN) with a NON-ATOMIC positive
+  assertion via the `once_na_assert` KIND_ONCE boundary (contains THEN like a
+  positive assertion, but does NOT set mb.once_base — non-atomic, re-enterable);
+  a NA assertion's branch ALTs carry `Ir.then_always` so a THEN reaching them
+  (from anywhere, incl. the continuation) tries the next branch (the C's RM3
+  next-branch retry, which for a non-atomic assertion re-explores its live
+  branches — the nomatch_mark witness). OP_RECURSE into a possessive capture
+  (OP_CBRAPOS/OP_SCBRAPOS): `compile_possess` records the bracket + t_ketrpos /
+  t_possess_done carry the recursion `number`, so the ket RETURNS like a normal
+  recursion (pcre2_match.c:6056-6074) and branch exhaustion is a plain NOMATCH,
+  bypassing the possessive loop; a group defined only in a `{0}` block
+  (OP_SKIPZERO) is now COMPILED behind a forward-skip JMP so a `(?N)` can call it.
+  New IR tags SET_SOM (74) / ASSERT_ACCEPT (75) + subtype once_na_assert + save
+  kind KIND_SET_SOM (17). Ratchet +67 units (testinput1 +37, testinput2 +27,
+  testinput5 +3), zero failures; fuzz fast-vs-interp clean over 2.8M+ comparisons
+  (7 seeds x 100k) + the battery's fresh-seed stages. **After K2 the decline list
+  reads exactly {PCRE2_FIRSTLINE (chunk L)}.**
 - [ ] **L — JIT start-opts** — scan_prefix + range skip table (`:5592,6159-6330`),
   first_cu/req_cu scalar ports, startline/start_bits/minlength.
 - [ ] **M — Early-fail + tuning** — detect_early_fail watermarks (`:1292`, types `:232`);

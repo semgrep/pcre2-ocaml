@@ -183,6 +183,78 @@ captures — could be stale). Design notes:
   check (the RM11 THEN case = the grouploop one).
 - **RECURSELOOP (-52)** — see §3 (`last_used_ptr` resolution) and §4.
 
+**Chunk K2 additions — \K, (\*ACCEPT)-in-assertion, (\*THEN)+NA, recursion into a
+possessive capture.** Two new tags (74 `SET_SOM`, 75 `ASSERT_ACCEPT`), one new
+save kind (KIND_SET_SOM 17), a third KIND_ONCE subtype (`once_na_assert` 2), and
+operand additions to existing tags (`t_once` gains a `cont`; `t_ketrpos`/
+`t_possess_done` gain a recursion `number`). After K2 the compile decline list is
+exactly {PCRE2_FIRSTLINE}. Design notes:
+
+- **\K (`OP_SET_SOM`, tag 74).** The C's per-frame `Fstart_match` (the reported
+  match start, moved to the current position by `\K`, read at OP_END/OP_ACCEPT
+  for ovector[0] and the empty-match test) becomes `mb.start_match` (= the attempt
+  start each attempt). `SET_SOM` pushes a KIND_SET_SOM record (`[old_start_match;
+  kind]`, width 2) and sets `mb.start_match = eptr`; on backtrack-past the record
+  restores it — the LIFO record reproduces the frame model (a choice point
+  recorded before the \K resumes with the old start, one after with the new). A
+  COMMITTING construct (atomic group / assertion / possessive / recursion)
+  truncates an inner KIND_SET_SOM, so its boundary record ALSO snapshots
+  start_match (`saved_start_match`), exactly like `saved_mark`. `pcre2_get_startchar`
+  (the attempt start, `outcome.ostartchar` → `Engine.Match.start_char`) is
+  reported SEPARATELY from ovector[0] (which \K can move forward of it).
+- **(\*ACCEPT) inside an assertion (`OP_ASSERT_ACCEPT`, tag 75).** The C RRETURNs
+  MATCH_ACCEPT, which the innermost ACTIVE assertion frame's RM3/RM4/RM5 handles
+  (pcre2_match.c:832-840). `backtrack_accept` walks the save stack to the FIRST
+  assertion boundary, discarding intermediate records WITHOUT running their
+  restores (the ACCEPT-point CAPTURES persist — the C's memcpy fishes
+  ovector + offset_top from the accept frame, RM3 :5522-5525 / RM5 :5713-5716);
+  the boundary then applies its per-case mark/\K rules. A POSITIVE boundary
+  (KIND_ONCE `once_pos_assert`/`once_na_assert`) may be an INNER assertion whose
+  boundary lingered past its success (not the ACCEPT's lexical enclosing
+  lookaround), so it commits and jumps to THAT boundary's OWN continuation —
+  stored in the new KIND_ONCE `cont` slot, the assertion's pc past its
+  `ASSERT_END` — and CONVERTS its subtype to `once_group` so the continuation's
+  re-fired ACCEPT passes through it to the next active assertion (mirroring the
+  C's re-run in the assertion frame past its consumed RM3). The positive commit
+  KEEPS the accept frame's mark (`Fmark = assert_accept_frame->mark`, :5526) but
+  REVERTS `mb.start_match` to the assertion entry (`saved_start_match`): the
+  memcpy covers ONLY ovector/offset_top/mark, and execution continues in the
+  assertion ENTRY frame — a \K terminated by ( \*ACCEPT) does not escape a
+  positive assertion. (C-exact asymmetry: the NORMAL success path — the ket
+  `break` :5534-5535 — continues in the matching BRANCH's frame, so t_assert_end
+  lets \K escape.) A NEGATIVE boundary (KIND_NASSERT, `conv_kind=accept_negative`)
+  FAILS the assertion (NASSERT_MATCH: full snapshot + mark + start_match revert).
+  A CONDITION boundary (`conv_kind=accept_cond`) is COND_ASSERT_MATCH — captures
+  persist but the mark AND \K revert (RM5's MATCH_ACCEPT copies only
+  ovector+offset_top, :5712-5716, unlike a normal cond-assert match whose ket
+  copies P->mark, :5945). `t_assert_accept` carries the compile-time
+  `conv_kind`/`target` (used only at a KIND_NASSERT, always the lexical
+  assertion); the positive `cont` comes from the boundary.
+- **(\*THEN) with a NON-ATOMIC positive assertion.** `OP_ASSERT_NA`/`ASSERTBACK_NA`
+  now push a KIND_ONCE boundary (`once_na_assert`) so a THEN reaching it is
+  CONTAINED (like an atomic positive assertion — both share RM3), lifting the H-era
+  `pos_na && hasthen` decline. The boundary does NOT set `mb.once_base` (the
+  assertion is non-atomic — its body re-enters, and once_base cannot follow one
+  boundary across backtrack in/out; the atomic COMMIT never targets it; the
+  THEN/ACCEPT walks find it by save-stack order). Its `ASSERT_END` (atomic=0) is
+  unchanged (no commit). Because a NA assertion keeps its branches LIVE, a THEN
+  reaching them (from a branch OR the continuation, which runs in the still-live
+  body) must retry the NEXT branch (the C's RM3 next-branch retry for any
+  MATCH_THEN, :5529-5532); so a NA assertion's branch ALTs carry `Ir.then_always`
+  (convert THEN regardless of the grouploop pc scope check — an atomic assertion
+  discards its branches at the commit, so it needs only the normal scope check).
+- **OP_RECURSE into a possessive capture (K1b-residual).** `compile_possess`
+  records the bracket's recursion entry (`t_bra`) and `t_ketrpos`/`t_possess_done`
+  carry the group `number` (2N/2 for a capturing OP_CBRAPOS/SCBRAPOS, else -2 —
+  never `mb.current_recurse`). A recursion into the group runs the branches
+  grouploop-style (RM11); the KETRPOS ket RETURNS when `current_recurse == number`
+  (pcre2_match.c:6056-6074, bypassing the possessive loop) and branch exhaustion
+  (`t_possess_done`, `current_recurse == number`) is a plain NOMATCH (:5495). A
+  group defined only in a `{0}` block (`OP_SKIPZERO`) is now COMPILED behind a
+  forward-skip `JMP` (not elided) so a `(?N)`/`(?&name)` can call it (the DEFINE
+  idiom); after K2 no opcode is out-of-subset, so compiling a `{0}` body cannot
+  decline.
+
 **Chunk K additions — script runs, callout no-ops, and the G+ repeated-atomic
 cleanup.** One new tag (69 `SCRIPT_RUN_END`), NO new save kind. Design notes:
 
@@ -765,12 +837,10 @@ gate runs BEFORE the walk: `PCRE2_FIRSTLINE` → `"... (chunk L)"` (chunk I remo
 the `PCRE2_UTF` gate, chunk I2 removed the `PCRE2_UCP` and
 `PCRE2_MATCH_INVALID_UTF` gates; chunk D removed the `top_bracket > 0` one).
 The first out-of-subset opcode yields `Error "fast: <construct> (chunk X)"`
-(taxonomy §6) — chunk K1b lowered OP_RECURSE in all forms, so the remaining
-decline reasons are OP_RECURSE into a POSSESSIVE capture (`"fast: OP_RECURSE
-into possessive capture (K1b)"`, resolved at fixup time when a call's target
-bracket was not recorded as a plain CBRA/SCBRA/whole-pattern bracket),
-`( *ACCEPT)` inside an assertion and `( *THEN)` with a non-atomic assertion (K2),
-`\K` (K2), and `PCRE2_FIRSTLINE` (L).
+(taxonomy §6) — chunk K2 lowered \K, ( \*ACCEPT)-in-assertion, ( \*THEN)+NA and
+OP_RECURSE into a possessive capture (the last recursion residual), so the ONLY
+remaining decline is the `PCRE2_FIRSTLINE` compile-option gate (chunk L). No
+construct-level opcode declines any more.
 
 ## §3 Runner and save records (choice-point IR landed in C1; runner in C2)
 
@@ -833,12 +903,13 @@ first:
 | `KIND_REF_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REF_MIN` | minimizing ref repeat with `lmin<lmax` (RM20) | match one more copy at `eptr` (`count` up to Lmax), retry the continuation; `rep_pc` re-derives ovbase/caseless/Lmax/cont |
 | `KIND_REF_MAX` | 6 | `cont; try_pos; flength; lstart; rdepth; KIND_REF_MAX` | maximizing ref repeat, samelengths (RM21) | give back one copy (`try_pos` −= `flength`, down to and INCLUDING `lstart`), retry the continuation; below `lstart` → NOMATCH |
 | `KIND_REF_MAX2` | 6 | `ref_pc; lmax_cur; try_eptr; lstart; rdepth; KIND_REF_MAX2` | maximizing ref repeat, DIFFERING lengths (RM22, chunk I2 — caseless UTF only, pcre2_match.c:5164-5184) | `try_eptr = lstart` → NOMATCH; else `lmax_cur--`, re-scan `lmax_cur − lmin` copies forward from `lstart` (match_ref known to succeed, rc discarded like the C's (void)), retry the continuation at the new end (tick) |
-| `KIND_ONCE` | `2*oveccount+3` | `ov_snapshot[2,2n); prev_once_base; saved_mark; entry_eptr; subtype; KIND_ONCE` | each `ONCE` (atomic group / atomic positive assertion) | restore the snapshot + `mb.once_base` + `mb.mark`, then keep popping. `entry_eptr` (chunk K1b) is recorded into last_used_ptr when a VERB code passes the boundary (the C's RRETURN(rrc) from the construct's frame, :5408/:5529 — §4); `subtype` (chunk H) = 0 atomic group / 1 pos-assert, read only by `backtrack_code` (THEN escape vs contain) |
-| `KIND_NASSERT` | `2*oveccount+4` | `ov_snapshot; prev_once_base; cont; eptr_enter; rdepth_enter; saved_mark; KIND_NASSERT` | each `NASSERT` (negative assertion) OR `COND_ASSERT` (assertion condition, chunk J — `cont = nomatch_target`) | ALL branches failed = SUCCESS / the condition's !Lpositive branch: restore snapshot + `mb.once_base` + entry `mb.mark`, continue at `cont` with the entry eptr/rdepth |
+| `KIND_ONCE` | `2*oveccount+6` | `ov_snapshot[2,2n); prev_once_base; saved_mark; entry_eptr; entry_rdepth; saved_start_match; cont; subtype; KIND_ONCE` | each `ONCE` (atomic group / atomic OR non-atomic positive assertion) | restore the snapshot + `mb.once_base` + `mb.mark` + `mb.start_match`, then keep popping. `entry_eptr` (K1b) → last_used_ptr on a VERB pass (§4); `entry_rdepth`/`cont` (K2) restore the assertion's entry depth + continuation for a (\*ACCEPT) reaching this boundary; `saved_start_match` (K2) reverts \K on backtrack-past a commit; `subtype` = 0 atomic group / 1 atomic pos-assert / 2 non-atomic pos-assert (K2), read by `backtrack_code` (THEN escape vs contain) and `backtrack_accept` (pass-through vs commit) |
+| `KIND_NASSERT` | `2*oveccount+6` | `ov_snapshot; prev_once_base; cont; eptr_enter; rdepth_enter; saved_mark; saved_start_match; pad; KIND_NASSERT` | each `NASSERT` (negative assertion) OR `COND_ASSERT` (assertion condition, chunk J — `cont = nomatch_target`) | ALL branches failed = SUCCESS / the condition's !Lpositive branch: restore snapshot + `mb.once_base` + entry `mb.mark` + `mb.start_match`, continue at `cont` with the entry eptr/rdepth. `saved_start_match` (K2) reverts \K; the `pad` (K2) keeps the width = KIND_ONCE's so COND_ASSERT_MATCH converts in place |
 | `KIND_VREVERSE` | 6 | `body_pc; cur_lmax; lmin; cur_eptr; rdepth; KIND_VREVERSE` | each `VREVERSE` (RM37) | `if cur_lmax<=lmin` NOMATCH, else give up one back-step (`cur_lmax--`, `cur_eptr++`) and retry the branch body |
-| `KIND_POS` | `2*oveccount+5` | `ov_snapshot; prev_once_base; iter_start; matched_once; zero_allowed; entry_rdepth; saved_mark; KIND_POS` | each `POSSESS` (possessive bracket) | backtrack PAST the group: restore snapshot + `mb.once_base` + `mb.mark`, keep popping (as `KIND_ONCE`); the extra slots are read only on the forward loop |
+| `KIND_POS` | `2*oveccount+6` | `ov_snapshot; prev_once_base; iter_start; matched_once; zero_allowed; entry_rdepth; saved_mark; saved_start_match; KIND_POS` | each `POSSESS` (possessive bracket) | backtrack PAST the group: restore snapshot + `mb.once_base` + `mb.mark` + `mb.start_match` (K2), keep popping (as `KIND_ONCE`); the extra slots are read only on the forward loop |
+| `KIND_SET_SOM` | 2 | `old_start_match; KIND_SET_SOM` | each `SET_SOM` (\K, chunk K2) | restore `mb.start_match` to `old_start_match` (the C's per-frame Fstart_match), then keep popping. No tick |
 | `KIND_VERB` | 5 | `vtype; aux; eptr; old_mark; KIND_VERB` | each `MARK`/`COMMIT`/`PRUNE`/`SKIP`/`SKIP_ARG`/`THEN` (chunk H) | revert `mb.mark` = `old_mark`; MARK keeps backtracking (and catches a name-matching `MATCH_SKIP_ARG` → `MATCH_SKIP`); every other `vtype` FIRES its verb code into `backtrack_code` |
-| `KIND_RECURSE` | `2*(2n)-2 + n_groups + 9` | `ov_snapshot[2,2n); group_start_snap[0,n_groups); cap_start_snap[0,2n); prev_once_base; prev_current_recurse; prev_recurse_base; saved_mark; number; call_eptr; recurse_last_used; cont_pc; KIND_RECURSE` | each `RECURSE` (chunk K1b) | backtrack PAST (the whole recursion failed): restore ALL arrays + `once_base`/`current_recurse`/`recurse_base`/`mark`, keep popping. `mb.recurse_base` chains open records (via `prev_recurse_base`) for the RECURSELOOP walk (pcre2_match.c:5438-5453). In `backtrack_code` a verb with `verb_current_recurse == number` NOMATCHes the recursion (contained), else passes through |
+| `KIND_RECURSE` | `2*(2n)-2 + n_groups + 10` | `ov_snapshot[2,2n); group_start_snap[0,n_groups); cap_start_snap[0,2n); prev_once_base; prev_current_recurse; prev_recurse_base; saved_mark; number; call_eptr; recurse_last_used; cont_pc; saved_start_match; KIND_RECURSE` | each `RECURSE` (chunk K1b; K2 added `saved_start_match`) | backtrack PAST (the whole recursion failed): restore ALL arrays + `once_base`/`current_recurse`/`recurse_base`/`mark`/`start_match` (K2), keep popping. `mb.recurse_base` chains open records (via `prev_recurse_base`) for the RECURSELOOP walk (pcre2_match.c:5438-5453). In `backtrack_code` a verb with `verb_current_recurse == number` NOMATCHes the recursion (contained), else passes through |
 | `KIND_RECURSE_RET` | `2*(2n)-2 + n_groups + 3` | `ov_body[2,2n); group_start_body[0,n_groups); cap_start_body[0,2n); number; my_recurse_base; KIND_RECURSE_RET` | each recursion RETURN (the ket saw `current_recurse == number`; chunk K1b) | backtrack INTO the completed body: restore the POST-body arrays + `current_recurse = number` + `recurse_base = my_recurse_base`, keep popping (the body's records retry its branches) |
 
 `KIND_ONCE` / `KIND_NASSERT` / `KIND_POS` / `KIND_RECURSE` / `KIND_RECURSE_RET`
@@ -1103,6 +1174,8 @@ child frame. `grouploop`'s single/last branch ticks (the top level "can't optimi
 | `RECURSE` RECURSELOOP (-52) direct return / recursion RETURN (`recurse_return`, ( \*ACCEPT)) | 0 | `d` | none |
 | `COND_RREF` / `COND_DNRREF` (inline recursion-test, branch pick) | 0 | `d` | none |
 | backtrack pop `KIND_RECURSE` (past) / `KIND_RECURSE_RET` (into body) | 0 | — | none |
+| `SET_SOM` (\K, chunk K2) / backtrack pop `KIND_SET_SOM` | 0 | `d` | none |
+| `ASSERT_ACCEPT` (chunk K2) + the `backtrack_accept` walk / commit | 0 | assertion entry `d` | none |
 
 The whole-pattern outer `BRA` (dispatched at rdepth 0) is `grouploop` at the
 top level; nested `OP_BRA` is `bra_loop` (rdepth `>= 1`, no THEN in chunk D).
@@ -1420,12 +1493,11 @@ first; the conformance diff does not depend on scan strategy).
 
 `Unsupported of string` — the string names the construct (stable prefix for skip-report
 grouping), e.g. `"fast: IR compiler not yet implemented (chunk C, 11-fast-engine.md)"`,
-`"fast: OP_RECURSE into possessive capture (K1b)"`. Coverage only widens (baseline
-ratchet `fast_baseline_counts.sexp`); chunk K1b lowered OP_RECURSE in all forms,
-leaving OP_RECURSE into a POSSESSIVE capture (K1b-residual), the two K2
-assertion combinations (`( *ACCEPT)` inside an assertion, `( *THEN)` with a
-non-atomic assertion), `\K` (K2) and PCRE2_FIRSTLINE (L) as the residual decline
-reasons.
+`"fast: PCRE2_FIRSTLINE (chunk L)"`. Coverage only widens (baseline ratchet
+`fast_baseline_counts.sexp`); chunk K2 lowered the last construct-level declines
+(\K, ( \*ACCEPT)-in-assertion, ( \*THEN)+NA, OP_RECURSE into a possessive
+capture), so `PCRE2_FIRSTLINE` (a compile-option gate, chunk L) is the SOLE
+remaining `Unsupported` reason.
 
 ## §7 Testing hooks
 

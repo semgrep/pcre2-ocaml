@@ -402,9 +402,21 @@ let goldens : (string * string) list =
           " 23 KET";
           " 24 END";
         ] );
-    (* SKIPZERO: a {0}-quantified group is elided entirely (no IR). *)
+    (* SKIPZERO: a {0}-quantified group is COMPILED behind a forward-skip JMP
+       (chunk K2, so a recursion can call a group defined only in a {0} block);
+       forward flow jumps over the dead group. *)
     ( "(?:abc){0}x",
-      g [ "  0 BRA"; "  1 CHAR_RUN \"x\""; "  4 KET"; "  5 END" ] );
+      g
+        [
+          "  0 BRA";
+          "  1 JMP 8";
+          "  3 BRA";
+          "  4 CHAR_RUN \"abc\"";
+          "  7 KET";
+          "  8 CHAR_RUN \"x\"";
+          " 11 KET";
+          " 12 END";
+        ] );
     (* --- Chunk E: classes, types, word boundaries --- *)
     (* A class (any of [abc] / [a-z]) compiles to one 32-byte-bitmap CLASS; the
        IR records the map's byte offset in re.code. *)
@@ -551,16 +563,16 @@ let goldens : (string * string) list =
           "  0 BRA";
           "  1 CHAR_RUN \"a\"";
           "  4 ONCE";
-          "  5 GROUP_START g=0";
-          "  7 BRA";
-          "  8 ALT next=15";
-          " 10 CHAR_RUN \"b\"";
-          " 13 JMP 16";
-          " 15 FAIL";
-          " 16 ASSERT_END atomic g=0";
-          " 19 CHAR_RUN \"c\"";
-          " 22 KET";
-          " 23 END";
+          "  6 GROUP_START g=0";
+          "  8 BRA";
+          "  9 ALT next=16";
+          " 11 CHAR_RUN \"b\"";
+          " 14 JMP 17";
+          " 16 FAIL";
+          " 17 ASSERT_END atomic g=0";
+          " 20 CHAR_RUN \"c\"";
+          " 23 KET";
+          " 24 END";
         ] );
     ( "a(?!b)",
       g
@@ -582,54 +594,54 @@ let goldens : (string * string) list =
         [
           "  0 BRA";
           "  1 ONCE";
-          "  2 GROUP_START g=0";
-          "  4 BRA";
-          "  5 ALT next=14";
-          "  7 REVERSE 2";
-          "  9 CHAR_RUN \"ab\"";
-          " 12 JMP 15";
-          " 14 FAIL";
-          " 15 ASSERT_END atomic g=0";
-          " 18 CHAR_RUN \"c\"";
-          " 21 KET";
-          " 22 END";
+          "  3 GROUP_START g=0";
+          "  5 BRA";
+          "  6 ALT next=15";
+          "  8 REVERSE 2";
+          " 10 CHAR_RUN \"ab\"";
+          " 13 JMP 16";
+          " 15 FAIL";
+          " 16 ASSERT_END atomic g=0";
+          " 19 CHAR_RUN \"c\"";
+          " 22 KET";
+          " 23 END";
         ] );
     ( "(?<=\\d{2,3})x",
       g
         [
           "  0 BRA";
           "  1 ONCE";
-          "  2 GROUP_START g=0";
-          "  4 BRA";
-          "  5 ALT next=24";
-          "  7 VREVERSE {2,3}";
-          " 10 TYPE_REP min {2,2} \\d";
-          " 15 TYPE_REP max {0,1} \\d";
-          " 20 ASSERTBACK_CHECK g=0";
-          " 22 JMP 25";
-          " 24 FAIL";
-          " 25 ASSERT_END atomic g=0";
-          " 28 CHAR_RUN \"x\"";
-          " 31 KET";
-          " 32 END";
+          "  3 GROUP_START g=0";
+          "  5 BRA";
+          "  6 ALT next=25";
+          "  8 VREVERSE {2,3}";
+          " 11 TYPE_REP min {2,2} \\d";
+          " 16 TYPE_REP max {0,1} \\d";
+          " 21 ASSERTBACK_CHECK g=0";
+          " 23 JMP 26";
+          " 25 FAIL";
+          " 26 ASSERT_END atomic g=0";
+          " 29 CHAR_RUN \"x\"";
+          " 32 KET";
+          " 33 END";
         ] );
     ( "(?>a|b)c",
       g
         [
           "  0 BRA";
           "  1 ONCE";
-          "  2 BRA";
-          "  3 ALT next=10";
-          "  5 CHAR_RUN \"a\"";
-          "  8 JMP 18";
-          " 10 ALT next=17";
-          " 12 CHAR_RUN \"b\"";
-          " 15 JMP 18";
-          " 17 FAIL";
-          " 18 ONCE_END";
-          " 19 CHAR_RUN \"c\"";
-          " 22 KET";
-          " 23 END";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 19";
+          " 11 ALT next=18";
+          " 13 CHAR_RUN \"b\"";
+          " 16 JMP 19";
+          " 18 FAIL";
+          " 19 ONCE_END";
+          " 20 CHAR_RUN \"c\"";
+          " 23 KET";
+          " 24 END";
         ] );
     ( "(?:ab)++c",
       g
@@ -637,14 +649,14 @@ let goldens : (string * string) list =
           "  0 BRA";
           "  1 POSSESS ovbase=0 zero=0";
           "  4 BRA";
-          "  5 ALT next=15";
+          "  5 ALT next=16";
           "  7 CHAR_RUN \"ab\"";
           " 10 JMP 12";
-          " 12 KETRPOS entry=4 ovbase=0";
-          " 15 POSSESS_DONE";
-          " 16 CHAR_RUN \"c\"";
-          " 19 KET";
-          " 20 END";
+          " 12 KETRPOS entry=4 ovbase=0 n=-2";
+          " 16 POSSESS_DONE n=-2";
+          " 18 CHAR_RUN \"c\"";
+          " 21 KET";
+          " 22 END";
         ] );
     ( "(a)*+",
       g
@@ -652,13 +664,13 @@ let goldens : (string * string) list =
           "  0 BRA";
           "  1 POSSESS ovbase=2 zero=1";
           "  4 BRA";
-          "  5 ALT next=15";
+          "  5 ALT next=16";
           "  7 CHAR_RUN \"a\"";
           " 10 JMP 12";
-          " 12 KETRPOS entry=4 ovbase=2";
-          " 15 POSSESS_DONE";
-          " 16 KET";
-          " 17 END";
+          " 12 KETRPOS entry=4 ovbase=2 n=1";
+          " 16 POSSESS_DONE n=1";
+          " 18 KET";
+          " 19 END";
         ] );
   ]
 
@@ -972,13 +984,11 @@ let unsupported_cases : (string * string * string) list =
        record snapshots the whole ovector + group_start + cap_start + mark +
        current_recurse + once_base, so "(?R)", "(a(?1)?b)", "(?(R)a|b)" etc. are
        now ACCEPTED (parity pinned in parity_cases / the LIMIT_MATCH sweeps).
-       ONE recursion shape still declines: a call INTO a possessive capture
-       (OP_CBRAPOS/OP_SCBRAPOS, e.g. "(a)++(?1)b") — its OP_KETRPOS ket-return
-       protocol (bypassing the possessive commit + the KIND_POS boundary the
-       recursion entry skips) is out of this subset. *)
-    ( "recursion into possessive capture",
-      "(a)++(?1)b",
-      "fast: OP_RECURSE into possessive capture (K1b)" );
+       Chunk K2 lowered the last recursion shape — a call INTO a possessive
+       capture (OP_CBRAPOS/OP_SCBRAPOS, e.g. "(a)++(?1)b"): the recursion runs the
+       branches grouploop-style and returns at OP_KETRPOS like a normal recursion
+       (pcre2_match.c:6056-6074, bypassing the possessive loop), so it is now
+       ACCEPTED (parity in parity_cases). *)
     (* Chunk I supports UTF mode and OP_XCLASS (wide chars, ranges AND \p
        properties, via the self-contained Xclass helper), so "[\\p{L}]" and
        "(*UTF)abc" are ACCEPTED. Chunk I2 lowered the rest of the chunk-I
@@ -987,27 +997,23 @@ let unsupported_cases : (string * string * string) list =
        \R / (?s). / \C repeats in UTF — so none of those decline any more
        (parity is pinned in parity_cases / the LIMIT_MATCH sweeps below). *)
     (* Chunk H supports MARK/PRUNE/SKIP/THEN/COMMIT (+_ARG), FAIL, ACCEPT and
-       OP_CLOSE (so "a(*FAIL)", "(*MARK:x)a", "a(*PRUNE)b", "a(*ACCEPT)", and
-       ( *THEN) with atomic positive assertions, are now ACCEPTED). Two
-       combinations still decline: ( *ACCEPT) inside an assertion (needs
-       MATCH_ACCEPT propagation to the assertion boundary with capture fishing),
-       and ( *THEN) in a pattern that also has a NON-ATOMIC positive assertion
-       (no KIND_ONCE boundary to contain the THEN). *)
+       OP_CLOSE (so "a(*FAIL)", "(*MARK:x)a", "a(*PRUNE)b", "a(*ACCEPT)" are
+       ACCEPTED). Chunk K2 lowered the last two verb combinations — ( *ACCEPT)
+       inside an assertion (propagated to the innermost assertion boundary by
+       backtrack_accept) and ( *THEN) with a NON-ATOMIC positive assertion (the
+       once_na_assert KIND_ONCE boundary now contains it) — so both are now
+       ACCEPTED (parity in parity_cases). *)
     (* Chunk K lowers OP_CALLOUT / OP_CALLOUT_STR as pure no-ops (this library
        surfaces no callout function, so do_callout is always 0 in both engines)
        and the OP_SCRIPT_RUN group (the sr / script_run verb, its ket applies the
        script-checking rules to the matched span), so "a(?C1)b", AUTO_CALLOUT
        patterns, a MANUAL callout before a condition assertion "(?(?C1)(?=a)b|c)",
        "(*sr:\\d+)" and "(*asr:\\d+)" are now ACCEPTED (parity in parity_cases). *)
-    ( "accept in assertion",
-      "(?=a(*ACCEPT))",
-      "fast: (*ACCEPT) inside assertion (chunk H+)" );
-    ( "then with non-atomic lookahead (inside)",
-      "(*napla:a(*THEN)b)c",
-      "fast: (*THEN) with non-atomic assertion (chunk H+)" );
-    ( "then with non-atomic lookahead (after)",
-      "(*napla:a)b(*THEN)",
-      "fast: (*THEN) with non-atomic assertion (chunk H+)" );
+    (* Chunk K2 lowered \K (OP_SET_SOM), ( *ACCEPT)-in-assertion, ( *THEN)+NA and
+       OP_RECURSE-into-possessive-capture — the whole engine now declines ONLY
+       PCRE2_FIRSTLINE (chunk L), a compile-level OPTION gate (not a pattern
+       construct, so it has no per-pattern unsupported_reason entry here). The
+       list is intentionally empty: every construct-level pattern now compiles. *)
   ]
 
 let unsupported_tests =
@@ -2301,6 +2307,45 @@ let parity_cases : (string * string * int * int32) list =
     ("(?!x)*ab", "ab", 0, 0l);
     ("(?<=x)+y", "xy", 1, 0l);
     ("(?>ab){2,4}c", "ababc", 0, 0l);
+    (* ---------- Chunk K2: \K, ( *ACCEPT)-in-assertion, ( *THEN)+NA,
+       recursion into a possessive capture ---------- *)
+    (* \K (OP_SET_SOM): the reported start moves to the \K position (ovector[0]),
+       while pcre2_get_startchar stays at the attempt start. *)
+    ("(foo)\\Kbar", "foobar", 0, 0l);
+    ("abc\\K123", "abc123", 0, 0l);
+    ("a\\K", "a", 0, 0l) (* empty match after \K *);
+    ("\\++\\KZ|\\d+X|9+Y", "++++Z", 0, 0l);
+    ("(a|b)*\\Kc", "abac", 0, 0l) (* \K after an alternation loop (backtrack) *);
+    ("(?:a\\Kb|x)c", "xc", 0, 0l) (* \K in a failed branch must be undone *);
+    (* \K inside committing constructs — the boundary snapshot reverts start_match
+       on backtrack-past. *)
+    ("(?>a\\Kb)z|(ab)", "ab", 0, 0l) (* \K in an atomic group, then backtrack *);
+    ("(?:a\\Kb)*+c", "abababc", 0, 0l) (* \K in a possessive group *);
+    (* \K in a positive lookahead ((?=a\Kb)ab) needs PCRE2_EXTRA_ALLOW_LOOKAROUND_
+       BSK (else compile error 199); covered by conformance testinput2:1786. *)
+    ("a\\K.(?0)*", "abcd", 0, 0l) (* \K with recursion *);
+    (* ( *ACCEPT) inside assertions. *)
+    ("^(?=a(*ACCEPT)b)", "ab", 0, 0l) (* positive lookahead *);
+    ("(?=a(*ACCEPT)bc)axyz", "axyz", 0, 0l);
+    ("(?<=a(*ACCEPT)b)c", "abc", 2, 0l) (* positive lookbehind *);
+    ("(?<=(a(*ACCEPT)b))c", "abc", 2, 0l);
+    ("(?(?=(a(*ACCEPT)z))a)", "az", 0, 0l) (* assertion condition (positive) *);
+    ("^(?(?=(a)(*ACCEPT))abc|def)", "abc", 0, 0l);
+    ("^(?(?!(a)(*ACCEPT))def|abc)", "abc", 0, 0l) (* negative cond *);
+    ("(*napla:a|(.)(*ACCEPT)zz)\\1..", "bbcd", 0, 0l) (* ACCEPT in a NA lookahead *);
+    ("(*napla:a(*ACCEPT)zz|(.))\\1..", "aabb", 0, 0l);
+    (* ( *THEN) with a non-atomic positive assertion (NA boundary contains it). *)
+    ("(*napla:a(*THEN)b)c", "ac", 0, 0l);
+    ("(*napla:a(*THEN)b|d)c", "adc", 0, 0l);
+    ("(*napla:a)b(*THEN)c|x", "abx", 0, 0l);
+    ("(?*a(*THEN)b|c)d", "cd", 0, 0l);
+    (* Recursion INTO a possessive capture (OP_CBRAPOS/OP_SCBRAPOS). *)
+    ("(a)++(?1)b", "aaab", 0, 0l);
+    ("(a)*+(?1)", "aaa", 0, 0l);
+    ("(?:(a(*PRUNE)b)){0}(?:(?1)|ac)", "ac", 0, 0l) (* recursion into a {0} group *);
+    ("(?1)(?:(b)){0}", "b", 0, 0l);
+    ("^(X(*THEN)Y|AB){0}(?1)", "AB", 0, 0l);
+    ("(a(*MARK:m)(*ACCEPT)){0}(?1)", "a", 0, 0l);
   ]
 
 let parity_tests =
@@ -2323,6 +2368,57 @@ let parity_tests =
           | Error _, _ | _, Error _ ->
               Alcotest.failf "compile mismatch for %S" pat))
     parity_cases
+
+(* ---------- 5b. K2 \K-in-assertion ( *ACCEPT) witnesses ----------
+
+   The positive-assertion ( *ACCEPT) commit must REVERT mb.start_match to the
+   assertion entry: the C's RM3 MATCH_ACCEPT memcpy covers ONLY ovector +
+   offset_top + mark from the accept frame (pcre2_match.c:5522-5526) and
+   execution continues in the assertion ENTRY frame — a \K terminated by
+   ( *ACCEPT) does NOT escape a positive assertion (fidelity-review witness:
+   without the revert, /(?=a\K( *ACCEPT))a/ on "aa" gave fast [1,1] vs interp
+   [0,1]). The NORMAL success path is asymmetric BY DESIGN (the ket `break`
+   :5534-5535 continues in the matching branch's frame): \K DOES escape there —
+   pinned too so the fix is never "generalized" to t_assert_end. \K needs
+   PCRE2_EXTRA_ALLOW_LOOKAROUND_BSK (0x40) lexically inside a lookaround; the
+   recursion variant (\K in a {0}-defined group called by (?1) from inside the
+   assertion) needs NO option (the 199 check is lexical). *)
+let k2_bsk_accept_tests =
+  let bsk = Pcre2_engine.Options.extra_allow_lookaround_bsk in
+  let run_both ?(extra = 0) pat subj =
+    match (F.compile_ctx ~extra pat 0l, E.compile_ctx ~extra pat 0l) with
+    | Ok fre, Ok ere ->
+        (norm (F.exec_full fre subj 0 0l), norm (E.exec_full ere subj 0 0l))
+    | _ -> Alcotest.failf "compile failed for %S" pat
+  in
+  [
+    Alcotest.test_case "\\K + (*ACCEPT) in assertions (fast == interp)" `Quick
+      (fun () ->
+        List.iter
+          (fun (extra, pat, subj, expect_interp) ->
+            let f, e = run_both ~extra pat subj in
+            Alcotest.(check string)
+              (Printf.sprintf "interp result for %S/%S" pat subj)
+              expect_interp e;
+            Alcotest.(check string)
+              (Printf.sprintf "fast == interp for %S/%S" pat subj)
+              e f)
+          [
+            (* ACCEPT path: \K reverts (the blocking-finding witness). *)
+            (bsk, "(?=a\\K(*ACCEPT))a", "aa", "M@0[0,1]");
+            (* recursion variant, NO option: \K executes in a group called by
+               (?1) from inside the assertion, ACCEPT after — still reverts. *)
+            (0, "(?:(a\\K)){0}(?=(?1)(*ACCEPT))a.", "ab", "M@0[0,2]");
+            (* NORMAL success path (no ACCEPT): \K escapes — the asymmetry. *)
+            (bsk, "(?=a\\Kb)ab", "ab", "M@0[1,2]");
+            (* negative assertion: ACCEPT fails it; \K reverts with the
+               snapshot (the assertion succeeds on "bb" via no match of "a"). *)
+            (bsk, "(?!a\\K(*ACCEPT)).", "bb", "M@0[0,1]");
+            (* condition assertion: ACCEPT = condition TRUE; \K reverts (RM5
+               copies only ovector+offset_top). *)
+            (bsk, "(?(?=a\\K(*ACCEPT))ab)", "ab", "M@0[0,2]");
+          ])
+  ]
 
 (* ---------- 6. LIMIT_MATCH tick-boundary parity ----------
 
@@ -2664,6 +2760,33 @@ let limit_match_boundary_test =
             ("\\A(?(?!x|y|z)a|b)9", "a9");
             (* Conditional inside a greedy repeat that backtracks. *)
             ("(*NO_AUTO_POSSESS)\\A(?:(a)?(?(1)b|c))*9", "abcbc9");
+          ]);
+    (* Chunk K2: \K, ( *ACCEPT)-in-assertion, ( *THEN)+NA, recursion into a
+       possessive capture. \K / ( *ACCEPT) commits add NO ticks (the C's SET_SOM /
+       MATCH_ACCEPT propagation dispatch in-frame); the NA-assertion THEN retries
+       its live branches via resume_alt (the RM5 next-branch RMATCH tick); a
+       recursion into a possessive capture ticks RM11 per branch. The two engines
+       must trip -47 at the SAME N — sweep across the boundary. *)
+    Alcotest.test_case "LIMIT_MATCH sweep, K2 (fast == interp)" `Quick (fun () ->
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 40 do
+              let f, e = run_both body n subj in
+              Alcotest.(check string)
+                (Printf.sprintf "fast == interp for /%s/ on %S at N=%d" body subj
+                   n)
+                e f
+            done)
+          [
+            ("(?:a\\Kb|x)+c", "abababc"); (* \K in a repeated group + backtrack *)
+            ("(a|b)*\\Kz", "ababz");
+            ("(?>a\\Kb)+z|(ab)+", "abab"); (* \K in a repeated atomic group *)
+            ("^(?=a(*ACCEPT)b)", "ab"); (* ( *ACCEPT) in a positive lookahead *)
+            ("(?:(?=a(*ACCEPT))|b)+c", "aac");
+            ("(*napla:a(*THEN)b|x)+y", "axxy"); (* ( *THEN) in a NA lookahead *)
+            ("(*napla:a|(.)(*ACCEPT)z)+\\1", "bb"); (* ( *ACCEPT) in a NA lookahead *)
+            ("(a)++(?1)b", "aaab"); (* recursion into a possessive capture *)
+            ("(?:(a(*PRUNE)b)){0}(?:(?1)|ac)+z", "acacz"); (* recursion into {0} *)
           ]);
   ]
 
@@ -3438,6 +3561,7 @@ let () =
       ("verifier", verifier_tests);
       ("sweep", sweep_tests);
       ("runner parity", parity_tests);
+      ("K2 bsk/accept witnesses", k2_bsk_accept_tests);
       ("backref option parity", ref_options_tests);
       ("invalid-utf fragment parity", invalid_utf_tests);
       ("limit-match boundary", limit_match_boundary_test);

@@ -103,7 +103,9 @@ let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
   if o.R.orc > 0 then
     (* [ovec] holds the pcre2 rc pairs (Engine.exec_full's shape): the whole
        match + captures up to the high-water group; consumers pad the rest. *)
-    E.Match { ovector = o.R.ovec; mark; start_char = o.R.ostart }
+    (* Chunk K2 — start_char is pcre2_get_startchar (the attempt start,
+       o.R.ostartchar), which \K can leave behind ovector.(0) (= o.R.ostart). *)
+    E.Match { ovector = o.R.ovec; mark; start_char = o.R.ostartchar }
   else if Int.equal o.R.orc Errors.error_nomatch then E.No_match { mark }
   else if Int.equal o.R.orc Errors.error_partial then
     E.Partial { start = o.R.ostart; mark }

@@ -197,6 +197,19 @@ let kind_ref_max2 = 14
 let kind_recurse = 15
 let kind_recurse_ret = 16
 
+(* Chunk K2 (fast-design.md §3) — \K (OP_SET_SOM).
+     KIND_SET_SOM (width 2): [old_start_match; KIND_SET_SOM]. Pushed by [t_set_som]
+        before it moves mb.start_match to the current position; on backtrack-past
+        restore mb.start_match to [old_start_match], then keep popping. This
+        mirrors the C's per-frame Fstart_match: a choice point recorded BEFORE the
+        \K resumes with the old start, one recorded AFTER with the new — the LIFO
+        record achieves the same for the single shared mb.start_match. Committing
+        constructs (atomic group / assertion / possessive / recursion) truncate an
+        inner KIND_SET_SOM, so their boundary records ALSO snapshot start_match
+        (saved_start_match), like saved_mark. *)
+let kind_set_som = 17
+
+let width_set_som = 2
 let width_ref_max2 = 6
 let width_verb = 5
 let width_vreverse = 6

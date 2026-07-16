@@ -130,7 +130,16 @@ let t_cap_end_ref = 37 (* [t_cap_end_ref; ovbase]   — referenced capture close
    pcre2_match.c:5995/6009/6038). *)
 let t_reverse = 38 (* [t_reverse; number]   — OP_REVERSE (fixed lookbehind step) *)
 let t_vreverse = 39 (* [t_vreverse; lmin; lmax] — OP_VREVERSE (variable step) *)
-let t_once = 40 (* [t_once]              — atomic group / atomic assertion entry *)
+
+(* [t_once; cont] — atomic group / atomic|NA positive assertion entry. [cont]
+   (chunk K2) is the assertion's continuation pc (just past its ASSERT_END),
+   stored in the KIND_ONCE boundary so a ( *ACCEPT) reaching THIS assertion's
+   boundary (possibly an INNER one still live between the ACCEPT and its lexical
+   enclosing lookaround) commits it and continues at ITS own continuation — the C
+   RRETURNs MATCH_ACCEPT to the innermost active assertion frame, not the lexical
+   one (pcre2_match.c:5520-5535). For an atomic GROUP (subtype once_group) [cont]
+   is unused (-1): a ( *ACCEPT) walk passes through it. *)
+let t_once = 40
 let t_once_end = 41 (* [t_once_end]          — atomic group ket (commit) *)
 let t_assert_end = 42 (* [t_assert_end; atomic; g] — positive assertion ket *)
 let t_nassert = 43 (* [t_nassert; g; cont]  — negative assertion entry *)
@@ -149,8 +158,21 @@ let t_assertback_check = 45 (* [t_assertback_check; g] — variable-lookbehind c
    Lzero_allowed success test, pcre2_match.c:5320-5328). [cap_ovbase] = 2N for a
    capturing possessive bracket (0 = non-capturing). *)
 let t_possess = 46 (* [t_possess; cap_ovbase; zero_allowed] — possessive entry *)
-let t_ketrpos = 47 (* [t_ketrpos; body_entry; cap_ovbase] — iteration commit *)
-let t_possess_done = 48 (* [t_possess_done]      — possessive loop end *)
+
+(* [t_ketrpos; body_entry; cap_ovbase; number] — iteration commit. [number]
+   (chunk K2) = the possessive group's recursion number (2N/2 for a capturing
+   OP_CBRAPOS/OP_SCBRAPOS, else -1): when [mb.current_recurse == number] the ket
+   is a recursion RETURN (pcre2_match.c:6056-6074), NOT the possessive commit —
+   a recursion into a possessive capture runs the branches grouploop-style
+   (RM11) and returns at the ket like a normal recursion, bypassing the
+   possessive loop (:6092 is after the :6065 `continue`). *)
+let t_ketrpos = 47
+
+(* [t_possess_done; number] — possessive loop end. [number] (chunk K2) as
+   t_ketrpos: during a recursion into this possessive capture the branch
+   exhaustion is a plain NOMATCH (the C's :5495 RRETURN(MATCH_NOMATCH)), not the
+   possessive success/fail test — checked via [mb.current_recurse == number]. *)
+let t_possess_done = 48
 
 (* Chunk H additions (fast-design.md §2/§3) — backtracking control verbs and
    forced accept/close.
@@ -298,6 +320,28 @@ let t_cond_rref = 71 (* [t_cond_rref; number; no_target] *)
    FALSE jumps to [no_target]. *)
 let t_cond_dnrref = 72 (* [t_cond_dnrref; slot_base; count; no_target] *)
 
+(* [t_set_som] (chunk K2) — \K (OP_SET_SOM, pcre2_match.c:6252-6255): reset the
+   start of the reported match to the current position (Fstart_match = Feptr).
+   The runner pushes a KIND_SET_SOM record saving the old start_match (restored
+   on backtrack-past, mirroring the C's per-frame Fstart_match) and sets
+   mb.start_match = eptr. No operands. *)
+let t_set_som = 74
+
+(* [t_assert_accept; conv_kind; target] (chunk K2) — ( *ACCEPT) inside a
+   lookaround assertion (OP_ASSERT_ACCEPT, pcre2_match.c:832-840): the C RRETURNs
+   MATCH_ACCEPT, which propagates to the innermost enclosing assertion boundary
+   (RM3 positive / RM4 negative / RM5 condition) and commits it there. The runner
+   walks the save stack to that boundary ([backtrack_accept]) and applies the
+   assertion's success/fail action; [conv_kind] (0 = positive, 1 = negative,
+   2 = condition) and [target] (the positive continuation pc, or the condition's
+   match_target; unused for negative) name that action, chosen at IR-compile time
+   from the lexically-enclosing lookaround. *)
+let t_assert_accept = 75
+
+let accept_positive = 0
+let accept_negative = 1
+let accept_cond = 2
+
 (* [t_fail_nassert] (chunk K1b) — branch exhaustion of a NEGATIVE assertion
    (OP_ASSERT_NOT/OP_ASSERTBACK_NOT) or an assertion CONDITION: identical to
    [t_fail] (propagate a NOMATCH backtrack) EXCEPT it does NOT record
@@ -330,7 +374,7 @@ let rep_inf = 0xFFFFFFFF
 let rref_any = 0xffff
 
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 73
+let max_tag = 75
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -377,15 +421,15 @@ let arity =
     2 (* t_cap_end_ref: ovbase *);
     2 (* t_reverse: number *);
     3 (* t_vreverse: lmin, lmax *);
-    1 (* t_once *);
+    2 (* t_once: cont *);
     1 (* t_once_end *);
     3 (* t_assert_end: atomic, g *);
     3 (* t_nassert: g, cont *);
     1 (* t_nassert_match *);
     2 (* t_assertback_check: g *);
     3 (* t_possess: cap_ovbase, zero_allowed *);
-    3 (* t_ketrpos: body_entry, cap_ovbase *);
-    1 (* t_possess_done *);
+    4 (* t_ketrpos: body_entry, cap_ovbase, number *);
+    2 (* t_possess_done: number *);
     2 (* t_mark: name_off *);
     2 (* t_commit: mark_off *);
     2 (* t_prune: mark_off *);
@@ -411,6 +455,8 @@ let arity =
     3 (* t_cond_rref: number, no_target *);
     4 (* t_cond_dnrref: slot_base, count, no_target *);
     1 (* t_fail_nassert *);
+    1 (* t_set_som *);
+    3 (* t_assert_accept: conv_kind, target *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -491,6 +537,8 @@ let tag_name =
     "COND_RREF";
     "COND_DNRREF";
     "FAIL_NASSERT";
+    "SET_SOM";
+    "ASSERT_ACCEPT";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -533,9 +581,24 @@ type t = {
   has_recurse : bool;
 }
 
-(* Chunk H — KIND_ONCE subtype values. *)
+(* Chunk K2 — the [alt_then_end] value for a NON-ATOMIC positive assertion's
+   branch ALT: THEN is ALWAYS converted to the next branch there (the C's RM3
+   tries the next branch for any MATCH_THEN reaching the assertion, not the
+   grouploop pc scope check). Since [verb_then_pc] is always a valid IR pc,
+   [max_int] makes `verb_then_pc < then_end` unconditionally true. The verifier
+   accepts this sentinel alongside -1 / a valid head. *)
+let then_always = max_int
+
+(* Chunk H — KIND_ONCE subtype values. Chunk K2 adds [once_na_assert] for a
+   NON-ATOMIC positive assertion (OP_ASSERT_NA/ASSERTBACK_NA): it pushes a
+   KIND_ONCE boundary (so a ( *THEN)/( *ACCEPT) reaching it is contained / handled
+   like any positive assertion) but the boundary does NOT set mb.once_base (the
+   assertion is non-atomic — its body is re-enterable, so once_base cannot track a
+   single boundary across re-entry; the atomic COMMIT never targets it, and the
+   THEN/ACCEPT walks find it by save-stack order). *)
 let once_group = 0
 let once_pos_assert = 1
+let once_na_assert = 2
 
 (* ---------- Decode accessors (fast-design.md §2) ----------
    Positional reads used by the runner (chunk C2) and the verifier. They
@@ -635,6 +698,10 @@ let dnref_rep_caseless (ir : t) (pc : int) : int = ir.code.(pc + 6)
 
 (* Chunk G operands (fast-design.md §2/§3). *)
 
+(* [t_once] operand (chunk K2) — the assertion's continuation pc (or -1 for an
+   atomic group). *)
+let once_cont (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
 (* [t_reverse] operand — the fixed lookbehind back-step (code units). *)
 let reverse_number (ir : t) (pc : int) : int = ir.code.(pc + 1)
 
@@ -663,10 +730,21 @@ let assertback_check_group (ir : t) (pc : int) : int = ir.code.(pc + 1)
 let possess_ovbase (ir : t) (pc : int) : int = ir.code.(pc + 1)
 let possess_zero_allowed (ir : t) (pc : int) : int = ir.code.(pc + 2)
 
-(* [t_ketrpos] operands — [body_entry] (IR index the iteration loops back to)
-   and [cap_ovbase] (the capture pair to write each iteration, 0 = none). *)
+(* [t_ketrpos] operands — [body_entry] (IR index the iteration loops back to),
+   [cap_ovbase] (the capture pair to write each iteration, 0 = none) and
+   [number] (chunk K2 — the recursion number, -1 if not a capture). *)
 let ketrpos_entry (ir : t) (pc : int) : int = ir.code.(pc + 1)
 let ketrpos_ovbase (ir : t) (pc : int) : int = ir.code.(pc + 2)
+let ketrpos_number (ir : t) (pc : int) : int = ir.code.(pc + 3)
+
+(* [t_possess_done] operand — [number] (chunk K2, as t_ketrpos). *)
+let possess_done_number (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* [t_assert_accept] operands (chunk K2) — [conv_kind] (accept_positive /
+   accept_negative / accept_cond) and [target] (the positive continuation pc or
+   the condition match_target). *)
+let assert_accept_kind (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let assert_accept_target (ir : t) (pc : int) : int = ir.code.(pc + 2)
 
 (* Chunk H operands (fast-design.md §2/§3). *)
 
@@ -820,8 +898,13 @@ let render (ir : t) (pc : int) (t : int) : string =
     Printf.sprintf "POSSESS ovbase=%d zero=%d" (possess_ovbase ir pc)
       (possess_zero_allowed ir pc)
   else if Int.equal t t_ketrpos then
-    Printf.sprintf "KETRPOS entry=%d ovbase=%d" (ketrpos_entry ir pc)
-      (ketrpos_ovbase ir pc)
+    Printf.sprintf "KETRPOS entry=%d ovbase=%d n=%d" (ketrpos_entry ir pc)
+      (ketrpos_ovbase ir pc) (ketrpos_number ir pc)
+  else if Int.equal t t_possess_done then
+    Printf.sprintf "POSSESS_DONE n=%d" (possess_done_number ir pc)
+  else if Int.equal t t_assert_accept then
+    Printf.sprintf "ASSERT_ACCEPT kind=%d target=%d" (assert_accept_kind ir pc)
+      (assert_accept_target ir pc)
   else if Int.equal t t_mark then
     Printf.sprintf "MARK name_off=%d" (verb_name_off ir pc)
   else if Int.equal t t_skip_arg then

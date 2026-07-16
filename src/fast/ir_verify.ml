@@ -135,11 +135,14 @@ let check (ir : Ir.t) : (unit, string) result =
                          Ir.tag_name.(t) pc code.(pc + 2) n_groups)
                   else if
                     (* Chunk H: the ALT's THEN scope boundary (Ir.alt_then_end)
-                       must be -1 or a valid instruction head. *)
+                       must be -1, a valid instruction head, or (chunk K2) the
+                       [Ir.then_always] sentinel (a NA-assertion branch always
+                       converts THEN). *)
                     Int.equal t Ir.t_alt
                     &&
                     let te = ir.Ir.alt_then_end.(pc) in
                     (not (Int.equal te (-1)))
+                    && (not (Int.equal te Ir.then_always))
                     && (te < 0 || te >= len || not is_head.(te))
                   then
                     Error
@@ -503,7 +506,11 @@ let check (ir : Ir.t) : (unit, string) result =
                   (* Chunk H: the KIND_ONCE subtype (Ir.once_subtype) must be a
                      known value. *)
                   let st = ir.Ir.once_subtype.(pc) in
-                  if not (Int.equal st Ir.once_group || Int.equal st Ir.once_pos_assert)
+                  if
+                    not
+                      (Int.equal st Ir.once_group
+                      || Int.equal st Ir.once_pos_assert
+                      || Int.equal st Ir.once_na_assert)
                   then
                     Error
                       (Printf.sprintf "fast-verify: ONCE at pc %d bad subtype %d"
