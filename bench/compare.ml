@@ -11,19 +11,32 @@
 
 let usage () =
   print_string
-    "usage: compare [RESULTS.json] [--max-ratio R]\n\
-     \  default results file: bench/results.json; default max ratio: 2.0\n";
+    "usage: compare [RESULTS.json] [--max-ratio R] [--fast-gate-geomean G]\n\
+     \  default results file: bench/results.json\n\
+     \  --max-ratio R          engine/oracle gate (M10, informational since the\n\
+     \                         2.159 sign-off); default 2.0\n\
+     \  --fast-gate-geomean G  M11 G11.2 fast/oracle geomean gate; default 1.5.\n\
+     \                         The per-benchmark fast<engine half is ALWAYS\n\
+     \                         enforced; raise G (e.g. 99) to print the report\n\
+     \                         without hard-failing on the geomean.\n";
   exit 64
 
 let () =
   let path = ref "bench/results.json" in
   let max_ratio = ref 2.0 in
+  (* M11 chunk N — G11.2 fast/oracle geomean gate (default 1.5); overridable so
+     the orchestrator can run the report without hard-failing while a residual
+     sign-off question is open (the per-bench fast<engine half stays enforced). *)
+  let fast_gate_geomean = ref 1.5 in
   let argc = Array.length Sys.argv in
   let rec parse i =
     if i < argc then
       match Sys.argv.(i) with
       | "--max-ratio" when i + 1 < argc ->
           max_ratio := float_of_string Sys.argv.(i + 1);
+          parse (i + 2)
+      | "--fast-gate-geomean" when i + 1 < argc ->
+          fast_gate_geomean := float_of_string Sys.argv.(i + 1);
           parse (i + 2)
       | "--help" | "-h" -> usage ()
       | a when String.length a > 0 && not (Char.equal a.[0] '-') ->
@@ -59,11 +72,14 @@ let () =
   let timestamp = get_string ~default:"?" (member "timestamp" meta) in
   let benches = get_list (member "benchmarks" json) in
   Printf.printf
-    "== M10 perf gate == results: %s (mode=%s reps=%d %s)\n\
-     gate: engine/oracle ratio <= %.2f, geomean AND per-benchmark\n"
+    "== M11 G11.2 fast-engine perf gate == results: %s (mode=%s reps=%d %s)\n\
+     ENFORCED: fast/oracle geomean <= %.2f AND fast < engine on every \
+     benchmark.\n\
+     engine/oracle ratio (M10, max %.2f) is INFORMATIONAL — closed by the \
+     2.159 sign-off.\n"
     timestamp mode reps
     (if contended then "CONTENDED" else "uncontended")
-    !max_ratio;
+    !fast_gate_geomean !max_ratio;
   if contended then
     Printf.printf
       "** advisory: results were taken while a fuzz campaign ran — not a \
@@ -98,8 +114,15 @@ let () =
           if fast_agrees then get_float ~default:0. (member "fast_ratio" b)
           else 0.
         in
+        let fast_ms =
+          if fast_agrees then get_float ~default:0. (member "fast_median_ms" b)
+          else 0.
+        in
         rows := (name, ratio) :: !rows;
-        if fast_agrees then fast_rows := (name, fast_ratio) :: !fast_rows;
+        (* M11 chunk N — capture (name, fast/oracle ratio, fast ms, engine ms)
+           so the fast gate can check both halves of G11.2. *)
+        if fast_agrees then
+          fast_rows := (name, fast_ratio, fast_ms, eng) :: !fast_rows;
         Printf.printf "%-16s %12.1f %12.1f %7.2f %11.1f %8.2f %10s %7s  %s\n"
           name eng orc ratio raw raw_ratio
           (if fast_agrees then
@@ -123,54 +146,85 @@ let () =
           /. float_of_int (List.length l))
   in
   let gm_ok = (not (Float.is_nan gm)) && gm <= !max_ratio in
-  Printf.printf "geomean ratio: %.3f (max allowed %.2f) — %s\n" gm !max_ratio
-    (if gm_ok then "pass" else "FAIL");
-  (* M11 chunk L — informational fast/oracle geomean over the in-subset
-     benchmarks (NOT gated until chunk N). *)
+  (* Engine/oracle (M10) numbers are now INFORMATIONAL: the M10 gate was closed
+     by explicit sign-off at 2.159 (performance-report.md §4). The ENFORCED gate
+     below is M11 G11.2 (fast/oracle). *)
+  Printf.printf
+    "engine/oracle geomean: %.3f (M10 max %.2f — %s; informational, closed by \
+     the 2.159 sign-off)\n"
+    gm !max_ratio
+    (if gm_ok then "within" else "over");
+  (* M11 chunk N — G11.2 fast-engine gate: fast/oracle geomean <= threshold AND
+     fast strictly faster than the engine on EVERY supported benchmark. *)
+  let fast_gm =
+    match fast_rows with
+    | [] -> Float.nan
+    | l ->
+        exp
+          (List.fold_left (fun acc (_, r, _, _) -> acc +. log r) 0. l
+          /. float_of_int (List.length l))
+  in
+  let fast_slower =
+    List.filter (fun (_, _, fms, ems) -> fms >= ems) fast_rows
+  in
+  let fast_gm_ok =
+    (not (Float.is_nan fast_gm)) && fast_gm <= !fast_gate_geomean
+  in
+  let fast_perbench_ok = match fast_slower with [] -> true | _ -> false in
   (match fast_rows with
   | [] -> Printf.printf "fast/oracle geomean: n/a (no in-subset benchmarks)\n"
   | l ->
-      let fgm =
-        exp
-          (List.fold_left (fun acc (_, x) -> acc +. log x) 0. l
-          /. float_of_int (List.length l))
-      in
       Printf.printf
-        "fast/oracle geomean: %.3f over %d/%d benchmarks (informational — \
-         chunk N gate)\n"
-        fgm (List.length l) (List.length rows));
+        "fast/oracle geomean: %.3f over %d/%d benchmarks (G11.2 max %.2f — %s)\n"
+        fast_gm (List.length l) (List.length rows) !fast_gate_geomean
+        (if fast_gm_ok then "pass" else "FAIL"));
+  Printf.printf "fast<engine on every benchmark: %s\n"
+    (if fast_perbench_ok then "pass"
+     else Printf.sprintf "FAIL (%d slower)" (List.length fast_slower));
   (match
      List.fold_left
-       (fun acc (n, r) ->
+       (fun acc (n, r, _, _) ->
          match acc with
          | Some (_, r0) when r0 >= r -> acc
          | _ -> Some (n, r))
-       None rows
+       None fast_rows
    with
-  | Some (n, r) -> Printf.printf "slowest benchmark: %s at %.2fx\n" n r
+  | Some (n, r) -> Printf.printf "slowest fast benchmark: %s at %.2fx\n" n r
   | None -> ());
-  let pass =
-    match (invalids, violations, rows) with
-    | [], [], _ :: _ -> gm_ok
-    | _ -> false
-  in
   (match invalids with
   | [] -> ()
   | l ->
       Printf.printf
-        "\n** %d INVALID benchmark(s) — engine/oracle count mismatch or \
+        "\n** %d INVALID benchmark(s) — engine/oracle/fast count mismatch or \
          compile failure (fuzz-grade bug): **\n"
         (List.length l);
       List.iter (fun (n, r) -> Printf.printf "   %s: %s\n" n r) l);
   (match violations with
   | [] -> ()
   | l ->
-      Printf.printf "\nper-benchmark gate violations (> %.2fx):\n" !max_ratio;
+      Printf.printf
+        "\nengine/oracle per-benchmark over %.2fx (informational):\n" !max_ratio;
       List.iter (fun (n, r) -> Printf.printf "   %s: %.2fx\n" n r) l);
+  (match fast_slower with
+  | [] -> ()
+  | l ->
+      Printf.printf "\nfast NOT faster than engine (G11.2 violation):\n";
+      List.iter
+        (fun (n, _, fms, ems) ->
+          Printf.printf "   %s: fast=%.1fms engine=%.1fms\n" n fms ems)
+        l);
   (match rows with
   | [] -> Printf.printf "\nno valid benchmarks in %s\n" !path
   | _ -> ());
+  (* The ENFORCED gate is M11 G11.2 (fast). Invalids (correctness) always fail. *)
+  let pass =
+    match (invalids, fast_rows) with
+    | [], _ :: _ -> fast_gm_ok && fast_perbench_ok
+    | _ -> false
+  in
   Printf.printf "\nVERDICT: %s\n"
-    (if pass then "PASS — engine within the 2.0x gate"
-     else "FAIL — gate not met (do not commit perf sign-off)");
+    (if pass then
+       Printf.sprintf "PASS — fast engine meets G11.2 (geomean <= %.2f, fast < engine)"
+         !fast_gate_geomean
+     else "FAIL — G11.2 not met (do not commit perf sign-off)");
   exit (if pass then 0 else 1)

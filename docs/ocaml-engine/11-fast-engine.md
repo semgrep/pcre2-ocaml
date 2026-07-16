@@ -366,7 +366,38 @@ interpreter is its differential oracle. Approved plan:
   (a leading greedy/lazy repeat's give-back/extend ticks O(run length) — §4), so no static
   LIMIT_MATCH gate is sound and the only constant-tick subcase (a possessive leading
   iterator) still diverges at match_limit<2 and is not JIT-mirrored. Not a coverage gap.
-- [ ] **N — Perf close** — bench Fast column + compare gates; meet G11.2.
+- [x] **N — Perf close** — met G11.2 (fast/oracle geomean **1.488** ≤ 1.5,
+  release profile, full bench, 3-run medians 1.486–1.488; fast strictly faster
+  than the engine on all 12 benchmarks). Levers (each measured, §8 discipline
+  intact — zero conformance/fuzz regressions, tick parity + all alloc pins /
+  N-sweeps / mutation witnesses green): (1) verifier-proven `Array.unsafe_get`
+  for every IR dispatch + operand read in `runner.ml` (the always-on
+  `Ir_verify` subset is the bounds proof); (2) HOT/COLD dispatch split — `run`
+  keeps the ~40 hot arms (CHAR_RUN/CHARI/anchors/ALT/JMP/BRA/KET/CAP_*/REP*/
+  CLASS/TYPE/WORDBOUND/group-repeats/backrefs/xclass-prop-extuni/END), the
+  rarely-taken arms (lookbehind / assertion + atomic boundaries / possessive /
+  verbs / conditionals / script-run / recursion / \K / FAIL_NASSERT) moved to an
+  `[@inline never]` `run_cold` (stabilizes layout, shrinks the hot icache
+  footprint — 1.775→1.736); (3) hoisted `rep_unit_matches`/`rep_unit_utf` +
+  `class_bit_at` OUT of the recursive group as `[@inline always]` so the
+  per-character repeat test INLINES into the scan loops (was a per-char function
+  call under non-flambda — 1.736→1.615); (4) register-localized non-UTF CLASS /
+  caseful-CHAR / positive-CTYPE greedy+min scan loops (the M10 P3 lever:
+  per-char invariants subject/end/map_off/mask/lmax in registers, not re-read
+  from the `mb` heap block — 1.615→1.508); (5) a `len==1` fast path in the hot
+  CHAR_RUN arm (the ubiquitous single-unit literal `@`/`.`/space, inlining the
+  one-unit compare — 1.508→1.488). compare.ml now ENFORCES the fast gate
+  (per-bench fast<engine + geomean ≤ 1.5, `--fast-gate-geomean X` override;
+  engine/oracle numbers demoted to informational under the M10 2.159 sign-off).
+  Assessed-and-declined (layout-noise trap, reverted): a `giveback_tag` that read
+  the repeat tag once for the give-back position — algorithmically fewer reads
+  but landed on a ~3% WORSE code layout across two runs (the documented ±9%
+  monolithic-`run` layout sensitivity), so not kept. Residual per-benchmark
+  worst cases: ipv4 2.05 (alternation-dispatch bound — ALT tick+save-record per
+  branch, no JIT-mirrored accelerator applies), pathological 1.77 / backref 1.67
+  (backtrack-tick / referenced-capture protocol overhead) — the fundamental
+  fused-dispatch cost per tick vs the C's single-function register residency,
+  the same class of residual M10 characterized for the interpreter.
 - [ ] **O — Gate close** — G11.1 + fuzz long run + plan-update marks the gate.
 
 ## Testing (added incrementally; see the approved plan's testing matrix)
