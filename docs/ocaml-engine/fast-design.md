@@ -119,6 +119,12 @@ following the tag. Widths are `Ir.arity`:
 | 60 | `PROP_REP` | `reptype; lmin; lmax; notprop; ptype; pdata` | 7 | a property TYPE repeat (chunk I2, pcre2_match.c:2708-2714): the shared REP machinery as `rk_prop` (char/type maxbt shape — floor in place; the PT_ANY-NOTPROP min-loop hoist of :2731-2732 fires before any SCHECK) |
 | 61 | `EXTUNI` | — | 1 | one `\X` extended grapheme cluster (chunk I2, pcre2_match.c:2617-2635) via `Pcre2_engine.Extuni.extuni` + CHECK_PARTIAL. No choice point, no tick |
 | 62 | `EXTUNI_REP` | `reptype; lmin; lmax` | 4 | `\X` type repeat (chunk I2, pcre2_match.c:2976-2996/3804-3827/4401-4466): dedicated cluster-wise loops (`rk_extuni`, CHECK_PARTIAL after each step); the greedy give-back steps one CLUSTER per tick (`extuni_back`, the RM220 pair-table re-walk) with the floor tried in place |
+| 63 | `COND_CREF` | `ovbase; no_target` | 3 | conditional numbered-group-set test `(?(1)…)` (chunk J, OP_CREF pcre2_match.c:5668-5671): TRUE (`ovector.(ovbase) <> UNSET`, `ovbase = 2N`) falls through to the yes-branch, FALSE jumps to `no_target`. CREF groups are non-optimized (F-era analysis), so the slot is written only at CLOSE — the test matches the interpreter. No tick, no choice point |
+| 64 | `COND_DNCREF` | `slot_base; count; no_target` | 4 | conditional dup-named-group-set test `(?(<n>)…)` (chunk J, OP_DNCREF :5673-5685): TRUE iff ANY group in the name-table list `[slot_base, slot_base+count*entry)` is set (`dncref_test`, scanned like `dnref_scan`). No tick |
+| 65 | `COND_FALSE` | `no_target` | 2 | always-false condition (chunk J): OP_FALSE/OP_FAIL ((?(DEFINE)…), (?(VERSION<x)…), :5687-5689) and OP_RREF/OP_DNRREF (recursion tests, ALWAYS false with recursion out of subset — `Fcurrent_recurse == RECURSE_UNSET`, :5645-5666; chunk K revisits). Jump to `no_target`; the DEFINE body is the never-taken yes-branch. No tick |
+| 66 | `COND_ASSERT` | `nomatch_target` | 2 | assertion-condition ENTRY `(?(?=…)…)` (chunk J, :5701-5708): push a KIND_NASSERT boundary whose `cont = nomatch_target` (the branch taken when the assertion body does NOT match, condition = !Lpositive), set `mb.once_base`, fall into the body (grouploop-style ALT per branch = RM5 per branch). Exhausting the branches (FAIL) backtracks to the boundary → `backtrack_nassert` → `nomatch_target` |
+| 67 | `COND_ASSERT_MATCH` | `match_target` | 2 | an assertion-condition branch matched (chunk J, condition = Lpositive; the ket memcpy :5934-5948): COMMIT (truncate the assertion's choice points, CONVERT the KIND_NASSERT boundary to a KIND_ONCE so a later backtrack PAST the conditional rolls back the snapshot rather than re-taking the nomatch branch), captures persist (already in the shared ovector), restore `eptr`/`rdepth` to the conditional entry, jump to `match_target`. `match_target`/`nomatch_target` = the yes/no branch heads chosen by the assertion's positivity. No tick |
+| 68 | `SCOND_DESCEND` | — | 1 | the OP_SCOND descend (chunk J, RM35 :5772-5776): a repeated conditional that might match empty descends one virtual frame per iteration so the empty-string loop check has the iteration start. One tick (like a single-branch grouploop entry), no choice point |
 
 **Chunk H additions — backtracking control verbs, FAIL, ACCEPT, CLOSE.** Eight
 new tags (49-56) and one save kind (KIND_VERB 13). Verbs turn backtracking into
@@ -548,6 +554,67 @@ only; KIND_REF_MAX2 re-derives its state from the IR + ovector like
 KIND_REF_MIN), so the proof's read-site enumeration is unchanged — the real
 revisit remains chunk K.
 
+**Chunk J additions — conditional groups OP_COND / OP_SCOND.** Six new tags
+(63-68, above), NO new save kind. A conditional `(?(cond)yes|no)` (or a
+single-branch `(?(cond)yes)`, where an absent no-branch means "match empty past
+the KET") picks its branch DETERMINISTICALLY from the condition — there is no
+ALT choice point for the yes/no selection, so the fast engine cannot backtrack
+between the branches (only INTO the chosen branch, and — for an assertion
+condition — over the assertion's own branches). `ir_compile.compile_cond`
+(routed from `compile_branch` and the BRAZERO handler) lowers:
+
+- **Non-assertion conditions inline** (no tick, no choice point). The condition
+  test jumps to `no_target` on FALSE and falls through to the yes-branch on
+  TRUE; the yes-branch ends with a `JMP` to the KET (skipping the no-branch).
+  `COND_CREF` (a numbered group-set test), `COND_DNCREF` (a dup-named-list
+  scan), and `COND_FALSE` (OP_FALSE/OP_FAIL for DEFINE/low VERSION, plus
+  OP_RREF/OP_DNRREF which are always false without recursion). OP_TRUE emits NO
+  test (the yes-branch runs directly). The CREF/DNCREF "set" test reads the
+  group's ovector slot, which — because CREF/DNCREF-referenced groups are marked
+  non-optimized by the F-era `optimized_cbracket` analysis (they clear the bit,
+  ir_compile.ml:289-301) — is written only at CLOSE, so it equals the
+  interpreter's `offset < Foffset_top && Fovector[offset] != PCRE2_UNSET`
+  (attempt-reset-to-UNSET slots make the `< Foffset_top` guard redundant).
+
+- **Assertion conditions** reuse chunk G's KIND_NASSERT boundary + grouploop
+  branch lowering ENTIRELY (the negative-assertion machinery's boundary verb
+  semantics, RM4, are IDENTICAL to the condition-assertion's RM5): `COND_ASSERT`
+  pushes `push_nassert` with `cont = nomatch_target`; the assertion body's
+  branches are ALT-per-branch + FAIL; exhausting them (X does not match)
+  backtracks to the boundary → `backtrack_nassert` → `nomatch_target` (condition
+  = !Lpositive). A matching branch (X matches) reaches `COND_ASSERT_MATCH`, the
+  ONLY new "end" action: it COMMITS (like a positive atomic assertion, keeping
+  the captures X set — the C's `memcpy(...F->ovector...)` "for all assertions,
+  both positive and negative", pcre2_match.c:5934-5948) and CONVERTS the
+  KIND_NASSERT record to a KIND_ONCE in place (identical snapshot + prev_once_base
+  prefix; rewrite the tail to `saved_mark; once_group; KIND_ONCE` and truncate),
+  so a later backtrack PAST the whole conditional rolls back the snapshot instead
+  of re-taking the nomatch branch. `match_target`/`nomatch_target` are the yes/no
+  branch heads chosen at compile time by positivity (positive: match→yes,
+  nomatch→no; negative: swapped). Both restore `eptr`/`rdepth` to the entry
+  (the C RRETURNs to the OP_COND frame). A variable-lookbehind assertion
+  condition uses a `t_group_start`/`t_assertback_check` pair (chunk G) placed
+  BELOW the boundary so the group-start slot survives the commit.
+
+- **OP_SCOND** (a repeated conditional that might match empty, single- OR
+  two-branch — `pcre2_compile.c:7706-7707` and the `OP_SBRA - OP_BRA` delta at
+  7705 that turns OP_COND into OP_SCOND) is lowered as a repeated group: a
+  `GROUP_START g` records the iteration start (empty check via `mb.group_start`)
+  and a `KET_RMAX`/`KET_RMIN g` closes it. The RM35 descend becomes a
+  `SCOND_DESCEND` (one tick per iteration, no choice point): for a non-assertion
+  SCOND it precedes the (tick-free) condition test (one descend, both branches
+  run in it); for an assertion SCOND it heads each branch (the descend follows
+  the assertion eval, as in the C). A repeated OP_COND that CANNOT match empty
+  (a two-branch non-empty conditional) stays OP_COND: its `KET_RMAX` carries
+  `g = no_group` (no empty check, matching the C's `P == NULL`) and there is NO
+  descend (one tick/iteration, the ket only).
+
+The chunk-K snapshot-proof revisit flag still holds: chunk J adds no recursion /
+subroutine re-entry. The condition-assertion boundary reads `mb.group_start`
+only at fixed positions strictly inside the assertion (the `t_assertback_check`)
+and at the SCOND ket, both re-entered only through the entry `t_group_start`, so
+the chunk-G read-site enumeration is unchanged.
+
 `Ir.dump : Format.formatter -> Ir.t -> unit` prints one `%3d TAG operands` line per head
 (debug_printer.ml style); `CHAR_RUN`/`CHARI` show the escaped literal, `ALT` shows
 `next=<pc>`, `JMP` shows the target pc. Used for golden tests (`test/fast/fast_tests.ml`).
@@ -569,11 +636,10 @@ gate runs BEFORE the walk: `PCRE2_FIRSTLINE` → `"... (chunk L)"` (chunk I remo
 the `PCRE2_UTF` gate, chunk I2 removed the `PCRE2_UCP` and
 `PCRE2_MATCH_INVALID_UTF` gates; chunk D removed the `top_bracket > 0` one).
 The first out-of-subset opcode yields `Error "fast: <construct> (chunk X)"`
-(taxonomy §6) — after I2 the remaining decline reasons are conditionals
-(OP_COND/SCOND + refs, chunk J), recursion / script-run / callouts (chunk K),
-`\K` (C2+), repeated atomic groups/assertions (G+), `( *ACCEPT)` inside an
-assertion and `( *THEN)` with a non-atomic assertion (H+), and
-`PCRE2_FIRSTLINE` (L).
+(taxonomy §6) — after J the remaining decline reasons are recursion /
+script-run / callouts (chunk K), `\K` (C2+), repeated atomic groups/assertions
+(G+), `( *ACCEPT)` inside an assertion and `( *THEN)` with a non-atomic
+assertion (H+), and `PCRE2_FIRSTLINE` (L).
 
 ## §3 Runner and save records (choice-point IR landed in C1; runner in C2)
 
@@ -637,7 +703,7 @@ first:
 | `KIND_REF_MAX` | 6 | `cont; try_pos; flength; lstart; rdepth; KIND_REF_MAX` | maximizing ref repeat, samelengths (RM21) | give back one copy (`try_pos` −= `flength`, down to and INCLUDING `lstart`), retry the continuation; below `lstart` → NOMATCH |
 | `KIND_REF_MAX2` | 6 | `ref_pc; lmax_cur; try_eptr; lstart; rdepth; KIND_REF_MAX2` | maximizing ref repeat, DIFFERING lengths (RM22, chunk I2 — caseless UTF only, pcre2_match.c:5164-5184) | `try_eptr = lstart` → NOMATCH; else `lmax_cur--`, re-scan `lmax_cur − lmin` copies forward from `lstart` (match_ref known to succeed, rc discarded like the C's (void)), retry the continuation at the new end (tick) |
 | `KIND_ONCE` | `2*oveccount+2` | `ov_snapshot[2,2n); prev_once_base; saved_mark; subtype; KIND_ONCE` | each `ONCE` (atomic group / atomic positive assertion) | restore the snapshot + `mb.once_base` + `mb.mark`, then keep popping. `subtype` (chunk H) = 0 atomic group / 1 pos-assert, read only by `backtrack_code` (THEN escape vs contain) |
-| `KIND_NASSERT` | `2*oveccount+4` | `ov_snapshot; prev_once_base; cont; eptr_enter; rdepth_enter; saved_mark; KIND_NASSERT` | each `NASSERT` (negative assertion) | ALL branches failed = SUCCESS: restore snapshot + `mb.once_base` + entry `mb.mark`, continue at `cont` with the entry eptr/rdepth |
+| `KIND_NASSERT` | `2*oveccount+4` | `ov_snapshot; prev_once_base; cont; eptr_enter; rdepth_enter; saved_mark; KIND_NASSERT` | each `NASSERT` (negative assertion) OR `COND_ASSERT` (assertion condition, chunk J — `cont = nomatch_target`) | ALL branches failed = SUCCESS / the condition's !Lpositive branch: restore snapshot + `mb.once_base` + entry `mb.mark`, continue at `cont` with the entry eptr/rdepth |
 | `KIND_VREVERSE` | 6 | `body_pc; cur_lmax; lmin; cur_eptr; rdepth; KIND_VREVERSE` | each `VREVERSE` (RM37) | `if cur_lmax<=lmin` NOMATCH, else give up one back-step (`cur_lmax--`, `cur_eptr++`) and retry the branch body |
 | `KIND_POS` | `2*oveccount+5` | `ov_snapshot; prev_once_base; iter_start; matched_once; zero_allowed; entry_rdepth; saved_mark; KIND_POS` | each `POSSESS` (possessive bracket) | backtrack PAST the group: restore snapshot + `mb.once_base` + `mb.mark`, keep popping (as `KIND_ONCE`); the extra slots are read only on the forward loop |
 | `KIND_VERB` | 5 | `vtype; aux; eptr; old_mark; KIND_VERB` | each `MARK`/`COMMIT`/`PRUNE`/`SKIP`/`SKIP_ARG`/`THEN` (chunk H) | revert `mb.mark` = `old_mark`; MARK keeps backtracking (and catches a name-matching `MATCH_SKIP_ARG` → `MATCH_SKIP`); every other `vtype` FIRES its verb code into `backtrack_code` |
@@ -648,6 +714,28 @@ snapshot size depends on `oveccount`); `backtrack` derives the width from
 innermost open atomic construct (or -1), maintained as a balanced stack by those
 boundary records so the atomic COMMIT can find the boundary without a
 `run`/`backtrack` parameter (the hot mainline signature is unchanged).
+
+**Conditionals (chunk J) add NO save kind.** An assertion condition's boundary
+IS a `KIND_NASSERT` (its `cont` = the branch taken when the assertion body does
+not match, condition = !Lpositive); its "all branches failed" backtrack
+(`backtrack_nassert`) and its verb handling (`backtrack_code`, RM4 = RM5:
+COMMIT/SKIP/PRUNE/THEN → `cont`, SKIP_ARG escapes) are shared with the negative
+assertion unchanged. The ONLY new action is `COND_ASSERT_MATCH` (a matching
+assertion branch): it COMMITS by truncating to the boundary and CONVERTING the
+`KIND_NASSERT` (width `2*oveccount+4`) IN PLACE to a `KIND_ONCE` (width
+`2*oveccount+2`) — the `ov_snapshot`/`prev_once_base` prefix is identical, so it
+rewrites the tail (`saved_mark; once_group; KIND_ONCE`) and drops `sp` to
+`base + 2*oveccount + 2`. After the conversion a later backtrack PAST the whole
+conditional hits the `KIND_ONCE` (roll back the snapshot + propagate NOMATCH),
+NOT the `KIND_NASSERT` (which would wrongly re-take the nomatch branch). The
+condition assertion's captures PERSIST (the shared ovector already holds them;
+the commit keeps them, mirroring the C's `memcpy(...F->ovector...)`); `mb.mark`
+is kept (the assertion's mark persists, the C's `P->mark = F->mark`), while the
+converted `KIND_ONCE`'s `saved_mark` = the conditional-entry mark for the
+backtrack-past rollback. Non-assertion conditions push NO record at all (inline
+tests). The chunk-J `t_group_start` for a SCOND / variable-lookbehind condition
+sits BELOW the boundary so its `KIND_GSTART` survives the commit (the empty check
+needs the slot after the condition is decided).
 
 `match_call_count`, `hitend`, `start_used_ptr` are NOT saved (monotonic /
 constant per attempt). `sp` is a runner tail-call parameter; push/pop are
@@ -868,6 +956,11 @@ child frame. `grouploop`'s single/last branch ticks (the top level "can't optimi
 | maximize ref repeat: first give-back try at greedy end (push `KIND_REF_MAX`, RM21) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
 | backtrack pop `KIND_REF_MAX`: `try_pos−flength >= lstart` (give back one copy) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
 | backtrack pop `KIND_REF_MAX`: `try_pos−flength < lstart` (below floor) | 0 | — | none (pop) |
+| `COND_CREF`/`COND_DNCREF`/`COND_FALSE` (inline test), branch pick | 0 | `d` | none |
+| `COND_ASSERT` (push `KIND_NASSERT`), assertion branch `ALT` | 1 (rdepth `d+1`) per branch | `d+1` | frame `d+1` |
+| `COND_ASSERT_MATCH` (commit, restore to entry `d`) | 0 | `d` | none |
+| backtrack pop `KIND_NASSERT` (cond nomatch → `cont` at entry `d`) | 0 | `d` | none (pop) |
+| `SCOND_DESCEND` (RM35, one per repeated-conditional iteration) | 1 (rdepth `d+1`) | `d+1` | frame `d+1` |
 
 The whole-pattern outer `BRA` (dispatched at rdepth 0) is `grouploop` at the
 top level; nested `OP_BRA` is `bra_loop` (rdepth `>= 1`, no THEN in chunk D).
@@ -991,6 +1084,31 @@ SKIP_ARG rerun re-runs the whole match at the same start with
 fuzz `--mode fast-vs-interp` `LIMIT_MATCH=2000` differential (0 divergences over
 500k+ cases with verbs across 5 seeds) and the verb `LIMIT_MATCH` boundary/sweep
 tests.
+
+**Conditionals (chunk J) tick at the RM5 / RM35 / KET sites.** The non-assertion
+condition tests (`COND_CREF`/`COND_DNCREF`/`COND_FALSE`, and OP_TRUE's absent
+test) and the branch selection NEVER tick — the C's OP_COND evaluates the
+condition inline and dispatches the chosen branch in the SAME frame (no RMATCH),
+so the yes/no branch runs at the conditional's rdepth. An assertion condition
+ticks per assertion branch tried: the body branches lower grouploop-style so each
+branch's `ALT` ticks a child frame at rdepth+1 (the C's RM5), and
+`COND_ASSERT_MATCH` restores rdepth to the entry (the C RRETURNs to the OP_COND
+frame) — its continuation therefore runs at the conditional's rdepth, NOT the
+matching branch's (the difference from a normal atomic assertion, which continues
+at the matching-branch rdepth; the condition assertion's `Fback_frame = F - P`
+jumps all the way back to the COND frame). `SCOND_DESCEND` ticks ONCE per
+iteration of a repeated might-be-empty conditional (the C's RM35 GF_NOCAPTURE
+descend, :5772-5776) — like a single-branch grouploop's entry tick — and the
+repeating ket ticks (RM7/RM6) as the chunk-D2 rows; a repeated OP_COND that
+cannot match empty has NO descend (ket only). So a plain repeated assertion
+SCOND iteration is RM5 + RM35 + RM7 (3 ticks), a non-assertion SCOND iteration is
+RM35 + RM7 (2), and a repeated OP_COND iteration is RM7 (1), matching the C's
+frame counts. `COND_ASSERT`/`COND_ASSERT_MATCH`/the inline tests never tick. The
+`SCOND_DESCEND` tick is load-bearing: dropping it trips `(*LIMIT_MATCH=N)` at a
+different N (the conditional `LIMIT_MATCH` sweep is mutation-tested against that
+break). Verified by the fuzz `--mode fast-vs-interp` `LIMIT_MATCH=2000`
+differential (0 divergences, conditionals generated by the fuzzer) and the
+conditional `LIMIT_MATCH` N-sweep.
 
 **Start-of-match scan is required for tick parity (chunk C2, not deferred).** A skipped
 attempt does ZERO ticks, so a naive bump-along that runs attempts the interpreter's

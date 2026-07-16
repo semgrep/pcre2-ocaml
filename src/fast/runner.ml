@@ -1219,6 +1219,23 @@ let rec dnref_scan (mb : mb) (remaining : int) (slot : int) : int =
   then ovbase (* first set group *)
   else (dnref_scan [@tailcall]) mb (remaining - 1) (slot + mb.name_entry_size)
 
+(* pcre2_match.c:5675-5684 (interpreter.ml dncref_scan :6662-6677) — the
+   OP_DNCREF duplicate-name group-list test for a conditional: TRUE iff ANY of
+   the [remaining] groups in the name list (starting at byte offset [slot] in the
+   name table, each entry beginning with the group NUMBER) is SET. A group N is
+   set iff its ovector slot ovector.(2N) <> UNSET (a CREF/DNCREF-referenced group
+   is non-optimized — chunk F — so the slot is written only at CLOSE, matching
+   the interpreter's `Fovector[offset] != PCRE2_UNSET`). *)
+let rec dncref_test (mb : mb) (remaining : int) (slot : int) : bool =
+  if remaining <= 0 then false
+  else
+    (* Compile.get2 (safe Bytes.get); Ir_verify proved the whole list span is
+       inside name_table (like t_dnref). *)
+    let ovbase = Compile.get2 mb.name_table slot lsl 1 (* 2N *) in
+    (* safe: ovbase = 2N, 1 <= N <= top_bracket, so ovbase < Array.length ovector. *)
+    if not (Int.equal (Array.unsafe_get mb.ovector ovbase) Frames.unset) then true
+    else (dncref_test [@tailcall]) mb (remaining - 1) (slot + mb.name_entry_size)
+
 (* [setup_ref_rep] decodes the ref-repeat instruction at [pc] into mb.ref_*
    (fast-design.md §2/§3). Called on the forward path (op_ref_repeat) and
    re-called on the RM20 backtrack (KIND_REF_MIN) to restore the fields a
@@ -2001,6 +2018,85 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
         Array.unsafe_set ov ovb (Array.unsafe_get mb.cap_start ovb);
       Array.unsafe_set ov (ovb + 1) (eptr - mb.start_subject);
       (run [@tailcall]) mb (pc + 3) eptr (sp + Save_stack.width_cap) rdepth mcc
+  | 63 ->
+      (* COND_CREF (fast-design.md §2/§4; OP_CREF pcre2_match.c:5668-5671 /
+         interpreter.ml:2506-2514) — numbered-group-set test for a conditional.
+         TRUE (group N set: ovector.(ovbase) <> UNSET) falls through to the
+         yes-branch; FALSE jumps to [no_target]. No tick, no choice point. *)
+      let ovb = code.(pc + 1) in
+      (* safe: ovb = 2N, 2 <= ovb < 2*oveccount = Array.length mb.ovector
+         (Ir_verify ovbase_ok). *)
+      if not (Int.equal (Array.unsafe_get mb.ovector ovb) Frames.unset) then
+        (run [@tailcall]) mb (pc + 3) eptr sp rdepth mcc
+      else (run [@tailcall]) mb code.(pc + 2) eptr sp rdepth mcc
+  | 64 ->
+      (* COND_DNCREF (fast-design.md §2/§4; OP_DNCREF pcre2_match.c:5673-5685 /
+         interpreter.ml:2515-2524) — duplicate-named-group-set test: TRUE iff any
+         group in the name list is set (dncref_test). No tick, no choice point. *)
+      if dncref_test mb code.(pc + 2) code.(pc + 1) then
+        (run [@tailcall]) mb (pc + 4) eptr sp rdepth mcc
+      else (run [@tailcall]) mb code.(pc + 3) eptr sp rdepth mcc
+  | 65 ->
+      (* COND_FALSE (fast-design.md §2; OP_FALSE/OP_FAIL pcre2_match.c:5687-5689,
+         and OP_RREF/OP_DNRREF which are always false without recursion,
+         :5645-5666) — the condition is always false: jump to [no_target].
+         (?(DEFINE)…) rides this arm (its body is the never-taken yes-branch).
+         No tick, no choice point. *)
+      (run [@tailcall]) mb code.(pc + 1) eptr sp rdepth mcc
+  | 66 ->
+      (* COND_ASSERT (fast-design.md §3; the assertion-condition entry
+         pcre2_match.c:5701-5708 / interpreter.ml:2534-2548) — push a
+         KIND_NASSERT boundary whose [cont] = [nomatch_target] (the branch taken
+         when the assertion body does NOT match), set mb.once_base, fall into the
+         assertion body (grouploop-style ALT per branch). No tick (the first
+         branch's ALT ticks — the C's RM5). Exhausting all branches backtracks to
+         the boundary -> backtrack_nassert -> [nomatch_target]; a matching branch
+         reaches t_cond_assert_match. *)
+      let nomatch_target = code.(pc + 1) in
+      let sp' = push_nassert mb sp nomatch_target eptr rdepth in
+      (run [@tailcall]) mb (pc + 2) eptr sp' rdepth mcc
+  | 67 ->
+      (* COND_ASSERT_MATCH (fast-design.md §3; the assertion-condition MATCH
+         action pcre2_match.c:5722-5724 + the ket memcpy :5934-5948 /
+         interpreter.ml:2685-2716,7733-7736) — an assertion branch matched, so
+         the condition is Lpositive: COMMIT the assertion (its captures persist —
+         they are already in the shared ovector), restore eptr/rdepth to the
+         conditional entry, and jump to [match_target]. The KIND_NASSERT boundary
+         is CONVERTED to a KIND_ONCE so a later backtrack PAST the whole
+         conditional rolls back the snapshot (rather than re-taking the nomatch
+         branch). No tick (the C RRETURNs to the OP_COND frame). *)
+      let match_target = code.(pc + 1) in
+      let base = mb.once_base in
+      let nov = 2 * mb.oveccount in
+      let d = mb.ss.Save_stack.data in
+      (* safe: [base] is the KIND_NASSERT boundary base (set by push_nassert via
+         t_cond_assert): snapshot [base, base+nov-2), prev_once_base at base+nov-2,
+         cont/eptr/rdepth at base+nov-1..base+nov+1, saved_mark at base+nov+2. *)
+      let prev = Array.unsafe_get d (base + nov - 2) in
+      let entry_eptr = Array.unsafe_get d (base + nov) in
+      let entry_rdepth = Array.unsafe_get d (base + nov + 1) in
+      let saved_mark = Array.unsafe_get d (base + nov + 2) in
+      (* Convert KIND_NASSERT (width nov+4) -> KIND_ONCE (width nov+2): the
+         snapshot + prev_once_base slots are identical; rewrite the tail
+         (saved_mark, subtype = atomic group, kind) and truncate to the boundary.
+         mb.mark is KEPT (the mark set inside the matched assertion persists, the
+         C's P->mark = F->mark); the converted KIND_ONCE's saved_mark restores the
+         entry mark only if the conditional is later backtracked past. *)
+      Array.unsafe_set d (base + nov - 1) saved_mark;
+      Array.unsafe_set d (base + nov) Ir.once_group;
+      Array.unsafe_set d (base + nov + 1) Save_stack.kind_once;
+      mb.once_base <- prev;
+      (run [@tailcall]) mb match_target entry_eptr (base + nov + 2) entry_rdepth
+        mcc
+  | 68 ->
+      (* SCOND_DESCEND (fast-design.md §4; the OP_SCOND descend RM35
+         pcre2_match.c:5772-5776) — a repeated conditional that might match empty
+         descends one virtual frame per iteration so the empty-string loop check
+         has the iteration start (the C's GF_NOCAPTURE RMATCH(RM35)). One tick
+         (like a single-branch grouploop's entry tick), no choice point. *)
+      let mcc' = tick_child mb mcc (rdepth + 1) in
+      if mcc' < 0 then mcc'
+      else (run [@tailcall]) mb (pc + 1) eptr sp (rdepth + 1) mcc'
   | _ ->
       (* Ir_verify rejects any other tag before the runner sees it; a compiled
          Ir.t cannot reach here (fast-design.md §2). *)
@@ -4504,7 +4600,13 @@ let () =
   assert (Int.equal Ir.t_prop_rep 60);
   assert (Int.equal Ir.t_extuni 61);
   assert (Int.equal Ir.t_extuni_rep 62);
-  assert (Int.equal Ir.max_tag 62);
+  assert (Int.equal Ir.t_cond_cref 63);
+  assert (Int.equal Ir.t_cond_dncref 64);
+  assert (Int.equal Ir.t_cond_false 65);
+  assert (Int.equal Ir.t_cond_assert 66);
+  assert (Int.equal Ir.t_cond_assert_match 67);
+  assert (Int.equal Ir.t_scond_descend 68);
+  assert (Int.equal Ir.max_tag 68);
   (* Save-record KIND / width constants the runner inlines as literals. *)
   assert (Int.equal Save_stack.kind_alt 0);
   assert (Int.equal Save_stack.kind_cap 1);

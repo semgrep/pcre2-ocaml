@@ -715,6 +715,119 @@ let i2_goldens : (string * string) list =
         ] );
   ]
 
+(* Chunk J goldens — conditionals (OP_COND/OP_SCOND). The CREF group in a
+   conditional is non-optimized (CAP_START_REF); a DEFINE group NOT otherwise
+   referenced stays optimized (CAP_START). *)
+let j_goldens : (string * string) list =
+  [
+    (* Two-branch numbered CREF: the referenced group 1 is a CAP_*_REF; the
+       COND_CREF tests ovbase=2, jumping to the no-branch on FALSE. *)
+    ( "(a)(?(1)b|c)",
+      g
+        [
+          "  0 BRA";
+          "  1 CAP_START_REF ovbase=2";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 12";
+          " 11 FAIL";
+          " 12 CAP_END_REF ovbase=2";
+          " 14 COND_CREF ovbase=2 no=22";
+          " 17 CHAR_RUN \"b\"";
+          " 20 JMP 25";
+          " 22 CHAR_RUN \"c\"";
+          " 25 KET";
+          " 26 KET";
+          " 27 END";
+        ] );
+    (* Positive assertion condition: the KIND_NASSERT boundary (COND_ASSERT)
+       runs the assertion body grouploop-style; a match reaches
+       COND_ASSERT_MATCH -> yes-branch, else -> no-branch (nomatch=). *)
+    ( "(?(?=a)b|c)",
+      g
+        [
+          "  0 BRA";
+          "  1 COND_ASSERT nomatch=19";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 12";
+          " 11 FAIL";
+          " 12 COND_ASSERT_MATCH match=14";
+          " 14 CHAR_RUN \"b\"";
+          " 17 JMP 22";
+          " 19 CHAR_RUN \"c\"";
+          " 22 KET";
+          " 23 KET";
+          " 24 END";
+        ] );
+    (* Negative assertion condition: match_target/nomatch_target are swapped
+       (a matching assertion body -> the NO branch). *)
+    ( "(?(?!a)b|c)",
+      g
+        [
+          "  0 BRA";
+          "  1 COND_ASSERT nomatch=14";
+          "  3 BRA";
+          "  4 ALT next=11";
+          "  6 CHAR_RUN \"a\"";
+          "  9 JMP 12";
+          " 11 FAIL";
+          " 12 COND_ASSERT_MATCH match=19";
+          " 14 CHAR_RUN \"b\"";
+          " 17 JMP 22";
+          " 19 CHAR_RUN \"c\"";
+          " 22 KET";
+          " 23 KET";
+          " 24 END";
+        ] );
+    (* (?(DEFINE)…) compiles the condition to OP_FALSE -> COND_FALSE (always the
+       no-branch = the group KET, matching empty); the DEFINE body is the
+       never-taken yes-branch (an optimized capture, never referenced here). *)
+    ( "(?(DEFINE)(?<x>y))z",
+      g
+        [
+          "  0 BRA";
+          "  1 COND_FALSE no=16";
+          "  3 CAP_START ovbase=2";
+          "  5 BRA";
+          "  6 ALT next=13";
+          "  8 CHAR_RUN \"y\"";
+          " 11 JMP 14";
+          " 13 FAIL";
+          " 14 CAP_END ovbase=2";
+          " 16 KET";
+          " 17 CHAR_RUN \"z\"";
+          " 20 KET";
+          " 21 END";
+        ] );
+    (* A repeated single-branch conditional that can match empty -> OP_SCOND:
+       the GROUP_START/SCOND_DESCEND pair (empty-check + RM35 descend) before the
+       condition test, and a KET_RMAX looping back to the GROUP_START. *)
+    ( "(a)?(?(1)b)*",
+      g
+        [
+          "  0 BRA";
+          "  1 BRAZERO skip=16";
+          "  3 CAP_START_REF ovbase=2";
+          "  5 BRA";
+          "  6 ALT next=13";
+          "  8 CHAR_RUN \"a\"";
+          " 11 JMP 14";
+          " 13 FAIL";
+          " 14 CAP_END_REF ovbase=2";
+          " 16 BRAZERO skip=30";
+          " 18 GROUP_START g=0";
+          " 20 SCOND_DESCEND";
+          " 21 COND_CREF ovbase=2 no=27";
+          " 24 CHAR_RUN \"b\"";
+          " 27 KET_RMAX entry=18 g=0";
+          " 30 KET";
+          " 31 END";
+        ] );
+  ]
+
 let golden_tests =
   List.map
     (fun (pat, expected) ->
@@ -725,7 +838,7 @@ let golden_tests =
           Alcotest.(check string)
             (Printf.sprintf "IR dump for %S" pat)
             expected (dump_of pat)))
-    (goldens @ i2_goldens)
+    (goldens @ i2_goldens @ j_goldens)
 
 (* Chunk F: a DNREF golden needs DUPNAMES (duplicate group names), so it
    compiles with that option rather than through the plain [dump_of]. Both
@@ -777,6 +890,57 @@ let dnref_golden_test =
         "DNREF dump" expected
         (Format.asprintf "%a" Ir.dump ir))
 
+(* Chunk J: a COND_DNCREF golden needs DUPNAMES (the duplicate-name group list
+   the condition scans). Two alternatives (?<A>a) / (?<A>b) share the name A;
+   the COND_DNCREF tests whether either is set (slot=0, count=2). *)
+let dncref_golden_test =
+  Alcotest.test_case "dump COND_DNCREF (dupnames)" `Quick (fun () ->
+      let ir =
+        match
+          C.pcre2_compile "(?:(?<A>a)|(?<A>b))(?(<A>)x|y)"
+            ~options:(Pcre2_engine.Options.of_int32 dupnames)
+        with
+        | Ok re -> (
+            match Ir_compile.compile re with
+            | Ok ir -> ir
+            | Error r -> Alcotest.failf "unexpectedly Unsupported: %s" r)
+        | Error (c, o) -> Alcotest.failf "compile err %d @ %d" c o
+      in
+      let expected =
+        g
+          [
+            "  0 BRA";
+            "  1 BRA";
+            "  2 ALT next=19";
+            "  4 CAP_START_REF ovbase=2";
+            "  6 BRA";
+            "  7 ALT next=14";
+            "  9 CHAR_RUN \"a\"";
+            " 12 JMP 15";
+            " 14 FAIL";
+            " 15 CAP_END_REF ovbase=2";
+            " 17 JMP 32";
+            " 19 CAP_START_REF ovbase=4";
+            " 21 BRA";
+            " 22 ALT next=29";
+            " 24 CHAR_RUN \"b\"";
+            " 27 JMP 30";
+            " 29 FAIL";
+            " 30 CAP_END_REF ovbase=4";
+            " 32 KET";
+            " 33 COND_DNCREF slot=0 count=2 no=42";
+            " 37 CHAR_RUN \"x\"";
+            " 40 JMP 45";
+            " 42 CHAR_RUN \"y\"";
+            " 45 KET";
+            " 46 KET";
+            " 47 END";
+          ]
+      in
+      Alcotest.(check string)
+        "COND_DNCREF dump" expected
+        (Format.asprintf "%a" Ir.dump ir))
+
 (* ---------- 2. unsupported reasons ---------- *)
 
 let unsupported_reason (pat : string) : string =
@@ -788,10 +952,10 @@ let unsupported_cases : (string * string * string) list =
   [
     (* (label, pattern, expected reason) *)
     (* Chunk F: a back-referenced capture is now LOWERED (referenced protocol),
-       so (a)\1 is accepted — no unsupported entry. A capture referenced by a
-       CONDITIONAL still declines, but at the OP_COND (chunk J), not the
-       referenced cbracket: the referenced-capture lowering is generic. *)
-    ("conditional ref", "(a)(?(1)b|c)", "fast: OP_COND (chunk J)");
+       so (a)\1 is accepted — no unsupported entry. Chunk J supports conditionals
+       (OP_COND/OP_SCOND + CREF/DNCREF/RREF/DNRREF/FALSE/TRUE + assertion
+       conditions), so "(a)(?(1)b|c)" and the like are now ACCEPTED (parity pinned
+       in parity_cases below). *)
     (* Chunk G supports atomic groups (OP_ONCE), so a possessive ref repeat
        "(a)\\1++" (compiled as (?>\\1+)) is now ACCEPTED — no unsupported entry. *)
     (* Chunk G supports possessive groups (BRAPOS/CBRAPOS/... + KETRPOS +
@@ -816,6 +980,14 @@ let unsupported_cases : (string * string * string) list =
        MATCH_ACCEPT propagation to the assertion boundary with capture fishing),
        and ( *THEN) in a pattern that also has a NON-ATOMIC positive assertion
        (no KIND_ONCE boundary to contain the THEN). *)
+    (* Chunk J supports conditionals, but a MANUAL callout inserted between
+       OP_COND and an assertion condition (pcre2_match.c:5623-5638) sits at the
+       condition-opcode position and must decline to chunk K (do_callout), not
+       fall into compile_cond's assertion lowering (whose link walk would read
+       the callout's payload as offsets). *)
+    ( "callout before condition assertion",
+      "(?(?C1)(?=a)b|c)",
+      "fast: OP_CALLOUT (chunk K)" );
     ( "accept in assertion",
       "(?=a(*ACCEPT))",
       "fast: (*ACCEPT) inside assertion (chunk H+)" );
@@ -1223,6 +1395,28 @@ let sweep_patterns =
     "(?:ab)*+";
     "(a*)++";
     "\\p{Common}{3}(())";
+    (* Chunk J: conditionals. *)
+    "(a)(?(1)b|c)";
+    "(a)?(?(1)b)";
+    "(a)?(?(1)b|c)*";
+    "(a)?(?(1)b)*";
+    "(a)?(?(1)b)+?";
+    "(a)?(?(1)|c)";
+    "(?(?=a)b|c)";
+    "(?(?!a)b|c)";
+    "(?(?<=a)b|c)";
+    "(?(?<=a{2,3})x|y)";
+    "(?(?=(a))b\\1|c)";
+    "(?(DEFINE)(?<x>abc))d";
+    "(?(R)a|b)";
+    "(?(VERSION>=10)y|n)";
+    "(a)?(b)?(?(1)(?(2)x|y)|z)";
+    "(?>(a)(?(1)b|c))";
+    "(?:(a)(?(1)b|c))++";
+    "(a)?(?(1)b)*+";
+    "(?(?=a)b)*";
+    "(?(?=a(*THEN)b)x|y)";
+    "(a)(?(1)b(*THEN)c|d)";
   ]
 
 let sweep_tests =
@@ -1950,6 +2144,77 @@ let parity_cases : (string * string * int * int32) list =
     ("(*UTF)(?<=\\x{3b1})\\x{3b2}", "\xce\xb1\xce\xb2", 2, 0l)
     (* start offset: max_lookbehind back-up + check_subject floor *);
     ("(*UTF)(?<=(\\x{3b1}|\\x{3b2}\\x{3b1}))x", "\xce\xb2\xce\xb1x", 0, 0l);
+    (* ---------- Chunk J: conditionals ----------
+       Numbered CREF (?(1)…) both set/unset paths, single- and two-branch. *)
+    ("(a)(?(1)b|c)", "ab", 0, 0l);
+    ("(a)?(?(1)b|c)", "ab", 0, 0l);
+    ("(a)?(?(1)b|c)", "c", 0, 0l);
+    ("(a)?(?(1)b|c)", "b", 0, 0l);
+    ("(a)?(?(1)b)", "ab", 0, 0l);
+    ("(a)?(?(1)b)", "a", 0, 0l);
+    ("(a)?(?(1)b)", "", 0, 0l);
+    ("(a)?(?(1)|c)", "", 0, 0l) (* empty yes-branch *);
+    ("(a)?(?(1)|c)", "c", 0, 0l);
+    ("(a)?(?(1)x|)", "a", 0, 0l) (* empty no-branch *);
+    (* Named DNCREF via (?J) inline DUPNAMES. *)
+    ("(?J)(?:(?<A>a)|(?<A>b))(?(<A>)x|y)", "ax", 0, 0l);
+    ("(?J)(?:(?<A>a)|(?<A>b))(?(<A>)x|y)", "bx", 0, 0l);
+    ("(?J)(?:(?<A>a)|z)(?(<A>)x|y)", "zy", 0, 0l);
+    ("(?<A>a)?(?(<A>)b|c)", "ab", 0, 0l);
+    ("(?<A>a)?(?(<A>)b|c)", "c", 0, 0l);
+    (* DEFINE / OP_FALSE: subroutine-less body, condition always false. *)
+    ("(?(DEFINE)(?<x>abc))d", "d", 0, 0l);
+    ("(?(DEFINE)(?<x>abc))d", "abc", 0, 0l);
+    ("(?(VERSION>=0)y|n)", "y", 0, 0l);
+    ("(?(VERSION>=99)y|n)", "n", 0, 0l);
+    (* Recursion condition (?(R)…) with recursion out of subset -> always false. *)
+    ("(?(R)a|b)", "a", 0, 0l);
+    ("(?(R)a|b)", "b", 0, 0l);
+    (* Assertion conditions, positive and negative, captures inside persist. *)
+    ("(?(?=a)b|c)", "ab", 0, 0l);
+    ("(?(?=a)b|c)", "c", 0, 0l);
+    ("(?(?!a)b|c)", "b", 0, 0l);
+    ("(?(?!a)b|c)", "ab", 0, 0l);
+    ("(?(?=a)b)", "ab", 0, 0l);
+    ("(?(?=a)b)", "b", 0, 0l);
+    ("(?(?=(a))b\\1|c)", "aba", 0, 0l) (* pos-assert capture persists into yes *);
+    ("x(?(?=(a))\\1y|z)", "xay", 0, 0l);
+    ("x(?(?!(a))y|\\1z)", "xaz", 0, 0l) (* neg-assert capture persists into no *);
+    ("(?(?=(a)(b))\\1\\2x|y)", "abababx", 0, 0l);
+    (* Lookbehind conditions (fixed + variable). *)
+    ("(?(?<=a)b|c)", "ab", 0, 0l);
+    ("(?(?<=a)b|c)", "c", 0, 0l);
+    ("(?(?<=a{2,3})x|y)", "aax", 0, 0l);
+    ("(?(?<=a{2,3})x|y)", "ay", 0, 0l);
+    (* Nested conditionals. *)
+    ("(a)?(b)?(?(1)(?(2)x|y)|z)", "abx", 0, 0l);
+    ("(a)?(b)?(?(1)(?(2)x|y)|z)", "ay", 0, 0l);
+    ("(a)?(b)?(?(1)(?(2)x|y)|z)", "z", 0, 0l);
+    (* Conditionals inside repeats and atomic groups. *)
+    ("(a)?(?(1)b)*", "abbb", 0, 0l);
+    ("(a)?(?(1)b)*", "bbb", 0, 0l);
+    ("(a)?(?(1)b|c)*", "abcbc", 0, 0l);
+    ("(a)?(?(1)b|c)*", "ccc", 0, 0l);
+    ("(a)?(?(1)b)+?c", "abbc", 0, 0l);
+    ("(?(?=a)b)*", "abab", 0, 0l);
+    ("(?(?=a)b)+", "ab", 0, 0l);
+    ("(?>(a)(?(1)b|c))", "ab", 0, 0l) (* conditional inside atomic group *);
+    ("(?:(a)(?(1)b|c))++", "abab", 0, 0l) (* conditional inside possessive *);
+    ("(x)(?(1)a|b){2,3}", "xaaa", 0, 0l);
+    (* Possessive repeated conditional (BRAPOS/SBRAPOS wrapping COND). *)
+    ("(a)?(?(1)b)*+c", "abbc", 0, 0l);
+    ("(?(?=a)ab|c)*+d", "abd", 0, 0l);
+    (* THEN / verb interplay at conditional branch boundaries. *)
+    ("(?(?=a(*THEN)b)x|y)", "ac", 0, 0l);
+    ("(?(?=a(*THEN)b)x|y)", "y", 0, 0l);
+    ("(?(?=aa|a(*THEN)b)x|y)", "ac", 0, 0l);
+    ("(a)(?(1)b(*THEN)c|d)", "abd", 0, 0l);
+    ("(a)(?(1)b(*THEN)c|d)", "abc", 0, 0l);
+    ("(?:(?(?=a)x(*THEN)y|z)|w)", "ac", 0, 0l);
+    ("(a)(?(1)(*COMMIT)b|c)d", "aXd", 0, 0l);
+    ("(?(?=a)(*MARK:m)b|c)", "cc", 0, 0l);
+    ("(a)?(?(1)(*MARK:y)b|c)", "ab", 0, 0l);
+    ("(a)?(?(1)(*MARK:y)b|c)", "c", 0, 0l);
   ]
 
 let parity_tests =
@@ -2261,6 +2526,50 @@ let limit_match_boundary_test =
             ("(?!a(*COMMIT))b", "b"); (* COMMIT in negative assertion *)
             ("a(*MARK:m)(b(*PRUNE)c|d)", "ad"); (* MARK + PRUNE in a group *)
           ]);
+    (* Chunk J: conditional tick parity. The tick sites are the OP_SCOND descend
+       (RM35 — one tick per iteration of a repeated might-be-empty conditional),
+       the assertion-condition branch RMATCHes (RM5 — one tick per assertion
+       branch tried), and the repeating ket (RM7). The two engines must trip -47
+       at the SAME N. Same discipline as the I2 sweep above: \A pins ONE attempt
+       so the divergent tick is binding, a req_cu tail ('9') keeps the attempt
+       from being skipped, and ( *NO_AUTO_POSSESS) keeps the greedy repeats true
+       maximizers (so the ket give-back / descend ticks fire). *)
+    Alcotest.test_case "LIMIT_MATCH sweep, conditionals (fast == interp)" `Quick
+      (fun () ->
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 40 do
+              let f, e = run_both body n subj in
+              Alcotest.(check string)
+                (Printf.sprintf "fast == interp for /%s/ on %S at N=%d" body subj
+                   n)
+                e f
+            done)
+          [
+            (* SCOND greedy: RM35 descend + RM7 ket per iteration (pins the
+               t_scond_descend tick — dropping it trips -47 one N earlier). *)
+            ("(*NO_AUTO_POSSESS)\\A(a)?(?(1)b)*9", "abbb9");
+            ("(*NO_AUTO_POSSESS)\\A(a)?(?(1)b)*9", "9");
+            ("(*NO_AUTO_POSSESS)\\A(a)?(?(1)b)+9", "abbb9");
+            (* SCOND lazy: RM35 descend + RM6 ket extend per iteration. *)
+            ("(*NO_AUTO_POSSESS)\\A(a)?(?(1)b)*?9", "abbb9");
+            (* SCOND, empty could-match two-branch (empty yes / empty no). *)
+            ("(*NO_AUTO_POSSESS)\\A(a)?(?(1)|c)*9", "cc9");
+            ("(*NO_AUTO_POSSESS)\\A(a)?(?(1)b|)*9", "abb9");
+            (* Repeated two-branch OP_COND (no descend: RM7 ket only). *)
+            ("(*NO_AUTO_POSSESS)\\A(a)(?(1)b|c)*9", "abbb9");
+            (* Bounded repeated conditional (each unrolled copy ticks). *)
+            ("(*NO_AUTO_POSSESS)\\A(a)(?(1)b|c){2,4}9", "abbb9");
+            (* Assertion-condition SCOND: RM5 (assert branch) + RM35 + RM7. *)
+            ("(*NO_AUTO_POSSESS)\\A(?(?=a)a)*9", "aaa9");
+            ("(*NO_AUTO_POSSESS)\\A(?(?=a)a)+9", "aaa9");
+            (* Assertion condition with a multi-branch assertion (RM5 per
+               branch tried before the condition is decided). *)
+            ("\\A(?(?=aa|a)ax|bx)9", "ac9");
+            ("\\A(?(?!x|y|z)a|b)9", "a9");
+            (* Conditional inside a greedy repeat that backtracks. *)
+            ("(*NO_AUTO_POSSESS)\\A(?:(a)?(?(1)b|c))*9", "abcbc9");
+          ]);
   ]
 
 (* ---------- 6b. backref compile-option parity vs the interpreter ----------
@@ -2295,7 +2604,7 @@ let ref_options_cases : (string * int32 * string) list =
   ]
 
 let ref_options_tests =
-  dnref_golden_test
+  dnref_golden_test :: dncref_golden_test
   :: List.map
        (fun (pat, copts, subj) ->
          Alcotest.test_case

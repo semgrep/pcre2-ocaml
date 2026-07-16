@@ -240,7 +240,35 @@ interpreter is its differential oracle. Approved plan:
   OP_RECURSE / OP_SCRIPT_RUN / callouts (chunk K); `\K` (C2+); repeated
   atomic group / assertion (G+); ( *ACCEPT) inside an assertion and ( *THEN)
   with a non-atomic assertion (H+); PCRE2_FIRSTLINE (chunk L).
-- [ ] **J — Conditionals** — COND/SCOND + CREF/DNCREF/RREF/DNRREF/FALSE/TRUE.
+- [x] **J — Conditionals** — OP_COND/OP_SCOND + all in-subset condition kinds:
+  OP_CREF (numbered group-set), OP_DNCREF (dup-named group-set list scan),
+  OP_FALSE/OP_FAIL ((?(DEFINE)…), (?(VERSION<x)…)), OP_TRUE, OP_RREF/OP_DNRREF
+  (recursion tests, ALWAYS false with recursion out of subset — chunk K
+  revisits), and assertion conditions ((?(?=…)…) etc, positive and negative,
+  lookahead and lookbehind incl. variable). Branch selection is DETERMINED by
+  the condition — no ALT choice point for the yes/no pick — so the non-assertion
+  tests are inline (COND_CREF/COND_DNCREF/COND_FALSE: TRUE falls through, FALSE
+  jumps to no_target; OP_TRUE emits no test). Assertion conditions reuse chunk
+  G's KIND_NASSERT boundary + grouploop branch lowering: COND_ASSERT pushes the
+  boundary (cont = the "did-not-match" branch), a matching assertion branch
+  reaches COND_ASSERT_MATCH which COMMITS (converts the KIND_NASSERT to a
+  KIND_ONCE — capture persistence + atomicity of pcre2_match.c:5934-5948) and
+  takes the "matched" branch; the positive/negative sense picks which of yes/no
+  is match vs nomatch (RM5, :5710-5745). OP_SCOND (a repeated conditional that
+  might match empty) adds SCOND_DESCEND (the RM35 descend, one tick/iteration)
+  and the empty-string loop check via mb.group_start.(g) (a GROUP_START +
+  KET_RMAX/KET_RMIN). CREF/DNCREF-referenced groups were already non-optimized
+  by the F-era analysis, so their ovector slot (written only at CLOSE) makes the
+  "set" test exact vs the interpreter. New IR tags COND_CREF/COND_DNCREF/
+  COND_FALSE/COND_ASSERT/COND_ASSERT_MATCH/SCOND_DESCEND (63-68); NO new save
+  kind (reuse KIND_NASSERT + KIND_ONCE). THEN/verb scoping at conditional
+  branch boundaries: a THEN in a non-assertion conditional branch ESCAPES (the
+  branches are deterministic, no KIND_ALT to contain it); a verb (incl. THEN)
+  reaching the assertion-condition boundary follows RM5 = RM4 (COMMIT/SKIP/
+  PRUNE/THEN → the nomatch branch, SKIP_ARG escapes). Ratchet 1064/612/594/406/43
+  → 1142/640/596/407/43 (testinput1/2/4/5/10), zero failures; fuzz
+  fast-vs-interp clean (163k+ conditional-inclusive comparisons). **Declined
+  (unchanged reasons):** OP_RECURSE / OP_SCRIPT_RUN / callouts (chunk K).
 - [ ] **K — Recursion + script-run + callout no-ops** — full parity reached; no
   `Unsupported` remains for in-scope patterns.
 - [ ] **L — JIT start-opts** — scan_prefix + range skip table (`:5592,6159-6330`),

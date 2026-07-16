@@ -518,6 +518,61 @@ let check (ir : Ir.t) : (unit, string) result =
                       (Printf.sprintf "fast-verify: CLOSE at pc %d bad referenced %d"
                          pc r)
                   else Ok ())
+                else if Int.equal t Ir.t_cond_cref then (
+                  (* [ovbase; no_target]: ovbase names a capture pair; no_target
+                     is a valid instruction head (the FALSE branch). *)
+                  let ovb = code.(pc + 1) in
+                  let no_target = code.(pc + 2) in
+                  if not (ovbase_ok ovb) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: COND_CREF at pc %d ovbase %d out of range \
+                          (top bracket %d)"
+                         pc ovb top_bracket)
+                  else if no_target < 0 || no_target >= len || not is_head.(no_target)
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: COND_CREF at pc %d no_target %d not an \
+                          instruction head"
+                         pc no_target)
+                  else Ok ())
+                else if Int.equal t Ir.t_cond_dncref then (
+                  (* [slot_base; count; no_target]: the name-table span
+                     [slot_base, slot_base+(count-1)*entry+1] must be inside the
+                     table (dncref_test reads GET2 there); no_target a valid head. *)
+                  let slot_base = code.(pc + 1) in
+                  let count = code.(pc + 2) in
+                  let no_target = code.(pc + 3) in
+                  let last_byte = slot_base + ((count - 1) * name_entry_size) + 1 in
+                  if count < 1 || slot_base < 0 || last_byte >= nt_len then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: COND_DNCREF at pc %d name-table span \
+                          [%d..%d) outside table of %d bytes (entry_size %d)"
+                         pc slot_base (last_byte + 1) nt_len name_entry_size)
+                  else if no_target < 0 || no_target >= len || not is_head.(no_target)
+                  then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: COND_DNCREF at pc %d no_target %d not an \
+                          instruction head"
+                         pc no_target)
+                  else Ok ())
+                else if
+                  Int.equal t Ir.t_cond_false || Int.equal t Ir.t_cond_assert
+                  || Int.equal t Ir.t_cond_assert_match
+                then (
+                  (* Each carries ONE jump target at pc+1 (no_target / nomatch /
+                     match) that must be a valid instruction head. *)
+                  let tgt = code.(pc + 1) in
+                  if tgt < 0 || tgt >= len || not is_head.(tgt) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: %s at pc %d target %d not an instruction \
+                          head"
+                         Ir.tag_name.(t) pc tgt)
+                  else Ok ())
                 else Ok ()
               in
               match step with

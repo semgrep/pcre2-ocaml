@@ -749,6 +749,236 @@ let compile (re : C.re) : (Ir.t, string) result =
       if !prev_cp >= 0 then patch_alt !prev_cp done_pc multibranch;
       List.iter (fun j -> set j ketrpos_pc) !jmp_fixups;
       ket_off + Op.op_lengths.(ket_op)
+    (* [compile_cond bra_off]: lower a conditional group OP_COND / OP_SCOND
+       ... OP_KET (pcre2_match.c:5603-5778 / interpreter.ml:2427-2548).
+       A conditional has one branch (the yes-branch) or two (yes | no); the
+       condition DETERMINES which runs — there is no backtrack-driven retry
+       between the branches (unlike ALT). The yes-branch begins just past the
+       condition item; the no-branch (if any) follows the OP_ALT; an absent
+       no-branch means "match empty" (past the group KET) when the condition is
+       false. Only backtracking INTO the chosen branch (and, for an assertion
+       condition, trying the assertion's own branches) happens.
+
+       - Non-assertion conditions (OP_CREF/OP_DNCREF/OP_FALSE/OP_FAIL/OP_TRUE and
+         the never-true-here OP_RREF/OP_DNRREF) are inline tests (no tick, no
+         choice point): TRUE falls through to the yes-branch, FALSE jumps to
+         [no_target].
+       - Assertion conditions reuse the KIND_NASSERT boundary + grouploop branch
+         lowering: [t_cond_assert] pushes the boundary (cont = the "assertion
+         did NOT match" branch), a matching branch reaches [t_cond_assert_match]
+         (commit + the "assertion matched" branch). The positive/negative sense
+         picks which of yes/no is match vs nomatch.
+       - OP_SCOND (a repeated conditional that might match empty) adds the RM35
+         descend ([t_scond_descend], one tick per iteration) and the empty-string
+         loop check via [mb.group_start.(g)] (a preceding [t_group_start]). *)
+    and compile_cond (bra_off : int) : int =
+      let op = byte bra_off in
+      let is_scond = Int.equal op Op.op_scond in
+      let cond_op_off = bra_off + 1 + Limits.link_size in
+      let cond_op = byte cond_op_off in
+      (* Collect the branch structure: the first "branch" begins with the
+         condition opcode; the (optional) no-branch follows an OP_ALT; find the
+         KET (mirrors compile_group's link walk, pcre2_match.c:5619-5620). *)
+      let rec collect (p : int) (acc : int list) : int list * int =
+        let start = p + Op.op_lengths.(byte p) in
+        let nxt = p + link p in
+        if Int.equal (byte nxt) Op.op_alt then
+          (collect [@tailcall]) nxt (start :: acc)
+        else (List.rev (start :: acc), nxt)
+      in
+      let branch_offs, ket_off = collect bra_off [] in
+      let two_branch = List.length branch_offs >= 2 in
+      let no_body_off = if two_branch then List.nth branch_offs 1 else -1 in
+      let ket_op = byte ket_off in
+      let is_max = Int.equal ket_op Op.op_ketrmax in
+      let is_min = Int.equal ket_op Op.op_ketrmin in
+      let repeating = is_max || is_min in
+      (* A possessive conditional is compiled as OP_BRAPOS/OP_SBRAPOS wrapping the
+         COND/SCOND (pcre2_compile.c:7714-7728), so OP_KETRPOS never closes a
+         COND/SCOND directly; decline anything but OP_KET/KETRMAX/KETRMIN. *)
+      if not (Int.equal ket_op Op.op_ket || repeating) then
+        raise (Unsupported (reason_of_op ket_op));
+      (* Condition classification (pcre2_match.c:5643-5701): the seven inline
+         tests, else an assertion (Lpositive = OP_ASSERT/OP_ASSERTBACK). *)
+      let is_cref = Int.equal cond_op Op.op_cref in
+      let is_dncref = Int.equal cond_op Op.op_dncref in
+      let is_true = Int.equal cond_op Op.op_true in
+      let is_false =
+        Int.equal cond_op Op.op_false || Int.equal cond_op Op.op_fail
+        || Int.equal cond_op Op.op_rref || Int.equal cond_op Op.op_dnrref
+      in
+      (* An assertion condition is exactly one of the four atomic kinds (a
+         non-atomic ( *napla:)/( *naplb:) condition is compile error 162, so it
+         cannot reach here). Anything ELSE — notably a callout inserted between
+         OP_COND and the condition (pcre2_match.c:5623-5638; reachable with a
+         MANUAL callout, `(?(?C1)(?=a)b|c)` — auto-callout declines earlier at
+         the pattern's first OP_CALLOUT) — must decline, NOT fall into the
+         assertion lowering whose link walk would read bogus offsets. Mirrors
+         compile_lookaround's defensive decline; reason_of_op names OP_CALLOUT /
+         OP_CALLOUT_STR as chunk K (which ports do_callout and this skip). *)
+      let is_assert =
+        Int.equal cond_op Op.op_assert
+        || Int.equal cond_op Op.op_assert_not
+        || Int.equal cond_op Op.op_assertback
+        || Int.equal cond_op Op.op_assertback_not
+      in
+      if not (is_cref || is_dncref || is_true || is_false || is_assert) then
+        raise (Unsupported (reason_of_op cond_op));
+      let positive =
+        Int.equal cond_op Op.op_assert || Int.equal cond_op Op.op_assertback
+      in
+      (* The yes-branch begins past the condition ITEM: for a non-assertion
+         condition that is the opcode length; for an assertion it is past the
+         assertion's own KET. *)
+      let yes_body_off =
+        if is_assert then (
+          let rec find_ket (p : int) : int =
+            let nxt = p + link p in
+            if Int.equal (byte nxt) Op.op_alt then (find_ket [@tailcall]) nxt
+            else nxt
+          in
+          let assert_ket = find_ket cond_op_off in
+          assert_ket + Op.op_lengths.(byte assert_ket))
+        else cond_op_off + Op.op_lengths.(cond_op)
+      in
+      (* Does the assertion condition contain a variable-lookbehind branch (its
+         end-point check needs a group id)? *)
+      let assert_has_vreverse =
+        is_assert
+        &&
+        let rec any (p : int) : bool =
+          let start = p + Op.op_lengths.(byte p) in
+          (Int.equal (byte start) Op.op_vreverse)
+          ||
+          let nxt = p + link p in
+          Int.equal (byte nxt) Op.op_alt && any nxt
+        in
+        any cond_op_off
+      in
+      (* The empty-check group id is needed for OP_SCOND (the ket loop check);
+         an assertion-condition variable lookbehind also needs one (for the
+         assertback end-point check). They record the SAME entry eptr (the
+         assertion is zero-width), so ONE t_group_start serves both. *)
+      let need_group = is_scond || assert_has_vreverse in
+      let group_id = if need_group then fresh_group () else Ir.no_group in
+      let ket_group = if is_scond then group_id else Ir.no_group in
+      (* Entry: the ket loops back here for a repeated conditional (re-record the
+         iteration start, re-evaluate the condition, re-descend). *)
+      let entry_pc = here () in
+      if need_group then (
+        push Ir.t_group_start;
+        push group_id);
+      (* Emit the ket at [ket_ir]; the branches/JMPs are patched to it. *)
+      let no_operand = ref (-1) in
+      (* jmp after the yes-branch (skip the no-branch), fixed up to ket_ir. *)
+      let yes_jmp = ref (-1) in
+      if is_assert then (
+        (* Assertion condition. The KIND_NASSERT boundary's cont = nomatch_target
+           (patched once the branch heads are known); a matching assertion
+           branch reaches t_cond_assert_match (match_target). *)
+        push Ir.t_cond_assert;
+        let nomatch_slot = here () in
+        push 0 (* nomatch_target placeholder *);
+        push Ir.t_bra;
+        let multibranch =
+          (* number of assertion branches, >= 2 -> THEN can convert at an ALT. *)
+          let rec count (p : int) (n : int) : int =
+            let nxt = p + link p in
+            if Int.equal (byte nxt) Op.op_alt then (count [@tailcall]) nxt (n + 1)
+            else n + 1
+          in
+          count cond_op_off 1 >= 2
+        in
+        let jmp_fixups = ref [] in
+        let prev_cp = ref (-1) in
+        let rec branches (p : int) : unit =
+          let entry = here () in
+          if !prev_cp >= 0 then patch_alt !prev_cp entry multibranch;
+          push Ir.t_alt;
+          let cp_operand = here () in
+          push 0 (* handler placeholder *);
+          prev_cp := cp_operand;
+          let start = p + Op.op_lengths.(byte p) in
+          ignore (compile_branch start : int);
+          if Int.equal (byte start) Op.op_vreverse then (
+            push Ir.t_assertback_check;
+            push group_id);
+          push Ir.t_jmp;
+          let j = here () in
+          push 0 (* -> conv *);
+          jmp_fixups := j :: !jmp_fixups;
+          let nxt = p + link p in
+          if Int.equal (byte nxt) Op.op_alt then (branches [@tailcall]) nxt
+        in
+        branches cond_op_off;
+        (* Exhausting the branches (last ALT handler = FAIL) backtracks to the
+           KIND_NASSERT boundary -> backtrack_nassert -> cont = nomatch_target. *)
+        let fail_pc = here () in
+        push Ir.t_fail;
+        if !prev_cp >= 0 then patch_alt !prev_cp fail_pc multibranch;
+        (* conv: a matching assertion branch commits + jumps to match_target. *)
+        let conv_pc = here () in
+        push Ir.t_cond_assert_match;
+        let match_slot = here () in
+        push 0 (* match_target placeholder *);
+        List.iter (fun j -> set j conv_pc) !jmp_fixups;
+        (* Yes head (match_target for positive), no head (nomatch_target for
+           positive). Each descends first for OP_SCOND. *)
+        let yes_head = here () in
+        if is_scond then push Ir.t_scond_descend;
+        ignore (compile_branch yes_body_off : int);
+        push Ir.t_jmp;
+        yes_jmp := here ();
+        push 0 (* -> ket_ir *);
+        let no_head = here () in
+        if is_scond then push Ir.t_scond_descend;
+        if two_branch then ignore (compile_branch no_body_off : int);
+        let ket_ir = here () in
+        if repeating then (
+          push (if is_max then Ir.t_ket_rmax else Ir.t_ket_rmin);
+          push entry_pc;
+          push ket_group)
+        else push Ir.t_ket;
+        set match_slot (if positive then yes_head else no_head);
+        set nomatch_slot (if positive then no_head else yes_head);
+        set !yes_jmp ket_ir)
+      else (
+        (* Non-assertion condition: inline test. OP_SCOND descends once BEFORE
+           the (tick-free) test so both branches run in the descended frame. *)
+        if is_scond then push Ir.t_scond_descend;
+        (if is_cref then (
+           push Ir.t_cond_cref;
+           push (2 * C.get2 src (cond_op_off + 1));
+           no_operand := here ();
+           push 0)
+         else if is_dncref then (
+           push Ir.t_cond_dncref;
+           push (C.get2 src (cond_op_off + 1) * re.C.name_entry_size);
+           push (C.get2 src (cond_op_off + 1 + Limits.imm2_size));
+           no_operand := here ();
+           push 0)
+         else if is_false then (
+           push Ir.t_cond_false;
+           no_operand := here ();
+           push 0)
+         else (* is_true: no test, the yes-branch runs directly *) ());
+        ignore (compile_branch yes_body_off : int);
+        if two_branch then (
+          push Ir.t_jmp;
+          yes_jmp := here ();
+          push 0 (* -> ket_ir *));
+        let no_ir = here () in
+        if two_branch then ignore (compile_branch no_body_off : int);
+        let ket_ir = here () in
+        if repeating then (
+          push (if is_max then Ir.t_ket_rmax else Ir.t_ket_rmin);
+          push entry_pc;
+          push ket_group)
+        else push Ir.t_ket;
+        (if !no_operand >= 0 then
+           set !no_operand (if two_branch then no_ir else ket_ir));
+        if two_branch then set !yes_jmp ket_ir);
+      ket_off + Op.op_lengths.(ket_op)
     (* [compile_branch p0]: lower one branch body; stops at (without
        consuming) the branch terminator (OP_ALT or an OP_KET family opcode)
        that closes the enclosing group; returns that terminator's offset. *)
@@ -841,6 +1071,9 @@ let compile (re : C.re) : (Ir.t, string) result =
           Int.equal op Op.op_bra || Int.equal op Op.op_cbra
           || Int.equal op Op.op_scbra || Int.equal op Op.op_sbra
         then p := compile_group !p
+        else if Int.equal op Op.op_cond || Int.equal op Op.op_scond then
+          (* Conditional group (chunk J, compile_cond). *)
+          p := compile_cond !p
         else if
           Int.equal op Op.op_once
           || (op >= Op.op_assert && op <= Op.op_assertback_na)
@@ -889,7 +1122,16 @@ let compile (re : C.re) : (Ir.t, string) result =
           push (if Int.equal op Op.op_brazero then Ir.t_brazero else Ir.t_braminzero);
           let skip_operand = here () in
           push 0 (* skip placeholder, resolved past the group *);
-          let after = compile_group (!p + Op.op_lengths.(op)) in
+          (* The wrapped bracket may be a normal group or a conditional
+             (a repeated conditional that might match empty, e.g. `(?(1)a)*`,
+             becomes BRAZERO + OP_SCOND — chunk J). *)
+          let inner = !p + Op.op_lengths.(op) in
+          let inner_op = byte inner in
+          let after =
+            if Int.equal inner_op Op.op_cond || Int.equal inner_op Op.op_scond
+            then compile_cond inner
+            else compile_group inner
+          in
           set skip_operand (here ());
           p := after)
         else if Int.equal op Op.op_skipzero then (

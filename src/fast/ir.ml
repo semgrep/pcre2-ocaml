@@ -209,6 +209,52 @@ let t_prop_rep = 60 (* [t_prop_rep; reptype; lmin; lmax; notprop; ptype; pdata] 
 let t_extuni = 61 (* [t_extuni]                                         *)
 let t_extuni_rep = 62 (* [t_extuni_rep; reptype; lmin; lmax]                *)
 
+(* Chunk J additions (fast-design.md §2/§3/§4) — conditional groups
+   OP_COND/OP_SCOND and their condition opcodes (pcre2_match.c:5603-5778 /
+   interpreter.ml:2427-2548). A conditional has one or two branches whose
+   selection is DETERMINED by the condition (not a backtrack-driven ALT retry):
+   the yes-branch when the condition is TRUE, else the no-branch (or an empty
+   match past the group when there is no no-branch). Only backtracking INTO the
+   chosen branch happens normally.
+
+   The NON-assertion condition tests are inline (no choice point, no tick): TRUE
+   falls through to the yes-branch, FALSE jumps to [no_target] (the no-branch's
+   entry, or the group KET for an empty no-branch).
+   - [t_cond_cref] (OP_CREF, pcre2_match.c:5668-5671): TRUE iff group N is SET,
+     i.e. [ovector.(ovbase) <> UNSET] (ovbase = 2N; CREF groups are marked
+     non-optimized by the F-era analysis, so the slot is written only at CLOSE —
+     the test matches the interpreter's `Fovector[offset] != PCRE2_UNSET`).
+   - [t_cond_dncref] (OP_DNCREF, pcre2_match.c:5673-5685): TRUE iff ANY group in
+     the duplicate-name list [slot_base, slot_base+count*entry) is set (the
+     runner scans it like dnref_scan, testing each group's ovector slot).
+   - [t_cond_false] (OP_FALSE/OP_FAIL for (?(DEFINE)…) and (?(VERSION<x)…), and
+     OP_RREF/OP_DNRREF: the recursion tests are ALWAYS false with recursion out
+     of subset — Fcurrent_recurse == RECURSE_UNSET, pcre2_match.c:5645-5666 —
+     chunk K revisits them): always jump to [no_target]. OP_TRUE emits NO test
+     (the yes-branch runs directly, since the condition never fails).
+
+   Assertion conditions ((?(?=…)…) etc.) reuse chunk G's grouploop-style branch
+   lowering + the KIND_NASSERT boundary (fast-design.md §3): [t_cond_assert]
+   pushes the boundary (its [cont] = [nomatch_target], the branch taken when the
+   assertion body does NOT match, i.e. condition = !Lpositive); a matching
+   assertion branch reaches [t_cond_assert_match], which COMMITS (converts the
+   KIND_NASSERT to a KIND_ONCE — the atomic behaviour + capture persistence of
+   pcre2_match.c:5934-5948) and jumps to [match_target] (condition = Lpositive).
+   [match_target]/[nomatch_target] are the yes/no branch heads chosen at
+   IR-compile time by the assertion's positivity.
+
+   [t_scond_descend] is the OP_SCOND descend (RM35, pcre2_match.c:5772-5776): a
+   repeated conditional that might match empty descends one virtual frame per
+   iteration so the empty-string loop check (mb.group_start.(g)) has the
+   iteration start — one tick, no choice point (like a single-branch grouploop's
+   entry tick). *)
+let t_cond_cref = 63 (* [t_cond_cref; ovbase; no_target] *)
+let t_cond_dncref = 64 (* [t_cond_dncref; slot_base; count; no_target] *)
+let t_cond_false = 65 (* [t_cond_false; no_target] *)
+let t_cond_assert = 66 (* [t_cond_assert; nomatch_target] *)
+let t_cond_assert_match = 67 (* [t_cond_assert_match; match_target] *)
+let t_scond_descend = 68 (* [t_scond_descend] *)
+
 (* Sentinel [g] for a repeated group whose bracket is OP_BRA (bra_loop, C's
    P == NULL): NO empty-string check (the C short-circuits it, and OP_BRA can
    never match empty), so no [t_group_start] and no [mb.group_start] slot. *)
@@ -224,7 +270,7 @@ let reptype_pos = 2
 let rep_inf = 0xFFFFFFFF
 
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 62
+let max_tag = 68
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -294,6 +340,12 @@ let arity =
     7 (* t_prop_rep: reptype, lmin, lmax, notprop, ptype, pdata *);
     1 (* t_extuni *);
     4 (* t_extuni_rep: reptype, lmin, lmax *);
+    3 (* t_cond_cref: ovbase, no_target *);
+    4 (* t_cond_dncref: slot_base, count, no_target *);
+    2 (* t_cond_false: no_target *);
+    2 (* t_cond_assert: nomatch_target *);
+    2 (* t_cond_assert_match: match_target *);
+    1 (* t_scond_descend *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -363,6 +415,12 @@ let tag_name =
     "PROP_REP";
     "EXTUNI";
     "EXTUNI_REP";
+    "COND_CREF";
+    "COND_DNCREF";
+    "COND_FALSE";
+    "COND_ASSERT";
+    "COND_ASSERT_MATCH";
+    "SCOND_DESCEND";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -556,6 +614,30 @@ let close_referenced (ir : t) (pc : int) : int = ir.code.(pc + 2)
    field. Read by the runner at ALT push time. *)
 let alt_then_end (ir : t) (alt_pc : int) : int = ir.alt_then_end.(alt_pc)
 
+(* Chunk J operands (fast-design.md §2/§3). *)
+
+(* [t_cond_cref] — [ovbase] (= 2N of the tested group) and [no_target] (the IR
+   index to jump to when the condition is FALSE). *)
+let cond_cref_ovbase (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let cond_cref_no (ir : t) (pc : int) : int = ir.code.(pc + 2)
+
+(* [t_cond_dncref] — the name-table [slot_base]/[count] of the duplicate-name
+   group list, and [no_target]. *)
+let cond_dncref_slot_base (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let cond_dncref_count (ir : t) (pc : int) : int = ir.code.(pc + 2)
+let cond_dncref_no (ir : t) (pc : int) : int = ir.code.(pc + 3)
+
+(* [t_cond_false] — [no_target] (always taken). *)
+let cond_false_no (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* [t_cond_assert] — [nomatch_target] (the branch taken when the assertion body
+   does NOT match; stored as the KIND_NASSERT record's [cont]). *)
+let cond_assert_nomatch (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* [t_cond_assert_match] — [match_target] (the branch taken when the assertion
+   body matches). *)
+let cond_assert_match_target (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
 (* ---------- Text dump (fast-design.md §2) ----------
    Stable, debug_printer.ml-style listing for golden tests: one line per
    instruction, [%3d TAG operands]. Printf/Format here is a debug path
@@ -657,6 +739,19 @@ let render (ir : t) (pc : int) (t : int) : string =
   else if Int.equal t t_close then
     Printf.sprintf "CLOSE ovbase=%d ref=%d" (close_ovbase ir pc)
       (close_referenced ir pc)
+  else if Int.equal t t_cond_cref then
+    Printf.sprintf "COND_CREF ovbase=%d no=%d" (cond_cref_ovbase ir pc)
+      (cond_cref_no ir pc)
+  else if Int.equal t t_cond_dncref then
+    Printf.sprintf "COND_DNCREF slot=%d count=%d no=%d"
+      (cond_dncref_slot_base ir pc) (cond_dncref_count ir pc)
+      (cond_dncref_no ir pc)
+  else if Int.equal t t_cond_false then
+    Printf.sprintf "COND_FALSE no=%d" (cond_false_no ir pc)
+  else if Int.equal t t_cond_assert then
+    Printf.sprintf "COND_ASSERT nomatch=%d" (cond_assert_nomatch ir pc)
+  else if Int.equal t t_cond_assert_match then
+    Printf.sprintf "COND_ASSERT_MATCH match=%d" (cond_assert_match_target ir pc)
   else if Int.equal t t_group_start then
     Printf.sprintf "GROUP_START g=%d" (group_start_id ir pc)
   else if Int.equal t t_brazero then
