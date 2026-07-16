@@ -18,6 +18,9 @@ module MakeConvenience (R : sig
   val bitvector_of_match_options : match_option list -> int32
 
   val capture_raw :
+    ?match_limit:int ->
+    ?depth_limit:int ->
+    ?heap_limit:int ->
     t ->
     string ->
     int ->
@@ -338,9 +341,19 @@ module MakeMatcher (R : sig
   val bitvector_of_match_options : match_option list -> int32
 
   val match_raw :
-    t -> string -> int -> int32 -> ((int * int) option, int) Result.t
+    ?match_limit:int ->
+    ?depth_limit:int ->
+    ?heap_limit:int ->
+    t ->
+    string ->
+    int ->
+    int32 ->
+    ((int * int) option, int) Result.t
 
   val capture_raw :
+    ?match_limit:int ->
+    ?depth_limit:int ->
+    ?heap_limit:int ->
     t ->
     string ->
     int ->
@@ -351,39 +364,52 @@ struct
   let ( let* ) = Result.bind
 
   let find ?(options : R.match_option list = []) ?(subject_offset : int = 0)
-      (re : R.t) (subject : string) : (match_ option, match_error) Result.t =
+      ?match_limit ?depth_limit ?heap_limit (re : R.t) (subject : string) :
+      (match_ option, match_error) Result.t =
     let options = R.bitvector_of_match_options options in
-    match R.match_raw re subject subject_offset options with
+    match
+      R.match_raw ?match_limit ?depth_limit ?heap_limit re subject
+        subject_offset options
+    with
     | Ok (Some (start, end_)) -> Ok (Some (subject, start, end_))
     | Ok None -> Ok None
     | Error n -> Error (match_error_of_int n)
 
   let find_iter ?(options : R.match_option list = [])
-      ?(subject_offset : int = 0) (re : R.t) (subject : string) :
-      (match_, match_error) Result.t Seq.t =
+      ?(subject_offset : int = 0) ?match_limit ?depth_limit ?heap_limit
+      (re : R.t) (subject : string) : (match_, match_error) Result.t Seq.t =
     Seq.unfold
       (fun offset ->
-        match find ~options ~subject_offset:offset re subject with
+        match
+          find ~options ?match_limit ?depth_limit ?heap_limit
+            ~subject_offset:offset re subject
+        with
         | Ok (Some (m : match_)) -> Some (Ok m, (range_of_match m).end_)
         | Ok None -> None
         | Error e -> Some (Error e, String.length subject))
       subject_offset
 
   let captures ?(options : R.match_option list = [])
-      ?(subject_offset : int = 0) (re : R.t) (subject : string) :
-      (captures option, match_error) Result.t =
+      ?(subject_offset : int = 0) ?match_limit ?depth_limit ?heap_limit
+      (re : R.t) (subject : string) : (captures option, match_error) Result.t =
     let options = R.bitvector_of_match_options options in
-    match R.capture_raw re subject subject_offset options with
+    match
+      R.capture_raw ?match_limit ?depth_limit ?heap_limit re subject
+        subject_offset options
+    with
     | Ok (Some (arr, names)) -> Ok (Some (subject, arr, names))
     | Ok None -> Ok None
     | Error n -> Error (match_error_of_int n)
 
   let captures_iter ?(options : R.match_option list = [])
-      ?(subject_offset : int = 0) (re : R.t) (subject : string) :
-      (captures, match_error) Result.t Seq.t =
+      ?(subject_offset : int = 0) ?match_limit ?depth_limit ?heap_limit
+      (re : R.t) (subject : string) : (captures, match_error) Result.t Seq.t =
     Seq.unfold
       (fun offset ->
-        match captures ~options ~subject_offset:offset re subject with
+        match
+          captures ~options ?match_limit ?depth_limit ?heap_limit
+            ~subject_offset:offset re subject
+        with
         | Ok (Some (c : captures)) -> Some (Ok c, (range_of_captures c).end_)
         | Ok None -> None
         | Error e -> Some (Error e, String.length subject))

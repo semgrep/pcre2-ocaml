@@ -243,15 +243,22 @@ module Matcher = struct
     type nonrec match_option = match_option
 
     let bitvector_of_match_options = bitvector_of_match_options
-    let match_raw = exec
 
-    (* INTERIM (chunk 2 of the per-call-limits plan): [exec_captures] now
-       carries the optional ?match_limit/?depth_limit/?heap_limit prefix, but
-       the MakeMatcher functor arg sig still expects the 4-arg raw shape.
-       Eta-expand to erase the optionals to their defaults until the matcher
-       chunk extends the functor signature (which will revert this to the bare
-       [let capture_raw = exec_captures]). *)
-    let capture_raw re s off o = exec_captures re s off o
+    (* The functor's [match_raw] carries the per-call limit knobs, but
+       [Pcre2_fast.exec] deliberately stays 4-arg (alloc pin, see [exec]).
+       Mirror Bindings.pcre2_match's routing: all-None -> the pinned 4-arg
+       [exec]; any Some -> [exec_full] (which carries the knobs), projected to
+       the same pair contract [exec] returns. *)
+    let match_raw ?match_limit ?depth_limit ?heap_limit re s off o =
+      match (match_limit, depth_limit, heap_limit) with
+      | None, None, None -> exec re s off o
+      | _ -> (
+          match exec_full ?match_limit ?depth_limit ?heap_limit re s off o with
+          | E.Match { ovector; _ } -> Ok (Some (ovector.(0), ovector.(1)))
+          | E.No_match _ | E.Partial _ -> Ok None
+          | E.Error { code; _ } -> Result.Error code)
+
+    let capture_raw = exec_captures
   end)
 
   include Pcre2_matcher.Convenience.MakeConvenience (struct
@@ -259,9 +266,6 @@ module Matcher = struct
     type nonrec match_option = match_option
 
     let bitvector_of_match_options = bitvector_of_match_options
-
-    (* INTERIM (see the MakeMatcher instantiation above): eta-expand until the
-       matcher chunk extends the MakeConvenience functor arg sig. *)
-    let capture_raw re s off o = exec_captures re s off o
+    let capture_raw = exec_captures
   end)
 end

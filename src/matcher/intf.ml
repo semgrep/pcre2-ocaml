@@ -210,6 +210,9 @@ module type Matcher = sig
   val find :
     ?options:match_option list ->
     ?subject_offset:int ->
+    ?match_limit:int ->
+    ?depth_limit:int ->
+    ?heap_limit:int ->
     t ->
     string ->
     (match_ option, match_error) Result.t
@@ -222,6 +225,19 @@ module type Matcher = sig
       no errors but does not result in a match the result is [Ok None].
       Otherwise, an error was encountered and is returned as [Error e].
 
+      The optional [match_limit] / [depth_limit] / [heap_limit] are the
+      per-call match-context limits (as in C's [pcre2_set_match_limit] /
+      [pcre2_set_depth_limit] / [pcre2_set_heap_limit]): [match_limit] caps the
+      number of backtracking steps (error [MATCHLIMIT]), [depth_limit] the
+      nested backtracking depth ([DEPTHLIMIT]), [heap_limit] the backtracking
+      frames vector in KiB ([HEAPLIMIT]). Each is combined with a pattern's
+      ( *LIMIT_MATCH= / *LIMIT_DEPTH= / *LIMIT_HEAP=) verb by taking the
+      smaller of the two. Omitting an arg uses the build default (10_000_000 /
+      10_000_000 / 20_000_000 KiB) — behavior then matches the pre-arg engine
+      bit-for-bit. Each value is a C uint32: a negative int is taken mod 2^32
+      (so a negative arg means an effectively unlimited value). Note these are
+      distinct from [split]'s [?limit], which is a split-count cap.
+
       NOTE: This function may be less efficient than [is_match] depending on the
       underlying implementation. If you don't care about the range of the
       match, but only if one exists use [is_match] instead. *)
@@ -229,6 +245,9 @@ module type Matcher = sig
   val find_iter :
     ?options:match_option list ->
     ?subject_offset:int ->
+    ?match_limit:int ->
+    ?depth_limit:int ->
+    ?heap_limit:int ->
     t ->
     string ->
     (match_, match_error) Result.t Seq.t
@@ -242,13 +261,19 @@ module type Matcher = sig
       The sequence ends when no more matches are found (so no matches in
       [subject] means an empty sequence) or a fatal error is encountered. In
       the latter case the error is returned as the last element of the
-      sequence. 
-    *)
+      sequence.
+
+      [match_limit] / [depth_limit] / [heap_limit] are the per-call
+      match-context limits applied to every underlying search step; see
+      [find]. *)
   (* TODO: Are there any errors which should be non-fatal? *)
 
   val captures :
     ?options:match_option list ->
     ?subject_offset:int ->
+    ?match_limit:int ->
+    ?depth_limit:int ->
+    ?heap_limit:int ->
     t ->
     string ->
     (captures option, match_error) Result.t
@@ -262,6 +287,9 @@ module type Matcher = sig
       no errors but does not result in a match the result is [Ok None].
       Otherwise, an error was encountered and is returned as [Error e].
 
+      [match_limit] / [depth_limit] / [heap_limit] are the per-call
+      match-context limits; see [find].
+
       NOTE: This function may be less efficient than [find] depending on the
       underlying implementation. If you don't need capture groups, you should
       use [find] instead.
@@ -270,6 +298,9 @@ module type Matcher = sig
   val captures_iter :
     ?options:match_option list ->
     ?subject_offset:int ->
+    ?match_limit:int ->
+    ?depth_limit:int ->
+    ?heap_limit:int ->
     t ->
     string ->
     (captures, match_error) Result.t Seq.t
@@ -283,7 +314,11 @@ module type Matcher = sig
       The sequence ends when no more matches are found (so no matches in
       [subject] means an empty sequence) or a fatal error is encountered. In
       the latter case the error is returned as the last element of the
-      sequence. 
+      sequence.
+
+      [match_limit] / [depth_limit] / [heap_limit] are the per-call
+      match-context limits applied to every underlying search step; see
+      [find].
 
       NOTE: This function may be less efficient than [find_iter] depending on
       the underlying implementation. If you don't need capture groups, you
@@ -303,6 +338,10 @@ module type Matcher = sig
       provided, matching to determine where to split starts there instead of
       the start of [subject]. If [limit] is provided then [subject] will be
       split into at most that many substrings.
+
+      NOTE: [split]'s [limit] is the split-count cap; it is unrelated to the
+      per-call match-context [match_limit] / [depth_limit] / [heap_limit] on
+      [find] / [captures]. [split] always uses the build-default limits.
 
       If a matching error occurs during this process, [Error e] is returned.
     *)

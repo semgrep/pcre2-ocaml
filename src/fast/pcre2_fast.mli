@@ -111,3 +111,8 @@ module Matcher :
   Pcre2_matcher.Intf.Matcher
     with type t = t
      and type compile_error = compile_error
+     and type match_ = Pcre2_matcher.Match.match_
+     and type captures = Pcre2_matcher.Match.captures
+     and type compile_option = Pcre2_matcher.Options.Interp.compile_option
+     and type match_option = Pcre2_matcher.Options.Interp.match_option
+     and type match_error = Pcre2_matcher.Error.match_error

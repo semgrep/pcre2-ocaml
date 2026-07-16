@@ -464,37 +464,52 @@ module Interp = struct
   let capture_groups (r : t) = Bindings.get_capture_groups r |> Array.to_list
 
   let find ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (match_ option, match_error) Result.t =
+      ?match_limit ?depth_limit ?heap_limit (re : t) (subject : string) :
+      (match_ option, match_error) Result.t =
     let options = bitvector_of_match_options options in
-    match Bindings.pcre2_match re subject subject_offset options with
+    match
+      Bindings.pcre2_match ?match_limit ?depth_limit ?heap_limit re subject
+        subject_offset options
+    with
     | Ok (Some (start, end_)) -> Ok (Some (subject, start, end_))
     | Ok None -> Ok None
     | Error n -> Error (match_error_of_int n)
 
   let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (match_, match_error) Result.t Seq.t =
+      ?match_limit ?depth_limit ?heap_limit (re : t) (subject : string) :
+      (match_, match_error) Result.t Seq.t =
     Seq.unfold
       (fun offset ->
-        match find ~options ~subject_offset:offset re subject with
+        match
+          find ~options ?match_limit ?depth_limit ?heap_limit
+            ~subject_offset:offset re subject
+        with
         | Ok (Some (m : match_)) -> Some (Ok m, (range_of_match m).end_)
         | Ok None -> None
         | Error e -> Some (Error e, String.length subject))
       subject_offset
 
   let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (captures option, match_error) Result.t =
+      ?match_limit ?depth_limit ?heap_limit (re : t) (subject : string) :
+      (captures option, match_error) Result.t =
     let options = bitvector_of_match_options options in
-    match Bindings.pcre2_capture re subject subject_offset options with
+    match
+      Bindings.pcre2_capture ?match_limit ?depth_limit ?heap_limit re subject
+        subject_offset options
+    with
     | Ok (Some (arr, names)) -> Ok (Some (subject, arr, names))
     | Ok None -> Ok None
     | Error n -> Error (match_error_of_int n)
 
   let captures_iter ?(options : match_option list = [])
-      ?(subject_offset : int = 0) (re : t) (subject : string) :
-      (captures, match_error) Result.t Seq.t =
+      ?(subject_offset : int = 0) ?match_limit ?depth_limit ?heap_limit
+      (re : t) (subject : string) : (captures, match_error) Result.t Seq.t =
     Seq.unfold
       (fun offset ->
-        match captures ~options ~subject_offset:offset re subject with
+        match
+          captures ~options ?match_limit ?depth_limit ?heap_limit
+            ~subject_offset:offset re subject
+        with
         | Ok (Some (c : captures)) -> Some (Ok c, (range_of_captures c).end_)
         | Ok None -> None
         | Error e -> Some (Error e, String.length subject))
@@ -587,28 +602,40 @@ module Jit = struct
   let capture_groups (r : t) = Bindings.get_capture_groups r |> Array.to_list
 
   let find ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (match_ option, match_error) Result.t =
+      ?match_limit ?depth_limit ?heap_limit (re : t) (subject : string) :
+      (match_ option, match_error) Result.t =
     let options = bitvector_of_match_options options in
-    match Bindings.pcre2_jit_match re subject subject_offset options with
+    match
+      Bindings.pcre2_jit_match ?match_limit ?depth_limit ?heap_limit re subject
+        subject_offset options
+    with
     | Ok (Some (start, end_)) -> Ok (Some (subject, start, end_))
     | Ok None -> Ok None
     | Error n -> Error (match_error_of_int n)
 
   (* TODO(cooper): dedup impl with a functor? - entirely derived from find *)
   let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (match_, match_error) Result.t Seq.t =
+      ?match_limit ?depth_limit ?heap_limit (re : t) (subject : string) :
+      (match_, match_error) Result.t Seq.t =
     Seq.unfold
       (fun offset ->
-        match find ~options ~subject_offset:offset re subject with
+        match
+          find ~options ?match_limit ?depth_limit ?heap_limit
+            ~subject_offset:offset re subject
+        with
         | Ok (Some (m : match_)) -> Some (Ok m, (range_of_match m).end_)
         | Ok None -> None
         | Error e -> Some (Error e, String.length subject))
       subject_offset
 
   let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (captures option, match_error) Result.t =
+      ?match_limit ?depth_limit ?heap_limit (re : t) (subject : string) :
+      (captures option, match_error) Result.t =
     let options = bitvector_of_match_options options in
-    match Bindings.pcre2_jit_capture re subject subject_offset options with
+    match
+      Bindings.pcre2_jit_capture ?match_limit ?depth_limit ?heap_limit re
+        subject subject_offset options
+    with
     | Ok (Some (arr, names)) -> Ok (Some (subject, arr, names))
     | Ok None -> Ok None
     | Error n -> Error (match_error_of_int n)
@@ -616,11 +643,14 @@ module Jit = struct
   (* TODO(cooper): dedup impl with a functor? - entirely derived from
      captures *)
   let captures_iter ?(options : match_option list = [])
-      ?(subject_offset : int = 0) (re : t) (subject : string) :
-      (captures, match_error) Result.t Seq.t =
+      ?(subject_offset : int = 0) ?match_limit ?depth_limit ?heap_limit
+      (re : t) (subject : string) : (captures, match_error) Result.t Seq.t =
     Seq.unfold
       (fun offset ->
-        match captures ~options ~subject_offset:offset re subject with
+        match
+          captures ~options ?match_limit ?depth_limit ?heap_limit
+            ~subject_offset:offset re subject
+        with
         | Ok (Some (c : captures)) -> Some (Ok c, (range_of_captures c).end_)
         | Ok None -> None
         | Error e -> Some (Error e, String.length subject))

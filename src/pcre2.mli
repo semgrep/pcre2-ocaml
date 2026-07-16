@@ -472,7 +472,10 @@ module Options : sig
         (* not for pcre2_dfa_match() *)
         (* not for pcre2_dfa_match() or pcre2_jit_match() *) ]
     (* TODO: split to enforce restrictions (maybe except `NO_JIT) *)
-    (* TODO: add match_context options (depth, heap, match) limits here or separately? *)
+    (* The match-context depth/heap/match limits are NOT match_option bits;
+       they are exposed as per-call optional args (?match_limit / ?depth_limit
+       / ?heap_limit) on find / find_iter / captures / captures_iter (see the
+       Matcher signature, Intf.find). *)
 
     type subst_options =
       (* shared *)

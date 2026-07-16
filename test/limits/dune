@@ -1,0 +1,21 @@
+; Per-call match-context limit args (?match_limit / ?depth_limit / ?heap_limit)
+; on the public Matcher surface (find / find_iter / captures / captures_iter).
+; A single Alcotest functor over Pcre2_matcher.Intf.Matcher instantiated for
+; Pcre2.Interp, Pcre2.Jit and Pcre2_fast.Matcher, plus one cross-engine interop
+; test. Test-only (alcotest lives in package pcre2-dev); runs on @runtest and
+; the libpcre2-free @pure-tests alias.
+
+(test
+ (name limits_tests)
+ (package pcre2-dev)
+ (libraries pcre2 pcre2.fast pcre2.matcher alcotest))
+
+(rule
+ (alias pure-tests)
+ (action
+  (run ./limits_tests.exe)))
+
+(env
+ (dev
+  (flags
+   (:standard -w -27))))
