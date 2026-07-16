@@ -1,4 +1,4 @@
-.PHONY: all clean doc test test-conformance
+.PHONY: all clean doc test test-conformance battery
 
 all:
 	dune build @install
@@ -18,3 +18,9 @@ clean:
 
 doc:
 	dune build @doc
+
+# Parallel commit-gate battery: build once, then run all independent stages
+# (runtest, 3 conformance drivers, regressions, fuzz seeds, pure build) as
+# concurrent processes. See scripts/battery.sh for the safety argument.
+battery:
+	scripts/battery.sh

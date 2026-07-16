@@ -5,8 +5,19 @@ description: Use when validating the working tree after a chunk (or before commi
 
 # Verify
 
-Run the stages in order. **Stop at the first FAIL** and report which stage failed and why.
-All commands run from the repo root via the Nix devshell (no global OCaml).
+**Preferred: the parallel battery.** `scripts/battery.sh [seeds...]` (or `make battery`)
+runs everything below concurrently as independent processes on a pre-built tree —
+one dune invocation for build+@runtest, then the three conformance drivers, the
+regressions replay, fuzz seeds, and the pure-package build in parallel (~20s vs ~3min
+sequential). Exit 0 = all stages pass; per-stage logs on failure. Safety argument is in
+the script header (process-level only; within-executable Alcotest stays sequential
+because the alloc pins measure Gc deltas and test/engine pins module-init order).
+Do NOT run it while another dune (e.g. a port-executor) is building — it retries on
+the lock but results on a mid-edit tree reflect the WIP, not HEAD.
+
+The stages below remain the reference definition (and the fallback when you need to
+isolate a single failing stage). Run in order, **stop at the first FAIL**, report which
+stage failed and why. All commands run from the repo root via the Nix devshell.
 
 ## 1. Build
 ```
