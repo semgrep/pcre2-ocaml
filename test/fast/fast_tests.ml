@@ -3076,6 +3076,106 @@ let limit_match_boundary_test =
           ]);
   ]
 
+(* ---------- 6a. per-call match/depth/heap limit parity vs the interpreter ----
+
+   The three limits are now settable per-exec at BOTH seams (fast
+   Pcre2_fast.exec_full / interp Engine.exec_full, chunks 1-2 of the per-call
+   limits plan): ?match_limit (-47), ?depth_limit (-53), ?heap_limit (-63).
+   The mcontext value is min'd with the pattern's ( *LIMIT_*=) verb
+   (pcre2_match.c:7036-7046, Limits.resolve_limit); a negative int is its C
+   uint32 wraparound (pcre2.h.in:632-636). Every case drives the SAME per-call
+   arg into both engines and compares the normalized rc+ovector+startchar —
+   the interpreter is the oracle, so fast MUST equal interp exactly (parity is
+   the whole point of the per-call knobs at the fast seam). *)
+let limit_percall_tests =
+  let run_both ?match_limit ?depth_limit ?heap_limit ?(copts = 0l) pat subj =
+    match (F.compile pat copts, E.compile pat copts) with
+    | Ok fre, Ok ere ->
+        ( norm (F.exec_full ?match_limit ?depth_limit ?heap_limit fre subj 0 0l),
+          norm
+            (E.exec_full ?match_limit ?depth_limit ?heap_limit ere subj 0 0l) )
+    | _ -> Alcotest.failf "compile failed for %S" pat
+  in
+  [
+    (* 1. per-call ~match_limit tick boundary: the same six-branch pattern as
+       the ( *LIMIT_MATCH=) verb boundary test above (matching subject "f"
+       needs 7 ticks), driven through the per-call arg instead of the verb.
+       Both engines trip -47 at N=6 and match at N=7. *)
+    Alcotest.test_case "per-call match_limit boundary (fast == interp)" `Quick
+      (fun () ->
+        let f6, e6 = run_both ~match_limit:6 "a|b|c|d|e|f" "f" in
+        Alcotest.(check string) "N=6 interp is MATCHLIMIT" "E-47" e6;
+        Alcotest.(check string) "N=6 fast == interp" e6 f6;
+        let f7, e7 = run_both ~match_limit:7 "a|b|c|d|e|f" "f" in
+        Alcotest.(check string) "N=7 interp matches" "M@0[0,1]" e7;
+        Alcotest.(check string) "N=7 fast == interp" e7 f7);
+    (* 2. per-call ~depth_limit sweep: a frame-deep repeated capturing group
+       recurses one frame per iteration (KETRMAX RMATCH), so both engines tick
+       rdepth identically and must give the SAME rc (and ovector when matched)
+       at EVERY N. Each subject's -53 -> Match boundary is well inside 1..40. *)
+    Alcotest.test_case "per-call depth_limit sweep (fast == interp)" `Quick
+      (fun () ->
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 40 do
+              let f, e = run_both ~depth_limit:n body subj in
+              Alcotest.(check string)
+                (Printf.sprintf "fast == interp for /%s/ on %S at depth=%d" body
+                   subj n)
+                e f
+            done)
+          [
+            ("(a)+", "aaaa");
+            ("(a)*b", "aaab");
+            ("(ab|c)+", "abcab");
+            ("(a){2,4}", "aaaaa");
+          ]);
+    (* 3. ~heap_limit:0 fails inside the initial frames-vector sizing before
+       any attempt (pcre2_match.c:7048-7060 / Runner.exec_with_limits) — both
+       engines return -63. *)
+    Alcotest.test_case "per-call heap_limit:0 -> -63 (fast == interp)" `Quick
+      (fun () ->
+        let f, e = run_both ~heap_limit:0 "a|b|c|d|e|f" "f" in
+        Alcotest.(check string) "interp is HEAPLIMIT" "E-63" e;
+        Alcotest.(check string) "fast == interp" e f);
+    (* 4. per-call arg vs ( *LIMIT_MATCH=) verb interplay: the resolved limit
+       is the MIN of the two (Limits.resolve_limit). At the N=6/7 boundary:
+       - per-call tighter: a generous verb + ~match_limit:6 still trips (6 < N);
+       - verb tighter: ( *LIMIT_MATCH=6) + a generous ~match_limit still trips.
+       Both engines must agree in each direction. *)
+    Alcotest.test_case "per-call + verb match_limit min (fast == interp)" `Quick
+      (fun () ->
+        (* per-call tighter wins *)
+        let fp, ep =
+          run_both ~match_limit:6 "(*LIMIT_MATCH=1000000)a|b|c|d|e|f" "f"
+        in
+        Alcotest.(check string) "per-call tighter: interp -47" "E-47" ep;
+        Alcotest.(check string) "per-call tighter: fast == interp" ep fp;
+        (* per-call tighter but still above the trip point -> match *)
+        let fp2, ep2 =
+          run_both ~match_limit:7 "(*LIMIT_MATCH=1000000)a|b|c|d|e|f" "f"
+        in
+        Alcotest.(check string) "per-call 7: interp matches" "M@0[0,1]" ep2;
+        Alcotest.(check string) "per-call 7: fast == interp" ep2 fp2;
+        (* verb tighter wins *)
+        let fv, ev =
+          run_both ~match_limit:1000000 "(*LIMIT_MATCH=6)a|b|c|d|e|f" "f"
+        in
+        Alcotest.(check string) "verb tighter: interp -47" "E-47" ev;
+        Alcotest.(check string) "verb tighter: fast == interp" ev fv);
+    (* 5. negative per-call arg = C uint32 wraparound (port-conventions §3):
+       -1 masks to 0xFFFF_FFFF, effectively unlimited, so the match runs on
+       both engines. *)
+    Alcotest.test_case "per-call match_limit:-1 masks to unlimited (fast == \
+                        interp)" `Quick (fun () ->
+        let f, e =
+          run_both ~match_limit:(-1) ~depth_limit:(-1) ~heap_limit:(-1)
+            "a|b|c|d|e|f" "f"
+        in
+        Alcotest.(check string) "interp matches" "M@0[0,1]" e;
+        Alcotest.(check string) "fast == interp" e f);
+  ]
+
 (* ---------- 6b. backref compile-option parity vs the interpreter ----------
 
    MATCH_UNSET_BACKREF (0x200, compile option) and DUPNAMES (0x40, needed for
@@ -4046,6 +4146,7 @@ let () =
       ("backref option parity", ref_options_tests);
       ("invalid-utf fragment parity", invalid_utf_tests);
       ("limit-match boundary", limit_match_boundary_test);
+      ("per-call limits parity", limit_percall_tests);
       ("recursion parity", recurse_parity_tests);
       ("recursion loop / limit", recurseloop_tests);
       ("alloc pins", alloc_tests);

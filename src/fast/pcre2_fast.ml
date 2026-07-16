@@ -12,6 +12,7 @@ module E = Pcre2_engine.Engine
 module C = Pcre2_engine.Compile
 module Opt = Pcre2_engine.Options
 module Errors = Pcre2_engine.Errors
+module Limits = Pcre2_engine.Limits
 module R = Runner
 
 (** {1 Unstable internals — exposed for tests only (M11 chunk C1/C2)}
@@ -76,9 +77,22 @@ let compile_ctx ?(newline = 0) ?(bsr = 0) ?(extra = 0) (pattern : string)
 let compile (pattern : string) (options : int32) : (t, compile_error) result =
   compile_ctx pattern options
 
+(* DEVIATION (alloc pin, port-conventions §8): [exec] does NOT take the
+   per-call limit args that [exec_full]/[exec_captures] gained. Optional
+   arguments on this entry would cost extra minor words/exec at every call
+   site under the stock (non-flambda) compiler, which would regress the frozen
+   Fast-seam alloc pin (test/fast/fast_tests.ml:3398, < 60 words at F.exec) —
+   identical to Engine.exec's resolution (engine.ml). So [exec] stays 4-arg and
+   always uses the build-default limits (calling the runner worker directly to
+   stay off the optional-arg wrapper); the limit-carrying pair path (a later
+   matcher chunk) routes through [exec_full]/[exec_captures]. *)
 let exec (re : t) (subject : string) (offset : int) (options : int32) :
     ((int * int) option, int) result =
-  let o = R.exec re ~subject ~offset ~options:(Opt.of_int32 options) in
+  let o =
+    R.exec_with_limits re ~match_limit:Limits.match_limit
+      ~depth_limit:Limits.match_limit_depth ~heap_limit:Limits.heap_limit
+      ~subject ~offset ~options:(Opt.of_int32 options)
+  in
   if o.R.orc > 0 then Ok (Some (o.R.ostart, o.R.oend))
   else if Int.equal o.R.orc Errors.error_nomatch
           || Int.equal o.R.orc Errors.error_partial
@@ -96,9 +110,20 @@ let mark_of_offset (re : C.re) (off : int) : string option =
     let len = Char.code (Bytes.get re.C.code (off - 1)) in
     Some (Bytes.sub_string re.C.code off len)
 
-let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
+(* The three optional args are the pcre2_match_context limit knobs; defaults
+   are the build values (module Limits = the C default match context,
+   pcre2_context.c:166-179), so an omitted arg behaves bit-for-bit like the
+   pre-knob seam. Forwarded to the runner worker (not the optional-arg
+   [R.exec] wrapper) to stay allocation-free; the worker masks (uint32,
+   pcre2.h.in:632-636) and does the min-with-verb resolution. *)
+let exec_full ?(match_limit = Limits.match_limit)
+    ?(depth_limit = Limits.match_limit_depth) ?(heap_limit = Limits.heap_limit)
+    (re : t) (subject : string) (offset : int) (options : int32) :
     E.exec_result =
-  let o = R.exec re ~subject ~offset ~options:(Opt.of_int32 options) in
+  let o =
+    R.exec_with_limits re ~match_limit ~depth_limit ~heap_limit ~subject ~offset
+      ~options:(Opt.of_int32 options)
+  in
   let mark = mark_of_offset re.Ir.re o.R.omark in
   if o.R.orc > 0 then
     (* [ovec] holds the pcre2 rc pairs (Engine.exec_full's shape): the whole
@@ -132,9 +157,16 @@ let capture_groups (re : t) : (string * int) array =
       done;
       (Bytes.sub_string r.C.name_table start !len, number))
 
-let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
+(* As [exec_full] for the optional limit args (see there); forwarded to the
+   runner worker directly with build-default fills. *)
+let exec_captures ?(match_limit = Limits.match_limit)
+    ?(depth_limit = Limits.match_limit_depth) ?(heap_limit = Limits.heap_limit)
+    (re : t) (subject : string) (offset : int) (options : int32) :
     (((int * int) array * (string * int) array) option, int) result =
-  let o = R.exec re ~subject ~offset ~options:(Opt.of_int32 options) in
+  let o =
+    R.exec_with_limits re ~match_limit ~depth_limit ~heap_limit ~subject ~offset
+      ~options:(Opt.of_int32 options)
+  in
   if o.R.orc > 0 then (
     (* Pad [ovec] (2*rc slots) up to top_bracket+1 pairs with (-1,-1), exactly
        Engine.exec_captures (engine.ml:200-211). *)
@@ -212,7 +244,14 @@ module Matcher = struct
 
     let bitvector_of_match_options = bitvector_of_match_options
     let match_raw = exec
-    let capture_raw = exec_captures
+
+    (* INTERIM (chunk 2 of the per-call-limits plan): [exec_captures] now
+       carries the optional ?match_limit/?depth_limit/?heap_limit prefix, but
+       the MakeMatcher functor arg sig still expects the 4-arg raw shape.
+       Eta-expand to erase the optionals to their defaults until the matcher
+       chunk extends the functor signature (which will revert this to the bare
+       [let capture_raw = exec_captures]). *)
+    let capture_raw re s off o = exec_captures re s off o
   end)
 
   include Pcre2_matcher.Convenience.MakeConvenience (struct
@@ -220,6 +259,9 @@ module Matcher = struct
     type nonrec match_option = match_option
 
     let bitvector_of_match_options = bitvector_of_match_options
-    let capture_raw = exec_captures
+
+    (* INTERIM (see the MakeMatcher instantiation above): eta-expand until the
+       matcher chunk extends the MakeConvenience functor arg sig. *)
+    let capture_raw re s off o = exec_captures re s off o
   end)
 end
