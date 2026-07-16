@@ -105,6 +105,16 @@ CAMLprim value oracle_get_version(void) /* -> int * int */ {
         CAMLreturn(version);
 }
 
+/// error_message : int -> string, exactly pcre2_get_error_message; empty
+/// string for unknown codes (caller decides).
+CAMLprim value oracle_error_message(value verrcode) {
+        CAMLparam1(verrcode);
+        PCRE2_UCHAR buf[256];
+        int rc = pcre2_get_error_message((int)Long_val(verrcode), buf, sizeof(buf));
+        if (rc < 0) buf[0] = 0;
+        CAMLreturn(caml_copy_string((const char *)buf));
+}
+
 /// Compiles the provided pattern.
 ///
 /// Note that the options from OCaml are not split between those which can
@@ -121,7 +131,7 @@ CAMLprim value oracle_compile_unboxed(value pattern /* : string */,
                                /* another arg for oracle_compile context options? */
                                ) /* : -> (regex, int) Result.t */ {
         CAMLparam1(pattern);
-        CAMLlocal2(result, regex_value);
+        CAMLlocal3(result, regex_value, err_pair);
 
         size_t ocaml_regexp_size = sizeof(struct ocaml_regex);
         int error_code;
@@ -142,11 +152,13 @@ CAMLprim value oracle_compile_unboxed(value pattern /* : string */,
         pcre2_compile_context_free(ccontext);
 
         if (!regex) {
-                // Returns [Error e] since the pattern could not be compiled.
+                // Returns [Error (code, offset)] since the pattern could not be
+                // compiled; the offset mirrors the pure engine's raw seam.
+                err_pair = caml_alloc_tuple(2);
+                Field(err_pair, 0) = Val_int(error_code);
+                Field(err_pair, 1) = Val_int((int)error_offset);
                 result = caml_alloc_small(1, oracle_RESULT_ERROR_TAG);
-                // TODO(cooper): mapping between error codes here and datatype
-                // above.
-                Field(result, 0) = Val_int(error_code);
+                Field(result, 0) = err_pair;
                 CAMLreturn(result);
         }
 

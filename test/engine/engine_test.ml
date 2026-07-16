@@ -33,7 +33,7 @@ let test_0 () =
   | Ok _ -> assert false);
   (* Unknown option bits: 117 at the raw int seam (port-conventions §5). *)
   (match compile "a" 0x08000000l with
-  | Result.Error e -> assert (Int.equal e Errors.err17)
+  | Result.Error (e, _) -> assert (Int.equal e Errors.err17)
   | Ok _ -> assert false);
   (* A leading (?i) reaches neither options word (pcre2test shows no
      "Options:" line for /(?i)abc/I, testoutput2:484-488). *)
@@ -193,7 +193,7 @@ let test_1 () =
   (* WITH the UTF check (no NO_UTF_CHECK): the PRIV(valid_utf) error is
      unchanged (testoutput10:9 shape). *)
   match compile "\xc3(" (Int32.of_int Options.utf) with
-  | Result.Error e -> assert (Int.equal e Errors.error_utf8_err6)
+  | Result.Error (e, _) -> assert (Int.equal e Errors.error_utf8_err6)
   | Ok _ -> assert false
 
 (* The fuzz repro pinned by fuzz/corpus/regressions/204387-b7915f8f.txt:

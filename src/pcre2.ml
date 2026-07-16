@@ -243,7 +243,10 @@ module Error = struct
       offset;
     }
 
-  type match_error =
+  (* Re-export the matcher's match_error so it is the SAME nominal type the
+     MakeConvenience functions (full_split/replace/...) return; only compile_error
+     diverges here (record form with message+offset). *)
+  type match_error = Pcre2_matcher.Error.match_error =
     (* Error codes for UTF-8 validity checks. See pcre2unicode(3). *)
     | UTF8_ERR1
     | UTF8_ERR2

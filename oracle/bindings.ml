@@ -9,8 +9,11 @@ let unset = (-1, -1)
 external pcre2_ocaml_init : unit -> unit = "oracle_pcre2_ocaml_init"
 
 external pcre2_compile :
-  string -> (int32[@unboxed]) -> (interp regex, int) Result.t
+  string -> (int32[@unboxed]) -> (interp regex, int * int) Result.t
   = "oracle_compile" "oracle_compile_unboxed"
+
+external error_message : int -> string = "oracle_error_message"
+(** Exactly [pcre2_get_error_message]; empty string for unknown codes. *)
 
 external pcre2_match :
   _ regex ->
