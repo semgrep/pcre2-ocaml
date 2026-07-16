@@ -74,3 +74,9 @@ let max_mark = 255
 (* pcre2_internal.h:248 — initial size (bytes) of the backtracking frames
    vector allocated for pcre2_match(). *)
 let start_frames_size = 20480
+
+(* pcre2_match.c:7036-7046 — pattern (*LIMIT_*) verbs override the match
+   context only if smaller; default context = build defaults
+   (pcre2_context.c:166-179). *)
+let resolve_limit ~(mcontext : int) ~(pattern : int) : int =
+  if mcontext < pattern then mcontext else pattern

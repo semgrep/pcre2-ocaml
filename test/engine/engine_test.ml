@@ -369,6 +369,116 @@ let test_7 () =
       | Match { ovector = [| 3; 3; 2; 2 |]; mark = None; start_char = 3 } -> ()
       | _ -> assert false)
 
+(* Per-call match/depth/heap limit knobs at the interpreter driver seam
+   (pcre2_match.c:7036-7046): exec_full's ?match_limit/?depth_limit/
+   ?heap_limit args become mb->{match_limit,match_limit_depth,heap_limit}
+   after the uint32 mask (pcre2.h.in:632-636) and the min-with-verb
+   resolution (Limits.resolve_limit). Omitting an arg keeps the build
+   default, so these cases exercise only the newly settable path. Expected
+   codes are the raw ints from Errors, matching this file's style. *)
+let test_8 () =
+  (* A pattern + subject that force real backtracking work: a* grabs every
+     'a', then gives one back so "ab" can match, so each limit does
+     nontrivial ticking. Overall match is (0, len). *)
+  let subj = String.make 8 'a' ^ "b" in
+  let re =
+    match compile "a*ab" 0l with Ok re -> re | Result.Error _ -> assert false
+  in
+  (* rc-code projection so the verb-set and per-call forms compare as ints:
+     a Match yields its positive pair count (rc), non-matches their code. *)
+  let rc_of = function
+    | Match { ovector; _ } -> Array.length ovector / 2
+    | No_match _ -> Errors.error_nomatch
+    | Partial _ -> Errors.error_partial
+    | Error { code; _ } -> code
+  in
+  (* Each limit at 0 trips its own error. match_limit uses the post-inc
+     [count >= limit] test (interpreter.ml:1164), so 0 fails on the first
+     RMATCH; depth_limit trips at the frame rdepth check (:1166); heap_limit
+     0 fails inside Frames.create before any tick. *)
+  (match exec_full ~match_limit:0 re subj 0 0l with
+  | Error { code; _ } -> assert (Int.equal code Errors.error_matchlimit)
+  | _ -> assert false);
+  (match exec_full ~depth_limit:0 re subj 0 0l with
+  | Error { code; _ } -> assert (Int.equal code Errors.error_depthlimit)
+  | _ -> assert false);
+  (match exec_full ~heap_limit:0 re subj 0 0l with
+  | Error { code; _ } -> assert (Int.equal code Errors.error_heaplimit)
+  | _ -> assert false);
+  (* Trip ORDERING: with all three at 0, Frames.create (heap) runs before
+     any match/depth tick (pcre2_match.c:7048-7060), so heap wins. *)
+  (match exec_full ~match_limit:0 ~depth_limit:0 ~heap_limit:0 re subj 0 0l with
+  | Error { code; _ } -> assert (Int.equal code Errors.error_heaplimit)
+  | _ -> assert false);
+  (* The plain [exec] fast path stays 4-arg (DEVIATION — the limit knobs
+     live on [exec_full]/[exec_captures] only, to protect the frozen engine
+     alloc pin, see engine.ml): omitting the knobs, it gives the whole-
+     subject match; the limit-tripping pair path goes through [exec_full]. *)
+  (match exec re subj 0 0l with
+  | Ok (Some (0, 9)) -> ()
+  | _ -> assert false);
+  (* Find the smallest per-call match_limit at which the match succeeds (the
+     pattern's real RMATCH count on this subject); only Match / matchlimit
+     are reachable here. *)
+  let matches n =
+    match exec_full ~match_limit:n re subj 0 0l with
+    | Match _ -> true
+    | Error { code; _ } when Int.equal code Errors.error_matchlimit -> false
+    | _ -> assert false
+  in
+  let boundary =
+    let rec find n =
+      if n > 100 then assert false else if matches n then n else find (n + 1)
+    in
+    find 1
+  in
+  (* Nontrivial (a real trip exists below it) and inside the scan window. *)
+  assert (boundary > 1 && boundary <= 100);
+  (* Straddle it: N-1 trips, N and N+1 match. *)
+  assert (not (matches (boundary - 1)));
+  assert (matches boundary);
+  assert (matches (boundary + 1));
+  (* Per-call ~match_limit:N is equivalent to the pattern verb
+     ( *LIMIT_MATCH=N): both resolve to effective match_limit = N (the other
+     term is the huge default / the 0xffff_ffff unset marker). Swept across
+     the boundary so both the trip and the success regions are covered. *)
+  let verb_re n =
+    match compile ("(*LIMIT_MATCH=" ^ string_of_int n ^ ")a*ab") 0l with
+    | Ok re -> re
+    | Result.Error _ -> assert false
+  in
+  for n = 1 to boundary + 2 do
+    let via_arg = rc_of (exec_full ~match_limit:n re subj 0 0l) in
+    let via_verb = rc_of (exec_full (verb_re n) subj 0 0l) in
+    assert (Int.equal via_arg via_verb)
+  done;
+  (* Verb wins when smaller than the per-call arg: ( *LIMIT_MATCH=N-1) with a
+     generous ~match_limit still trips (min = the verb). *)
+  (match exec_full ~match_limit:1_000_000 (verb_re (boundary - 1)) subj 0 0l with
+  | Error { code; _ } -> assert (Int.equal code Errors.error_matchlimit)
+  | _ -> assert false);
+  (* Per-call arg wins when smaller than the (unset) pattern limit. *)
+  (match exec_full ~match_limit:(boundary - 1) re subj 0 0l with
+  | Error { code; _ } -> assert (Int.equal code Errors.error_matchlimit)
+  | _ -> assert false);
+  (* Negative per-call arg = C uint32 wraparound (port-conventions §3):
+     -1 masks to 0xFFFF_FFFF, effectively unlimited, so the match runs. *)
+  (match exec_full ~match_limit:(-1) ~depth_limit:(-1) ~heap_limit:(-1) re subj 0
+           0l
+   with
+  | Match _ -> ()
+  | _ -> assert false);
+  (* Scratch-staleness pin: a tripping exec must not poison the shared
+     scratch trio / arena for the next one — a no-arg run on the SAME re
+     immediately after a tripping run matches (per-exec limits are reset in
+     the mb fill, interpreter.ml:9788-9789). *)
+  (match exec_full ~match_limit:1 re subj 0 0l with
+  | Error { code; _ } -> assert (Int.equal code Errors.error_matchlimit)
+  | _ -> assert false);
+  match exec_full re subj 0 0l with
+  | Match _ -> ()
+  | _ -> assert false
+
 let tests =
   [
     Alcotest.test_case "engine 0" `Quick test_0;
@@ -379,4 +489,5 @@ let tests =
     Alcotest.test_case "engine 5" `Quick test_5;
     Alcotest.test_case "engine 6" `Quick test_6;
     Alcotest.test_case "engine 7" `Quick test_7;
+    Alcotest.test_case "engine 8" `Quick test_8;
   ]

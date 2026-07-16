@@ -9465,6 +9465,18 @@ and endloop_tail (ds : driver_state) (rc : int) (start_match : int) : int =
      options       option bits (widened once at the seam, Options.of_int32)
      match_data    the match data block (results)
 
+   The pcre2_match_context limit knobs (match/depth/heap) arrive as the
+   three REQUIRED labeled args below — the mcontext values, already the
+   caller-resolved "no context supplied" build defaults or the per-call
+   overrides. DEVIATION from the chunk plan (which put those as three
+   OPTIONAL args on this function): optional args on this large function
+   cost ~43 minor words/exec under the stock compiler (measured against the
+   frozen alloc pin, test/pcre2_tests.ml:648), because omitting them forces
+   a currying wrapper at every call site; required labeled args are
+   allocation-free. The optional-arg convenience entry lives just below as
+   [pcre2_match], which defaults + forwards here; Engine.exec* call this
+   worker directly to stay on the allocation-free path.
+
    Returns (6522-6527): > 0 => success; value is the number of ovector
    pairs filled; = 0 => success, but ovector is not big enough; -1 =>
    failed to match (PCRE2_ERROR_NOMATCH); -2 => partial match
@@ -9479,8 +9491,17 @@ and endloop_tail (ds : driver_state) (rc : int) (start_match : int) : int =
      passes an explicit-length string;
    - magic_number (6612-6614) and the code unit width check (6616-6619):
      N/A, [re] is a typed Compile.re. *)
-let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
-    ~(options : int) (match_data : match_data) : int =
+let pcre2_match_with_limits (re : Compile.re) ~(match_limit : int)
+    ~(depth_limit : int) ~(heap_limit : int) ~(subject : string)
+    ~(start_offset : int) ~(options : int) (match_data : match_data) : int =
+  (* pcre2.h.in:632-636 — pcre2_set_{match,depth,heap}_limit take uint32_t;
+     a negative OCaml int is that value's C wraparound (port-conventions §3),
+     so normalize each context limit to its 32-bit unsigned value once here
+     (the mcontext-uint32 seam). The build defaults are already in range, so
+     this is a no-op when the per-call args are omitted. *)
+  let match_limit = match_limit land 0xFFFF_FFFF in
+  let depth_limit = depth_limit land 0xFFFF_FFFF in
+  let heap_limit = heap_limit land 0xFFFF_FFFF in
   let length = String.length subject in
   (* pcre2_match.c:6595-6597 — plausibility checks: undefined public match
      option bits (port-conventions §5: -34 at match time). *)
@@ -9703,22 +9724,26 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
            processed at the mb fill site below, writing the mb fields
            directly like the C switch. *)
         (* pcre2_match.c:7036-7046 — limits set in the pattern override the
-             match context only if they are smaller. The default match
-             context carries the build defaults (module Limits); the
-             re->limit_xxx fields are 0xffff_ffff unless ( *LIMIT_...=) set
-             them, so the unsigned < holds on plain ints. *)
+             match context only if they are smaller. The mcontext term now
+             arrives as this function's ~heap_limit/~match_limit/~depth_limit
+             args (masked above); callers pass either the build defaults
+             (module Limits = the C default match context,
+             pcre2_context.c:166-179 — the "no context supplied" case) or the
+             per-call overrides. The re->limit_xxx fields are 0xffff_ffff
+             unless ( *LIMIT_...=) set them, so the unsigned < holds on plain
+             ints. Resolution factored into Limits.resolve_limit so the two
+             engine drivers can't drift. *)
         let heap_limit =
-          if Limits.heap_limit < re.Compile.limit_heap then Limits.heap_limit
-          else re.Compile.limit_heap
+          Limits.resolve_limit ~mcontext:heap_limit
+            ~pattern:re.Compile.limit_heap
         in
         let match_limit =
-          if Limits.match_limit < re.Compile.limit_match then Limits.match_limit
-          else re.Compile.limit_match
+          Limits.resolve_limit ~mcontext:match_limit
+            ~pattern:re.Compile.limit_match
         in
         let match_limit_depth =
-          if Limits.match_limit_depth < re.Compile.limit_depth then
-            Limits.match_limit_depth
-          else re.Compile.limit_depth
+          Limits.resolve_limit ~mcontext:depth_limit
+            ~pattern:re.Compile.limit_depth
         in
         (* pcre2_match.c:7019-7034 + 7048-7083 — frame_size, the initial
            frames-vector sizing under the heap limit, the
@@ -10001,6 +10026,21 @@ let pcre2_match (re : Compile.re) ~(subject : string) ~(start_offset : int)
                growth during the match — is what gets retained. *)
             Frames.release a;
             rc)
+
+(* Optional-arg convenience entry over [pcre2_match_with_limits]: the three
+   pcre2_match_context limit knobs default to the build values (module
+   Limits = the C default match context, pcre2_context.c:166-179) when
+   omitted, so a call with no limit args behaves bit-for-bit like the
+   pre-knob driver. Kept as a thin forwarder (rather than making the worker
+   itself optional) purely for the allocation reason documented on
+   [pcre2_match_with_limits]; the worker performs the uint32 masking and the
+   min-with-verb resolution. *)
+let pcre2_match (re : Compile.re) ?(match_limit = Limits.match_limit)
+    ?(depth_limit = Limits.match_limit_depth) ?(heap_limit = Limits.heap_limit)
+    ~(subject : string) ~(start_offset : int) ~(options : int)
+    (match_data : match_data) : int =
+  pcre2_match_with_limits re ~match_limit ~depth_limit ~heap_limit ~subject
+    ~start_offset ~options match_data
 
 (* ---------- Test-only single-attempt entry ---------- *)
 

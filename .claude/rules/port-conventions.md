@@ -75,7 +75,9 @@ Every ported block (function, match arm group, table) carries a citation on its 
   both must stay green.
 - Unknown option bits → error 117 (BAD_OPTIONS) at compile, −34 (BADOPTION) at match.
 - `find_iter`/`captures_iter` semantics are FROZEN (empty-match-repeat bug included). Never
-  "fix" them; `src/pcre2.ml` is untouched by this project.
+  "fix" them; `src/pcre2.ml` is untouched by this project. (Sanctioned API change 2026-07-16:
+  `find`/`find_iter`/`captures`/`captures_iter` may gain the three optional per-call limit args
+  `?match_limit`/`?depth_limit`/`?heap_limit`; omitted-arg behavior stays bit-for-bit frozen.)
 - Compile errors: exact error NUMBER, exact `erroroffset`, and exact MESSAGE string from
   `pcre2_error.c` (the harness diffs `Failed: error NNN at offset N: <message>` lines).
 - `Engine.version = (10, 44)`.
@@ -100,7 +102,9 @@ Every ported block (function, match arm group, table) carries a citation on its 
 - `Str`, `Re`, or any new dependency in package `pcre2` (stdlib only; `dune build -p pcre2`
   must stay dependency-free).
 - `Printf`/`Format` in match/compile hot paths (fine in `debug_printer.ml` and error paths).
-- Mutation of vendored files; editing `src/pcre2.ml{,i}` or `src/intf.ml`.
+- Mutation of vendored files; editing `src/pcre2.ml{,i}` or `src/intf.ml`. (Sanctioned
+  exception 2026-07-16: adding the three optional per-call limit args
+  `?match_limit`/`?depth_limit`/`?heap_limit`, with unchanged omitted-arg behavior.)
 
 ## 8. Performance rules (hot loop = interpreter dispatch + frame ops)
 
@@ -136,7 +140,9 @@ not apply verbatim there. Instead:
   the SAME simulated C frame bytes (fast-design.md §4).
 - `src/matcher/` carries the FROZEN convenience semantics (find_iter/captures_iter
   empty-match quirk included) — §5's freeze applies to it verbatim; `src/pcre2.mli` stays
-  at zero diff (the real API freeze).
+  at zero diff (the real API freeze). (Sanctioned API change 2026-07-16: the three optional
+  per-call limit args `?match_limit`/`?depth_limit`/`?heap_limit` may be added; omitted-arg
+  behavior is unchanged.)
 
 ### §9 named hazard: local `let rec` closures in give-back/backtrack paths
 

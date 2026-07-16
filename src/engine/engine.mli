@@ -61,15 +61,44 @@ val error_message : int -> string
 (** Total variant of [Errors.message] (pcre2_get_error_message): returns
     [""] for codes where the C returns PCRE2_ERROR_BADDATA. *)
 
-val exec_full : t -> string -> int -> int32 -> exec_result
+val exec_full :
+  ?match_limit:int ->
+  ?depth_limit:int ->
+  ?heap_limit:int ->
+  t ->
+  string ->
+  int ->
+  int32 ->
+  exec_result
+(** The three optional args are the pcre2_match_context limit knobs
+    (pcre2_set_match_limit / pcre2_set_depth_limit / pcre2_set_heap_limit):
+    [match_limit] caps backtracking ticks (error -47), [depth_limit] caps
+    backtrack depth (-53), [heap_limit] caps the frames vector in KiB (-63).
+    A pattern's ( *LIMIT_*=) verb still wins when it is smaller
+    (pcre2_match.c:7036-7046). Omitting an arg uses the build default
+    (10_000_000 / 10_000_000 / 20_000_000, module Limits) — behavior then
+    matches the pre-arg engine bit-for-bit. Each value is a C uint32_t
+    (pcre2.h.in:632-636): a negative int is taken mod 2^32, so
+    [~match_limit:(-1)] means 0xFFFF_FFFF (effectively unlimited). *)
+
 val exec : t -> string -> int -> int32 -> ((int * int) option, int) result
+(** The bool/pair fast path; returns only the group-0 pair. DEVIATION: unlike
+    [exec_full]/[exec_captures] this entry does NOT take the per-call limit
+    args — optional arguments here would regress the frozen engine-seam
+    allocation pin (test/pcre2_tests.ml:648) by ~36 minor words/exec under
+    the stock compiler (see engine.ml). It always uses the build-default
+    limits; the limit-carrying pair path routes through [exec_full]. *)
 
 val exec_captures :
+  ?match_limit:int ->
+  ?depth_limit:int ->
+  ?heap_limit:int ->
   t ->
   string ->
   int ->
   int32 ->
   (((int * int) array * (string * int) array) option, int) result
+(** As [exec_full] for the optional limit args (see there). *)
 
 val capture_groups : t -> (string * int) array
 val version : int * int

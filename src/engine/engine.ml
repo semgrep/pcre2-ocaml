@@ -125,8 +125,9 @@ let mark_of_offset (re : t) (off : int) : string option =
      [Error] carrying pcre2_get_startchar (the subject UTF-error offset
      for the UTF error codes, pcre2_match.c:6899-6903; pcre2test prints
      it as " at offset N"). *)
-let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
-    exec_result =
+let exec_full ?(match_limit = Limits.match_limit)
+    ?(depth_limit = Limits.match_limit_depth) ?(heap_limit = Limits.heap_limit)
+    (re : t) (subject : string) (offset : int) (options : int32) : exec_result =
   let oveccount = re.Compile.top_bracket + 1 in
   let md =
     {
@@ -139,9 +140,15 @@ let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
       mark = -1;
     }
   in
+  (* This is the seam that stands in for "no pcre2_match_context supplied":
+     an omitted limit arg defaults to the build value (module Limits = the C
+     default match context, pcre2_context.c:166-179), so the driver behaves
+     bit-for-bit like the pre-knob path. The worker masks (uint32) and does
+     the min-with-verb resolution; call the worker (not the optional
+     [pcre2_match] wrapper) to stay allocation-free (interpreter.ml). *)
   let rc =
-    Interpreter.pcre2_match re ~subject ~start_offset:offset
-      ~options:(Options.of_int32 options) md
+    Interpreter.pcre2_match_with_limits re ~match_limit ~depth_limit ~heap_limit
+      ~subject ~start_offset:offset ~options:(Options.of_int32 options) md
   in
   if rc > 0 then
     Match
@@ -169,7 +176,18 @@ let exec_full (re : t) (subject : string) (offset : int) (options : int32) :
    (port-conventions §5): rc > 0 -> the pair (the clip kept >= 2 slots
    when rc >= 1, so ovector.(0)/(1) are the same values); NOMATCH /
    PARTIAL -> Ok None (pcre2_stubs.c: PARTIAL -> Ok None); any other rc
-   (including the unreachable 0, see [exec_full]) -> Error rc. *)
+   (including the unreachable 0, see [exec_full]) -> Error rc.
+
+   DEVIATION (alloc pin, port-conventions §8): [exec] does NOT take the
+   per-call limit args that [exec_full]/[exec_captures] gained. Optional
+   arguments on this function cost ~36 extra minor words/exec at every call
+   site under the stock (non-flambda) compiler (measured: 28 -> 64
+   words/exec), which would regress the frozen engine-seam alloc pin
+   (test/pcre2_tests.ml:648, < 40 words at Engine.exec) — a real
+   default-path allocation regression, not just a test artifact. So [exec]
+   stays 4-arg and always uses the build-default limits; the limit-carrying
+   pair/bool path (bindings.ml, a later chunk) routes through [exec_full]
+   when a per-call limit is supplied and through [exec] otherwise. *)
 let exec (re : t) (subject : string) (offset : int) (options : int32) :
     ((int * int) option, int) result =
   let oveccount = re.Compile.top_bracket + 1 in
@@ -185,8 +203,9 @@ let exec (re : t) (subject : string) (offset : int) (options : int32) :
     }
   in
   let rc =
-    Interpreter.pcre2_match re ~subject ~start_offset:offset
-      ~options:(Options.of_int32 options) md
+    Interpreter.pcre2_match_with_limits re ~match_limit:Limits.match_limit
+      ~depth_limit:Limits.match_limit_depth ~heap_limit:Limits.heap_limit
+      ~subject ~start_offset:offset ~options:(Options.of_int32 options) md
   in
   if rc > 0 then
     Ok (Some (md.Interpreter.ovector.(0), md.Interpreter.ovector.(1)))
@@ -194,9 +213,11 @@ let exec (re : t) (subject : string) (offset : int) (options : int32) :
   then Ok None
   else Result.Error rc
 
-let exec_captures (re : t) (subject : string) (offset : int) (options : int32) :
+let exec_captures ?match_limit ?depth_limit ?heap_limit (re : t)
+    (subject : string) (offset : int) (options : int32) :
     (((int * int) array * (string * int) array) option, int) result =
-  match exec_full re subject offset options with
+  match exec_full ?match_limit ?depth_limit ?heap_limit re subject offset options
+  with
   | Match { ovector; _ } ->
       let n = re.Compile.top_bracket + 1 in
       (* The Match ovector holds rc pairs (see exec_full); groups at and
