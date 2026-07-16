@@ -70,12 +70,13 @@ let reason_of_op (op : int) : string =
        (chunk D2). The possessive repeating ket KETRPOS stays declined
        (possessive groups → chunk G; see the [compile_group] guard). *)
   else if Int.equal op Op.op_ketrpos then named "possessive group (KETRPOS)" "G"
-    (* Lookaround / lookbehind reverse / atomic (chunk G). *)
+    (* Lookaround / atomic groups (chunk G) are handled in [compile_lookaround]
+       (OP_ASSERT..OP_ASSERTBACK_NA, OP_ONCE) and their lookbehind step-back
+       opcodes OP_REVERSE/OP_VREVERSE in [compile_branch]. A bare OP_REVERSE /
+       OP_VREVERSE reaching here (outside an assertion branch) cannot occur in a
+       compiled program, so this defensive decline names them. *)
   else if Int.equal op Op.op_reverse then named "OP_REVERSE" "G"
   else if Int.equal op Op.op_vreverse then named "OP_VREVERSE" "G"
-  else if op >= Op.op_assert && op <= Op.op_assertback_na then
-    named "lookaround" "G"
-  else if Int.equal op Op.op_once then named "OP_ONCE" "G"
     (* Groups: non-capturing OP_BRA, capturing OP_CBRA/OP_SCBRA and the
        empty-checking non-capturing OP_SBRA are handled in [compile_group]
        (chunk D2). The possessive brackets (OP_*POS) resist the minimal-save
@@ -491,6 +492,194 @@ let compile (re : C.re) : (Ir.t, string) result =
       else if not is_capture then push Ir.t_ket;
       List.iter (fun j -> set j ket_ir) !jmp_fixups;
       ket_off + Op.op_lengths.(ket_op)
+    (* [compile_lookaround bra_off]: lower a lookaround assertion or atomic
+       group (OP_ASSERT/ASSERTBACK/ASSERT_NA/ASSERTBACK_NA/ASSERT_NOT/
+       ASSERTBACK_NOT/ONCE ... OP_KET) starting at [bra_off]; returns the
+       bytecode offset just past its KET (fast-design.md §3). Native design:
+       the body branches lower grouploop-style (an ALT choice point per branch
+       + a trailing FAIL — pcre2_match.c dispatches OP_ONCE and the assertions
+       through GROUPLOOP/assert_loop with an RM per branch, so the tick
+       accounting is grouploop's, §4), but the branch tail and the ket differ:
+
+       - Atomic group (OP_ONCE): [t_once] boundary; branches JMP to [t_once_end]
+         (commit — discard the body's internal choice points).
+       - Positive assertion (OP_ASSERT/ASSERTBACK atomic, OP_ASSERT_NA/
+         ASSERTBACK_NA non-atomic): [t_once] (atomic only) + [t_group_start g]
+         (record the entry eptr); branches JMP to [t_assert_end atomic g]
+         (restore eptr to the entry, + commit for the atomic kinds).
+       - Negative assertion (OP_ASSERT_NOT/ASSERTBACK_NOT): [t_nassert g cont]
+         boundary; branches JMP to [t_nassert_match] (a matched branch fails the
+         assertion). Exhausting all branches (FAIL -> backtrack to the KIND_NASSERT
+         record) is the assertion's SUCCESS (continue at [cont]).
+
+       Variable-lookbehind branches (first op OP_VREVERSE) get a
+       [t_assertback_check g] before the JMP (pcre2_match.c:5995/6009/6038). *)
+    and compile_lookaround (bra_off : int) : int =
+      let op = byte bra_off in
+      let atomic_group = Int.equal op Op.op_once in
+      let pos_atomic =
+        Int.equal op Op.op_assert || Int.equal op Op.op_assertback
+      in
+      let pos_na =
+        Int.equal op Op.op_assert_na || Int.equal op Op.op_assertback_na
+      in
+      let neg =
+        Int.equal op Op.op_assert_not || Int.equal op Op.op_assertback_not
+      in
+      (* Defensive: [compile_branch] only routes OP_ONCE and
+         OP_ASSERT..OP_ASSERTBACK_NA here, so every call sets one of the four
+         flags; an unexpected opcode (e.g. a future mis-routed OP_SCRIPT_RUN,
+         which declines at compile_branch's default via reason_of_op) would
+         decline rather than mis-lower. *)
+      if not (atomic_group || pos_atomic || pos_na || neg) then
+        raise (Unsupported (reason_of_op op));
+      let rec collect (p : int) (acc : int list) : int list * int =
+        let start = p + Op.op_lengths.(byte p) in
+        let nxt = p + link p in
+        if Int.equal (byte nxt) Op.op_alt then
+          (collect [@tailcall]) nxt (start :: acc)
+        else (List.rev (start :: acc), nxt)
+      in
+      let branch_offs, ket_off = collect bra_off [] in
+      let ket_op = byte ket_off in
+      (* A quantified atomic group/assertion attaches the repeat DIRECTLY to the
+         OP_ONCE/assertion via a repeating ket (e.g. "(?>a)+" is Once ... KetRmax,
+         combining the per-iteration atomic commit with the group-repeat loop).
+         That combination is out of this chunk's subset; decline it precisely
+         rather than mis-lower a non-OP_KET ket. *)
+      if not (Int.equal ket_op Op.op_ket) then
+        raise
+          (Unsupported "fast: repeated atomic group / assertion (chunk G+)");
+      let has_vreverse =
+        List.exists (fun b -> Int.equal (byte b) Op.op_vreverse) branch_offs
+      in
+      (* A positive assertion always needs a group id (eptr restore at the ket);
+         a negative assertion only when it has a variable-lookbehind branch (for
+         the end-point check). *)
+      let need_group = pos_atomic || pos_na || (neg && has_vreverse) in
+      let group_id = if need_group then fresh_group () else Ir.no_group in
+      (* Entry markers. *)
+      if atomic_group || pos_atomic then push Ir.t_once;
+      let nassert_cont_operand = ref (-1) in
+      if neg then (
+        push Ir.t_nassert;
+        push group_id;
+        nassert_cont_operand := here ();
+        push 0 (* cont placeholder, patched after t_nassert_match *));
+      if need_group then (
+        push Ir.t_group_start;
+        push group_id);
+      push Ir.t_bra;
+      let jmp_fixups = ref [] in
+      let prev_cp = ref (-1) in
+      List.iter
+        (fun b_off ->
+          let entry = here () in
+          if !prev_cp >= 0 then set !prev_cp entry;
+          push Ir.t_alt;
+          let cp_operand = here () in
+          push 0 (* handler placeholder *);
+          prev_cp := cp_operand;
+          ignore (compile_branch b_off : int);
+          (* Variable-lookbehind end-point check before the branch's JMP. *)
+          if Int.equal (byte b_off) Op.op_vreverse then (
+            push Ir.t_assertback_check;
+            push group_id);
+          push Ir.t_jmp;
+          let j = here () in
+          push 0 (* target placeholder, resolved at the convergence point *);
+          jmp_fixups := j :: !jmp_fixups)
+        branch_offs;
+      (* The last ALT's handler resolves to a FAIL: exhausting the branches
+         propagates NOMATCH (positive: the assertion fails; negative: the FAIL's
+         backtrack reaches the KIND_NASSERT record = SUCCESS). *)
+      let fail_pc = here () in
+      push Ir.t_fail;
+      if !prev_cp >= 0 then set !prev_cp fail_pc;
+      (* Convergence instruction the branch JMPs target. *)
+      let conv_ir = here () in
+      if atomic_group then push Ir.t_once_end
+      else if pos_atomic || pos_na then (
+        push Ir.t_assert_end;
+        push (if pos_atomic then 1 else 0);
+        push group_id)
+      else (
+        push Ir.t_nassert_match;
+        (* the negative assertion's success continuation is right past here. *)
+        set !nassert_cont_operand (here ()));
+      List.iter (fun j -> set j conv_ir) !jmp_fixups;
+      ket_off + Op.op_lengths.(ket_op)
+    (* [compile_possess bra_off zero_allowed]: lower a possessive quantified
+       group (OP_BRAPOS/CBRAPOS/SBRAPOS/SCBRAPOS ... OP_KETRPOS) starting at
+       [bra_off]; returns the bytecode offset just past its KETRPOS
+       (fast-design.md §3). A possessive group is a greedy-atomic repeat: the
+       body branches lower grouploop-style (an ALT per branch — each is one RM8
+       tick per attempt, §4), a matching branch reaches [t_ketrpos] which commits
+       the iteration (truncate the body's records) and loops back, and exhausting
+       the branches (the last ALT's handler) drops into [t_possess_done]. On the
+       whole group being backtracked past, the KIND_POS boundary restores the
+       pre-group captures + eptr (like KIND_ONCE). [zero_allowed] is set from a
+       preceding OP_BRAPOSZERO (the *+ / {0,n}+ form). *)
+    and compile_possess (bra_off : int) (zero_allowed : bool) : int =
+      let op = byte bra_off in
+      let is_cap =
+        Int.equal op Op.op_cbrapos || Int.equal op Op.op_scbrapos
+      in
+      (* [opt_cbracket] is NOT consulted here: a possessive capture (which the
+         JIT analysis marks non-optimized, pcre2_jit_compile.c:1159) writes its
+         ovector pair only at KETRPOS (its close), so a mid-body backref sees
+         only CLOSED values without the cap_start scratch — the
+         non-optimized-cbracket property holds by construction
+         (fast-design.md §3). *)
+      let ovbase =
+        if is_cap then 2 * C.get2 src (bra_off + 1 + Limits.link_size) else 0
+      in
+      let rec collect (p : int) (acc : int list) : int list * int =
+        let start = p + Op.op_lengths.(byte p) in
+        let nxt = p + link p in
+        if Int.equal (byte nxt) Op.op_alt then
+          (collect [@tailcall]) nxt (start :: acc)
+        else (List.rev (start :: acc), nxt)
+      in
+      let branch_offs, ket_off = collect bra_off [] in
+      let ket_op = byte ket_off in
+      (* The possessive bracket family always closes with OP_KETRPOS; decline
+         anything else defensively. *)
+      if not (Int.equal ket_op Op.op_ketrpos) then
+        raise (Unsupported (reason_of_op ket_op));
+      push Ir.t_possess;
+      push ovbase;
+      push (if zero_allowed then 1 else 0);
+      let body_entry = here () in
+      push Ir.t_bra;
+      let jmp_fixups = ref [] in
+      let prev_cp = ref (-1) in
+      List.iter
+        (fun b_off ->
+          let entry = here () in
+          if !prev_cp >= 0 then set !prev_cp entry;
+          push Ir.t_alt;
+          let cp_operand = here () in
+          push 0 (* handler placeholder *);
+          prev_cp := cp_operand;
+          ignore (compile_branch b_off : int);
+          push Ir.t_jmp;
+          let j = here () in
+          push 0 (* target placeholder, resolved to KETRPOS *);
+          jmp_fixups := j :: !jmp_fixups)
+        branch_offs;
+      (* KETRPOS: a matching branch commits + loops back to [body_entry]. *)
+      let ketrpos_pc = here () in
+      push Ir.t_ketrpos;
+      push body_entry;
+      push ovbase;
+      (* POSSESS_DONE: reached when the branches are exhausted (the last ALT's
+         handler) or on an empty-match break (falls through from KETRPOS). *)
+      let done_pc = here () in
+      push Ir.t_possess_done;
+      if !prev_cp >= 0 then set !prev_cp done_pc;
+      List.iter (fun j -> set j ketrpos_pc) !jmp_fixups;
+      ket_off + Op.op_lengths.(ket_op)
     (* [compile_branch p0]: lower one branch body; stops at (without
        consuming) the branch terminator (OP_ALT or an OP_KET family opcode)
        that closes the enclosing group; returns that terminator's offset. *)
@@ -560,6 +749,38 @@ let compile (re : C.re) : (Ir.t, string) result =
           Int.equal op Op.op_bra || Int.equal op Op.op_cbra
           || Int.equal op Op.op_scbra || Int.equal op Op.op_sbra
         then p := compile_group !p
+        else if
+          Int.equal op Op.op_once
+          || (op >= Op.op_assert && op <= Op.op_assertback_na)
+        then
+          (* Lookaround assertions + atomic groups (chunk G, compile_lookaround);
+             OP_SCRIPT_RUN (also >= OP_ONCE) is declined inside it. *)
+          p := compile_lookaround !p
+        else if Int.equal op Op.op_reverse then (
+          (* OP_REVERSE (pcre2_match.c:5793-5819) — the fixed lookbehind
+             back-step at the start of a lookbehind branch. GET2(code,p+1) =
+             number of code units. *)
+          push Ir.t_reverse;
+          push (C.get2 src (!p + 1));
+          p := !p + Op.op_lengths.(op))
+        else if Int.equal op Op.op_vreverse then (
+          (* OP_VREVERSE (pcre2_match.c:5834-5883) — the variable lookbehind
+             back-step. GET2(p+1) = Lmin, GET2(p+1+IMM2) = Lmax; the branch body
+             follows at p + 1 + 2*IMM2. *)
+          push Ir.t_vreverse;
+          push (C.get2 src (!p + 1));
+          push (C.get2 src (!p + 1 + Limits.imm2_size));
+          p := !p + Op.op_lengths.(op))
+        else if
+          Int.equal op Op.op_brapos || Int.equal op Op.op_cbrapos
+          || Int.equal op Op.op_sbrapos || Int.equal op Op.op_scbrapos
+        then
+          (* Possessive quantified group (?:X)++, (X)++, ... (chunk G). *)
+          p := compile_possess !p false
+        else if Int.equal op Op.op_braposzero then
+          (* OP_BRAPOSZERO (pcre2_match.c:5260-5265) — the *+ / {0,n}+ form:
+             step onto the following possessive bracket with zero_allowed set. *)
+          p := compile_possess (!p + Op.op_lengths.(op)) true
         else if Int.equal op Op.op_brazero || Int.equal op Op.op_braminzero
         then (
           (* OP_BRAZERO / OP_BRAMINZERO (pcre2_match.c:5224-5238) — the greedy

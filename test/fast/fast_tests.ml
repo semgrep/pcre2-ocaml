@@ -544,6 +544,122 @@ let goldens : (string * string) list =
           " 30 KET";
           " 31 END";
         ] );
+    (* ---- Chunk G: lookaround / atomic / possessive ---- *)
+    ( "a(?=b)c",
+      g
+        [
+          "  0 BRA";
+          "  1 CHAR_RUN \"a\"";
+          "  4 ONCE";
+          "  5 GROUP_START g=0";
+          "  7 BRA";
+          "  8 ALT next=15";
+          " 10 CHAR_RUN \"b\"";
+          " 13 JMP 16";
+          " 15 FAIL";
+          " 16 ASSERT_END atomic g=0";
+          " 19 CHAR_RUN \"c\"";
+          " 22 KET";
+          " 23 END";
+        ] );
+    ( "a(?!b)",
+      g
+        [
+          "  0 BRA";
+          "  1 CHAR_RUN \"a\"";
+          "  4 NASSERT g=-1 cont=17";
+          "  7 BRA";
+          "  8 ALT next=15";
+          " 10 CHAR_RUN \"b\"";
+          " 13 JMP 16";
+          " 15 FAIL";
+          " 16 NASSERT_MATCH";
+          " 17 KET";
+          " 18 END";
+        ] );
+    ( "(?<=ab)c",
+      g
+        [
+          "  0 BRA";
+          "  1 ONCE";
+          "  2 GROUP_START g=0";
+          "  4 BRA";
+          "  5 ALT next=14";
+          "  7 REVERSE 2";
+          "  9 CHAR_RUN \"ab\"";
+          " 12 JMP 15";
+          " 14 FAIL";
+          " 15 ASSERT_END atomic g=0";
+          " 18 CHAR_RUN \"c\"";
+          " 21 KET";
+          " 22 END";
+        ] );
+    ( "(?<=\\d{2,3})x",
+      g
+        [
+          "  0 BRA";
+          "  1 ONCE";
+          "  2 GROUP_START g=0";
+          "  4 BRA";
+          "  5 ALT next=24";
+          "  7 VREVERSE {2,3}";
+          " 10 TYPE_REP min {2,2} \\d";
+          " 15 TYPE_REP max {0,1} \\d";
+          " 20 ASSERTBACK_CHECK g=0";
+          " 22 JMP 25";
+          " 24 FAIL";
+          " 25 ASSERT_END atomic g=0";
+          " 28 CHAR_RUN \"x\"";
+          " 31 KET";
+          " 32 END";
+        ] );
+    ( "(?>a|b)c",
+      g
+        [
+          "  0 BRA";
+          "  1 ONCE";
+          "  2 BRA";
+          "  3 ALT next=10";
+          "  5 CHAR_RUN \"a\"";
+          "  8 JMP 18";
+          " 10 ALT next=17";
+          " 12 CHAR_RUN \"b\"";
+          " 15 JMP 18";
+          " 17 FAIL";
+          " 18 ONCE_END";
+          " 19 CHAR_RUN \"c\"";
+          " 22 KET";
+          " 23 END";
+        ] );
+    ( "(?:ab)++c",
+      g
+        [
+          "  0 BRA";
+          "  1 POSSESS ovbase=0 zero=0";
+          "  4 BRA";
+          "  5 ALT next=15";
+          "  7 CHAR_RUN \"ab\"";
+          " 10 JMP 12";
+          " 12 KETRPOS entry=4 ovbase=0";
+          " 15 POSSESS_DONE";
+          " 16 CHAR_RUN \"c\"";
+          " 19 KET";
+          " 20 END";
+        ] );
+    ( "(a)*+",
+      g
+        [
+          "  0 BRA";
+          "  1 POSSESS ovbase=2 zero=1";
+          "  4 BRA";
+          "  5 ALT next=15";
+          "  7 CHAR_RUN \"a\"";
+          " 10 JMP 12";
+          " 12 KETRPOS entry=4 ovbase=2";
+          " 15 POSSESS_DONE";
+          " 16 KET";
+          " 17 END";
+        ] );
   ]
 
 let golden_tests =
@@ -623,18 +739,16 @@ let unsupported_cases : (string * string * string) list =
        CONDITIONAL still declines, but at the OP_COND (chunk J), not the
        referenced cbracket: the referenced-capture lowering is generic. *)
     ("conditional ref", "(a)(?(1)b|c)", "fast: OP_COND (chunk J)");
-    (* A possessive ref repeat compiles to an atomic group (OP_ONCE), which is
-       out of subset (chunk G). *)
-    ("possessive ref repeat", "(a)\\1++", "fast: OP_ONCE (chunk G)");
-    (* Chunk D2: possessive group repeats stay declined (their KETRPOS
-       frame-juggling protocol resists the minimal-save design → chunk G). *)
-    ("possessive group", "(a)++", "fast: possessive group (CBRAPOS) (chunk G)");
-    ( "possessive non-capturing",
-      "(?:ab)++",
-      "fast: possessive group (BRAPOS) (chunk G)" );
-    ( "possessive optional",
-      "(a)*+",
-      "fast: possessive group (BRAPOSZERO) (chunk G)" );
+    (* Chunk G supports atomic groups (OP_ONCE), so a possessive ref repeat
+       "(a)\\1++" (compiled as (?>\\1+)) is now ACCEPTED — no unsupported entry. *)
+    (* Chunk G supports possessive groups (BRAPOS/CBRAPOS/... + KETRPOS +
+       BRAPOSZERO), so "(a)++", "(?:ab)++", "(a)*+" are now ACCEPTED. A REPEATED
+       atomic group / assertion (Once ... KetRmax, e.g. "(?>a)+") still declines
+       (the per-iteration atomic commit combined with a repeating ket is out of
+       subset). *)
+    ( "repeated atomic group",
+      "(?>a)+",
+      "fast: repeated atomic group / assertion (chunk G+)" );
     (* Chunk E declines: a \p property in a class compiles to OP_XCLASS, which
        needs the property machinery (chunk I); \p / \X singles and repeats and
        the UCP word boundary are likewise chunk I. *)
@@ -756,6 +870,47 @@ let supported_patterns =
     "((a)\\2)+";
     "(a*)\\1";
     "\\1(a)";
+    (* Chunk G: lookaround + atomic groups. *)
+    "(?=abc)";
+    "(?!abc)";
+    "a(?=b)";
+    "a(?!b)";
+    "(?=a|b)c";
+    "(?<=abc)";
+    "(?<!abc)";
+    "(?<=a)b";
+    "(?<=ab|c)d";
+    "(?<=\\d{2,3})x";
+    "(?<=a\\d?b)";
+    "(?<!\\d{1,2})x";
+    "(?>abc)";
+    "(?>a|ab)c";
+    "(?>a+)b";
+    "(?>(a)b)c";
+    "a(?>b*)b";
+    "((?>a|ab))c";
+    "(?=(a))\\1";
+    "(?:(?=(a+))\\1)+";
+    "(a)\\1++";
+    "(?>(a)|(b))\\1";
+    "(?<=(a))b";
+    "(*napla:a|b)c";
+    "(?>x(?=y))";
+    "(?=(?>a+))a";
+    (* Chunk G: possessive brackets. *)
+    "(?:ab)++";
+    "(?:ab)*+";
+    "(?:ab)?+";
+    "(a)++";
+    "(a)*+";
+    "(a|b)++";
+    "(?:a|b)*+c";
+    "((a)b)++";
+    "(a)++\\1";
+    "x(?:\\d)++y";
+    "(?:a+)++";
+    "(?:)*+";
+    "(a?)*+";
   ]
 
 let verify_ok = function
@@ -1385,6 +1540,100 @@ let parity_cases : (string * string * int * int32) list =
     ("(a)\\1", "xaa", 0, o_anchored);
     ("(a)\\1", "aa", 0, o_endanchored);
     ("(a)\\1b", "aab", 0, o_endanchored);
+    (* ---- Chunk G: lookahead (positive / negative) ---- *)
+    ("a(?=b)", "ab", 0, 0l);
+    ("a(?=b)", "ac", 0, 0l);
+    ("a(?=b)c", "abc", 0, 0l);
+    ("a(?!b)", "ac", 0, 0l);
+    ("a(?!b)", "ab", 0, 0l);
+    ("(?=abc)", "abc", 0, 0l);
+    ("(?=abc)a", "abc", 0, 0l);
+    ("(?!abc)", "abd", 0, 0l);
+    ("(?=a|b)[ab]c", "bc", 0, 0l);
+    ("foo(?=bar|baz)", "foobaz", 0, 0l);
+    (* captures set inside a positive assertion PERSIST *)
+    ("(?=(a))\\1", "a", 0, 0l);
+    ("(?=(ab))a", "ab", 0, 0l);
+    ("a(?=(b))(b)", "ab", 0, 0l);
+    (* backtrack INTO a positive assertion fails for the atomic (?=...) *)
+    ("(?=(a)|(a))\\2", "a", 0, 0l);
+    ("(?:(?=(a+))\\1)+", "aaa", 0, 0l);
+    (* negative assertion captures do NOT leak on success *)
+    ("(?!(b))a", "a", 0, 0l);
+    ("a(?!(b))c", "ac", 0, 0l);
+    (* ---- Chunk G: lookbehind (fixed / variable) ---- *)
+    ("(?<=a)b", "ab", 0, 0l);
+    ("(?<=a)b", "xb", 0, 0l);
+    ("(?<=abc)d", "abcd", 0, 0l);
+    ("a(?<=a)", "a", 0, 0l);
+    ("(?<!a)b", "cb", 0, 0l);
+    ("(?<!a)b", "ab", 0, 0l);
+    ("(?<=\\d{2,3})x", "12x", 0, 0l);
+    ("(?<=\\d{2,3})x", "123x", 0, 0l);
+    ("(?<=\\d{2,3})x", "1x", 0, 0l);
+    ("(?<=a\\d?b)c", "abc", 0, 0l);
+    ("(?<=a\\d?b)c", "a1bc", 0, 0l);
+    ("(?<=(ab|c))d", "cd", 0, 0l);
+    ("(?<=(ab|c))d", "abd", 0, 0l);
+    ("(?<!\\d{2})x", "1x", 0, 0l);
+    ("(?<!\\d{2})x", "12x", 0, 0l);
+    (* \b-style boundary at subject start with lookbehind *)
+    ("(?<![a-z])a", "a", 0, 0l);
+    ("(?<![a-z])a", "ba", 0, 0l);
+    ("\\b(?<=\\s)x", " x", 0, 0l);
+    (* lookbehind + PARTIAL interplay + start floor *)
+    ("(?<=abc)d", "abc", 0, o_partial_soft);
+    ("a(?<=\\d?a)", "a", 0, 0l);
+    (* ---- Chunk G: atomic groups ---- *)
+    ("(?>a+)a", "aaa", 0, 0l);
+    ("(?>a+)b", "aaab", 0, 0l);
+    ("(?>a|ab)c", "abc", 0, 0l);
+    ("(?>a|ab)c", "ac", 0, 0l);
+    ("(?>(a)|(ab))c", "abc", 0, 0l);
+    ("(?>(a)b)c", "abc", 0, 0l);
+    ("a(?>bc|b)c", "abcc", 0, 0l);
+    ("a(?>bc|b)c", "abc", 0, 0l);
+    ("(?>\\d+)\\d", "123", 0, 0l);
+    ("((?>a|ab))(c)", "abc", 0, 0l);
+    (* captures inside atomic groups survive; backtrack-past restores them *)
+    ("(?>(a)(b))\\1", "aba", 0, 0l);
+    ("(?>(a)|b)x", "ax", 0, 0l);
+    ("(?>(a+))(b)", "aaab", 0, 0l);
+    ("x(?>(a)|(b))*y", "xaby", 0, 0l);
+    (* possessive ref repeat (lowers to atomic group) *)
+    ("(a)\\1++", "aaa", 0, 0l);
+    ("(a)\\1++b", "aab", 0, 0l);
+    (* atomic group + anchors / partial *)
+    ("(?>abc)", "abc", 0, o_partial_soft);
+    ("(?>a+)", "aaa", 0, o_anchored);
+    (* ---- Chunk G: possessive brackets ---- *)
+    ("(?:ab)++", "ababab", 0, 0l);
+    ("(?:ab)++c", "ababc", 0, 0l);
+    ("(?:ab)++a", "abab", 0, 0l); (* possessive over-eats -> no give-back -> fail *)
+    ("(?:ab)*+c", "c", 0, 0l);
+    ("(?:ab)*+c", "ababc", 0, 0l);
+    ("(a)++", "aaa", 0, 0l);
+    ("(a)++", "aaab", 0, 0l);
+    ("(a)*+b", "aaab", 0, 0l);
+    ("(a)*+b", "b", 0, 0l);
+    ("(a|b)++", "abab", 0, 0l);
+    ("(a|b)++x", "abx", 0, 0l);
+    ("((a)b)++", "abab", 0, 0l);
+    (* possessive capture value = last committed iteration; backref after *)
+    ("(a)++\\1", "aaaa", 0, 0l);
+    ("(ab)++\\1", "ababab", 0, 0l);
+    ("(\\d)++", "123", 0, 0l);
+    (* possessive that can match empty *)
+    ("(a?)*+", "aa", 0, 0l);
+    ("(?:a?)*+b", "aab", 0, 0l);
+    ("(?:)*+x", "x", 0, 0l);
+    (* nested possessive / possessive inside atomic *)
+    ("(?:a+)++b", "aaab", 0, 0l);
+    ("(?>(a)++)b", "aaab", 0, 0l);
+    ("x(?:(a)|(b))++y", "xaby", 0, 0l);
+    (* possessive + partial / anchored *)
+    ("(?:ab)++", "abab", 0, o_partial_soft);
+    ("(a)++", "aaa", 0, o_anchored);
   ]
 
 let parity_tests =
@@ -1523,6 +1772,40 @@ let limit_match_boundary_test =
             ("(\\1a|b)+", "baaa"); (* self-referential loop *)
             ("((a)\\2)+", "aaaa"); (* nested captured ref repeat *)
             ("(a+)\\1", "aaaaaa"); (* variable-length ref *)
+          ]);
+    (* Chunk G: lookaround / atomic tick parity. Positive/negative assertions
+       loop over branches (RM3/RM4, each a tick), atomic groups run grouploop
+       (RM2) then commit, variable lookbehinds try back-lengths one at a time
+       (RM37, each a tick). The two engines must trip -47 at the SAME N. Sweep
+       across the boundary. *)
+    Alcotest.test_case "LIMIT_MATCH sweep, lookaround/atomic (fast == interp)"
+      `Quick (fun () ->
+        List.iter
+          (fun (body, subj) ->
+            for n = 1 to 40 do
+              let f, e = run_both body n subj in
+              Alcotest.(check string)
+                (Printf.sprintf "fast == interp for /%s/ on %S at N=%d" body subj
+                   n)
+                e f
+            done)
+          [
+            ("a(?=b|c|d)x", "ax"); (* pos lookahead branch loop, fails *)
+            ("a(?=b|c|d)", "ad"); (* pos lookahead, last branch matches *)
+            ("a(?!b|c|d)", "ae"); (* neg lookahead all branches fail *)
+            ("a(?!b|c|d)", "ab"); (* neg lookahead a branch matches *)
+            ("(?>a|ab|abc)c", "abc"); (* atomic commits first branch *)
+            ("(?>a+)b", "aaaab"); (* atomic possessive-like, then continue *)
+            ("(?>a+)a", "aaaa"); (* atomic over-eats, no give-back -> fail *)
+            ("(?<=\\d{2,4})x", "1234x"); (* variable lookbehind back-length loop *)
+            ("(?<=a{1,3})b", "aaab"); (* variable lookbehind, bounded *)
+            ("(?:(?=(a+))\\1)+b", "aaab"); (* nested pos-assert capture loop *)
+            ("(a)\\1++b", "aaaab"); (* possessive ref repeat -> atomic *)
+            ("(?:a|b)++x", "abab"); (* possessive: one RM8 tick per branch attempt *)
+            ("(?:ab)++c", "ababab"); (* possessive multi-unit iterations *)
+            ("(a)++b", "aaab"); (* possessive capture iterations *)
+            ("(?:a?)*+b", "aab"); (* possessive with empty-match break *)
+            ("(?:a+)++b", "aaab"); (* nested possessive *)
           ]);
   ]
 

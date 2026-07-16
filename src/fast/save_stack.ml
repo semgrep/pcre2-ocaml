@@ -85,6 +85,50 @@ let kind_gstart = 5
 let kind_capstart = 6
 let kind_ref_min = 7
 let kind_ref_max = 8
+
+(* Chunk G additions (fast-design.md §3) — lookaround and atomic groups.
+     KIND_ONCE (VARIABLE width 2*oveccount): the atomic-group / atomic-assertion
+        boundary. Layout [ov_snapshot(2*oveccount-2); prev_once_base; KIND_ONCE].
+        Pushed by [t_once]; snapshots the group ovector slots [2, 2*oveccount)
+        and the enclosing [mb.once_base]. On backtrack (the atomic construct is
+        backtracked PAST): restore the ovector snapshot + [mb.once_base], then
+        keep popping (propagate NOMATCH). This reproduces the C frame arena's
+        "abandon-and-restore-wholesale" of everything an atomic group did
+        (pcre2_match.c:6023-6031 Fback_frame; the ovector/eptr of P are restored
+        because P is a distinct frame). The width is not fixed here — the runner
+        computes 2*mb.oveccount (fast-design.md §3).
+     KIND_NASSERT (VARIABLE width 2*oveccount+3): the negative-assertion
+        boundary. Layout [ov_snapshot(2*oveccount-2); prev_once_base; cont;
+        eptr_enter; rdepth_enter; KIND_NASSERT]. Pushed by [t_nassert]. On
+        backtrack (ALL branches failed = the negative assertion SUCCEEDS,
+        pcre2_match.c:5578-5584 ASSERT_NOT_FAILED): restore the snapshot +
+        [mb.once_base], continue at [cont] with eptr/rdepth = the entry values.
+        A branch that matched instead reaches [t_nassert_match], which rolls the
+        snapshot back and propagates NOMATCH past the record (the assertion
+        fails, pcre2_match.c:5557-5559).
+     KIND_VREVERSE (width 6): a variable-lookbehind back-step choice point (RM37,
+        pcre2_match.c:5874-5883). Layout [body_pc; cur_lmax; lmin; cur_eptr;
+        rdepth; KIND_VREVERSE]. On backtrack: give up one back-step (cur_lmax--,
+        cur_eptr++) and retry the branch body, until cur_lmax <= lmin (NOMATCH).
+   KIND_ONCE / KIND_NASSERT are variable-width; [max_record_width] below is only
+   used for the fixed-width records — the runner grows the stack per push with
+   the exact [need], so no static bound is required for the variable kinds. *)
+let kind_once = 9
+let kind_nassert = 10
+let kind_vreverse = 11
+
+(* KIND_POS (VARIABLE width 2*oveccount+4): the possessive-bracket boundary
+   (fast-design.md §3). Layout [ov_snapshot(2*oveccount-2); prev_once_base;
+   iter_start; matched_once; zero_allowed; entry_rdepth; KIND_POS]. Pushed by
+   [t_possess]; carries the KIND_ONCE snapshot + the per-loop state the
+   greedy-atomic repeat needs (the iteration start for the empty-match check,
+   whether an iteration ever matched, whether zero iterations are allowed, and
+   the loop-level rdepth to reset to on loop-back). On backtrack PAST the whole
+   group it behaves exactly like KIND_ONCE (restore snapshot + once_base,
+   propagate NOMATCH); the extra state slots are read only on the forward loop
+   (t_ketrpos / t_possess_done). *)
+let kind_pos = 12
+let width_vreverse = 6
 let width_alt = 4
 let width_cap = 4
 let width_rep_max = 5

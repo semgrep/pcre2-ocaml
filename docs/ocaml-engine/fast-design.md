@@ -90,6 +90,17 @@ following the tag. Widths are `Ir.arity`:
 | 35 | `DNREF_REP` | `reptype; lmin; lmax; slot_base; count; caseless` | 7 | dup-named backref + `OP_CR*` repeat |
 | 36 | `CAP_START_REF` | `ovbase` | 2 | open a REFERENCED capture N (`ovbase = 2N`): push a `KIND_CAPSTART` (private-scratch save), set `mb.cap_start[ovbase]` to the current position — the ovector slot stays UNSET until CLOSE |
 | 37 | `CAP_END_REF` | `ovbase` | 2 | close a REFERENCED capture: push a `KIND_CAP` (ovector save), write `ovector[ovbase] = cap_start[ovbase]` and `ovector[ovbase+1]` = current position |
+| 38 | `REVERSE` | `number` | 2 | `OP_REVERSE` fixed lookbehind step (`eptr -= number`, lower `start_used_ptr`); NOMATCH if too close to the start |
+| 39 | `VREVERSE` | `lmin; lmax` | 3 | `OP_VREVERSE` variable lookbehind step: back up by the clamped max, try forward one unit at a time (KIND_VREVERSE / RM37) |
+| 40 | `ONCE` | — | 1 | atomic-group / atomic-positive-assertion ENTRY: push a KIND_ONCE boundary (group-ovector snapshot + enclosing `mb.once_base`), set `mb.once_base` |
+| 41 | `ONCE_END` | — | 1 | atomic-group ket (`OP_ONCE`): COMMIT — truncate the body's records to the boundary, restore `mb.once_base`, continue |
+| 42 | `ASSERT_END` | `atomic; g` | 3 | positive-assertion ket: `eptr := mb.group_start.(g)` (entry eptr), then commit if `atomic=1` |
+| 43 | `NASSERT` | `g; cont` | 3 | negative-assertion ENTRY: push a KIND_NASSERT boundary (snapshot + entry eptr/rdepth + `cont`), set `mb.once_base` |
+| 44 | `NASSERT_MATCH` | — | 1 | a negative-assertion branch matched → the assertion FAILS: roll the snapshot back, restore `mb.once_base`, propagate NOMATCH past the boundary |
+| 45 | `ASSERTBACK_CHECK` | `g` | 2 | variable-lookbehind end-point check: `eptr == mb.group_start.(g)` else backtrack |
+| 46 | `POSSESS` | `cap_ovbase; zero_allowed` | 3 | possessive-bracket ENTRY: push a KIND_POS boundary (snapshot + per-loop state), set `mb.once_base` |
+| 47 | `KETRPOS` | `body_entry; cap_ovbase` | 3 | possessive iteration commit (`OP_KETRPOS`): write the capture (if `cap_ovbase>0`), truncate to the boundary, loop back to `body_entry` (or break on empty) |
+| 48 | `POSSESS_DONE` | — | 1 | possessive loop end: success iff `matched_once \|\| zero_allowed`, else the group fails |
 
 **Chunk D additions.** `CIRCM`/`DOLLM` are the multiline anchors (their arms
 carry no operands; runtime semantics only). `CAP_START`/`CAP_END` bracket a
@@ -135,18 +146,15 @@ lowered. `OP_SKIPZERO` (a `{0}` group) is elided entirely — no IR, the walk
 just steps past the dead bytecode (so an unsupported construct inside a `{0}`
 group cannot decline the pattern — strictly safe, the group is never entered).
 
-**Declined to chunk G — possessive group repeats.** `OP_KETRPOS` +
-`OP_BRAPOS`/`OP_CBRAPOS`/`OP_SCBRAPOS`/`OP_SBRAPOS` + `OP_BRAPOSZERO`
-(`(?:…)++`, `(…)*+`, …). The C's KETRPOS protocol (`pcre2_match.c:5283-5328`)
-juggles frames — `OP_KETRPOS` copies the whole frame-copy region back to the
-predecessor `P` and returns `MATCH_KETRPOS`, and the `POSSESSIVE_GROUP` loop
-(RM8) iterates one at a time from the outer level, committing each iteration
-(discarding its internal backtracking) while still restoring the group's
-captures if the whole group is backtracked past. That commit-but-restore
-interplay does not map onto the minimal per-choice-point save records without a
-frame-copy-back mechanism the fast engine deliberately lacks; it belongs to
-chunk G (atomic/`OP_ONCE` groups, already declined there). The IR compiler
-declines them precisely (`"fast: possessive group (…) (chunk G)"`).
+**Possessive group repeats — LANDED in chunk G** (was declined here in D2).
+`OP_KETRPOS` + `OP_BRAPOS`/`OP_CBRAPOS`/`OP_SCBRAPOS`/`OP_SBRAPOS` +
+`OP_BRAPOSZERO` (`(?:…)++`, `(…)*+`, …). The commit-but-restore interplay the
+D2 decline flagged is solved by the chunk-G atomic-commit machinery (the
+`mb.once_base` stack + the KIND_POS boundary's group-ovector snapshot, §3):
+each iteration commits by truncating the body's records back to the boundary,
+and the boundary's snapshot restores the whole group's captures + eptr if it is
+backtracked past — exactly the C's abandon-and-restore-wholesale, without a
+frame-copy-back mechanism. See "Chunk G additions" below.
 
 **detect_repeat (`pcre2_jit_compile.c:1699-1835`) — DECLINED PERMANENTLY (not
 a coverage gap).** Now that group repeats exist, detect_repeat's recognised
@@ -262,6 +270,105 @@ notes:
   re-run `CAP_END_REF` must read the restored `cap_start`, which `KIND_CAPSTART`
   provides) and 260k+ fuzz cases.
 
+**Chunk G additions — lookaround, atomic groups, possessive brackets.** Eleven
+new tags (38-48) and four new save kinds (KIND_ONCE 9, KIND_NASSERT 10,
+KIND_VREVERSE 11, KIND_POS 12). The hard problem — the C frame arena's
+abandon-and-restore-wholesale of an atomic construct's captures + eptr on
+backtrack-past, which the fast engine's single shared ovector cannot reproduce
+once a per-iteration COMMIT truncates the body's per-capture cleanup records — is
+solved with two pieces:
+
+- **Group-ovector snapshot in a boundary record.** `t_once` (atomic groups +
+  atomic positive assertions), `t_nassert` (negative assertions) and `t_possess`
+  (possessive brackets) each push a boundary record (KIND_ONCE / KIND_NASSERT /
+  KIND_POS) that snapshots the group ovector slots `[2, 2*oveccount)`. On
+  backtrack PAST the construct the snapshot restores those slots — exactly the
+  C's P->ovector restore (`pcre2_match.c:6023-6031`). The record is
+  VARIABLE-width (`2*oveccount` + a per-kind tail); the runner derives the width
+  from `mb.oveccount`. (A range-limited snapshot — only the capture numbers
+  textually inside the construct — is a possible optimization; the full group
+  snapshot is correct and simplest, and per-attempt allocation stays zero since
+  the snapshot lives in the save-stack int array.)
+- **`mb.once_base` stack.** A single `mb` int holds the save-stack base of the
+  innermost open atomic construct, so the atomic COMMIT (`t_once_end` /
+  `t_assert_end` atomic / `t_nassert_match` / `t_ketrpos`) finds the boundary
+  without a per-loop `run`/`backtrack` parameter (the hot mainline signature is
+  unchanged). Each boundary record stores the ENCLOSING `once_base` and restores
+  it on commit or backtrack-past, so nested constructs form a balanced stack.
+
+**Snapshot completeness proof.** The boundary snapshot deliberately covers ONLY
+the group ovector slots — NOT `mb.group_start[]` and NOT `mb.cap_start[]` — even
+though the atomic COMMIT truncates the body's `KIND_GSTART`/`KIND_CAPSTART`
+restore records along with everything else. This is sound because both arrays
+are read only at fixed IR positions strictly INSIDE the construct that wrote
+them: `mb.group_start.(g)` is read by `t_ket_rmax`/`t_ket_rmin` (the empty-check
+of the repeated group whose `t_group_start` wrote `g`) and by
+`t_assert_end`/`t_assertback_check` (the assertion whose entry `t_group_start`
+wrote `g`); `mb.cap_start.(ovb)` is read only by the matching `t_cap_end_ref`.
+After backtracking PAST the construct, those inside positions are unreachable —
+there are no recursion/subroutine calls in scope yet, so the only way back in is
+through the construct's entry — and on every path that re-enters, the read is
+dominated by a fresh write (the entry `t_group_start` / `t_cap_start_ref`
+re-executes before any read). Stale values left by the truncation are therefore
+never observed; only the ovector (readable ANYWHERE via backrefs and at END)
+needs the snapshot. **Chunk K (recursion) MUST revisit this proof**: a
+subroutine call `(?N)`/`(?R)` can jump to an IR position inside a construct
+without executing its entry, making inside-positions reachable with stale
+`group_start`/`cap_start` state — chunk K either widens the snapshot or gives
+recursion frames their own save/restore of these arrays.
+
+Design notes:
+
+- **Positive assertions** (`t_assert_end atomic g`). `OP_ASSERT`/`OP_ASSERTBACK`
+  are atomic (`t_once` boundary + commit); `OP_ASSERT_NA`/`OP_ASSERTBACK_NA` are
+  non-atomic (no boundary, the body's choice points stay live for re-entry).
+  BOTH record the entry eptr in `mb.group_start.(g)` via a preceding
+  `t_group_start` (reused from D2) and restore it at the ket (a zero-width
+  lookahead restores the advanced eptr; a lookbehind's is a no-op). The body
+  branches lower grouploop-style (ALT per branch + FAIL), so each branch entry
+  ticks at rdepth+1 exactly as the C's RM3 (§4); the continuation runs at the
+  matching branch's rdepth (the C's ket `break` in that frame). Captures set
+  inside PERSIST forward and are rolled back by the boundary snapshot (atomic) or
+  the branch CAP records (NA) on backtrack-past.
+- **Negative assertions** (`t_nassert g cont` + `t_nassert_match`). The body
+  branches lower grouploop-style; a branch that MATCHES reaches `t_nassert_match`
+  (the assertion fails: roll the snapshot back, restore `once_base`, propagate
+  NOMATCH past the boundary). Exhausting ALL branches backtracks to the
+  KIND_NASSERT record = SUCCESS (`ASSERT_NOT_FAILED`): continue at `cont` with the
+  entry eptr/rdepth stored in the record (the C's RM4 resume in the entry frame).
+  Negative assertions are atomic by nature (one way to succeed), so the record is
+  consumed on success.
+- **Lookbehind** (`t_reverse`, `t_vreverse`, `t_assertback_check`). `OP_REVERSE`
+  is a fixed back-step (`eptr -= number`, lowering `start_used_ptr`), no choice
+  point. `OP_VREVERSE` is the variable back-step: move back by the clamped max,
+  then try forward one code unit at a time (KIND_VREVERSE, the RM37 loop —
+  `pcre2_match.c:5874-5883`), each attempt a ticked child. A variable-lookbehind
+  branch ends with `t_assertback_check g` (Feptr == entry eptr, else backtrack —
+  `pcre2_match.c:5995/6009/6038`).
+- **Atomic groups** (`t_once` + `t_once_end`). `OP_ONCE`: the body matches, then
+  the ket commits (truncate to the boundary, discard internal choice points),
+  continuing with the advanced eptr. A possessive ref repeat `\1++` compiles to
+  `(?>\1+)` = OP_ONCE and rides this path. A REPEATED atomic group `(?>a)+`
+  (Once … KetRmax) combines the atomic commit with a repeating ket and is
+  declined (`"fast: repeated atomic group / assertion (chunk G+)"`).
+- **Possessive brackets** (`t_possess` + `t_ketrpos` + `t_possess_done`). A
+  possessive group is a greedy-atomic repeat. The KIND_POS boundary carries the
+  KIND_ONCE snapshot plus the per-loop state (`iter_start` for the empty-match
+  check, `matched_once`, `zero_allowed` from `OP_BRAPOSZERO`, `entry_rdepth`).
+  The body branches lower grouploop-style — one ALT per branch attempt = one
+  RM8 tick (`pcre2_match.c:5291`, §4). A matching branch reaches `t_ketrpos`,
+  which writes the capture (capturing brackets, at CLOSE only so a mid-body
+  backref sees only closed values — the non-optimized-cbracket property by
+  construction), commits the iteration (truncate to the boundary), and loops
+  back to the body entry at `entry_rdepth` (an empty match breaks to
+  `t_possess_done`). Exhausting the branches (the last ALT's handler) drops into
+  `t_possess_done`, which succeeds iff `matched_once || zero_allowed` (else the
+  whole group fails). `t_possess_done` is excluded from the KIND_ALT top-level
+  tick heuristic (it is a loop `break`, never a ticked branch — the possessive
+  body is never at rdepth 0 in practice, but the exclusion makes that safe).
+  Verified against the interpreter on `(?:ab)++`, `(a)*+`, `(a)++\1`,
+  `((a)b)++`, `(?:a?)*+`, `(?:a+)++` and 285k+ fuzz cases.
+
 **charpos (`pcre2_jit_compile.c:11831-12130`) — DECLINED PERMANENTLY (not a
 coverage gap), same class of decision as detect_repeat.** charpos optimises a
 GREEDY single-char/type repeat immediately followed by a fixed literal char
@@ -365,6 +472,17 @@ first:
 | `KIND_CAPSTART` | 3 | `ovbase; old_cap_start; KIND_CAPSTART` | each `CAP_START_REF` (referenced capture entry) | restore `mb.cap_start.(ovbase)` to the enclosing value, then keep popping (the ovector was already rolled back by the CLOSE's `KIND_CAP`) |
 | `KIND_REF_MIN` | 5 | `rep_pc; count; eptr; rdepth; KIND_REF_MIN` | minimizing ref repeat with `lmin<lmax` (RM20) | match one more copy at `eptr` (`count` up to Lmax), retry the continuation; `rep_pc` re-derives ovbase/caseless/Lmax/cont |
 | `KIND_REF_MAX` | 6 | `cont; try_pos; flength; lstart; rdepth; KIND_REF_MAX` | maximizing ref repeat, samelengths (RM21) | give back one copy (`try_pos` −= `flength`, down to and INCLUDING `lstart`), retry the continuation; below `lstart` → NOMATCH |
+| `KIND_ONCE` | `2*oveccount` | `ov_snapshot[2,2n); prev_once_base; KIND_ONCE` | each `ONCE` (atomic group / atomic positive assertion) | restore the group-ovector snapshot + `mb.once_base`, then keep popping (propagate NOMATCH past the atomic construct) |
+| `KIND_NASSERT` | `2*oveccount+3` | `ov_snapshot; prev_once_base; cont; eptr_enter; rdepth_enter; KIND_NASSERT` | each `NASSERT` (negative assertion) | ALL branches failed = SUCCESS: restore snapshot + `mb.once_base`, continue at `cont` with the entry eptr/rdepth |
+| `KIND_VREVERSE` | 6 | `body_pc; cur_lmax; lmin; cur_eptr; rdepth; KIND_VREVERSE` | each `VREVERSE` (RM37) | `if cur_lmax<=lmin` NOMATCH, else give up one back-step (`cur_lmax--`, `cur_eptr++`) and retry the branch body |
+| `KIND_POS` | `2*oveccount+4` | `ov_snapshot; prev_once_base; iter_start; matched_once; zero_allowed; entry_rdepth; KIND_POS` | each `POSSESS` (possessive bracket) | backtrack PAST the group: restore snapshot + `mb.once_base`, keep popping (as `KIND_ONCE`); the extra slots are read only on the forward loop |
+
+`KIND_ONCE` / `KIND_NASSERT` / `KIND_POS` are VARIABLE-width (the group-ovector
+snapshot size depends on `oveccount`); `backtrack` derives the width from
+`mb.oveccount`. The single `mb.once_base` int is the save-stack base of the
+innermost open atomic construct (or -1), maintained as a balanced stack by those
+boundary records so the atomic COMMIT can find the boundary without a
+`run`/`backtrack` parameter (the hot mainline signature is unchanged).
 
 `match_call_count`, `hitend`, `start_used_ptr` are NOT saved (monotonic /
 constant per attempt). `sp` is a runner tail-call parameter; push/pop are
@@ -446,9 +564,13 @@ ovector slots are written only at CLOSE, so a mid-match backref sees only CLOSED
 values. Chunk D declined all non-optimized captures (its subset had no
 referencing opcode in scope); chunk F flips the gate to the referenced lowering
 (behaviour-correct for any referencer) — an out-of-subset referencer
-(`OP_COND`/`OP_CBRAPOS`, chunks J/G) still declines at ITS opcode, so the
-lowered IR is never executed for it. The walk is written to never index out of
-bounds (a conservative early stop only leaves captures optimized).
+(`OP_COND`, chunk J) still declines at ITS opcode, so the lowered IR is never
+executed for it. (A possessive capture `OP_CBRAPOS`/`OP_SCBRAPOS` clears the bit
+too, but chunk G does NOT route it through `CAP_START_REF`/`CAP_END_REF`:
+`t_ketrpos` writes the ovector directly at the iteration CLOSE, so the "mid-body
+backref sees only CLOSED values" property holds by construction without the
+`cap_start` scratch.) The walk is written to never index out of bounds (a
+conservative early stop only leaves captures optimized).
 
 **Scratch policy (chunk C2).** `save_stack.ml` retains ONE module-level `int array` across
 execs, guarded by its OWN `Atomic.t busy` flag (NOT Frames' scratch slot); a concurrent exec
@@ -574,6 +696,27 @@ true), so the rare RM22 rescan never fires and there is no tick divergence from
 it. Verified by the fuzz `--mode fast-vs-interp` `LIMIT_MATCH=2000` differential
 (0 divergences over 260k+ cases with backrefs) and the ref-repeat `LIMIT_MATCH`
 N-sweep test.
+
+**Lookaround / atomic / possessive (chunk G) tick at grouploop / RM8 sites.**
+The boundary entries (`ONCE`, `NASSERT`, `POSSESS`) and the group-start / ket
+markers (`GROUP_START`, `ONCE_END`, `ASSERT_END`, `NASSERT_MATCH`,
+`ASSERTBACK_CHECK`, `POSSESS_DONE`, `REVERSE`) NEVER tick — they dispatch in the
+current frame, mirroring the C where the OP_ONCE/assertion opcode itself and its
+ket `break` add no frame. The WORK ticks at the branch level: assertion / atomic
+/ possessive bodies lower grouploop-style, so each branch entry `ALT` ticks a
+child frame at rdepth+1 (the C's per-branch RM3 for positive assertions, RM4 for
+negative, RM2 for OP_ONCE, RM8 for the possessive loop — all one RMATCH per
+branch attempt). A positive assertion's continuation runs at the matching
+branch's rdepth (the C's ket `break` in that frame); a negative assertion's
+SUCCESS continuation runs at the stored entry rdepth (the RM4 resume in the entry
+frame). A `VREVERSE` back-length attempt ticks a child frame at rdepth+1 (RM37),
+each RM37 backtrack too. A possessive `KETRPOS` loop-back does NOT tick — the
+next iteration's first `ALT` does (the next RM8), and the loop-back resets rdepth
+to the boundary's `entry_rdepth`; `POSSESS_DONE` is excluded from the KIND_ALT
+top-level tick heuristic (a loop `break`, not a ticked branch). Verified by the
+fuzz `--mode fast-vs-interp` `LIMIT_MATCH=2000` differential (0 divergences over
+285k+ cases with lookaround/atomic/possessive across 6 seeds) and the
+lookaround/atomic/possessive `LIMIT_MATCH` N-sweep test.
 
 **Capturing groups (chunk D) are `grouploop`, so their LAST branch ticks too.**
 `OP_CBRA`/`OP_SCBRA` (interpreter.ml:2434-2444 → `grouploop`) record a

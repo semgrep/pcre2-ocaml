@@ -106,6 +106,47 @@ let t_dnref_rep = 35
 let t_cap_start_ref = 36 (* [t_cap_start_ref; ovbase] — referenced capture entry *)
 let t_cap_end_ref = 37 (* [t_cap_end_ref; ovbase]   — referenced capture close *)
 
+(* Chunk G additions (fast-design.md §2/§3) — lookaround and atomic groups.
+
+   [t_reverse]/[t_vreverse] are the lookbehind step-back opcodes (OP_REVERSE /
+   OP_VREVERSE, pcre2_match.c:5793-5883): fixed and variable back-step at the
+   start of a lookbehind branch. [t_once] is the atomic-group / atomic-assertion
+   ENTRY (it pushes the KIND_ONCE boundary that snapshots the group ovector +
+   the enclosing [mb.once_base] and enables the atomic COMMIT); [t_once_end] is
+   the atomic-GROUP ket (OP_ONCE, pcre2_match.c:6023-6031: commit — discard the
+   body's internal choice points). [t_assert_end] is the POSITIVE-assertion ket
+   (OP_ASSERT/ASSERTBACK/ASSERT_NA/ASSERTBACK_NA, pcre2_match.c:5999-6016):
+   restore eptr to the assertion's entry position ([mb.group_start.(g)], written
+   by a preceding [t_group_start]) and, for the atomic kinds ([atomic]=1),
+   commit. [t_nassert]/[t_nassert_match] are the NEGATIVE-assertion boundary and
+   its "a branch matched" fail action (OP_ASSERT_NOT/ASSERTBACK_NOT,
+   pcre2_match.c:5547-5584); [t_assertback_check] is the variable-lookbehind
+   end-point check (branch_start[1+LINK_SIZE] == OP_VREVERSE && Feptr != P->eptr,
+   pcre2_match.c:5995/6009/6038). *)
+let t_reverse = 38 (* [t_reverse; number]   — OP_REVERSE (fixed lookbehind step) *)
+let t_vreverse = 39 (* [t_vreverse; lmin; lmax] — OP_VREVERSE (variable step) *)
+let t_once = 40 (* [t_once]              — atomic group / atomic assertion entry *)
+let t_once_end = 41 (* [t_once_end]          — atomic group ket (commit) *)
+let t_assert_end = 42 (* [t_assert_end; atomic; g] — positive assertion ket *)
+let t_nassert = 43 (* [t_nassert; g; cont]  — negative assertion entry *)
+let t_nassert_match = 44 (* [t_nassert_match]     — negative branch matched (fail) *)
+let t_assertback_check = 45 (* [t_assertback_check; g] — variable-lookbehind check *)
+
+(* Chunk G possessive brackets (fast-design.md §2/§3) — OP_BRAPOS / OP_CBRAPOS /
+   OP_SBRAPOS / OP_SCBRAPOS + OP_KETRPOS + OP_BRAPOSZERO ((?:X)++, (X)*+, ...).
+   A possessive quantified group is a greedy-atomic repeat: match X as many times
+   as possible, each iteration COMMITTED (its internal backtracking discarded),
+   the whole group giving nothing back (pcre2_match.c:5283-5328). [t_possess] is
+   the entry (push a KIND_POS boundary — the KIND_ONCE snapshot + the per-loop
+   matched_once / iter_start / zero_allowed / entry_rdepth state); [t_ketrpos] is
+   the per-iteration commit + loop-back (OP_KETRPOS, pcre2_match.c:6092-6098);
+   [t_possess_done] ends the loop (the RM8 loop `break` + the Lmatched_once ||
+   Lzero_allowed success test, pcre2_match.c:5320-5328). [cap_ovbase] = 2N for a
+   capturing possessive bracket (0 = non-capturing). *)
+let t_possess = 46 (* [t_possess; cap_ovbase; zero_allowed] — possessive entry *)
+let t_ketrpos = 47 (* [t_ketrpos; body_entry; cap_ovbase] — iteration commit *)
+let t_possess_done = 48 (* [t_possess_done]      — possessive loop end *)
+
 (* Sentinel [g] for a repeated group whose bracket is OP_BRA (bra_loop, C's
    P == NULL): NO empty-string check (the C short-circuits it, and OP_BRA can
    never match empty), so no [t_group_start] and no [mb.group_start] slot. *)
@@ -121,7 +162,7 @@ let reptype_pos = 2
 let rep_inf = 0xFFFFFFFF
 
 (* fast-design.md §2 — highest valid tag; used by the verifier and dump. *)
-let max_tag = 37
+let max_tag = 48
 
 (* fast-design.md §2 — instruction WIDTH in ints (tag + operands), indexed
    by tag. The verifier walks [code] by these widths; the runner advances by
@@ -166,6 +207,17 @@ let arity =
     7 (* t_dnref_rep: reptype, lmin, lmax, slot_base, count, caseless *);
     2 (* t_cap_start_ref: ovbase *);
     2 (* t_cap_end_ref: ovbase *);
+    2 (* t_reverse: number *);
+    3 (* t_vreverse: lmin, lmax *);
+    1 (* t_once *);
+    1 (* t_once_end *);
+    3 (* t_assert_end: atomic, g *);
+    3 (* t_nassert: g, cont *);
+    1 (* t_nassert_match *);
+    2 (* t_assertback_check: g *);
+    3 (* t_possess: cap_ovbase, zero_allowed *);
+    3 (* t_ketrpos: body_entry, cap_ovbase *);
+    1 (* t_possess_done *);
   |]
 
 (* fast-design.md §2 — textual tag names for [dump] (golden tests) and the
@@ -210,6 +262,17 @@ let tag_name =
     "DNREF_REP";
     "CAP_START_REF";
     "CAP_END_REF";
+    "REVERSE";
+    "VREVERSE";
+    "ONCE";
+    "ONCE_END";
+    "ASSERT_END";
+    "NASSERT";
+    "NASSERT_MATCH";
+    "ASSERTBACK_CHECK";
+    "POSSESS";
+    "KETRPOS";
+    "POSSESS_DONE";
   |]
 
 (* fast-design.md §2 — the compiled fast program. [code] is the flat
@@ -301,6 +364,41 @@ let dnref_rep_slot_base (ir : t) (pc : int) : int = ir.code.(pc + 4)
 let dnref_rep_count (ir : t) (pc : int) : int = ir.code.(pc + 5)
 let dnref_rep_caseless (ir : t) (pc : int) : int = ir.code.(pc + 6)
 
+(* Chunk G operands (fast-design.md §2/§3). *)
+
+(* [t_reverse] operand — the fixed lookbehind back-step (code units). *)
+let reverse_number (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* [t_vreverse] operands — the min/max variable lookbehind back-step. *)
+let vreverse_lmin (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let vreverse_lmax (ir : t) (pc : int) : int = ir.code.(pc + 2)
+
+(* [t_assert_end] operands — [atomic] (1 = OP_ASSERT/ASSERTBACK, 0 = NA) and
+   the assertion's group id [g] (its entry eptr lives in mb.group_start.(g)). *)
+let assert_atomic (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let assert_group (ir : t) (pc : int) : int = ir.code.(pc + 2)
+
+(* [t_nassert] operands — the group id [g] (used only by a variable-lookbehind
+   [t_assertback_check]; [no_group] otherwise) and the success continuation
+   [cont] (past the whole negative assertion). *)
+let nassert_group (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let nassert_cont (ir : t) (pc : int) : int = ir.code.(pc + 2)
+
+(* [t_assertback_check] operand — the assertion group id whose entry eptr the
+   variable lookbehind branch must have reached. *)
+let assertback_check_group (ir : t) (pc : int) : int = ir.code.(pc + 1)
+
+(* [t_possess] operands — [cap_ovbase] (2N for a capturing possessive bracket,
+   0 = non-capturing) and [zero_allowed] (1 for a BRAPOSZERO-prefixed *+ / {0,n}+
+   group). *)
+let possess_ovbase (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let possess_zero_allowed (ir : t) (pc : int) : int = ir.code.(pc + 2)
+
+(* [t_ketrpos] operands — [body_entry] (IR index the iteration loops back to)
+   and [cap_ovbase] (the capture pair to write each iteration, 0 = none). *)
+let ketrpos_entry (ir : t) (pc : int) : int = ir.code.(pc + 1)
+let ketrpos_ovbase (ir : t) (pc : int) : int = ir.code.(pc + 2)
+
 (* ---------- Text dump (fast-design.md §2) ----------
    Stable, debug_printer.ml-style listing for golden tests: one line per
    instruction, [%3d TAG operands]. Printf/Format here is a debug path
@@ -370,6 +468,25 @@ let render (ir : t) (pc : int) (t : int) : string =
     Printf.sprintf "DNREF_REP %s {%d,%s} slot=%d count=%d ci=%d" tystr
       (rep_lmin ir pc) lmaxstr (dnref_rep_slot_base ir pc)
       (dnref_rep_count ir pc) (dnref_rep_caseless ir pc))
+  else if Int.equal t t_reverse then
+    Printf.sprintf "REVERSE %d" (reverse_number ir pc)
+  else if Int.equal t t_vreverse then
+    Printf.sprintf "VREVERSE {%d,%d}" (vreverse_lmin ir pc) (vreverse_lmax ir pc)
+  else if Int.equal t t_assert_end then
+    Printf.sprintf "ASSERT_END %s g=%d"
+      (if Int.equal (assert_atomic ir pc) 1 then "atomic" else "na")
+      (assert_group ir pc)
+  else if Int.equal t t_nassert then
+    Printf.sprintf "NASSERT g=%d cont=%d" (nassert_group ir pc)
+      (nassert_cont ir pc)
+  else if Int.equal t t_assertback_check then
+    Printf.sprintf "ASSERTBACK_CHECK g=%d" (assertback_check_group ir pc)
+  else if Int.equal t t_possess then
+    Printf.sprintf "POSSESS ovbase=%d zero=%d" (possess_ovbase ir pc)
+      (possess_zero_allowed ir pc)
+  else if Int.equal t t_ketrpos then
+    Printf.sprintf "KETRPOS entry=%d ovbase=%d" (ketrpos_entry ir pc)
+      (ketrpos_ovbase ir pc)
   else if Int.equal t t_group_start then
     Printf.sprintf "GROUP_START g=%d" (group_start_id ir pc)
   else if Int.equal t t_brazero then

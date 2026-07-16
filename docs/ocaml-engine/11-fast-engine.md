@@ -131,7 +131,28 @@ interpreter is its differential oracle. Approved plan:
   (testinput1/2); fuzz fast-vs-interp clean over 260k+ cases.
   **Declined (unchanged reason):** possessive ref repeat `\1++` (OP_ONCE →
   chunk G); a capture referenced by a conditional (OP_COND → chunk J).
-- [ ] **G — Lookaround/atomic** — ASSERT* families, REVERSE/VREVERSE, ONCE.
+- [x] **G — Lookaround/atomic** — ASSERT* families (positive atomic
+  OP_ASSERT/OP_ASSERTBACK, non-atomic OP_ASSERT_NA/OP_ASSERTBACK_NA, negative
+  OP_ASSERT_NOT/OP_ASSERTBACK_NOT), lookbehind REVERSE/VREVERSE (fixed + variable
+  step-back, with the variable end-point check), atomic groups OP_ONCE, AND the
+  possessive brackets re-pointed here from D2/F: OP_BRAPOS/CBRAPOS/SBRAPOS/
+  SCBRAPOS + OP_KETRPOS + OP_BRAPOSZERO (`(?:X)++`, `(X)*+`, …), plus the
+  possessive ref repeat `\1++` (compiles to OP_ONCE). The hard problem — the C
+  frame arena's abandon-and-restore-wholesale of an atomic group's captures/eptr
+  on backtrack-past, which the fast engine's single shared ovector cannot roll
+  back after a per-iteration COMMIT truncates the body's cleanup records — is
+  solved by a group-ovector SNAPSHOT in the boundary record (KIND_ONCE /
+  KIND_NASSERT / KIND_POS) + an `mb.once_base` stack maintained by those records
+  (fast-design.md §3). New IR tags REVERSE/VREVERSE/ONCE/ONCE_END/ASSERT_END/
+  NASSERT/NASSERT_MATCH/ASSERTBACK_CHECK/POSSESS/KETRPOS/POSSESS_DONE (38-48);
+  new save kinds KIND_ONCE/KIND_NASSERT/KIND_VREVERSE/KIND_POS (9-12). Positive
+  assertions reuse t_group_start for the entry-eptr restore; assertion/atomic
+  bodies reuse the grouploop branch lowering (ALT-per-branch tick = RM3/RM4/RM8
+  parity, §4). Ratchet 727/503 → 893/534 (testinput1/2); fuzz fast-vs-interp
+  clean over 285k+ cases (5 seeds), oracle fuzz clean. **Declined to chunk G+:**
+  a REPEATED atomic group / assertion (`(?>a)+` = Once … KetRmax — the
+  per-iteration atomic commit combined with a repeating ket); SKIP_ARG / verbs
+  stay chunk H; conditional assertions `(?(?=…)…)` stay chunk J (OP_COND).
 - [ ] **H — Verbs** — MARK/PRUNE/SKIP/THEN/COMMIT (+_ARG), ACCEPT/FAIL; SKIP_ARG rerun
   protocol (interpreter.ml:9336-9377 semantics).
 - [ ] **I — UTF/UCP** — runner UTF decode, per-exec validation, PROP/NOTPROP, caseless via

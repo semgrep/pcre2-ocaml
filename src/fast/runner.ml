@@ -188,6 +188,14 @@ type mb = {
   mutable ref_lmin : int;
   mutable ref_lmax : int;
   mutable ref_cont : int; (* continuation pc past the ref-repeat instruction *)
+  (* Chunk G — lookaround / atomic groups. [once_base] is the save-stack base
+     (sp) of the innermost currently-open atomic construct (OP_ONCE / atomic
+     assertion / negative assertion), or -1 if none; it lets the atomic COMMIT
+     (t_once_end / t_assert_end / t_nassert_match) find the boundary record
+     without a per-loop parameter (fast-design.md §3). Maintained as a stack via
+     the boundary records: each pushes the ENCLOSING [once_base] and restores it
+     on commit or backtrack-past. *)
+  mutable once_base : int;
   (* the backtracking save stack *)
   ss : Save_stack.t;
 }
@@ -268,6 +276,7 @@ let make_mb (ss : Save_stack.t) : mb =
     ref_lmin = 0;
     ref_lmax = 0;
     ref_cont = 0;
+    once_base = -1;
     ss;
   }
 
@@ -591,6 +600,104 @@ let push_cont (mb : mb) (sp : int) (target : int) (eptr : int) (rdepth : int) :
   Array.unsafe_set d (sp + 1) eptr;
   Array.unsafe_set d (sp + 2) rdepth;
   Array.unsafe_set d (sp + 3) Save_stack.kind_cont
+
+(* ---------- Atomic-construct boundary records (chunk G, §3) ----------
+
+   The atomic constructs (OP_ONCE, atomic assertions, negative assertions) push
+   a boundary record that snapshots the group ovector slots [2, 2*oveccount) and
+   the enclosing [mb.once_base], and sets [mb.once_base] to its base so the COMMIT
+   (t_once_end / t_assert_end / t_nassert_match) can find it. Backtracking PAST
+   the boundary restores the snapshot + [mb.once_base] — reproducing the C frame
+   arena's whole-scale restore of everything the construct did (its captures and,
+   for atomic groups, the abandoned iterations), which the fast engine's shared
+   single ovector otherwise cannot roll back after a COMMIT truncated the body's
+   per-capture cleanup records (fast-design.md §3). *)
+
+(* Push a KIND_ONCE boundary at [sp]: snapshot ov[2, 2*oveccount) + the enclosing
+   [mb.once_base]; set [mb.once_base] = sp. Returns the new sp. Cold (atomic
+   entry only). Layout (fast-design.md §3): [ov_snapshot; prev_once_base;
+   KIND_ONCE], width 2*oveccount. *)
+let push_once (mb : mb) (sp : int) : int =
+  let ss = mb.ss in
+  let nov = 2 * mb.oveccount in
+  let need = sp + nov in
+  if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+  let d = ss.Save_stack.data in
+  let ov = mb.ovector in
+  (* safe: [grow] ensured length >= sp + nov; ov has 2*oveccount = nov slots. *)
+  for i = 2 to nov - 1 do
+    Array.unsafe_set d (sp + i - 2) (Array.unsafe_get ov i)
+  done;
+  Array.unsafe_set d (sp + nov - 2) mb.once_base (* prev_once_base *);
+  Array.unsafe_set d (sp + nov - 1) Save_stack.kind_once;
+  mb.once_base <- sp;
+  need
+
+(* The atomic COMMIT (t_once_end / t_assert_end with atomic=1): the body matched;
+   discard its internal choice points by truncating the save stack back to just
+   past the KIND_ONCE boundary at [mb.once_base], and restore [mb.once_base] to
+   the enclosing value. The KIND_ONCE record itself STAYS (its snapshot restores
+   captures if the construct is later backtracked past). Returns the truncated
+   sp. *)
+let once_commit (mb : mb) : int =
+  let base = mb.once_base in
+  let nov = 2 * mb.oveccount in
+  let d = mb.ss.Save_stack.data in
+  (* safe: [base] is a KIND_ONCE record base (set by push_once); base + nov - 2
+     is its prev_once_base slot. *)
+  mb.once_base <- Array.unsafe_get d (base + nov - 2);
+  base + nov
+
+(* Push a KIND_NASSERT boundary at [sp]: snapshot ov[2, 2*oveccount) + the
+   enclosing [mb.once_base] + the entry [cont]/[eptr]/[rdepth]; set
+   [mb.once_base] = sp. Returns the new sp. Layout (fast-design.md §3):
+   [ov_snapshot; prev_once_base; cont; eptr; rdepth; KIND_NASSERT], width
+   2*oveccount + 3. *)
+let push_nassert (mb : mb) (sp : int) (cont : int) (eptr : int) (rdepth : int) :
+    int =
+  let ss = mb.ss in
+  let nov = 2 * mb.oveccount in
+  let need = sp + nov + 3 in
+  if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+  let d = ss.Save_stack.data in
+  let ov = mb.ovector in
+  (* safe: [grow] ensured length >= sp + nov + 3. *)
+  for i = 2 to nov - 1 do
+    Array.unsafe_set d (sp + i - 2) (Array.unsafe_get ov i)
+  done;
+  Array.unsafe_set d (sp + nov - 2) mb.once_base (* prev_once_base *);
+  Array.unsafe_set d (sp + nov - 1) cont;
+  Array.unsafe_set d (sp + nov) eptr;
+  Array.unsafe_set d (sp + nov + 1) rdepth;
+  Array.unsafe_set d (sp + nov + 2) Save_stack.kind_nassert;
+  mb.once_base <- sp;
+  need
+
+(* Push a KIND_POS boundary at [sp] (fast-design.md §3): the KIND_ONCE snapshot +
+   the possessive per-loop state (iter_start = [eptr]; matched_once = 0;
+   [zero_allowed]; entry_rdepth = [rdepth]); set [mb.once_base] = sp. Returns the
+   new sp. Layout: [ov_snapshot; prev_once_base; iter_start; matched_once;
+   zero_allowed; entry_rdepth; KIND_POS], width 2*oveccount + 4. *)
+let push_pos (mb : mb) (sp : int) (eptr : int) (rdepth : int) (zero_allowed : int)
+    : int =
+  let ss = mb.ss in
+  let nov = 2 * mb.oveccount in
+  let need = sp + nov + 4 in
+  if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+  let d = ss.Save_stack.data in
+  let ov = mb.ovector in
+  (* safe: [grow] ensured length >= sp + nov + 4. *)
+  for i = 2 to nov - 1 do
+    Array.unsafe_set d (sp + i - 2) (Array.unsafe_get ov i)
+  done;
+  Array.unsafe_set d (sp + nov - 2) mb.once_base (* prev_once_base *);
+  Array.unsafe_set d (sp + nov - 1) eptr (* iter_start *);
+  Array.unsafe_set d (sp + nov) 0 (* matched_once *);
+  Array.unsafe_set d (sp + nov + 1) zero_allowed;
+  Array.unsafe_set d (sp + nov + 2) rdepth (* entry_rdepth *);
+  Array.unsafe_set d (sp + nov + 3) Save_stack.kind_pos;
+  mb.once_base <- sp;
+  need
 
 (* ---------- Backreferences (chunk F, §2/§3) ---------- *)
 
@@ -1065,6 +1172,130 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       Array.unsafe_set ov ovb (Array.unsafe_get mb.cap_start ovb);
       Array.unsafe_set ov (ovb + 1) (eptr - mb.start_subject);
       (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_cap) rdepth mcc
+  | 38 ->
+      (* REVERSE (fast-design.md §2/§3; OP_REVERSE pcre2_match.c:5793-5819 /
+         interpreter.ml:2644-2660) — fixed lookbehind step-back (non-UTF: code
+         unit count). If too close to the subject start, NOMATCH. Save the
+         earliest consulted character (start_used_ptr floor), then continue. No
+         tick, no choice point. *)
+      let number = code.(pc + 1) in
+      if number > eptr - mb.start_subject then (backtrack [@tailcall]) mb sp mcc
+      else
+        let e = eptr - number in
+        if e < mb.start_used_ptr then mb.start_used_ptr <- e;
+        (run [@tailcall]) mb (pc + 2) e sp rdepth mcc
+  | 39 ->
+      (* VREVERSE (fast-design.md §2/§3; OP_VREVERSE pcre2_match.c:5834-5883 /
+         interpreter.ml:2661-2707) — variable lookbehind step-back. *)
+      (op_vreverse [@tailcall]) mb pc eptr sp rdepth mcc
+  | 40 ->
+      (* ONCE (fast-design.md §2/§3; OP_ONCE / atomic-assertion entry) — push a
+         KIND_ONCE boundary (snapshot the group ovector + enclosing once_base),
+         set mb.once_base, fall into the body. No tick (the C dispatches OP_ONCE
+         in the current frame; the first branch's RMATCH ticks — the body's ALT).
+         Also the entry marker for atomic positive assertions (t_once precedes
+         their t_group_start). *)
+      let sp' = push_once mb sp in
+      (run [@tailcall]) mb (pc + 1) eptr sp' rdepth mcc
+  | 41 ->
+      (* ONCE_END (fast-design.md §3; OP_ONCE ket pcre2_match.c:6023-6031 /
+         interpreter.ml:6887-6902) — atomic group commit: discard the body's
+         internal choice points (truncate to the boundary). eptr unchanged (the
+         group advanced it). Continue at the current rdepth (the C's ket `break`
+         continues in the matching branch's frame). No tick. *)
+      let sp' = once_commit mb in
+      (run [@tailcall]) mb (pc + 1) eptr sp' rdepth mcc
+  | 42 ->
+      (* ASSERT_END (fast-design.md §3; the positive-assertion ket
+         pcre2_match.c:5999-6016 / interpreter.ml:6857-6902) — restore eptr to
+         the assertion's entry position (mb.group_start.(g), written by the
+         preceding t_group_start), then continue. For the atomic kinds
+         (atomic=1: OP_ASSERT/OP_ASSERTBACK) also commit (like OP_ONCE); the NA
+         kinds (atomic=0) keep the body's choice points (non-atomic). No tick
+         (the C's ket continues in the matching branch's frame). *)
+      let atomic = code.(pc + 1) in
+      let g = code.(pc + 2) in
+      (* safe: g in [0, n_groups) (Ir_verify) indexes mb.group_start. *)
+      let e = Array.unsafe_get mb.group_start g in
+      if Int.equal atomic 1 then
+        let sp' = once_commit mb in
+        (run [@tailcall]) mb (pc + 3) e sp' rdepth mcc
+      else (run [@tailcall]) mb (pc + 3) e sp rdepth mcc
+  | 43 ->
+      (* NASSERT (fast-design.md §3; negative-assertion entry
+         pcre2_match.c:5547-5554) — push a KIND_NASSERT boundary (snapshot +
+         entry cont/eptr/rdepth), set mb.once_base, fall into the body. No tick.
+         A matching branch reaches t_nassert_match (fail); exhausting all
+         branches backtracks to the KIND_NASSERT record = SUCCESS. *)
+      let cont = code.(pc + 2) in
+      let sp' = push_nassert mb sp cont eptr rdepth in
+      (run [@tailcall]) mb (pc + 3) eptr sp' rdepth mcc
+  | 44 ->
+      (* NASSERT_MATCH (fast-design.md §3; a negative-assertion branch matched
+         pcre2_match.c:5557-5559) — the assertion FAILS. Roll the group ovector
+         back to the boundary snapshot, restore mb.once_base, then propagate the
+         NOMATCH past the boundary (backtrack below it). No tick. *)
+      let base = mb.once_base in
+      let nov = 2 * mb.oveccount in
+      let d = mb.ss.Save_stack.data in
+      let ov = mb.ovector in
+      (* safe: [base] is a KIND_NASSERT record base (set by push_nassert); its
+         snapshot occupies [base, base + nov - 2) and prev_once_base at
+         base + nov - 2. ov has nov slots. *)
+      for i = 2 to nov - 1 do
+        Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+      done;
+      mb.once_base <- Array.unsafe_get d (base + nov - 2);
+      (backtrack [@tailcall]) mb base mcc
+  | 45 ->
+      (* ASSERTBACK_CHECK (fast-design.md §3; the variable-lookbehind end-point
+         check pcre2_match.c:5995/6009/6038) — a VREVERSE branch is a valid
+         lookbehind match only if it ended exactly at the assertion entry
+         position; otherwise this back-length fails (backtrack into the VREVERSE
+         RM37 loop / next branch). No tick. *)
+      let g = code.(pc + 1) in
+      (* safe: g in [0, n_groups) (Ir_verify). *)
+      if not (Int.equal eptr (Array.unsafe_get mb.group_start g)) then
+        (backtrack [@tailcall]) mb sp mcc
+      else (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
+  | 46 ->
+      (* POSSESS (fast-design.md §3; OP_BRAPOS/CBRAPOS/SBRAPOS/SCBRAPOS entry
+         pcre2_match.c:5283-5285) — push a KIND_POS boundary (snapshot + per-loop
+         state), set mb.once_base, fall into the body at the current rdepth. No
+         tick (the first branch's ALT ticks — the RM8 tick). *)
+      let sp' = push_pos mb sp eptr rdepth code.(pc + 2) in
+      (run [@tailcall]) mb (pc + 3) eptr sp' rdepth mcc
+  | 47 ->
+      (* KETRPOS (fast-design.md §3; OP_KETRPOS pcre2_match.c:5292-5302/6092-6098)
+         — a possessive iteration matched: commit it (truncate the body's records)
+         and loop back to the body entry, or break on an empty match. *)
+      (op_ketrpos [@tailcall]) mb pc eptr mcc
+  | 48 ->
+      (* POSSESS_DONE (fast-design.md §3; the RM8 loop break + success test
+         pcre2_match.c:5320-5328) — the possessive loop ended. Success iff an
+         iteration matched or zero repeats are allowed; else the whole group
+         fails. No tick (the C's loop `break`). *)
+      let base = mb.once_base in
+      let nov = 2 * mb.oveccount in
+      let d = mb.ss.Save_stack.data in
+      (* safe: [base] is a KIND_POS record base; matched_once at base+nov,
+         zero_allowed at base+nov+1, prev_once_base at base+nov-2. *)
+      let matched_once = Array.unsafe_get d (base + nov) in
+      let zero_allowed = Array.unsafe_get d (base + nov + 1) in
+      if matched_once <> 0 || zero_allowed <> 0 then (
+        (* success: commit — restore once_base, keep the KIND_POS boundary (its
+           snapshot restores captures if the group is later backtracked past).
+           sp is already base + width_pos. *)
+        mb.once_base <- Array.unsafe_get d (base + nov - 2);
+        (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc)
+      else (
+        (* failure: restore the snapshot + once_base, propagate NOMATCH past. *)
+        let ov = mb.ovector in
+        for i = 2 to nov - 1 do
+          Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+        done;
+        mb.once_base <- Array.unsafe_get d (base + nov - 2);
+        (backtrack [@tailcall]) mb base mcc)
   | 0 ->
       (* END (fast-design.md §2; op_end_tail interpreter.ml:3416-3492 /
          pcre2_match.c:876-940) — accept, subject to the empty-match and
@@ -1125,7 +1356,11 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
       if
         Int.equal dsaved 0
         && (not (Int.equal code.(handler) 5 (* ALT *)))
-        && not (Int.equal code.(handler) 15 (* FAIL *))
+        && (not (Int.equal code.(handler) 15 (* FAIL *)))
+        && not (Int.equal code.(handler) 48 (* POSSESS_DONE — a loop break,
+             not a ticked branch (chunk G); the possessive body is never at
+             rdepth 0 in practice, but exclude it so a dsaved=0 last-ALT handler
+             cannot spuriously tick *))
       then
         (* §4 — the whole-pattern (bra_loop-lowered) wrapper's LAST branch is
            reached via the preceding ALT's handler (a non-ALT, non-FAIL head at
@@ -1183,6 +1418,26 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
       (* KIND_REF_MAX [cont; try_eptr; flength; lstart; rdepth; kind] —
          maximizing ref repeat give-back (RM21, pcre2_match.c:5154-5162). *)
       (backtrack_ref_max [@tailcall]) mb sp mcc
+    else if Int.equal kind Save_stack.kind_once then
+      (* KIND_ONCE — the atomic construct is backtracked PAST (its body failed,
+         or it committed and the continuation later failed): restore the group
+         ovector snapshot + mb.once_base, then keep popping (fast-design.md §3;
+         the C frame arena's wholesale restore of P's ovector/eptr past OP_ONCE,
+         pcre2_match.c:6023-6031). *)
+      (backtrack_once [@tailcall]) mb sp mcc
+    else if Int.equal kind Save_stack.kind_nassert then
+      (* KIND_NASSERT — ALL branches of a negative assertion failed = the
+         assertion SUCCEEDS (pcre2_match.c:5578-5584 ASSERT_NOT_FAILED): restore
+         mb.once_base + the snapshot and continue at the stored [cont] with the
+         entry eptr/rdepth. *)
+      (backtrack_nassert [@tailcall]) mb sp mcc
+    else if Int.equal kind Save_stack.kind_vreverse then
+      (* KIND_VREVERSE — a variable-lookbehind branch failed at this back-length
+         (RM37, pcre2_match.c:5877-5882): give up one back-step and retry. *)
+      (backtrack_vreverse [@tailcall]) mb sp mcc
+    else if Int.equal kind Save_stack.kind_pos then
+      (* KIND_POS — the possessive group is backtracked past (like KIND_ONCE). *)
+      (backtrack_pos [@tailcall]) mb sp mcc
     else
       (* KIND_CONT [target; eptr; rdepth; kind] (fast-design.md §3) — a
          chunk-D2 group choice point: resume at [target] with [eptr]/[rdepth]
@@ -1520,6 +1775,164 @@ and backtrack_ref_max (mb : mb) (sp : int) (mcc : int) : int =
       Array.unsafe_set d (base + 1) new_eptr;
       (run [@tailcall]) mb cont new_eptr sp (dd + 1) mcc'))
   else (backtrack [@tailcall]) mb base mcc (* Feptr < Lstart: NOMATCH, 5186 *)
+
+(* ---------- Lookaround / atomic groups (chunk G, §2/§3) ---------- *)
+
+(* KIND_ONCE backtrack (fast-design.md §3): the atomic construct is backtracked
+   PAST. Restore the group-ovector snapshot and mb.once_base, then keep popping
+   (propagate NOMATCH below the boundary). This reproduces the C's abandon-and-
+   restore-wholesale of everything the atomic group did — its captures (undone by
+   the snapshot) and its abandoned iterations (their records were discarded by the
+   COMMIT) — since the fast engine's shared single ovector has no per-frame copy
+   (pcre2_match.c:6023-6031). eptr on the continued backtrack comes from the lower
+   record (as in the C, where backtracking past OP_ONCE lands in P's frame). *)
+and backtrack_once (mb : mb) (sp : int) (mcc : int) : int =
+  let nov = 2 * mb.oveccount in
+  let base = sp - nov in
+  let d = mb.ss.Save_stack.data in
+  let ov = mb.ovector in
+  (* safe: [base] is a KIND_ONCE record base; its snapshot occupies
+     [base, base + nov - 2) and prev_once_base at base + nov - 2. ov has nov
+     slots. *)
+  for i = 2 to nov - 1 do
+    Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+  done;
+  mb.once_base <- Array.unsafe_get d (base + nov - 2);
+  (backtrack [@tailcall]) mb base mcc
+
+(* KIND_NASSERT backtrack (fast-design.md §3): ALL branches of a negative
+   assertion failed = the assertion SUCCEEDS (pcre2_match.c:5578-5584). Restore
+   the snapshot (defensive: the failed branches' CAP records already rolled it
+   back) and mb.once_base, then continue at the stored [cont] with the entry
+   eptr/rdepth. The record is popped (sp = base): the negative assertion is
+   atomic (no other way to succeed), so nothing is retried. No tick (the C's RM4
+   resume + ASSERT_NOT_FAILED continues in the entry frame). *)
+and backtrack_nassert (mb : mb) (sp : int) (mcc : int) : int =
+  let nov = 2 * mb.oveccount in
+  let base = sp - (nov + 3) in
+  let d = mb.ss.Save_stack.data in
+  let ov = mb.ovector in
+  (* safe: [base] is a KIND_NASSERT record base; snapshot [base, base + nov - 2),
+     prev_once_base at base + nov - 2, cont/eptr/rdepth at base + nov - 1 ..
+     base + nov + 1. ov has nov slots. *)
+  for i = 2 to nov - 1 do
+    Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+  done;
+  mb.once_base <- Array.unsafe_get d (base + nov - 2);
+  let cont = Array.unsafe_get d (base + nov - 1) in
+  let eptr = Array.unsafe_get d (base + nov) in
+  let rdepth = Array.unsafe_get d (base + nov + 1) in
+  (run [@tailcall]) mb cont eptr base rdepth mcc
+
+(* OP_VREVERSE forward (fast-design.md §2/§3; pcre2_match.c:5834-5883,
+   interpreter.ml:2661-2707) — variable lookbehind step-back, non-UTF. Move back
+   by the maximum available branch length, then work forwards on failure (the
+   RM37 loop) down to the minimum. The first attempt is a ticked RMATCH(RM37)
+   at rdepth+1. *)
+and op_vreverse (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
+    (mcc : int) : int =
+  let lmin = mb.code.(pc + 1) in
+  let lmax = mb.code.(pc + 2) in
+  let body_pc = pc + 3 in
+  (* pcre2_match.c:5864-5865 — available = clamp(Feptr - start_subject, 0,
+     65535). *)
+  let diff = eptr - mb.start_subject in
+  let available = if diff > 65535 then 65535 else if diff > 0 then diff else 0 in
+  if lmin > available then (backtrack [@tailcall]) mb sp mcc
+    (* pcre2_match.c:5866 — too close to the start for even the minimum. *)
+  else
+    let cur_lmax = if lmax > available then available else lmax in
+    let start_eptr = eptr - cur_lmax in
+    let mcc' = tick_child mb mcc (rdepth + 1) in
+    if mcc' < 0 then mcc'
+    else (
+      let ss = mb.ss in
+      let need = sp + Save_stack.width_vreverse in
+      if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
+      let d = ss.Save_stack.data in
+      (* safe: [grow] ensured length >= sp + width_vreverse. Layout: [body_pc;
+         cur_lmax; lmin; cur_eptr; rdepth; KIND_VREVERSE]. *)
+      Array.unsafe_set d sp body_pc;
+      Array.unsafe_set d (sp + 1) cur_lmax;
+      Array.unsafe_set d (sp + 2) lmin;
+      Array.unsafe_set d (sp + 3) start_eptr;
+      Array.unsafe_set d (sp + 4) rdepth;
+      Array.unsafe_set d (sp + 5) Save_stack.kind_vreverse;
+      (run [@tailcall]) mb body_pc start_eptr need (rdepth + 1) mcc')
+
+(* KIND_VREVERSE backtrack (RM37, pcre2_match.c:5877-5882): the branch failed at
+   this back-length. `if (Lmax-- <= Lmin) NOMATCH` (compare OLD Lmax) else Feptr++
+   and retry the body (a ticked RMATCH at rdepth+1). *)
+and backtrack_vreverse (mb : mb) (sp : int) (mcc : int) : int =
+  let d = mb.ss.Save_stack.data in
+  let base = sp - Save_stack.width_vreverse in
+  let body_pc = Array.unsafe_get d base in
+  let cur_lmax = Array.unsafe_get d (base + 1) in
+  let lmin = Array.unsafe_get d (base + 2) in
+  let cur_eptr = Array.unsafe_get d (base + 3) in
+  let dd = Array.unsafe_get d (base + 4) in
+  if cur_lmax <= lmin then (backtrack [@tailcall]) mb base mcc (* NOMATCH, 5878 *)
+  else
+    let mcc' = tick_child mb mcc (dd + 1) in
+    if mcc' < 0 then mcc'
+    else (
+      let new_eptr = cur_eptr + 1 in
+      Array.unsafe_set d (base + 1) (cur_lmax - 1);
+      Array.unsafe_set d (base + 3) new_eptr;
+      (run [@tailcall]) mb body_pc new_eptr sp (dd + 1) mcc')
+
+(* OP_KETRPOS (fast-design.md §3; pcre2_match.c:5292-5302 / 6092-6098): a
+   possessive iteration matched (a branch reached here via JMP). Commit it —
+   discard the body's internal choice points by truncating to the KIND_POS
+   boundary — writing the capture for a capturing bracket, then loop back to the
+   body entry (Fecode = Lstart_group) or, on an empty match, break to
+   POSSESS_DONE (pc+3). Reset rdepth to the loop-level entry_rdepth. No tick (the
+   next iteration's first ALT ticks). *)
+and op_ketrpos (mb : mb) (pc : int) (eptr : int) (mcc : int) : int =
+  let code = mb.code in
+  let body_entry = code.(pc + 1) in
+  let cap_ovbase = code.(pc + 2) in
+  let base = mb.once_base in
+  let nov = 2 * mb.oveccount in
+  let d = mb.ss.Save_stack.data in
+  (* safe: [base] is a KIND_POS record base; iter_start at base+nov-1,
+     matched_once at base+nov, entry_rdepth at base+nov+2. *)
+  let iter_start = Array.unsafe_get d (base + nov - 1) in
+  let entry_rdepth = Array.unsafe_get d (base + nov + 2) in
+  (* pcre2_match.c:6079-6083 — a capturing possessive bracket writes its ovector
+     pair each iteration (the last committed iteration wins). The ovector is
+     written only HERE (at close), so a mid-body backref sees only closed values
+     (the non-optimized-cbracket property, fast-design.md §3). safe: cap_ovbase =
+     2N (Ir_verify) < 2*oveccount. *)
+  if cap_ovbase > 0 then (
+    let ov = mb.ovector in
+    Array.unsafe_set ov cap_ovbase (iter_start - mb.start_subject);
+    Array.unsafe_set ov (cap_ovbase + 1) (eptr - mb.start_subject));
+  Array.unsafe_set d (base + nov) 1 (* Lmatched_once = TRUE, 5294 *);
+  let sp' = base + nov + 4 (* commit: truncate to boundary + width_pos *) in
+  if Int.equal eptr iter_start then
+    (* pcre2_match.c:5295-5299 — empty match: break the loop (to POSSESS_DONE). *)
+    (run [@tailcall]) mb (pc + 3) eptr sp' entry_rdepth mcc
+  else (
+    (* pcre2_match.c:5301-5302 — restart from the bracket for the next iteration. *)
+    Array.unsafe_set d (base + nov - 1) eptr (* iter_start = eptr *);
+    (run [@tailcall]) mb body_entry eptr sp' entry_rdepth mcc)
+
+(* KIND_POS backtrack (fast-design.md §3): the possessive group is backtracked
+   past. Restore the group-ovector snapshot + mb.once_base, then keep popping
+   (propagate NOMATCH). Identical to KIND_ONCE but for the wider record. *)
+and backtrack_pos (mb : mb) (sp : int) (mcc : int) : int =
+  let nov = 2 * mb.oveccount in
+  let base = sp - (nov + 4) in
+  let d = mb.ss.Save_stack.data in
+  let ov = mb.ovector in
+  (* safe: [base] is a KIND_POS record base; snapshot [base, base + nov - 2),
+     prev_once_base at base + nov - 2. *)
+  for i = 2 to nov - 1 do
+    Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+  done;
+  mb.once_base <- Array.unsafe_get d (base + nov - 2);
+  (backtrack [@tailcall]) mb base mcc
 
 (* ---------- Repeat superinstructions (§2/§4) ----------
 
@@ -2116,6 +2529,7 @@ and run_attempt (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
   else (
     mb.attempt_start <- start_match;
     mb.start_used_ptr <- start_match;
+    mb.once_base <- -1 (* no open atomic construct at attempt start (chunk G) *);
     (* pcre2_match.c reset_ovector (JIT :14382) / the frame-0 UNSET fill: each
        attempt starts with all group slots UNSET (the whole-match [0,1] is set
        at END). Group slots only: [0,1] are overwritten at END. *)
@@ -2484,7 +2898,18 @@ let () =
   assert (Int.equal Ir.t_dnref_rep 35);
   assert (Int.equal Ir.t_cap_start_ref 36);
   assert (Int.equal Ir.t_cap_end_ref 37);
-  assert (Int.equal Ir.max_tag 37);
+  assert (Int.equal Ir.t_reverse 38);
+  assert (Int.equal Ir.t_vreverse 39);
+  assert (Int.equal Ir.t_once 40);
+  assert (Int.equal Ir.t_once_end 41);
+  assert (Int.equal Ir.t_assert_end 42);
+  assert (Int.equal Ir.t_nassert 43);
+  assert (Int.equal Ir.t_nassert_match 44);
+  assert (Int.equal Ir.t_assertback_check 45);
+  assert (Int.equal Ir.t_possess 46);
+  assert (Int.equal Ir.t_ketrpos 47);
+  assert (Int.equal Ir.t_possess_done 48);
+  assert (Int.equal Ir.max_tag 48);
   (* Save-record KIND / width constants the runner inlines as literals. *)
   assert (Int.equal Save_stack.kind_alt 0);
   assert (Int.equal Save_stack.kind_cap 1);
@@ -2494,4 +2919,8 @@ let () =
   assert (Int.equal Save_stack.kind_gstart 5);
   assert (Int.equal Save_stack.kind_capstart 6);
   assert (Int.equal Save_stack.kind_ref_min 7);
-  assert (Int.equal Save_stack.kind_ref_max 8)
+  assert (Int.equal Save_stack.kind_ref_max 8);
+  assert (Int.equal Save_stack.kind_once 9);
+  assert (Int.equal Save_stack.kind_nassert 10);
+  assert (Int.equal Save_stack.kind_vreverse 11);
+  assert (Int.equal Save_stack.kind_pos 12)

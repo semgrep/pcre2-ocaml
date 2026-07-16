@@ -280,6 +280,94 @@ let check (ir : Ir.t) : (unit, string) result =
                           (reptype=%d min=%d max=%d payload=%d)"
                          Ir.tag_name.(t) pc reptype lmin lmax payload)
                   else Ok ())
+                else if Int.equal t Ir.t_nassert then (
+                  (* [g; cont]: g is no_group or a valid group id; cont is a
+                     valid instruction head (the success continuation). *)
+                  let g = code.(pc + 1) in
+                  let cont = code.(pc + 2) in
+                  if g < Ir.no_group || g >= n_groups then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: NASSERT at pc %d group id %d out of range \
+                          (n_groups %d)"
+                         pc g n_groups)
+                  else if cont < 0 || cont >= len || not is_head.(cont) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: NASSERT at pc %d cont %d not an \
+                          instruction head"
+                         pc cont)
+                  else Ok ())
+                else if Int.equal t Ir.t_assert_end then (
+                  (* [atomic; g]. *)
+                  let atomic = code.(pc + 1) in
+                  let g = code.(pc + 2) in
+                  if not (Int.equal atomic 0 || Int.equal atomic 1) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: ASSERT_END at pc %d bad atomic %d" pc
+                         atomic)
+                  else if g < 0 || g >= n_groups then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: ASSERT_END at pc %d group id %d out of \
+                          range (n_groups %d)"
+                         pc g n_groups)
+                  else Ok ())
+                else if Int.equal t Ir.t_assertback_check then (
+                  let g = code.(pc + 1) in
+                  if g < 0 || g >= n_groups then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: ASSERTBACK_CHECK at pc %d group id %d out \
+                          of range (n_groups %d)"
+                         pc g n_groups)
+                  else Ok ())
+                else if Int.equal t Ir.t_reverse then (
+                  let number = code.(pc + 1) in
+                  if number < 0 then
+                    Error
+                      (Printf.sprintf "fast-verify: REVERSE at pc %d bad number %d"
+                         pc number)
+                  else Ok ())
+                else if Int.equal t Ir.t_vreverse then (
+                  let lmin = code.(pc + 1) and lmax = code.(pc + 2) in
+                  if lmin < 0 || lmax < 0 then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: VREVERSE at pc %d bad bounds {%d,%d}" pc
+                         lmin lmax)
+                  else Ok ())
+                else if Int.equal t Ir.t_possess then (
+                  (* [cap_ovbase; zero_allowed]: ovbase 0 (non-capturing) or a
+                     valid capture pair; zero_allowed in {0,1}. *)
+                  let ovb = code.(pc + 1) and z = code.(pc + 2) in
+                  if not (Int.equal ovb 0 || ovbase_ok ovb) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: POSSESS at pc %d ovbase %d out of range \
+                          (top bracket %d)"
+                         pc ovb top_bracket)
+                  else if not (Int.equal z 0 || Int.equal z 1) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: POSSESS at pc %d bad zero_allowed %d" pc z)
+                  else Ok ())
+                else if Int.equal t Ir.t_ketrpos then (
+                  (* [body_entry; cap_ovbase]: body_entry is a valid head. *)
+                  let entry = code.(pc + 1) and ovb = code.(pc + 2) in
+                  if entry < 0 || entry >= len || not is_head.(entry) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: KETRPOS at pc %d entry %d not an \
+                          instruction head"
+                         pc entry)
+                  else if not (Int.equal ovb 0 || ovbase_ok ovb) then
+                    Error
+                      (Printf.sprintf
+                         "fast-verify: KETRPOS at pc %d ovbase %d out of range"
+                         pc ovb)
+                  else Ok ())
                 else Ok ()
               in
               match step with
