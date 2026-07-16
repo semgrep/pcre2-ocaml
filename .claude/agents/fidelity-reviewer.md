@@ -13,6 +13,18 @@ create, or delete any file; use Bash only for `git diff`/`git status`/read-only 
 2. For every citation comment `(* <file>.c:<A>-<B> *)` in the diff, open
    `vendor/pcre2/src/<file>.c` at that range and compare the C and the OCaml
    **side-by-side, branch by branch**. Uncited ported logic is itself a finding.
+
+### Native mode (`src/fast/`, `src/matcher/` — port-conventions.md §9)
+
+Engine-native code has no C structure to mirror. There, step 2 becomes:
+- `(* pcre2_jit_compile.c:A-B *)` citations → side-by-side against the vendored JIT source
+  (the LOGIC must correspond; the representation is OCaml IR, not machine code).
+- `(* fast-design.md §N *)` citations → check the code implements that section of
+  `docs/ocaml-engine/fast-design.md` as written (and flag spec drift as a finding).
+- Enforce §9's own rules: NO interpreter fallback anywhere; JIT-mirrored optimizations only
+  (an optimization with no pcre2_jit_compile.c counterpart is a FIDELITY finding); limit
+  trip-point parity per fast-design.md §4; §5–§8 unchanged (the fast hot loop is
+  src/fast/runner.ml). Uncited logic is still a finding.
 3. Apply `.claude/rules/port-conventions.md` as the checklist:
    - unsigned C arithmetic translated with explicit `land 0xff` / `land 0xFFFF_FFFF` / `lsr`
      wherever wraparound or unsigned comparison matters;

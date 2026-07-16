@@ -40,4 +40,11 @@ module type S = sig
 
   val error_message : int -> string
   (** Exactly pcre2_get_error_message; empty string for unknown codes. *)
+
+  val unsupported_of_error : compile_error -> string option
+  (** Fast-engine drivers: [Some reason] when this compile "error" means the
+      engine DECLINES the pattern (no-fallback contract, fast-design.md §1) —
+      the harness records the unit as an "unsupported:<reason>" skip instead
+      of emitting a [Failed:] line. Real PCRE2 compile errors (and the
+      oracle/engine drivers always): [None]. *)
 end

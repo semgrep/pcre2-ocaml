@@ -52,3 +52,6 @@ external name_table : code -> (string * int) array = "oracle_test_name_table"
 
 external error_message : int -> string = "oracle_test_error_message"
 (** Exactly [pcre2_get_error_message]; empty string for unknown codes. *)
+
+(* The C oracle never declines a pattern (test/pcre2test/driver.ml seam doc). *)
+let unsupported_of_error (_ : compile_error) : string option = None

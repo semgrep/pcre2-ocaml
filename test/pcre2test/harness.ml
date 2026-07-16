@@ -361,12 +361,20 @@ module Make (D : Driver.S) = struct
                 ~newline:nl_ctx ~bsr:pat.Ctl.ctx_bsr ~extra:pat.Ctl.ctx_extra
                 text
             with
-            | Error { D.errcode; erroroffset } ->
-                (* pcre2test.c:6084-6090 *)
-                emit t
-                  (Printf.sprintf "Failed: error %d at offset %d: %s" errcode
-                     erroroffset (D.error_message errcode));
-                t.skipping <- true
+            | Error ({ D.errcode; erroroffset } as e) -> (
+                match D.unsupported_of_error e with
+                | Some reason ->
+                    (* Fast-engine no-fallback contract (driver.ml seam doc):
+                       the driver declines the pattern — record a skip, no
+                       [Failed:] output line. *)
+                    note_skip t ("unsupported:" ^ reason);
+                    t.skipping <- true
+                | None ->
+                    (* pcre2test.c:6084-6090 *)
+                    emit t
+                      (Printf.sprintf "Failed: error %d at offset %d: %s"
+                         errcode erroroffset (D.error_message errcode));
+                    t.skipping <- true)
             | Ok code ->
                 let inf = D.info code in
                 t.compiled <-

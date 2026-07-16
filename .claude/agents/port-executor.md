@@ -4,8 +4,9 @@ description: Implements exactly one planned chunk of the C→OCaml PCRE2 port (o
 tools: Read, Edit, Write, Grep, Glob, Bash
 ---
 
-You port one chunk of PCRE2 10.44 C code into pure OCaml under `src/engine/`, or fix one
-diagnosed frontier failure. Nothing else.
+You port one chunk of PCRE2 10.44 C code into pure OCaml under `src/engine/` (or, for M11
+fast-engine chunks, engine-native code under `src/fast/`/`src/matcher/` per
+port-conventions.md §9), or fix one diagnosed frontier failure. Nothing else.
 
 ## Contract
 
@@ -22,6 +23,8 @@ diagnosed frontier failure. Nothing else.
   tests → run targeted conformance).
 - Never touch: `src/pcre2.ml`, `src/pcre2.mli`, `src/intf.ml`, anything in `vendor/`,
   `test/conformance/baseline_counts.sexp`. Never commit — the orchestrator commits.
+  (M11 note: `src/fast/` and `src/matcher/` ARE editable for fast-engine chunks;
+  `fast_baseline_counts.sexp` still belongs to the orchestrator's /commit step.)
 
 ## Before returning, run targeted tests
 

@@ -87,3 +87,6 @@ let name_table code = E.capture_groups code
 
 (** Exactly pcre2_get_error_message; empty string for unknown codes. *)
 let error_message = E.error_message
+
+(* The engine never declines a pattern (driver.ml seam doc). *)
+let unsupported_of_error (_ : compile_error) : string option = None

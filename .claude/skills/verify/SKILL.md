@@ -38,6 +38,14 @@ Compare per-file pass counts against `test/conformance/baseline_counts.sexp`:
 - Zero delta after a PORT chunk is suspicious — flag it (chunk may not be covered by
   in-scope tests yet; acceptable only if the milestone doc says the coverage lands later).
 
+## 3b. Fast-engine conformance vs baseline (M11+, once src/fast exists)
+```
+nix develop -c dune exec test/conformance/runner.exe -- --driver=fast
+```
+Compare against `test/conformance/fast_baseline_counts.sexp` — a RATCHET (counts only
+rise as chunk coverage grows). Any previously-passing fast unit now failing → **FAIL**.
+`unsupported:*` skips are expected until chunk K (full parity).
+
 ## 4. Skiplist staleness
 The runner enforces this itself, but check its summary explicitly:
 - A skipped test that now PASSES → FAIL (remove the stale entry — see /commit).
@@ -54,9 +62,11 @@ conformance inputs.
 ## 6. Bench smoke (post-M9 only)
 Skip entirely before gate G9 is marked met in `docs/ocaml-engine/10-performance.md`. After:
 ```
-nix develop -c dune exec bench/bench.exe -- --smoke
+nix develop -c dune exec bench/bench.exe -- --quick
 nix develop -c dune exec bench/compare.exe
 ```
+(The bench CLI flag is `--quick` — one rep, reduced corpora; an earlier revision of this
+skill said `--smoke`, which the CLI never implemented.)
 FAIL if `compare.exe` reports ratio > 2.0 (geomean or any per-benchmark, per gate G10 rules).
 
 ## Report format

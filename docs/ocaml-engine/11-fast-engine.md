@@ -34,10 +34,12 @@ interpreter is its differential oracle. Approved plan:
   `MakeMatcher` functor (find/captures/split over a `match_raw`/`capture_raw` seam, frozen
   empty-match semantics); pcre2.ml aliases, Interp/Jit bodies byte-identical;
   `src/pcre2.mli` zero diff.
-- [ ] **B — Scaffolding + process** — src/fast/ skeleton (compile → `Unsupported` for all);
+- [x] **B — Scaffolding + process** — src/fast/ skeleton (compile → `Unsupported` for all;
+  real compile errors already byte-parity → 307 units pass under `--driver=fast`);
   vendor `pcre2_jit_compile.c`; `fast_driver.ml` + `runner --driver=fast` +
-  `fast_baseline_counts.sexp`; fuzz `--mode fast-vs-interp` stub; `fast-design.md` v0;
-  rules/agents/skills amendments; fix verify-skill `--smoke`→`--quick` drift.
+  `fast_baseline_counts.sexp`; `fast-design.md` v0; rules/agents/skills amendments; fix
+  verify-skill `--smoke`→`--quick` drift. (Deviation: the fuzz `--mode fast-vs-interp`
+  plumbing moved to chunk C, where the fast engine first executes matches.)
 - [ ] **C — IR + verifier + runner core** — CHAR/CHARI, CHAR_RUN fusion
   (`pcre2_jit_compile.c:7479`), BRA/KET, ALT save records, simple anchors, END; fused loop +
   save_stack + shadow limits + naive bump-along; IR goldens, runner units, fast alloc pins.

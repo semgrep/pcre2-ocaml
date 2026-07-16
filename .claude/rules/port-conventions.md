@@ -2,6 +2,7 @@
 
 Every line of `src/engine/` follows these rules. The fidelity-reviewer agent enforces them.
 Reference sources live in `vendor/pcre2/src/` and are READ-ONLY. Never modify vendor files.
+Engine-native code (`src/fast/`, `src/matcher/`) follows §9 instead of §1–§4.
 
 ## 1. Naming map
 
@@ -110,3 +111,29 @@ Every ported block (function, match arm group, table) carries a citation on its 
 - No polymorphic comparison, no `List.*` in the hot loop.
 - Prefer copying C's specialization structure (e.g. separate caseful/caseless arms) over
   "cleaner" unified code — fidelity and speed align here.
+
+## 9. Engine-native code (`src/fast/`, `src/matcher/`) — M11
+
+The fast engine (docs/ocaml-engine/11-fast-engine.md) is NOT a C-structure port; §1–§4 do
+not apply verbatim there. Instead:
+
+- **§5–§8 bind unchanged.** The fast engine's hot loop is `src/fast/runner.ml`
+  (chunk C+): iterative only, no exceptions across it, zero allocation, `[@tailcall]`,
+  no `Obj.*`/polymorphic compare, `unsafe_*` only under bounds-proof comments, stdlib-only
+  (`dune build -p pcre2` stays dependency-free).
+- **Citations**: blocks mirroring PCRE2's JIT logic cite it exactly like §4 —
+  `(* pcre2_jit_compile.c:A-B *)` (vendored read-only). Native design (IR encoding, runner
+  loop, save records, verifier) cites the design doc instead:
+  `(* fast-design.md §N *)`. Uncited logic is still a review finding.
+- **NO fallback**: `Pcre2_fast.compile` returns `Unsupported` for constructs it does not
+  handle; no code path may route a fast match through the interpreter. The interpreter is
+  the fast engine's differential ORACLE (conformance `--driver=fast`, fuzz fast-vs-interp),
+  never its fallback.
+- **JIT-mirrored optimizations ONLY** (binding user constraint): nothing PCRE2 itself does
+  not do — no BMH-on-full-literal, no Aho–Corasick, no mid-pattern prefix entry.
+- **Semantics parity on accepted patterns**: identical rc/ovector/mark/startchar to
+  `Engine.exec*`; match/depth limits tick at C-equivalent sites; heap limit accounted in
+  the SAME simulated C frame bytes (fast-design.md §4).
+- `src/matcher/` carries the FROZEN convenience semantics (find_iter/captures_iter
+  empty-match quirk included) — §5's freeze applies to it verbatim; `src/pcre2.mli` stays
+  at zero diff (the real API freeze).

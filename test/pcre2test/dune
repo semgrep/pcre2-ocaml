@@ -15,8 +15,9 @@
   subject
   driver
   engine_driver
+  fast_driver
   harness)
- (libraries pcre2.engine))
+ (libraries pcre2.engine pcre2.fast))
 
 (executable
  (name pcre2test_ml)

@@ -7,7 +7,8 @@
 ```
 
 - `<area>` = engine module or work area: `parse`, `compile`, `interp`, `frames`, `utf`,
-  `ucd`, `study`, `harness`, `runner`, `fuzz`, `bench`, `build`, `docs`, `vendor`, `skiplist`.
+  `ucd`, `study`, `harness`, `runner`, `fuzz`, `bench`, `build`, `docs`, `vendor`, `skiplist`,
+  `fast` (src/fast/, M11), `matcher` (src/matcher/).
 - `<summary>` = imperative, ≤ 60 chars. Example:
   `[ocaml-engine] interp: port backreference opcodes OP_REF..OP_DNREFI`
 
@@ -16,7 +17,9 @@
 Must list, in this order:
 
 1. **C refs** — every vendored range ported/consulted, e.g. `pcre2_match.c:5011-5220`.
+   For `fast` chunks: `pcre2_jit_compile.c` ranges and/or `fast-design.md §N` sections.
 2. **Tests newly passing** — conformance ordinals, e.g. `testinput1:642-687, testinput2:14`.
+   For `fast` chunks these are `--driver=fast` ordinals.
 3. **Frontier** — `frontier: testinput1:642 -> testinput1:731` (before → after).
 4. Deviations from the C, if any (mirror the `(* DEVIATION *)` comments).
 
