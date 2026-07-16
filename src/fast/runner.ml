@@ -988,7 +988,18 @@ let rep_fail_pos (mb : mb) (p : int) (minimize : bool) : int =
       then p
       else p + 1
     else if Int.equal k rk_ctype then
-      if mb.utf then p + cp_len mb p else if minimize then p + 1 else p
+      if mb.utf then
+        (* UTF per-kind (chunk-O follow-up): minimize (RM219) GETCHARINCs for
+           EVERY ctype (:3846-3862) -> p + len. The mandatory min loops split:
+           OP_NOT_DIGIT GETCHARINCs (:3147-3156) -> p + len — the only kind
+           still reaching here with minimize=false; the peek-shaped kinds
+           (positive :3161-3245, \S/\W :3178-3228) leave Feptr UNADVANCED at
+           the mismatch and their dedicated loops ([rep_min_pos_ctype_utf] /
+           [rep_min_neg_ctype_utf]) pass the C-exact position to [bt]
+           directly, bypassing this function. *)
+        p + cp_len mb p
+      else if minimize then p + 1
+      else p
     else (* class / xclass / prop / hspace / vspace: read-first *)
       p + cp_len mb p
 
@@ -4267,6 +4278,15 @@ and op_repeat (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     && (Int.equal mb.rep_mask Chartables.ctype_word
        || Int.equal mb.rep_mask Chartables.ctype_space)
   then (rep_min_neg_ctype_utf [@tailcall]) mb 0 eptr sp rdepth mcc
+  else if mb.utf && Int.equal k rk_ctype && mb.rep_want then
+    (* OP_DIGIT / OP_WHITESPACE / OP_WORDCHAR mandatory min-count loop, UTF:
+       the C peeks the RAW first code unit — cc = UCHAR21(Feptr), never
+       decoded — so cc >= 128 is a mismatch with Feptr UNADVANCED, and a match
+       (cc < 128, a one-unit character) advances exactly one unit
+       (pcre2_match.c:3161-3245 / interpreter.ml typemin_utf_pos_ctype).
+       rep_unit_utf's GETCHARINC decode diverges on invalid UTF below
+       check_subject (see [rep_min_pos_ctype_utf]). *)
+    (rep_min_pos_ctype_utf [@tailcall]) mb 0 eptr sp rdepth mcc
   else (rep_min_loop [@tailcall]) mb 0 eptr sp rdepth mcc
 
 and rep_min_loop (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
@@ -4324,6 +4344,39 @@ and rep_min_neg_ctype_utf (mb : mb) (i : int) (eptr : int) (sp : int)
     else
       (rep_min_neg_ctype_utf [@tailcall]) mb (i + 1) (any_advance mb eptr) sp
         rdepth mcc
+
+(* OP_DIGIT / OP_WHITESPACE / OP_WORDCHAR mandatory min-count loop, UTF
+   (pcre2_match.c:3161-3176 / 3195-3211 / 3229-3245; interpreter.ml
+   typemin_utf_pos_ctype :5600-5627): cc = UCHAR21(Feptr) — the RAW first code
+   unit, never decoded. cc >= 128 or a clear ctype bit is a mismatch with
+   Feptr UNADVANCED (the RRETURN precedes Feptr++), so [bt] records the
+   C-exact [eptr]; a match implies cc < 128 = a one-unit character, so the
+   advance is exactly Feptr++ ("No need to skip more code units - we know it
+   has only one", :3174). DEVIATION from the generic
+   [rep_min_loop]/[rep_unit_utf], whose GETCHARINC decode differs on invalid
+   UTF below check_subject (a variable lookbehind stepping over a previous
+   MATCH_INVALID_UTF fragment's bytes, as in [rep_min_neg_ctype_utf]): an
+   overlong sequence (e.g. C0 B5 "decoding" to ASCII '5') would falsely MATCH
+   and advance by the declared length where the C's peek fails at the raw
+   lead >= 128 (repro: /(?<=\d{2,3})/ MATCH_INVALID_UTF on "\xc0\xb55" —
+   engine NOMATCH, pre-fix fast matched), and a mismatch would record
+   last_used_ptr at p + cp_len where the C's RRETURN leaves Feptr at p. The
+   C's minimize (RM219, GETCHARINC :3836-3959) and maximize (GETCHARLEN
+   :4607-4695) loops DO decode — they stay on the generic
+   rep_unit_utf path. *)
+and rep_min_pos_ctype_utf (mb : mb) (i : int) (eptr : int) (sp : int)
+    (rdepth : int) (mcc : int) : int =
+  if i >= mb.rep_lmin then (rep_after_min [@tailcall]) mb eptr sp rdepth mcc
+  else if eptr >= mb.end_subject then
+    let r = scheck_partial mb eptr in
+    if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc
+  else
+    (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
+    let cc = Char.code (String.unsafe_get mb.subject eptr) in
+    if cc >= 128 || Int.equal (Chartables.ctypes cc land mb.rep_mask) 0 then
+      (bt [@tailcall]) mb eptr sp mcc
+    else
+      (rep_min_pos_ctype_utf [@tailcall]) mb (i + 1) (eptr + 1) sp rdepth mcc
 
 (* OP_ALLANY / OP_ANYBYTE min loop (pcre2_match.c:3280-3287): one bound check
    for [lmin] code units. The scheck fires at the ORIGINAL eptr (not a

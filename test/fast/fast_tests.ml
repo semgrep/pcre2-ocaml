@@ -3256,6 +3256,31 @@ let invalid_utf_cases : (string * string * int * int32) list =
     ("(?<=\\D{2,3})", "\xf6\x15", 0, 0l);
     (* - a negated class [^0-9] is a CLASS/XCLASS read (extralen) *)
     ("(?<=[^0-9]{2,3})", "\xf6\x15", 0, 0l);
+    (* ---------- OP_DIGIT / OP_WHITESPACE / OP_WORDCHAR mandatory min-count
+       loop reading invalid UTF below check_subject (chunk-O follow-up to
+       regression 95312: the POSITIVE peek-shaped kinds) ----------
+
+       The C's positive-ctype min loops peek the RAW first code unit
+       (cc = UCHAR21, pcre2_match.c:3161-3245): a lead >= 128 NEVER matches
+       the type, and a mismatch leaves Feptr UNADVANCED. An overlong sequence
+       (C0 B5 "decoding" to ASCII '5', C1 B7 to 'w', C0 A0 to ' ') reached
+       below check_subject via a variable lookbehind must therefore FAIL the
+       positive type; the pre-fix generic GETCHARINC decode falsely MATCHED
+       it (fast: empty match at the fragment end; interp/C: No match). *)
+    ("(?<=\\d{2,3})", "\xc0\xb55", 0, 0l);
+    ("(?<=\\w{2,3})", "\xc1\xb7z", 0, 0l);
+    ("(?<=\\s{2,3})", "\xc0\xa0 ", 0, 0l);
+    (* lazy / possessive: the mandatory min part peeks all the same *)
+    ("(?<=\\d{2,3}?)", "\xc0\xb55", 0, 0l);
+    ("(?<=\\d{2,3}+)", "\xc0\xb55", 0, 0l);
+    (* truncated 4-byte lead: the peek fails (>= 128), RM37 steps forward one
+       character and the two real digits match — both engines MATCH *)
+    ("(?<=\\d{2,3})", "\xf656", 0, 0l);
+    (* decode controls — \D (OP_NOT_DIGIT, GETCHARINC :3147-3159) and the
+       class repeat (read-first) DO decode the overlong sequence in the C,
+       so these must keep the generic decode path *)
+    ("(?<=\\D{2,3})", "\xc0\xb5x", 0, 0l);
+    ("(?<=[0-9]{2,3})", "\xc0\xb55", 0, 0l);
   ]
 
 let invalid_utf_tests =
@@ -3864,6 +3889,22 @@ let recurseloop_tests =
             ("(?(R)[^x]?(?R)|ab(?R))", "abq");
             ("(?(R)(?i)q?(?R)|ab(?R))", "ab");
             ("(?(R)(?<!\\1x)(?R)|(a)b(?R))", "ab");
+            (* Chunk-O follow-up witnesses: the UTF ctype mandatory min loops
+               with the PEEK shape — positive \d/\s/\w (pcre2_match.c:
+               3161-3245) and negative \S/\W (:3178-3228) — leave Feptr
+               UNADVANCED at a mismatch; the failing probe's RRETURN feeds
+               last_used_ptr and thus the RECURSELOOP -52 depth. A p + cp_len
+               record (the generic rep_fail_pos family) fires the -52 one
+               recursion level LATER, flipping -47/-52 across this sweep
+               (mutation-tested: with the positives routed back through the
+               generic rep_min_loop, the \d{2} shape diverges at N=4 — see
+               [rep_min_pos_ctype_utf]/[rep_min_neg_ctype_utf]). The final
+               shape probes a MULTI-BYTE lead (peek 0xC3 -> unadvanced 0;
+               decode would record 0 + 2). *)
+            ("(*UTF)(?(R)(?<!\\d{2})(?R)|ab(?R))", "ab");
+            ("(*UTF)(?(R)(?<!\\s{2})(?R)|ab(?R))", "ab");
+            ("(*UTF)(?(R)(?<!\\W{2})(?R)|ab(?R))", "ab");
+            ("(*UTF)(?(R)(?<!\\d{2})(?R)|\xc3\xa9b(?R))", "\xc3\xa9b");
             (* Reviewer witnesses (round 4): a VERB code passing a KIND_ONCE /
                KIND_POS boundary is an RRETURN from that construct's frame in
                the C (pcre2_match.c:5408 RM2 / :5529 RM3 / :5315 RM8), recording
