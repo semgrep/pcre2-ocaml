@@ -351,12 +351,21 @@ interpreter is its differential oracle. Approved plan:
   repeats and skips over assertions the interpreter executes), so no JIT-mirrored form can
   be tick-safe against the interpreter oracle; no static LIMIT_MATCH gate is sound without
   disabling the fuzz `fast-vs-interp` differential.
-- [ ] **M — Early-fail assessment + tuning** — CHAR_RUN word-compare
-  (`String.get_int64_ne`) verification (in-attempt acceleration, cannot change the attempt
-  set); detect_early_fail watermarks (`:1292`, types `:232`) ASSESSMENT against the §5.2
-  tick-parity test — early_fail skips bump-along start positions the interpreter
-  attempts-and-ticks, so it likely hits the SAME obstacle and is likely a documented
-  decline, not a port.
+- [x] **M — Early-fail assessment + tuning** — CHAR_RUN word-compare LANDED
+  (`runner.ml` `char_run_word`/`char_run_eq`, `String.get_int64_ne` 8-byte chunks + byte tail
+  for LONG runs (`len >= 8`) that fully fit before end_subject; the per-byte `char_run_cmp`
+  (byte-identical to pre-M, SCHECK placement) keeps short runs and the span-crosses-end/
+  partial path — a short run pays one `len >= 8` gate check): in-attempt acceleration,
+  identical attempt set /
+  hitend / partial / last_used_ptr; native-endian equality on both sides (order-insensitive);
+  zero-alloc (ocamlopt unboxes the local int64s — alloc-pinned); mutation-tested boundary +
+  word + tail pins (fast_tests parity + alloc pin). detect_early_fail watermarks (`:1292`,
+  types `:232`, reset `:3345`) ASSESSED against the §5.2 tick-parity test and **DECLINED
+  PERMANENTLY** (fast-design.md §5.3): its watermarks skip bump-along start positions the
+  interpreter attempts-and-ticks, and a skipped attempt's tick count is UNBOUNDED
+  (a leading greedy/lazy repeat's give-back/extend ticks O(run length) — §4), so no static
+  LIMIT_MATCH gate is sound and the only constant-tick subcase (a possessive leading
+  iterator) still diverges at match_limit<2 and is not JIT-mirrored. Not a coverage gap.
 - [ ] **N — Perf close** — bench Fast column + compare gates; meet G11.2.
 - [ ] **O — Gate close** — G11.1 + fuzz long run + plan-update marks the gate.
 

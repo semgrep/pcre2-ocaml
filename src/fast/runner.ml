@@ -633,12 +633,50 @@ let getchar_sub (s : string) (pos : int) : int =
   let c = Utf.peek s pos in
   if c >= 0xc0 then Utf.getutf8 c s pos else c
 
-(* pcre2_match.c:992-1025 non-UTF OP_CHAR run (interpreter.ml:1509-1539),
-   fused: compare [lit_pos, lit_end) against the subject from [eptr]. Each
-   code unit mirrors one OP_CHAR — SCHECK_PARTIAL at/past end_subject, then a
-   caseful compare. Returns the new eptr (>= 0) on full match, [sig_backtrack]
-   on a plain NOMATCH, or a negative error code (PARTIAL) to propagate.
-   Module-level + fully applied so the loop builds no closure (§8). *)
+(* Chunk M — word-at-a-time caseful equality for a fully-available literal
+   run: lit[li, li+n) vs subject[si, si+n). Mirrors the JIT's fused-run compare
+   (pcre2_jit_compile.c:7479-7620 byte_sequence_compare), which loads a literal
+   run in machine-word chunks. [String.get_int64_ne] reads 8 bytes in the
+   NATIVE byte order on BOTH sides, so the equality is order-insensitive — this
+   is an EQUALITY test only, never a lexicographic compare, so endianness does
+   not matter. Bytes primitives read unaligned safely (no alignment
+   requirement). Byte-by-byte tail for the < 8 remainder. Allocation-free:
+   ocamlopt (non-flambda 4.14) unboxes the two local int64s consumed by
+   [Int64.equal] (alloc-pinned). *)
+let rec char_run_eq (lit : string) (li : int) (subj : string) (si : int)
+    (n : int) : bool =
+  if n >= 8 then
+    (* safe: the CHAR_RUN dispatch arm entered [char_run_word] only when
+       li + n <= |lit| (Ir_verify CHAR_RUN bound: lit_off + len <= |lit|) and
+       eptr + len <= end_subject <= |subject| (si = eptr, n = len); with n >= 8
+       that gives li + 8 <= |lit| and si + 8 <= |subject|, and get_int64_ne
+       reads [i, i+8). *)
+    if
+      Int64.equal (String.get_int64_ne lit li) (String.get_int64_ne subj si)
+    then (char_run_eq [@tailcall]) lit (li + 8) subj (si + 8) (n - 8)
+    else false
+  else (char_run_eq_tail [@tailcall]) lit li subj si n
+
+and char_run_eq_tail (lit : string) (li : int) (subj : string) (si : int)
+    (n : int) : bool =
+  if n <= 0 then true
+  else if
+    (* safe: n <= 7 here, and li + n / si + n stay within the same proven
+       upper bounds (|lit| / |subject|). *)
+    Char.equal (String.unsafe_get lit li) (String.unsafe_get subj si)
+  then (char_run_eq_tail [@tailcall]) lit (li + 1) subj (si + 1) (n - 1)
+  else false
+
+(* pcre2_match.c:992-1025 non-UTF OP_CHAR run (interpreter.ml:1509-1539) — the
+   per-byte path: each iteration mirrors one OP_CHAR — SCHECK_PARTIAL at/past
+   end_subject, then a caseful compare. This is the K1b-era placement (the
+   DEVIATION below). It handles SHORT runs and the SPAN-CROSSES-END case where a
+   SCHECK_PARTIAL boundary CAN occur inside the run; long fully-available runs
+   are word-accelerated by [char_run_eq] at the CHAR_RUN dispatch arm instead
+   (chunk M). Byte-IDENTICAL to the pre-chunk-M implementation, so short runs
+   (the hot case) pay ZERO added cost. Returns the new eptr on full match,
+   [sig_backtrack] on a plain NOMATCH, or a negative error code (PARTIAL) to
+   propagate. Module-level + fully applied so the loop builds no closure (§8). *)
 let rec char_run_cmp (mb : mb) (lit_pos : int) (lit_end : int) (eptr : int) : int
     =
   if lit_pos >= lit_end then eptr
@@ -668,6 +706,24 @@ let rec char_run_cmp (mb : mb) (lit_pos : int) (lit_end : int) (eptr : int) : in
          (Char.code (String.unsafe_get mb.subject eptr)))
   then sig_backtrack
   else (char_run_cmp [@tailcall]) mb (lit_pos + 1) lit_end (eptr + 1)
+
+(* Chunk M — the fused-run WORD path (pcre2_match.c:992-1025 per-unit compare arm;
+   pcre2_jit_compile.c:7479 byte_sequence_compare). Entered from the CHAR_RUN
+   dispatch arm ONLY when the whole run is >= 8 units AND fully fits before
+   end_subject (eptr + len <= end_subject). In that case eptr never reaches
+   end_subject inside the run, so NO SCHECK_PARTIAL can fire — the run reduces
+   to a pure caseful comparison, accelerated word-at-a-time by [char_run_eq].
+   IN-ATTEMPT acceleration only: identical result to the per-byte
+   [char_run_cmp] (full match -> eptr + len; any mismatch -> sig_backtrack; no
+   PARTIAL possible here), so the attempt set, hitend and last_used_ptr
+   semantics are unchanged. A has_recurse run is DE-FUSED to ONE char (1..4
+   units) by the IR compiler, so len < 8 and it NEVER reaches here (its per-char
+   [char_run_cfail] behavior is preserved). The `len >= 8` gate lives at the
+   dispatch (using the already-loaded [len]) so SHORT runs — the hot case — pay
+   ONE comparison and route straight to the byte-identical [char_run_cmp]. *)
+let char_run_word (mb : mb) (lit_off : int) (len : int) (eptr : int) : int =
+  if char_run_eq mb.lit lit_off mb.subject eptr len then eptr + len
+  else sig_backtrack
 
 (* Chunk K1b — the C-exact last_used_ptr record position for a FAILED char run
    (OP_CHAR, pcre2_match.c:995-1025). Called only for has_recurse patterns,
@@ -1653,10 +1709,21 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
      the module-initialization asserts at the bottom of this file. *)
   match code.(pc) with
   | 1 ->
-      (* CHAR_RUN (fast-design.md §2; OP_CHAR arm) — fused caseful run. *)
+      (* CHAR_RUN (fast-design.md §2; OP_CHAR arm) — fused caseful run.
+         Chunk M: a LONG run (>= 8 units) whose whole span fits before
+         end_subject is word-accelerated ([char_run_word]); everything else —
+         SHORT runs (the hot case, incl. all de-fused has_recurse runs) and any
+         span that crosses end_subject — takes the byte-identical per-byte
+         [char_run_cmp]. The `len >= 8` gate uses the already-loaded [len], so a
+         short run pays ONE comparison over the pre-chunk-M dispatch. Both paths
+         return the identical result (attempt-set-neutral). *)
       let lit_off = code.(pc + 1) in
       let len = code.(pc + 2) in
-      let e = char_run_cmp mb lit_off (lit_off + len) eptr in
+      let e =
+        if len >= 8 && eptr + len <= mb.end_subject then
+          char_run_word mb lit_off len eptr
+        else char_run_cmp mb lit_off (lit_off + len) eptr
+      in
       if e >= 0 then (run [@tailcall]) mb (pc + 3) e sp rdepth mcc
       else if e = sig_backtrack then
         (* Chunk K1b — a has_recurse run is DE-FUSED to one character, and the

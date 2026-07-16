@@ -1658,6 +1658,42 @@ let parity_cases : (string * string * int * int32) list =
     ("abc", "xab", 0, o_partial_soft);
     ("\\Aabc", "ab", 0, o_partial_hard);
     ("(?:a|b)cd", "bc", 0, o_partial_soft);
+    (* ---------- Chunk M: CHAR_RUN word-compare boundary pins ----------
+       A fused caseful run >= 8 code units exercises the word-at-a-time
+       [char_run_eq] loop (8-byte chunks + byte tail); a mismatch/partial at
+       various offsets is the differential oracle against the interpreter. The
+       word compare is used ONLY where the whole run fits before end_subject
+       (no partial boundary in the span); a subject that ends INSIDE the run
+       must route through the per-byte [char_run_cmp_partial] with its
+       SCHECK_PARTIAL placement. These pins would fail if the word path were
+       wrongly used across end_subject, or if [char_run_eq] mis-compared a word
+       or the tail. *)
+    (* full-span match / mismatch across the 8-byte boundary (no partial) *)
+    ("abcdefghij", "abcdefghij", 0, 0l) (* exact: 1 word + 2-byte tail *);
+    ("abcdefghij", "abcdefghijk", 0, 0l) (* match then extra *);
+    ("abcdefghij", "Zabcdefghij", 0, 0l) (* match after one bump *);
+    ("abcdefghij", "abcXefghij", 0, 0l) (* mismatch in the first word (idx 3) *);
+    ("abcdefghij", "abcdefghiX", 0, 0l) (* mismatch in the byte tail (idx 9) *);
+    ("abcdefghijklmnop", "abcdefghijklmnop", 0, 0l) (* exact: 2 full words *);
+    ("abcdefghijklmnop", "abcdefghijklXnop", 0, 0l) (* mismatch 2nd word idx 12 *);
+    ("abcdefghijklmnopqr", "abcdefghijklmnopqr", 0, 0l) (* 2 words + 2 tail *);
+    (* subject ends EXACTLY at the 8-byte word boundary, mid-run -> PARTIAL *)
+    ("abcdefghij", "abcdefgh", 0, o_partial_soft);
+    ("abcdefghij", "abcdefgh", 0, o_partial_hard);
+    ("abcdefghij", "abcdefgh", 0, 0l) (* same, no partial -> NM *);
+    ("\\Aabcdefghij", "abcdefgh", 0, o_partial_hard) (* anchored boundary *);
+    (* subject ends in the byte tail, mid-run -> PARTIAL *)
+    ("abcdefghij", "abcdefghi", 0, o_partial_soft);
+    ("abcdefghij", "abcdefghi", 0, o_partial_hard);
+    (* subject ends WITHIN the first word -> PARTIAL (per-byte path) *)
+    ("abcdefghij", "abcdefg", 0, o_partial_soft);
+    ("abcdefghij", "abc", 0, o_partial_hard);
+    (* two-word run, subject ends mid-second-word -> PARTIAL *)
+    ("abcdefghijklmnop", "abcdefghijklmno", 0, o_partial_hard);
+    ("abcdefghijklmnop", "abcdefghijkl", 0, o_partial_soft) (* ends at 2nd bnd *);
+    (* multi-byte UTF fused run crossing the 8-byte boundary, ends mid-char *)
+    ("(*UTF)\\x{100}\\x{101}\\x{102}\\x{103}\\x{104}",
+      "\xc4\x80\xc4\x81\xc4\x82\xc4\x83", 0, o_partial_soft);
     (* BADOFFSET / bad option bits *)
     ("abc", "ab", 5, 0l);
     ("abc", "abc", -1, 0l);
@@ -3514,6 +3550,42 @@ let alloc_tests =
               (Printf.sprintf
                  "expected O(1) minor allocation for the FIRSTLINE scan over \
                   ~2000 attempts, measured %.0f words"
+                 delta)
+              true (delta < 1000.));
+    (* Chunk M — the CHAR_RUN word compare ([char_run_eq]) reads 8 bytes per
+       chunk via String.get_int64_ne and compares them with Int64.equal. Under
+       ocamlopt (non-flambda 4.14) the two local int64s are UNBOXED; a
+       regression that let them escape (e.g. routing them through a non-inlined
+       [int64 -> int64 -> bool] helper, binding to a tuple, or returning the
+       int64) boxes each read — ~3 words per 8-byte chunk (measured ~6 for the
+       pair). A 40-'a' + 'X' run against a long all-'a' subject makes EVERY bump
+       attempt run 5 matching word-compares (bytes 0..39) then fail on the tail
+       'X'; NO_START_OPTIMIZE (0x10000) is REQUIRED so the required-code-unit
+       'X' (absent from the subject) does NOT short-circuit the whole match to
+       NOMATCH before any word compare runs. ~50k attempts * 5 chunks = ~250k
+       word-compares: the boxed form allocates ~1.5M words and trips this pin
+       (verified by the [@inline never] mutation), while the unboxed form stays
+       O(1). Confirms §8 zero-alloc for the word path. *)
+    Alcotest.test_case "alloc: O(1) CHAR_RUN word-compare over ~250k chunks"
+      `Slow (fun () ->
+        let pat = String.make 40 'a' ^ "X" in
+        match F.compile pat 0x00010000l (* NO_START_OPTIMIZE *) with
+        | Error _ -> Alcotest.fail "compile failed"
+        | Ok re ->
+            let subject = String.make 50_000 'a' in
+            (match F.exec re subject 0 0l with
+            | Ok None -> ()
+            | _ -> Alcotest.fail "expected no match (warm-up)");
+            let before = Gc.minor_words () in
+            let r = F.exec re subject 0 0l in
+            let delta = Gc.minor_words () -. before in
+            (match r with
+            | Ok None -> ()
+            | _ -> Alcotest.fail "expected no match");
+            Alcotest.(check bool)
+              (Printf.sprintf
+                 "expected O(1) minor allocation for the CHAR_RUN word compare \
+                  over ~250k chunks, measured %.0f words"
                  delta)
               true (delta < 1000.));
   ]

@@ -34,8 +34,25 @@ Principles (fixed by the plan) and the CONCRETE layout as implemented:
 - Operands are PRE-DECODED: no `get2` link reads at run time; LINK offsets resolved to
   absolute IR indices at IR-compile time.
 - `CHAR_RUN`: consecutive caseful `OP_CHAR`s fuse into one instruction comparing against a
-  literal pool (`lit : string`) word-at-a-time (`String.get_int64_ne` + masked tail —
-  chunk M) — mirrors `byte_sequence_compare` (pcre2_jit_compile.c:7479). `OP_CHARI` runs do
+  literal pool (`lit : string`). The runner (LANDED chunk M) routes at the CHAR_RUN dispatch
+  arm on the compile-time length `len` (already loaded): a LONG run (`len >= 8`) whose whole
+  span fits before `end_subject` (`eptr + len <= end_subject`, so no partial boundary can
+  occur inside it — it reduces to the C's memcmp path) goes to `char_run_word`, which
+  compares word-at-a-time via `String.get_int64_ne` on BOTH sides (native endianness →
+  order-insensitive EQUALITY, never lexicographic) 8 bytes at a time plus a byte tail
+  (`char_run_eq`), mirroring `byte_sequence_compare` (pcre2_jit_compile.c:7479). EVERYTHING
+  else — SHORT runs (the hot case, and all de-fused `has_recurse` runs) and any span that
+  crosses `end_subject` — takes the per-byte `char_run_cmp`, byte-IDENTICAL to the pre-M
+  implementation with its `SCHECK_PARTIAL` placement (the K1b DEVIATION); a short run pays
+  ONE `len >= 8` comparison over the pre-M dispatch. This is IN-ATTEMPT acceleration ONLY —
+  identical attempt set, hitend/partial and last_used_ptr semantics (a `has_recurse` run is
+  de-fused to one 1..4-unit char that never reaches the word path, preserving its per-char
+  `char_run_cfail` behavior). Zero-alloc: ocamlopt (non-flambda 4.14) unboxes the two local
+  int64s consumed by `Int64.equal` (alloc-pinned). The `len >= 8` gate is a perf refinement:
+  the word loop only pays off at >= 8 units, and real patterns' hot runs are short, so
+  routing decisions and per-benchmark bench swings (±9% code-layout noise in the monolithic
+  `run` function — a functionally-identical edit swings that much) stay off the short path.
+  `OP_CHARI` runs do
   NOT fuse: one `CHARI` per code unit. That is a DELIBERATE conservative simplification,
   not JIT parity — the JIT fuses caseless runs too when a code unit's othercase differs by
   a single bit (or it has none): `compile_charn_matchingpath`
@@ -1553,6 +1570,47 @@ attempt set. **Chunk M scope note:** `detect_early_fail` (pcre2_jit_compile.c:12
 :232) likely hits the SAME obstacle — its watermarks skip bump-along start positions that
 the interpreter attempts-and-ticks — so chunk M must ASSESS it against this same
 tick-parity test and likely decline it too (documented, not ported).
+
+### §5.3 `detect_early_fail` watermarks — DECLINED PERMANENTLY (chunk M assessment)
+
+`detect_early_fail` (pcre2_jit_compile.c:1292-1665, `early_fail_types` :232-236, per-attempt
+reset :3345-3352) is DECLINED PERMANENTLY — the SAME differential-contract class as
+`scan_prefix` (§5.2) and `detect_repeat` (§2). It recognises an "accelerated" leading
+iterator (a char/type/class/prop repeat, greedy/lazy/possessive — the `OP_STAR`/`OP_TYPESTAR`/
+`OP_CLASS+OP_CR*`/… cases at :1370-1565) near the pattern start and installs a runtime
+WATERMARK (`type_skip` when count==0, `type_fail`/`type_fail_range` when count 1-3, :1609-1645):
+after an attempt fails, the furthest position the accelerated iterator reached is remembered,
+and the bump-along SKIPS every start position up to that watermark on subsequent attempts
+(they provably fail too). It is RESULT-neutral — the skipped positions all NOMATCH in both
+engines — so the ONLY divergence risk is the tick-based `PCRE2_ERROR_MATCHLIMIT` (-47):
+
+- The interpreter has NO early-fail, so every position early-fail skips is one the
+  interpreter ATTEMPTS. `match_call_count` resets per attempt, so a skipped attempt is
+  observable ONLY through a per-attempt `-47` trip — the interpreter can trip `-47` inside a
+  skipped attempt where the fast engine (having skipped it) never ticks and continues,
+  returning a MATCH or NOMATCH where the interpreter returns `-47`. That is a wrong answer.
+- The tick count of a skipped attempt is UNBOUNDED for the dominant (and JIT-accelerated)
+  cases. A leading GREEDY/lazy repeat (`\d+x`, `[a-z]*x`, `.*b`) at a skipped position P runs
+  the iterator scan (tick-free) then the maximize give-back / minimize extend loop, which
+  ticks ONCE per position (§4: "backtrack pop `KIND_REP_MAX`: try_pos > floor → 1 tick";
+  "backtrack pop `KIND_REP_MIN`: extend one char → 1 tick"). So T(P) = O(run length) —
+  witnessed by the pinned `(*LIMIT_MATCH=N)a*ab` test (raising the no-match tail raises the
+  `-47` trip N), and by the fuzz `LIMIT_MATCH` differential the port already runs. No static
+  `match_limit > K` gate is sound: a high K DISABLES the fuzz `--mode fast-vs-interp
+  LIMIT_MATCH=2000` differential (the very oracle that would catch a divergence) and the
+  conformance `(*LIMIT_MATCH=n)` cases; a low K leaves a divergence window.
+- **No sound JIT-mirrored subset exists.** The only accelerated iterator whose skipped-position
+  attempt ticks a CONSTANT is a POSSESSIVE leading repeat (`[a-z]*+x` — the possessive scan
+  does not give back, §4: possessive REP = 0 ticks; T(P) = frame-0 + top-group BRA = 2). Even
+  that is not safe: it still diverges at `match_limit < 2` (a value the conformance
+  `(*LIMIT_MATCH=n)` cases and the fuzz differential DO exercise), and restricting early-fail
+  to only-possessive-leading-iterators is a substantial DEVIATION from the JIT's
+  `detect_early_fail` (which accelerates greedy/lazy/type/class/prop iterators
+  indiscriminately, :1370-1565), violating the "JIT-mirrored ONLY" constraint. So there is no
+  proven-safe JIT-MIRRORED form.
+
+The in-attempt acceleration that IS safe — the CHAR_RUN word-compare (§2) — is landed;
+`detect_early_fail`, like `scan_prefix` and `detect_repeat`, is NOT ported BY DESIGN.
 
 ## §6 Unsupported taxonomy
 
