@@ -240,33 +240,53 @@ let scratch_max_retained_ints = 131072
 
 type t = { mutable data : int array }
 
-(* The ONE module-level scratch instance, retained across execs. Its [data]
-   is re-pointed by [grow]; [Runner] reuses this same [t] (through its cached
-   match block) whenever the [busy] flag is free. *)
-let scratch : t = { data = Array.make initial_ints 0 }
+(* PER-DOMAIN scratch reuse. This was a single module-global [scratch] guarded
+   by an [Atomic] [busy] flag; under semgrep's multi-domain scans only ONE
+   domain could win the flag and reuse the arena, so every other concurrent
+   exec fell back to a fresh allocation on EVERY call (a large per-exec
+   allocation cliff that spilled into the major heap), and all domains
+   funnelled through one contended atomic. Each domain now owns its own slot
+   via [Pcre2_engine.Dls_compat.DLS]: no cross-domain sharing, no atomic, and the arena is
+   reused on every exec regardless of how many domains run in parallel.
+   The [in_use] guard is now purely for RE-ENTRANCY within a single domain (a
+   match started while that domain is already mid-match) — that case still
+   falls back to a fresh, unshared stack. A domain's DLS slot is only ever
+   touched by that domain, so a plain bool needs no atomicity. *)
+type slot = { stack : t; mutable in_use : bool }
 
-(* This stack's OWN busy flag (port-conventions.md §9 / frames.ml:283); NOT
-   Frames' scratch flag. *)
-let busy = Atomic.make false
+let dls : slot Pcre2_engine.Dls_compat.DLS.key =
+  Pcre2_engine.Dls_compat.DLS.new_key (fun () ->
+      { stack = { data = Array.make initial_ints 0 }; in_use = false })
 
-(* Test-only view of the busy flag (never true between execs). *)
-let is_busy () : bool = Atomic.get busy
+(* Test-only view of this domain's in-use flag (never true between execs). *)
+let is_busy () : bool = (Pcre2_engine.Dls_compat.DLS.get dls).in_use
 
-(* Acquire the scratch slot for one exec: the compare-and-set is the whole
-   acquire (frames.ml:352). Returns true iff this exec owns the slot and may
-   use/retain [scratch]; a busy slot makes the caller allocate a fresh [t]. *)
-let try_acquire () : bool = Atomic.compare_and_set busy false true
+(* Acquire THIS domain's scratch slot for one exec. Returns true iff the
+   caller owns the slot (and may use/retain [scratch ()]); a re-entrant call
+   on the same domain finds it in use and gets false, allocating a fresh [t].
+   No atomic: the slot is domain-local. *)
+let try_acquire () : bool =
+  let s = Pcre2_engine.Dls_compat.DLS.get dls in
+  if s.in_use then false
+  else (
+    s.in_use <- true;
+    true)
 
-(* A fresh, unshared stack for the busy fallback path (never written back). *)
+(* This domain's reused scratch stack. Valid only while the caller holds the
+   slot (i.e. [try_acquire] returned true). [data] is re-pointed by [grow]. *)
+let scratch () : t = (Pcre2_engine.Dls_compat.DLS.get dls).stack
+
+(* A fresh, unshared stack for the re-entrant fallback path (never written
+   back to the slot). *)
 let fresh () : t = { data = Array.make initial_ints 0 }
 
-(* Release the scratch slot at exec exit (only the owner calls this): apply
-   the retention cap to [scratch], then publish the busy clear (its release
-   store synchronizes with the next acquire's compare-and-set). *)
+(* Release this domain's slot at exec exit (only the owner calls this): apply
+   the retention cap to the domain's stack, then clear its in-use flag. *)
 let release () : unit =
-  if Array.length scratch.data > scratch_max_retained_ints then
-    scratch.data <- Array.make initial_ints 0;
-  Atomic.set busy false
+  let s = Pcre2_engine.Dls_compat.DLS.get dls in
+  if Array.length s.stack.data > scratch_max_retained_ints then
+    s.stack.data <- Array.make initial_ints 0;
+  s.in_use <- false
 
 (* Cold path: grow [t.data] geometrically so it holds at least [need] ints,
    preserving the existing contents. Called from the runner's ALT arm only

@@ -8704,7 +8704,13 @@ let fresh_trio ~(re : Compile.re) ~(arena : Frames.t) ~(match_data : match_data)
    ds.match_data (the last match data, its ovector sized by the
    pattern's group count), plus the small dead arena record in
    st.arena. *)
-let scratch_trio : driver_state option ref = ref None
+(* PER-DOMAIN cached driver-state trio (was a single module-global ref),
+   matching the per-domain Frames scratch slot: each domain reuses its own
+   trio across execs instead of one domain reusing while every other
+   concurrent exec rebuilds a fresh trio. Only touched while holding this
+   domain's Frames scratch slot (a.Frames.holds_scratch). *)
+let scratch_trio : driver_state option ref Dls_compat.DLS.key =
+  Dls_compat.DLS.new_key (fun () -> ref None)
 
 (* pcre2_internal.h:496-521 — IS_NEWLINE(p) / WAS_NEWLINE(p)
    for the driver's own scan sites (7176/7184, 7328/7336,
@@ -9768,7 +9774,7 @@ let pcre2_match_with_limits (re : Compile.re) ~(match_limit : int)
                  and fresh cannot drift. *)
               let ds =
                 if a.Frames.holds_scratch then
-                  match !scratch_trio with
+                  match !(Dls_compat.DLS.get scratch_trio) with
                   | Some ds -> ds
                   | None -> fresh_trio ~re ~arena:a ~match_data ~subject
                 else fresh_trio ~re ~arena:a ~match_data ~subject
@@ -9994,9 +10000,10 @@ let pcre2_match_with_limits (re : Compile.re) ~(match_limit : int)
                    steady state finds it already installed). Frames.release
                    below clears the flag after this exec is done with it. *)
                 (if a.Frames.holds_scratch then
-                   match !scratch_trio with
+                   let cache = Dls_compat.DLS.get scratch_trio in
+                   match !cache with
                    | Some _ -> ()
-                   | None -> scratch_trio := Some ds);
+                   | None -> cache := Some ds);
                 (* pcre2_match.c:6601-6602 + 7139-7151 — enter the bumpalong
                    loop through the FRAGMENT_RESTART fall-through resets:
                    start_match is subject + start_offset possibly advanced

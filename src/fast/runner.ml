@@ -5614,11 +5614,15 @@ and next_fragment (mb : mb) (frag_end : int) (req_cu_ptr : int) : int =
 
 (* ---------- Cross-exec scratch (mb reuse, §3 / frames.ml scratch trio) ---------- *)
 
-(* ONE cached match block, reused whenever this exec owns the save stack's
-   busy flag (the single acquire). A busy slot (concurrent exec) allocates a
-   fresh mb + fresh save stack, never written back — mirrors
-   interpreter.ml's fresh_trio gated on Frames.holds_scratch. *)
-let scratch_mb : mb option ref = ref None
+(* PER-DOMAIN cached match block, reused whenever this exec owns its domain's
+   save-stack slot (Save_stack.try_acquire). Was a single module-global ref;
+   now domain-local via [Pcre2_engine.Dls_compat.DLS] to match the per-domain save stack, so
+   every domain reuses its own mb across execs instead of one domain reusing
+   while all others rebuilt a fresh mb + save stack on every concurrent exec.
+   A re-entrant exec on the same domain (slot in use) still builds a fresh mb
+   + fresh save stack, never written back. *)
+let scratch_mb : mb option ref Pcre2_engine.Dls_compat.DLS.key =
+  Pcre2_engine.Dls_compat.DLS.new_key (fun () -> ref None)
 
 (* ---------- Public exec ----------
 
@@ -5884,16 +5888,17 @@ let exec_with_limits (ir : Ir.t) ~(match_limit : int) ~(depth_limit : int)
            (pcre2_match.c:6897 sets it even when allow_invalid proceeds). *)
         entry_error_off heapframes_size0 startchar0
       else (
-        (* Acquire the scratch bundle (single acquire, gated reuse). *)
+        (* Acquire this domain's scratch bundle (domain-local, gated reuse). *)
         let holds = Save_stack.try_acquire () in
         let mb =
-          if holds then
-            match !scratch_mb with
+          if holds then (
+            let cache = Pcre2_engine.Dls_compat.DLS.get scratch_mb in
+            match !cache with
             | Some m -> m
             | None ->
-                let m = make_mb Save_stack.scratch in
-                scratch_mb := Some m;
-                m
+                let m = make_mb (Save_stack.scratch ()) in
+                cache := Some m;
+                m)
           else make_mb (Save_stack.fresh ())
         in
         (* Fill the match block (interpreter.ml:9868-9962 field block). *)

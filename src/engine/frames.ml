@@ -279,8 +279,19 @@ let base (a : t) (f : int) : int = f * a.frame_size_ints
    fill (pcre2_match.c:7079-7083, in [create]) plus the frame-0 field
    setup at match() entry (pcre2_match.c:649-656, in the interpreter);
    every other slot is write-before-read under the frame protocol. *)
-let scratch_arena : int array ref = ref [||]
-let scratch_busy : bool Atomic.t = Atomic.make false
+(* PER-DOMAIN scratch slot. Was a single module-global [scratch_arena] +
+   [Atomic] [scratch_busy]; under multi-domain scans only ONE domain could
+   reuse the frames vector while every other concurrent match re-allocated it
+   on each exec (a large per-exec allocation that promoted to the major heap
+   and drove major GC), and all domains contended one atomic. Each domain now
+   owns its slot via [Dls_compat.DLS]: the vector is reused on every exec
+   regardless of parallelism, with no atomic. [in_use] guards only
+   same-domain re-entrancy (a nested match), which still falls back to a
+   fresh, un-written-back vector. Mirrors src/fast/save_stack.ml. *)
+type scratch_slot = { mutable arena : int array; mutable in_use : bool }
+
+let scratch_dls : scratch_slot Dls_compat.DLS.key =
+  Dls_compat.DLS.new_key (fun () -> { arena = [||]; in_use = false })
 
 (* DEVIATION: the C never caps the cached vector — its lifetime is
    caller-controlled (it lives until pcre2_match_data_free). Ours is a
@@ -348,12 +359,15 @@ let create ~(use_scratch : bool) ~(top_bracket : int) ~(heap_limit : int) :
        per-exec allocation before this cache existed, i.e. to a
        permanently busy slot), and OOM is already effectively fatal to
        the differential harness (the C oracle stubs abort on OOM). *)
+    let slot = Dls_compat.DLS.get scratch_dls in
     let holds_scratch =
-      use_scratch && Atomic.compare_and_set scratch_busy false true
+      if use_scratch && not slot.in_use then (
+        slot.in_use <- true;
+        true)
+      else false
     in
     let frames =
-      if holds_scratch && Array.length !scratch_arena >= needed then
-        !scratch_arena
+      if holds_scratch && Array.length slot.arena >= needed then slot.arena
       else Array.make needed 0
     in
     (* pcre2_match.c:7079-7083 — mark every capture in frame 0 unset. *)
@@ -385,8 +399,9 @@ let create ~(use_scratch : bool) ~(top_bracket : int) ~(heap_limit : int) :
    [create]). *)
 let release (a : t) : unit =
   if a.holds_scratch then (
+    let slot = Dls_compat.DLS.get scratch_dls in
     if Array.length a.frames <= scratch_max_retained_ints then
-      scratch_arena := a.frames
+      slot.arena <- a.frames
     else (
       (* DEVIATION (retention cap): see [scratch_max_retained_ints].
          Also un-pin the dead arena record's own reference: [a] stays
@@ -397,10 +412,8 @@ let release (a : t) : unit =
          last act before pcre2_match returns, and the results live in
          the caller's match data. *)
       a.frames <- [||];
-      scratch_arena := [||]);
-    (* The plain writes above are published by this release store: the
-       next acquire's compare_and_set synchronizes with them. *)
-    Atomic.set scratch_busy false)
+      slot.arena <- [||]);
+    slot.in_use <- false)
 
 (* pcre2_match.c:668-712 — the frames vector is full: get a new one,
    doubling the size, but constrained by the heap limit (which is in KiB).

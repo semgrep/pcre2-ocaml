@@ -206,8 +206,12 @@ let test_3 () =
    cap drop. Runs last and leaves the slot exactly as module init found
    it (empty, not busy) — the fresh-path creates above never touch it. *)
 let test_4 () =
-  assert (Int.equal (Array.length !scratch_arena) 0);
-  assert (not (Atomic.get scratch_busy));
+  (* This domain's scratch slot (was the module-global [scratch_arena] +
+     [scratch_busy]; now per-domain via [Dls_compat.DLS] — single-domain
+     here, so the protocol is identical). *)
+  let slot () = Dls_compat.DLS.get scratch_dls in
+  assert (Int.equal (Array.length (slot ()).arena) 0);
+  assert (not (slot ()).in_use);
   (match
      create ~use_scratch:true ~top_bracket:2 ~heap_limit:Limits.heap_limit
    with
@@ -215,11 +219,11 @@ let test_4 () =
   | Ok a ->
       (* Empty slot: fresh (zeroed) arena, but the slot is now held. *)
       assert a.holds_scratch;
-      assert (Atomic.get scratch_busy);
+      assert (slot ()).in_use;
       for i = 0 to slot_ovector - 1 do
         assert (Int.equal a.frames.(i) 0)
       done;
-      (* Busy slot: a nested/concurrent match falls back to a fresh
+      (* Busy slot: a nested/re-entrant match falls back to a fresh
          arena and its release is a no-op. *)
       (match
          create ~use_scratch:true ~top_bracket:2 ~heap_limit:Limits.heap_limit
@@ -229,12 +233,12 @@ let test_4 () =
           assert (not b.holds_scratch);
           assert (not (b.frames == a.frames));
           release b;
-          assert (Atomic.get scratch_busy);
-          assert (Int.equal (Array.length !scratch_arena) 0));
+          assert (slot ()).in_use;
+          assert (Int.equal (Array.length (slot ()).arena) 0));
       a.frames.(slot_ecode) <- 424242 (* dirt: must survive reuse *);
       release a;
-      assert (not (Atomic.get scratch_busy));
-      assert (!scratch_arena == a.frames));
+      assert (not (slot ()).in_use);
+      assert ((slot ()).arena == a.frames));
   (* Reuse: the same array comes back, NOT re-zeroed; only frame 0's
      ovector region is re-marked unset (pcre2_match.c:7079-7083). *)
   (match
@@ -243,7 +247,7 @@ let test_4 () =
   | Error _ -> assert false
   | Ok a ->
       assert a.holds_scratch;
-      assert (a.frames == !scratch_arena);
+      assert (a.frames == (slot ()).arena);
       assert (Int.equal a.frames.(slot_ecode) 424242);
       for i = slot_ovector to a.frame_size_ints - 1 do
         assert (Int.equal a.frames.(i) unset)
@@ -258,9 +262,9 @@ let test_4 () =
   | Error _ -> assert false
   | Ok a ->
       assert a.holds_scratch;
-      assert (not (a.frames == !scratch_arena));
+      assert (not (a.frames == (slot ()).arena));
       release a;
-      assert (!scratch_arena == a.frames));
+      assert ((slot ()).arena == a.frames));
   (* Retention cap: an arena grown past [scratch_max_retained_ints]
      (simulated here by re-pointing [frames] like [grow] does) is dropped
      at release instead of staying pinned in the slot. *)
@@ -272,11 +276,11 @@ let test_4 () =
       assert a.holds_scratch;
       a.frames <- Array.make (scratch_max_retained_ints + 1) 0;
       release a;
-      assert (not (Atomic.get scratch_busy));
-      assert (Int.equal (Array.length !scratch_arena) 0));
+      assert (not (slot ()).in_use);
+      assert (Int.equal (Array.length (slot ()).arena) 0));
   (* The slot is back to its pristine state. *)
-  assert (Int.equal (Array.length !scratch_arena) 0);
-  assert (not (Atomic.get scratch_busy))
+  assert (Int.equal (Array.length (slot ()).arena) 0);
+  assert (not (slot ()).in_use)
 
 let tests =
   [

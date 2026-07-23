@@ -4,4 +4,23 @@
 
 (library
  (name pcre2_engine)
- (public_name pcre2.engine))
+ (public_name pcre2.engine)
+ ; [dls_compat_4]/[dls_compat_5] are version variants copied to [dls_compat]
+ ; by the rules below; only the generated copy is compiled into the library.
+ (modules
+  (:standard \ dls_compat_4 dls_compat_5)))
+
+; Per-domain-storage shim: [Domain.DLS] on OCaml >= 5.0, a plain global cell
+; on 4.x (single-domain runtime, so contention-free). Keeps the library's
+; ocaml >= 4.14 support while enabling the per-domain scratch fix on 5.x.
+(rule
+ (enabled_if
+  (>= %{ocaml_version} 5.0.0))
+ (action
+  (copy dls_compat_5.ml dls_compat.ml)))
+
+(rule
+ (enabled_if
+  (< %{ocaml_version} 5.0.0))
+ (action
+  (copy dls_compat_4.ml dls_compat.ml)))
