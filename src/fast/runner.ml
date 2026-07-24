@@ -852,57 +852,57 @@ let setup_rep (mb : mb) (pc : int) : unit =
   (* safe (every unsafe_get on [code] below): [pc] is a repeat instruction head
      — the verifier (always-on in Fast.compile, ir_verify.ml) proves its tag +
      operands (widths up to +6 for the caseless/prop forms) fit in [code]. *)
-  let tag = (Array.unsafe_get code (pc)) in
+  let tag = (Array.get code (pc)) in
   mb.rep_pc <- pc;
-  mb.rep_reptype <- (Array.unsafe_get code (pc + 1));
-  mb.rep_lmin <- (Array.unsafe_get code (pc + 2));
-  mb.rep_lmax <- (Array.unsafe_get code (pc + 3));
+  mb.rep_reptype <- (Array.get code (pc + 1));
+  mb.rep_lmin <- (Array.get code (pc + 2));
+  mb.rep_lmax <- (Array.get code (pc + 3));
   if Int.equal tag 18 (* t_rep *) then (
     mb.rep_kind <- rk_char;
-    mb.rep_c1 <- (Array.unsafe_get code (pc + 4));
-    mb.rep_c2 <- (Array.unsafe_get code (pc + 4));
+    mb.rep_c1 <- (Array.get code (pc + 4));
+    mb.rep_c2 <- (Array.get code (pc + 4));
     mb.rep_want <- true;
     mb.rep_ci <- false;
     mb.rep_cont <- pc + 5)
   else if Int.equal tag 19 (* t_repi *) then (
     mb.rep_kind <- rk_char;
-    mb.rep_c1 <- (Array.unsafe_get code (pc + 4));
-    mb.rep_c2 <- (Array.unsafe_get code (pc + 5));
+    mb.rep_c1 <- (Array.get code (pc + 4));
+    mb.rep_c2 <- (Array.get code (pc + 5));
     mb.rep_want <- true;
     mb.rep_ci <- true;
     mb.rep_cont <- pc + 6)
   else if Int.equal tag 20 (* t_notrep *) then (
     mb.rep_kind <- rk_char;
-    mb.rep_c1 <- (Array.unsafe_get code (pc + 4));
-    mb.rep_c2 <- (Array.unsafe_get code (pc + 4));
+    mb.rep_c1 <- (Array.get code (pc + 4));
+    mb.rep_c2 <- (Array.get code (pc + 4));
     mb.rep_want <- false;
     mb.rep_ci <- false;
     mb.rep_cont <- pc + 5)
   else if Int.equal tag 21 (* t_notrepi *) then (
     mb.rep_kind <- rk_char;
-    mb.rep_c1 <- (Array.unsafe_get code (pc + 4));
-    mb.rep_c2 <- (Array.unsafe_get code (pc + 5));
+    mb.rep_c1 <- (Array.get code (pc + 4));
+    mb.rep_c2 <- (Array.get code (pc + 5));
     mb.rep_want <- false;
     mb.rep_ci <- true;
     mb.rep_cont <- pc + 6)
   else if Int.equal tag 31 (* t_class_rep *) then (
     mb.rep_kind <- rk_class;
-    mb.rep_map_off <- (Array.unsafe_get code (pc + 4));
+    mb.rep_map_off <- (Array.get code (pc + 4));
     mb.rep_cont <- pc + 5)
   else if Int.equal tag 58 (* t_xclass_rep *) then (
     (* Chunk I — store the XCLASS data offset in rep_map_off (reused as an int
        byte offset); rep_unit_utf matches via Xclass.xclass. *)
     mb.rep_kind <- rk_xclass;
-    mb.rep_map_off <- (Array.unsafe_get code (pc + 4));
+    mb.rep_map_off <- (Array.get code (pc + 4));
     mb.rep_cont <- pc + 5)
   else if Int.equal tag 60 (* t_prop_rep *) then (
     (* Chunk I2 — property repeat (pcre2_match.c:2708-2714): rep_want is the
        POSITIVE sense (OP_PROP), false for OP_NOTPROP; ptype/pdata feed
        prop_test per unit. *)
     mb.rep_kind <- rk_prop;
-    mb.rep_want <- Int.equal (Array.unsafe_get code (pc + 4)) 0;
-    mb.rep_ptype <- (Array.unsafe_get code (pc + 5));
-    mb.rep_pdata <- (Array.unsafe_get code (pc + 6));
+    mb.rep_want <- Int.equal (Array.get code (pc + 4)) 0;
+    mb.rep_ptype <- (Array.get code (pc + 5));
+    mb.rep_pdata <- (Array.get code (pc + 6));
     mb.rep_cont <- pc + 7)
   else if Int.equal tag 62 (* t_extuni_rep *) then (
     (* Chunk I2 — \X repeat: cluster-wise dedicated loops. *)
@@ -910,7 +910,7 @@ let setup_rep (mb : mb) (pc : int) : unit =
     mb.rep_cont <- pc + 4)
   else (
     (* tag 30 t_type_rep — map the C type opcode to a rep_kind + payload. *)
-    let ct = (Array.unsafe_get code (pc + 4)) in
+    let ct = (Array.get code (pc + 4)) in
     mb.rep_cont <- pc + 5;
     if Int.equal ct Opcodes.op_digit then (
       mb.rep_kind <- rk_ctype;
@@ -1019,8 +1019,8 @@ let rep_fail_pos (mb : mb) (p : int) (minimize : bool) : int =
    head (verifier-proven, ir_verify.ml); a t_type_rep (tag 30) has arity 5, so
    rep_pc+4 is in range, and the tag guard short-circuits any other family. *)
 let is_anynl_rep (mb : mb) (rep_pc : int) : bool =
-  Int.equal (Array.unsafe_get mb.code (rep_pc)) 30 (* t_type_rep *)
-  && Int.equal (Array.unsafe_get mb.code (rep_pc + 4)) Opcodes.op_anynl
+  Int.equal (Array.get mb.code (rep_pc)) 30 (* t_type_rep *)
+  && Int.equal (Array.get mb.code (rep_pc + 4)) Opcodes.op_anynl
 
 (* GETCHARINCTEST(fc, Feptr); Feptr = PRIV(extuni)(fc, Feptr,
    mb->start_subject, mb->end_subject, utf, NULL) — the shared body of the
@@ -1088,7 +1088,7 @@ let extuni_back (mb : mb) (floor : int) (pos : int) : int =
    (cold give-back path only, chunk I2). safe: [rep_pc] is a repeat head, so
    reading its tag is in range (verifier-proven, ir_verify.ml). *)
 let is_extuni_rep (mb : mb) (rep_pc : int) : bool =
-  Int.equal (Array.unsafe_get mb.code (rep_pc)) 62 (* t_extuni_rep *)
+  Int.equal (Array.get mb.code (rep_pc)) 62 (* t_extuni_rep *)
 
 (* The corrected greedy give-back position for a maximizing repeat
    (pcre2_match.c:4963-4967 / RM34). [x] is the candidate position after one
@@ -1181,10 +1181,10 @@ let push_cont (mb : mb) (sp : int) (target : int) (eptr : int) (rdepth : int) :
   if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
   let d = ss.Save_stack.data in
   (* safe: [grow] ensured Array.length d >= sp + width_cont. *)
-  Array.unsafe_set d sp target;
-  Array.unsafe_set d (sp + 1) eptr;
-  Array.unsafe_set d (sp + 2) rdepth;
-  Array.unsafe_set d (sp + 3) Save_stack.kind_cont
+  Array.set d sp target;
+  Array.set d (sp + 1) eptr;
+  Array.set d (sp + 2) rdepth;
+  Array.set d (sp + 3) Save_stack.kind_cont
 
 (* Push a KIND_VERB record [vtype; aux; eptr; old_mark; KIND_VERB] at [sp]
    (chunk H, fast-design.md §3). Cold (verb forward path only). *)
@@ -1195,11 +1195,11 @@ let push_verb (mb : mb) (sp : int) (vtype : int) (aux : int) (eptr : int)
   if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
   let d = ss.Save_stack.data in
   (* safe: [grow] ensured Array.length d >= sp + width_verb. *)
-  Array.unsafe_set d sp vtype;
-  Array.unsafe_set d (sp + 1) aux;
-  Array.unsafe_set d (sp + 2) eptr;
-  Array.unsafe_set d (sp + 3) old_mark;
-  Array.unsafe_set d (sp + 4) Save_stack.kind_verb
+  Array.set d sp vtype;
+  Array.set d (sp + 1) aux;
+  Array.set d (sp + 2) eptr;
+  Array.set d (sp + 3) old_mark;
+  Array.set d (sp + 4) Save_stack.kind_verb
 
 (* pcre2_match.c:919-940 (interpreter.ml op_end_tail :3442-3485) — record a
    successful whole-pattern match (shared by OP_END and OP_ACCEPT): the whole
@@ -1268,16 +1268,16 @@ let push_once (mb : mb) (sp : int) (eptr : int) (rdepth : int) (cont : int)
      (a ( *ACCEPT) reaching this boundary jumps there — the innermost active
      assertion, not necessarily the ACCEPT's lexical one). *)
   for i = 2 to nov - 1 do
-    Array.unsafe_set d (sp + i - 2) (Array.unsafe_get ov i)
+    Array.set d (sp + i - 2) (Array.get ov i)
   done;
-  Array.unsafe_set d (sp + nov - 2) mb.once_base (* prev_once_base *);
-  Array.unsafe_set d (sp + nov - 1) mb.mark (* saved_mark *);
-  Array.unsafe_set d (sp + nov) eptr (* entry_eptr *);
-  Array.unsafe_set d (sp + nov + 1) rdepth (* entry_rdepth *);
-  Array.unsafe_set d (sp + nov + 2) mb.start_match (* saved_start_match *);
-  Array.unsafe_set d (sp + nov + 3) cont;
-  Array.unsafe_set d (sp + nov + 4) subtype;
-  Array.unsafe_set d (sp + nov + 5) Save_stack.kind_once;
+  Array.set d (sp + nov - 2) mb.once_base (* prev_once_base *);
+  Array.set d (sp + nov - 1) mb.mark (* saved_mark *);
+  Array.set d (sp + nov) eptr (* entry_eptr *);
+  Array.set d (sp + nov + 1) rdepth (* entry_rdepth *);
+  Array.set d (sp + nov + 2) mb.start_match (* saved_start_match *);
+  Array.set d (sp + nov + 3) cont;
+  Array.set d (sp + nov + 4) subtype;
+  Array.set d (sp + nov + 5) Save_stack.kind_once;
   (* Chunk K2 — a NON-ATOMIC positive assertion's KIND_ONCE does NOT enter the
      once_base chain ([set_base] = false): the atomic COMMIT never targets it and
      its body is re-enterable (once_base cannot follow a single boundary across
@@ -1300,7 +1300,7 @@ let once_commit (mb : mb) : int =
   let d = mb.ss.Save_stack.data in
   (* safe: [base] is a KIND_ONCE record base (set by push_once); base + nov - 2
      is its prev_once_base slot. Width nov+6 (chunk K2). *)
-  mb.once_base <- Array.unsafe_get d (base + nov - 2);
+  mb.once_base <- Array.get d (base + nov - 2);
   base + nov + 6
 
 (* Push a KIND_NASSERT boundary at [sp]: snapshot ov[2, 2*oveccount) + the
@@ -1324,16 +1324,16 @@ let push_nassert (mb : mb) (sp : int) (cont : int) (eptr : int) (rdepth : int) :
      pad(nov+4); KIND_NASSERT(nov+5)]. The pad keeps the width = KIND_ONCE's
      (nov+6) so COND_ASSERT_MATCH can convert this record in place. *)
   for i = 2 to nov - 1 do
-    Array.unsafe_set d (sp + i - 2) (Array.unsafe_get ov i)
+    Array.set d (sp + i - 2) (Array.get ov i)
   done;
-  Array.unsafe_set d (sp + nov - 2) mb.once_base (* prev_once_base *);
-  Array.unsafe_set d (sp + nov - 1) cont;
-  Array.unsafe_set d (sp + nov) eptr;
-  Array.unsafe_set d (sp + nov + 1) rdepth;
-  Array.unsafe_set d (sp + nov + 2) mb.mark (* saved_mark *);
-  Array.unsafe_set d (sp + nov + 3) mb.start_match (* saved_start_match *);
-  Array.unsafe_set d (sp + nov + 4) 0 (* pad *);
-  Array.unsafe_set d (sp + nov + 5) Save_stack.kind_nassert;
+  Array.set d (sp + nov - 2) mb.once_base (* prev_once_base *);
+  Array.set d (sp + nov - 1) cont;
+  Array.set d (sp + nov) eptr;
+  Array.set d (sp + nov + 1) rdepth;
+  Array.set d (sp + nov + 2) mb.mark (* saved_mark *);
+  Array.set d (sp + nov + 3) mb.start_match (* saved_start_match *);
+  Array.set d (sp + nov + 4) 0 (* pad *);
+  Array.set d (sp + nov + 5) Save_stack.kind_nassert;
   mb.once_base <- sp;
   need
 
@@ -1356,16 +1356,16 @@ let push_pos (mb : mb) (sp : int) (eptr : int) (rdepth : int) (zero_allowed : in
   let ov = mb.ovector in
   (* safe: [grow] ensured length >= sp + nov + 6. *)
   for i = 2 to nov - 1 do
-    Array.unsafe_set d (sp + i - 2) (Array.unsafe_get ov i)
+    Array.set d (sp + i - 2) (Array.get ov i)
   done;
-  Array.unsafe_set d (sp + nov - 2) mb.once_base (* prev_once_base *);
-  Array.unsafe_set d (sp + nov - 1) eptr (* iter_start *);
-  Array.unsafe_set d (sp + nov) 0 (* matched_once *);
-  Array.unsafe_set d (sp + nov + 1) zero_allowed;
-  Array.unsafe_set d (sp + nov + 2) rdepth (* entry_rdepth *);
-  Array.unsafe_set d (sp + nov + 3) mb.mark (* saved_mark *);
-  Array.unsafe_set d (sp + nov + 4) mb.start_match (* saved_start_match *);
-  Array.unsafe_set d (sp + nov + 5) Save_stack.kind_pos;
+  Array.set d (sp + nov - 2) mb.once_base (* prev_once_base *);
+  Array.set d (sp + nov - 1) eptr (* iter_start *);
+  Array.set d (sp + nov) 0 (* matched_once *);
+  Array.set d (sp + nov + 1) zero_allowed;
+  Array.set d (sp + nov + 2) rdepth (* entry_rdepth *);
+  Array.set d (sp + nov + 3) mb.mark (* saved_mark *);
+  Array.set d (sp + nov + 4) mb.start_match (* saved_start_match *);
+  Array.set d (sp + nov + 5) Save_stack.kind_pos;
   mb.once_base <- sp;
   need
 
@@ -1392,17 +1392,17 @@ let snapshot_arrays (mb : mb) (d : int array) (base : int) : unit =
   let ng = mb.n_groups in
   let ov = mb.ovector in
   for i = 2 to nov - 1 do
-    Array.unsafe_set d (base + i - 2) (Array.unsafe_get ov i)
+    Array.set d (base + i - 2) (Array.get ov i)
   done;
   let gbase = base + (nov - 2) in
   let gs = mb.group_start in
   for i = 0 to ng - 1 do
-    Array.unsafe_set d (gbase + i) (Array.unsafe_get gs i)
+    Array.set d (gbase + i) (Array.get gs i)
   done;
   let cbase = gbase + ng in
   let cs = mb.cap_start in
   for i = 0 to nov - 1 do
-    Array.unsafe_set d (cbase + i) (Array.unsafe_get cs i)
+    Array.set d (cbase + i) (Array.get cs i)
   done
 
 (* Restore mb.{ovector[2,nov); group_start; cap_start} FROM [d] at [base]. The
@@ -1417,17 +1417,17 @@ let restore_arrays (mb : mb) (d : int array) (base : int) : unit =
   let ng = mb.n_groups in
   let ov = mb.ovector in
   for i = 2 to nov - 1 do
-    Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+    Array.set ov i (Array.get d (base + i - 2))
   done;
   let gbase = base + (nov - 2) in
   let gs = mb.group_start in
   for i = 0 to ng - 1 do
-    Array.unsafe_set gs i (Array.unsafe_get d (gbase + i))
+    Array.set gs i (Array.get d (gbase + i))
   done;
   let cbase = gbase + ng in
   let cs = mb.cap_start in
   for i = 0 to nov - 1 do
-    Array.unsafe_set cs i (Array.unsafe_get d (cbase + i))
+    Array.set cs i (Array.get d (cbase + i))
   done
 
 (* Push a FAT KIND_RECURSE record at [sp] (fast-design.md §3): snapshot the WHOLE
@@ -1445,16 +1445,16 @@ let push_recurse (mb : mb) (sp : int) (number : int) (call_eptr : int)
   (* safe: [grow] ensured the whole record fits. *)
   snapshot_arrays mb d sp;
   let f = sp + recurse_tail_off mb in
-  Array.unsafe_set d f mb.once_base;
-  Array.unsafe_set d (f + 1) mb.current_recurse;
-  Array.unsafe_set d (f + 2) mb.recurse_base;
-  Array.unsafe_set d (f + 3) mb.mark;
-  Array.unsafe_set d (f + 4) number;
-  Array.unsafe_set d (f + 5) call_eptr;
-  Array.unsafe_set d (f + 6) mb.last_used_ptr;
-  Array.unsafe_set d (f + 7) cont_pc;
-  Array.unsafe_set d (f + 8) mb.start_match (* saved_start_match, chunk K2 *);
-  Array.unsafe_set d (f + 9) Save_stack.kind_recurse;
+  Array.set d f mb.once_base;
+  Array.set d (f + 1) mb.current_recurse;
+  Array.set d (f + 2) mb.recurse_base;
+  Array.set d (f + 3) mb.mark;
+  Array.set d (f + 4) number;
+  Array.set d (f + 5) call_eptr;
+  Array.set d (f + 6) mb.last_used_ptr;
+  Array.set d (f + 7) cont_pc;
+  Array.set d (f + 8) mb.start_match (* saved_start_match, chunk K2 *);
+  Array.set d (f + 9) Save_stack.kind_recurse;
   mb.recurse_base <- sp;
   mb.current_recurse <- number;
   need
@@ -1466,11 +1466,11 @@ let restore_recurse (mb : mb) (b : int) : unit =
   let d = mb.ss.Save_stack.data in
   restore_arrays mb d b;
   let f = b + recurse_tail_off mb in
-  mb.once_base <- Array.unsafe_get d f;
-  mb.current_recurse <- Array.unsafe_get d (f + 1);
-  mb.recurse_base <- Array.unsafe_get d (f + 2);
-  mb.mark <- Array.unsafe_get d (f + 3);
-  mb.start_match <- Array.unsafe_get d (f + 8) (* revert \K, chunk K2 *)
+  mb.once_base <- Array.get d f;
+  mb.current_recurse <- Array.get d (f + 1);
+  mb.recurse_base <- Array.get d (f + 2);
+  mb.mark <- Array.get d (f + 3);
+  mb.start_match <- Array.get d (f + 8) (* revert \K, chunk K2 *)
 
 (* pcre2_match.c:5438-5453 — the RECURSELOOP walk. Called only when already in a
    recursion (mb.current_recurse >= 0). Walk the chain of open KIND_RECURSE
@@ -1486,13 +1486,13 @@ let rec recurse_loop_walk (d : int array) (toff : int) (number : int)
   if base < 0 then false
   else
     let f = base + toff in
-    if Int.equal (Array.unsafe_get d (f + 4)) number then
-      Int.equal eptr (Array.unsafe_get d (f + 5))
-      && Int.equal last_used (Array.unsafe_get d (f + 6))
+    if Int.equal (Array.get d (f + 4)) number then
+      Int.equal eptr (Array.get d (f + 5))
+      && Int.equal last_used (Array.get d (f + 6))
       && not disabled
     else
       (recurse_loop_walk [@tailcall]) d toff number eptr last_used disabled
-        (Array.unsafe_get d (f + 2))
+        (Array.get d (f + 2))
 
 let recurse_loop_check (mb : mb) (number : int) (eptr : int) : bool =
   recurse_loop_walk mb.ss.Save_stack.data (recurse_tail_off mb) number eptr
@@ -1598,7 +1598,7 @@ let match_ref (mb : mb) (ovbase : int) (caseless : bool) (eptr : int) : int =
      Array.length ov. *)
   (* pcre2_match.c:372-380 — unset group: no match, unless MATCH_UNSET_BACKREF
      (then an empty match). *)
-  if Int.equal (Array.unsafe_get ov ovbase) Frames.unset then
+  if Int.equal (Array.get ov ovbase) Frames.unset then
     if mb.match_unset_backref then (
       mb.ref_length <- 0;
       0)
@@ -1606,8 +1606,8 @@ let match_ref (mb : mb) (ovbase : int) (caseless : bool) (eptr : int) : int =
   else
     (* pcre2_match.c:384-386 — p = start_subject + Fovector[offset]; length =
        Fovector[offset+1] - Fovector[offset]. *)
-    let p = mb.start_subject + Array.unsafe_get ov ovbase in
-    let length = Array.unsafe_get ov (ovbase + 1) - Array.unsafe_get ov ovbase in
+    let p = mb.start_subject + Array.get ov ovbase in
+    let length = Array.get ov (ovbase + 1) - Array.get ov ovbase in
     if caseless then
       if mb.utf || mb.ucp then
         (* pcre2_match.c:388-434 — the SUPPORT_UNICODE utf/ucp fold (chunk
@@ -1647,7 +1647,7 @@ let rec dnref_scan (mb : mb) (remaining : int) (slot : int) : int =
   else if
     (* safe: ovbase = 2N, 1 <= N <= top_bracket (compiler-generated name-table
        group number), so ovbase < 2*oveccount = Array.length mb.ovector. *)
-    not (Int.equal (Array.unsafe_get mb.ovector ovbase) Frames.unset)
+    not (Int.equal (Array.get mb.ovector ovbase) Frames.unset)
   then ovbase (* first set group *)
   else (dnref_scan [@tailcall]) mb (remaining - 1) (slot + mb.name_entry_size)
 
@@ -1665,7 +1665,7 @@ let rec dncref_test (mb : mb) (remaining : int) (slot : int) : bool =
        inside name_table (like t_dnref). *)
     let ovbase = Compile.get2 mb.name_table slot lsl 1 (* 2N *) in
     (* safe: ovbase = 2N, 1 <= N <= top_bracket, so ovbase < Array.length ovector. *)
-    if not (Int.equal (Array.unsafe_get mb.ovector ovbase) Frames.unset) then true
+    if not (Int.equal (Array.get mb.ovector ovbase) Frames.unset) then true
     else (dncref_test [@tailcall]) mb (remaining - 1) (slot + mb.name_entry_size)
 
 (* pcre2_match.c:5656-5664 (interpreter.ml dnrref_scan :6649-6660) — the
@@ -1694,19 +1694,19 @@ let setup_ref_rep (mb : mb) (pc : int) : unit =
   (* safe (every unsafe_get on [code] below): [pc] is a REF_REP/DNREF_REP head
      whose tag + operands (up to +6) the verifier proved fit in [code]
      (ir_verify.ml). *)
-  let tag = (Array.unsafe_get code (pc)) in
+  let tag = (Array.get code (pc)) in
   mb.ref_pc <- pc;
-  mb.ref_reptype <- (Array.unsafe_get code (pc + 1));
-  mb.ref_lmin <- (Array.unsafe_get code (pc + 2));
-  mb.ref_lmax <- (Array.unsafe_get code (pc + 3));
+  mb.ref_reptype <- (Array.get code (pc + 1));
+  mb.ref_lmin <- (Array.get code (pc + 2));
+  mb.ref_lmax <- (Array.get code (pc + 3));
   if Int.equal tag 33 (* t_ref_rep *) then (
-    mb.ref_ovbase <- (Array.unsafe_get code (pc + 4));
-    mb.ref_caseless <- Int.equal (Array.unsafe_get code (pc + 5)) 1;
+    mb.ref_ovbase <- (Array.get code (pc + 4));
+    mb.ref_caseless <- Int.equal (Array.get code (pc + 5)) 1;
     mb.ref_cont <- pc + 6)
   else (
     (* tag 35 t_dnref_rep. *)
-    mb.ref_ovbase <- dnref_scan mb (Array.unsafe_get code (pc + 5)) (Array.unsafe_get code (pc + 4));
-    mb.ref_caseless <- Int.equal (Array.unsafe_get code (pc + 6)) 1;
+    mb.ref_ovbase <- dnref_scan mb (Array.get code (pc + 5)) (Array.get code (pc + 4));
+    mb.ref_caseless <- Int.equal (Array.get code (pc + 6)) 1;
     mb.ref_cont <- pc + 7)
 
 (* pcre2_match.c:5177-5182 (interpreter.ml ref_max_rescan) — the RM22 resume's
@@ -1819,7 +1819,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
      opcode switch); every literal — here and at the two ALT-detection sites
      (the BRA arm and [backtrack]) — is pinned against its Ir.t_* constant by
      the module-initialization asserts at the bottom of this file. *)
-  let tag = Array.unsafe_get code pc in
+  let tag = Array.get code pc in
   match tag with
   | 1 ->
       (* CHAR_RUN (fast-design.md §2; OP_CHAR arm) — fused caseful run.
@@ -1830,8 +1830,8 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          [char_run_cmp]. The `len >= 8` gate uses the already-loaded [len], so a
          short run pays ONE comparison over the pre-chunk-M dispatch. Both paths
          return the identical result (attempt-set-neutral). *)
-      let lit_off = (Array.unsafe_get code (pc + 1)) in
-      let len = (Array.unsafe_get code (pc + 2)) in
+      let lit_off = (Array.get code (pc + 1)) in
+      let len = (Array.get code (pc + 2)) in
       let e =
         if Int.equal len 1 then
           (* M11 chunk N — single-code-unit literal (the ubiquitous CHAR_RUN:
@@ -1875,7 +1875,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
         let r = scheck_partial mb eptr in
         if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
       else
-        let pch = (Array.unsafe_get code (pc + 1)) in
+        let pch = (Array.get code (pc + 1)) in
         if mb.utf && pch >= 128 then (
           (* pcre2_match.c:1061-1072 (interpreter.ml:1571-1587) — UTF, pattern
              char whose other case may be > 127: read the subject char
@@ -1918,7 +1918,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          interpreter.ml:2416-2432 / pcre2_match.c:5349-5372); nested it runs
          in the same frame (bra_loop last branch). A multi-branch group's
          first branch is handled by the following ALT (which always ticks). *)
-      if Int.equal (Array.unsafe_get code (pc + 1)) 5 (* next head is ALT *) then
+      if Int.equal (Array.get code (pc + 1)) 5 (* next head is ALT *) then
         (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
       else if Int.equal rdepth 0 then
         (* top-level single/last branch: grouploop tick (frame index 1). *)
@@ -1934,7 +1934,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          than reaching END. current_recurse = 0 arises only inside a group-0
          recursion, so normal matching (current_recurse = -1) falls straight
          through. *)
-      if Int.equal mb.current_recurse 0 && Int.equal (Array.unsafe_get code (pc + 1)) 0 (* END *)
+      if Int.equal mb.current_recurse 0 && Int.equal (Array.get code (pc + 1)) 0 (* END *)
       then (recurse_return [@tailcall]) mb eptr sp rdepth mcc
       else (run [@tailcall]) mb (pc + 1) eptr sp rdepth mcc
   | 5 ->
@@ -1942,7 +1942,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          (bra_loop/grouploop record a backtracking point, RM1/RM2). Tick +
          enter a child frame (rdepth+1), push the save record [handler; eptr;
          rdepth], fall through into the branch body. *)
-      let handler = (Array.unsafe_get code (pc + 1)) in
+      let handler = (Array.get code (pc + 1)) in
       let mcc' = tick_child mb mcc (rdepth + 1) in
       if mcc' < 0 then mcc'
       else (
@@ -1955,17 +1955,17 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
            KIND_ALT]. [then_end] is this ALT's THEN scope boundary
            (mb.alt_then_end.(pc)); the hot NOMATCH backtrack reads only
            handler/eptr/rdepth at slots 0/1/2. *)
-        Array.unsafe_set d sp handler;
-        Array.unsafe_set d (sp + 1) eptr;
-        Array.unsafe_set d (sp + 2) rdepth;
-        Array.unsafe_set d (sp + 3) (Array.unsafe_get mb.alt_then_end pc);
-        Array.unsafe_set d (sp + 4) Save_stack.kind_alt;
+        Array.set d sp handler;
+        Array.set d (sp + 1) eptr;
+        Array.set d (sp + 2) rdepth;
+        Array.set d (sp + 3) (Array.get mb.alt_then_end pc);
+        Array.set d (sp + 4) Save_stack.kind_alt;
         (run [@tailcall]) mb (pc + 2) eptr need (rdepth + 1) mcc')
   | 6 ->
       (* JMP (fast-design.md §2) — end-of-branch jump to the group KET; the
          branch matched, so skip the remaining alternatives. rdepth is
          unchanged (the branch's child frame carries the continuation). *)
-      (run [@tailcall]) mb (Array.unsafe_get code (pc + 1)) eptr sp rdepth mcc
+      (run [@tailcall]) mb (Array.get code (pc + 1)) eptr sp rdepth mcc
   | 7 ->
       (* SOD \A (pcre2_match.c:6139-6142 / interpreter.ml:3082-3088). *)
       if not (Int.equal eptr mb.start_subject) then
@@ -2047,7 +2047,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          cleanup record saving the group's current ovector pair, then set the
          start slot to the current position (used directly as the in-progress
          start, valid because the group is optimized). No tick. *)
-      let ovb = (Array.unsafe_get code (pc + 1)) in
+      let ovb = (Array.get code (pc + 1)) in
       let ss = mb.ss in
       let need = sp + Save_stack.width_cap in
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
@@ -2055,18 +2055,18 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       let ov = mb.ovector in
       (* safe: [grow] ensured length >= sp + width_cap; ovb in [2, 2*top]
          (Ir_verify), so ovb, ovb+1 < 2*oveccount = Array.length ov. *)
-      Array.unsafe_set d sp ovb;
-      Array.unsafe_set d (sp + 1) (Array.unsafe_get ov ovb);
-      Array.unsafe_set d (sp + 2) (Array.unsafe_get ov (ovb + 1));
-      Array.unsafe_set d (sp + 3) Save_stack.kind_cap;
-      Array.unsafe_set ov ovb (eptr - mb.start_subject);
+      Array.set d sp ovb;
+      Array.set d (sp + 1) (Array.get ov ovb);
+      Array.set d (sp + 2) (Array.get ov (ovb + 1));
+      Array.set d (sp + 3) Save_stack.kind_cap;
+      Array.set ov ovb (eptr - mb.start_subject);
       (run [@tailcall]) mb (pc + 2) eptr need rdepth mcc
   | 17 ->
       (* CAP_END (fast-design.md §3; the CBRA/SCBRA ket write
          pcre2_match.c:6077-6084) — close capture group N: record the end
          position. offset_top (the rc high-water) is recomputed at END. No
          tick (the C ket carries on at the same level). *)
-      let ovb = (Array.unsafe_get code (pc + 1)) in
+      let ovb = (Array.get code (pc + 1)) in
       (* Chunk K1b — when this capture's group N (= ovb/2) is the one currently
          being recursed (mb.current_recurse == N), the ket is a recursion RETURN
          (pcre2_match.c:6065-6074), NOT a capture write: group N does not capture
@@ -2077,7 +2077,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
         (recurse_return [@tailcall]) mb eptr sp rdepth mcc
       else (
         (* safe: ovb+1 < 2*oveccount = Array.length mb.ovector (Ir_verify). *)
-        Array.unsafe_set mb.ovector (ovb + 1) (eptr - mb.start_subject);
+        Array.set mb.ovector (ovb + 1) (eptr - mb.start_subject);
         (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc)
   | 18 | 19 | 20 | 21 | 30 | 31 ->
       (* Repeat superinstructions (fast-design.md §2/§4): char (18-21;
@@ -2087,7 +2087,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       (op_repeat [@tailcall]) mb pc eptr sp rdepth mcc
   | 27 ->
       (* TYPE (fast-design.md §2/§4) — a single character type. *)
-      (op_single_type [@tailcall]) mb pc (Array.unsafe_get code (pc + 1)) eptr sp rdepth mcc
+      (op_single_type [@tailcall]) mb pc (Array.get code (pc + 1)) eptr sp rdepth mcc
   | 28 ->
       (* CLASS (fast-design.md §2) — a single 32-byte-bitmap class test
          (OP_CLASS/OP_NCLASS, pcre2_match.c:1933-1972; in non-UTF a lone class
@@ -2099,7 +2099,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
         (* Chunk I — UTF: decode the code point; a code point > 255 matches only
            OP_NCLASS (interpreter.ml:4463-4468). safe: eptr < end_subject. *)
         let cp = cur_cp mb eptr in
-        if class_cp_match mb (Array.unsafe_get code (pc + 1)) cp then
+        if class_cp_match mb (Array.get code (pc + 1)) cp then
           (run [@tailcall]) mb (pc + 2) (eptr + cp_len mb eptr) sp rdepth mcc
         else
           (* Chunk K1b — the C's class loop GETCHARINCs before the bitmap test
@@ -2109,7 +2109,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       else
         (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
         let cc = Char.code (String.unsafe_get mb.subject eptr) in
-        if class_bit_at mb (Array.unsafe_get code (pc + 1)) cc then
+        if class_bit_at mb (Array.get code (pc + 1)) cc then
           (run [@tailcall]) mb (pc + 2) (eptr + 1) sp rdepth mcc
         else
           (* Chunk K1b — fc = *Feptr++ before the test (pcre2_match.c:2006):
@@ -2119,14 +2119,14 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       (* XCLASS (chunk I; OP_XCLASS single, pcre2_match.c:2175-2224) — a lone
          extended class (lmin=lmax=1: one character, no choice point, no tick).
          Read the code point and test via the self-contained Xclass.xclass
-         against the class data offset ((Array.unsafe_get code (pc+1))). *)
+         against the class data offset ((Array.get code (pc+1))). *)
       if eptr >= mb.end_subject then (
         let r = scheck_partial mb eptr in
         if r < 0 then r else (bt [@tailcall]) mb eptr sp mcc)
       else
         (* safe: eptr < mb.end_subject <= String.length mb.subject. *)
         let cp = cur_cp mb eptr in
-        if Xclass.xclass cp mb.bytecode (Array.unsafe_get code (pc + 1)) mb.utf then
+        if Xclass.xclass cp mb.bytecode (Array.get code (pc + 1)) mb.utf then
           (run [@tailcall]) mb (pc + 2) (eptr + cp_len mb eptr) sp rdepth mcc
         else
           (* Chunk K1b — GETCHARINCTEST before the xclass test
@@ -2152,8 +2152,8 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
         let fc = cur_cp mb eptr in
         if
           Bool.equal
-            (prop_test fc (Array.unsafe_get code (pc + 2)) (Array.unsafe_get code (pc + 3)))
-            (Int.equal (Array.unsafe_get code (pc + 1)) 1)
+            (prop_test fc (Array.get code (pc + 2)) (Array.get code (pc + 3)))
+            (Int.equal (Array.get code (pc + 1)) 1)
         then
           (* Chunk K1b — GETCHARINCTEST before the property test
              (pcre2_match.c:2486-2488): record the post-read position. *)
@@ -2181,7 +2181,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
   | 29 ->
       (* WORDBOUND \b / \B, ASCII or UCP per the operand's bit 1 (fast-design
          .md §2; pcre2_match.c:6250-6333 / interpreter.ml:3181-3332). *)
-      (op_wordbound [@tailcall]) mb pc (Array.unsafe_get code (pc + 1)) eptr sp rdepth mcc
+      (op_wordbound [@tailcall]) mb pc (Array.get code (pc + 1)) eptr sp rdepth mcc
   | 22 ->
       (* GROUP_START (fast-design.md §3; the C records the group-start eptr in
          the group frame's predecessor P, read at the ket, pcre2_match.c:6081/
@@ -2189,17 +2189,17 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          loop check, saving the enclosing iteration's start in a KIND_GSTART
          record so backtracking into an earlier iteration's branch restores it
          (the C keeps each iteration's start in its own frame). No tick. *)
-      let g = (Array.unsafe_get code (pc + 1)) in
+      let g = (Array.get code (pc + 1)) in
       let ss = mb.ss in
       let need = sp + Save_stack.width_gstart in
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
       let d = ss.Save_stack.data in
       (* safe: [grow] ensured length >= sp + width_gstart; g in [0, n_groups)
          (Ir_verify) so it indexes mb.group_start. *)
-      Array.unsafe_set d sp g;
-      Array.unsafe_set d (sp + 1) (Array.unsafe_get mb.group_start g);
-      Array.unsafe_set d (sp + 2) Save_stack.kind_gstart;
-      Array.unsafe_set mb.group_start g eptr;
+      Array.set d sp g;
+      Array.set d (sp + 1) (Array.get mb.group_start g);
+      Array.set d (sp + 2) Save_stack.kind_gstart;
+      Array.set mb.group_start g eptr;
       (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_gstart) rdepth
         mcc
   | 23 ->
@@ -2211,7 +2211,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       let mcc' = tick_child mb mcc (rdepth + 1) in
       if mcc' < 0 then mcc'
       else (
-        push_cont mb sp (Array.unsafe_get code (pc + 1)) eptr rdepth;
+        push_cont mb sp (Array.get code (pc + 1)) eptr rdepth;
         (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_cont)
           (rdepth + 1) mcc')
   | 24 ->
@@ -2224,7 +2224,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
       if mcc' < 0 then mcc'
       else (
         push_cont mb sp (pc + 2) eptr rdepth;
-        (run [@tailcall]) mb (Array.unsafe_get code (pc + 1)) eptr (sp + Save_stack.width_cont)
+        (run [@tailcall]) mb (Array.get code (pc + 1)) eptr (sp + Save_stack.width_cont)
           (rdepth + 1) mcc')
   | 25 ->
       (* KET_RMAX (fast-design.md §3/§4; OP_KETRMAX pcre2_match.c:6107-6120) —
@@ -2233,8 +2233,8 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          the loop and carry on past the group (no tick). Otherwise record a
          give-back point (KIND_CONT resuming at the continuation pc+3) and try
          one more iteration — RMATCH(bracode, RM7): tick, loop to [entry]. *)
-      let g = (Array.unsafe_get code (pc + 2)) in
-      if g >= 0 && Int.equal eptr (Array.unsafe_get mb.group_start g) then
+      let g = (Array.get code (pc + 2)) in
+      if g >= 0 && Int.equal eptr (Array.get mb.group_start g) then
         (* empty match: break the loop, continue past the group. *)
         (run [@tailcall]) mb (pc + 3) eptr sp rdepth mcc
       else
@@ -2242,7 +2242,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
         if mcc' < 0 then mcc'
         else (
           push_cont mb sp (pc + 3) eptr rdepth;
-          (run [@tailcall]) mb (Array.unsafe_get code (pc + 1)) eptr (sp + Save_stack.width_cont)
+          (run [@tailcall]) mb (Array.get code (pc + 1)) eptr (sp + Save_stack.width_cont)
             (rdepth + 1) mcc')
   | 26 ->
       (* KET_RMIN (fast-design.md §3/§4; OP_KETRMIN pcre2_match.c:6109-6114) —
@@ -2250,30 +2250,30 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          Otherwise try the rest of the pattern first — RMATCH(continuation,
          RM6): tick, run pc+3 at rdepth+1 — recording a reiteration point
          (KIND_CONT resuming at [entry]) for backtrack. *)
-      let g = (Array.unsafe_get code (pc + 2)) in
-      if g >= 0 && Int.equal eptr (Array.unsafe_get mb.group_start g) then
+      let g = (Array.get code (pc + 2)) in
+      if g >= 0 && Int.equal eptr (Array.get mb.group_start g) then
         (run [@tailcall]) mb (pc + 3) eptr sp rdepth mcc
       else
         let mcc' = tick_child mb mcc (rdepth + 1) in
         if mcc' < 0 then mcc'
         else (
-          push_cont mb sp (Array.unsafe_get code (pc + 1)) eptr rdepth;
+          push_cont mb sp (Array.get code (pc + 1)) eptr rdepth;
           (run [@tailcall]) mb (pc + 3) eptr (sp + Save_stack.width_cont)
             (rdepth + 1) mcc')
   | 32 ->
       (* REF (fast-design.md §2/§3; OP_REF single, pcre2_match.c:5045-5056) —
          match a numbered backref once, then continue. No choice point, no
          tick; on failure/partial: CHECK_PARTIAL then NOMATCH. *)
-      (op_single_ref [@tailcall]) mb (pc + 3) (Array.unsafe_get code (pc + 1))
-        (Int.equal (Array.unsafe_get code (pc + 2)) 1)
+      (op_single_ref [@tailcall]) mb (pc + 3) (Array.get code (pc + 1))
+        (Int.equal (Array.get code (pc + 2)) 1)
         eptr sp rdepth mcc
   | 34 ->
       (* DNREF (fast-design.md §2/§3; OP_DNREF single, pcre2_match.c:4994-5009 +
          5045-5056) — resolve the duplicate-named group list to the first set
          group (dnref_scan), then as REF. *)
-      let ovb = dnref_scan mb (Array.unsafe_get code (pc + 2)) (Array.unsafe_get code (pc + 1)) in
+      let ovb = dnref_scan mb (Array.get code (pc + 2)) (Array.get code (pc + 1)) in
       (op_single_ref [@tailcall]) mb (pc + 4) ovb
-        (Int.equal (Array.unsafe_get code (pc + 3)) 1)
+        (Int.equal (Array.get code (pc + 3)) 1)
         eptr sp rdepth mcc
   | 33 | 35 ->
       (* REF_REP / DNREF_REP (fast-design.md §2/§3/§4; the OP_CR* ref repeat
@@ -2286,17 +2286,17 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          slot, which must stay UNSET until CLOSE so a mid-match backref sees
          only closed values); push a KIND_CAPSTART saving the enclosing
          cap_start value. No ovector write, no tick. *)
-      let ovb = (Array.unsafe_get code (pc + 1)) in
+      let ovb = (Array.get code (pc + 1)) in
       let ss = mb.ss in
       let need = sp + Save_stack.width_capstart in
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
       let d = ss.Save_stack.data in
       (* safe: [grow] ensured length >= sp + width_capstart; ovb in [2, 2*top]
          (Ir_verify) < 2*oveccount = Array.length mb.cap_start. *)
-      Array.unsafe_set d sp ovb;
-      Array.unsafe_set d (sp + 1) (Array.unsafe_get mb.cap_start ovb);
-      Array.unsafe_set d (sp + 2) Save_stack.kind_capstart;
-      Array.unsafe_set mb.cap_start ovb (eptr - mb.start_subject);
+      Array.set d sp ovb;
+      Array.set d (sp + 1) (Array.get mb.cap_start ovb);
+      Array.set d (sp + 2) Save_stack.kind_capstart;
+      Array.set mb.cap_start ovb (eptr - mb.start_subject);
       (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_capstart) rdepth
         mcc
   | 37 ->
@@ -2307,7 +2307,7 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
          ovector[ovb+1] = current position. On backtrack past this point the
          KIND_CAP restores the pair (so a re-entered earlier iteration sees the
          group unset until it re-closes). No tick. *)
-      let ovb = (Array.unsafe_get code (pc + 1)) in
+      let ovb = (Array.get code (pc + 1)) in
       (* Chunk K1b — as t_cap_end, a recursion return of this referenced group. *)
       if Int.equal mb.current_recurse (ovb lsr 1) then
         (recurse_return [@tailcall]) mb eptr sp rdepth mcc
@@ -2319,12 +2319,12 @@ let rec run (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
         let ov = mb.ovector in
         (* safe: [grow] ensured length >= sp + width_cap; ovb, ovb+1 < 2*oveccount
            and ovb < Array.length mb.cap_start. *)
-        Array.unsafe_set d sp ovb;
-        Array.unsafe_set d (sp + 1) (Array.unsafe_get ov ovb);
-        Array.unsafe_set d (sp + 2) (Array.unsafe_get ov (ovb + 1));
-        Array.unsafe_set d (sp + 3) Save_stack.kind_cap;
-        Array.unsafe_set ov ovb (Array.unsafe_get mb.cap_start ovb);
-        Array.unsafe_set ov (ovb + 1) (eptr - mb.start_subject);
+        Array.set d sp ovb;
+        Array.set d (sp + 1) (Array.get ov ovb);
+        Array.set d (sp + 2) (Array.get ov (ovb + 1));
+        Array.set d (sp + 3) Save_stack.kind_cap;
+        Array.set ov ovb (Array.get mb.cap_start ovb);
+        Array.set ov (ovb + 1) (eptr - mb.start_subject);
         (run [@tailcall]) mb (pc + 2) eptr (sp + Save_stack.width_cap) rdepth mcc)
   | 0 ->
       (* END (fast-design.md §2; op_end_tail interpreter.ml:3416-3492 /
@@ -2388,7 +2388,7 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          floored at the subject start (5808-5813). If too close to the start,
          NOMATCH. Save the earliest consulted character (start_used_ptr
          floor), then continue. No tick, no choice point. *)
-      let number = (Array.unsafe_get code (pc + 1)) in
+      let number = (Array.get code (pc + 1)) in
       if mb.utf then (op_reverse_utf [@tailcall]) mb pc number eptr sp rdepth mcc
       else if number > eptr - mb.start_subject then
         (bt [@tailcall]) mb eptr sp mcc
@@ -2409,8 +2409,8 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          their t_group_start); its subtype (mb.once_subtype.(pc)) selects THEN
          containment vs escape at the boundary (chunk H). Chunk K2 — a NA
          positive assertion (subtype once_na_assert) does NOT set mb.once_base. *)
-      let subtype = Array.unsafe_get mb.once_subtype pc in
-      let cont = (Array.unsafe_get code (pc + 1)) (* Ir.once_cont: assertion continuation, chunk K2 *) in
+      let subtype = Array.get mb.once_subtype pc in
+      let cont = (Array.get code (pc + 1)) (* Ir.once_cont: assertion continuation, chunk K2 *) in
       let sp' =
         push_once mb sp eptr rdepth cont subtype
           (not (Int.equal subtype Ir.once_na_assert))
@@ -2432,14 +2432,14 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          (atomic=1: OP_ASSERT/OP_ASSERTBACK) also commit (like OP_ONCE); the NA
          kinds (atomic=0) keep the body's choice points (non-atomic). No tick
          (the C's ket continues in the matching branch's frame). *)
-      let atomic = (Array.unsafe_get code (pc + 1)) in
-      let g = (Array.unsafe_get code (pc + 2)) in
+      let atomic = (Array.get code (pc + 1)) in
+      let g = (Array.get code (pc + 2)) in
       (* pcre2_match.c:6000/6014 — the assertion's reached position [eptr] is
          consulted before eptr is put back to the entry, raising last_used_ptr
          (the RECURSELOOP input); gated on has_recurse. *)
       if mb.has_recurse && eptr > mb.last_used_ptr then mb.last_used_ptr <- eptr;
       (* safe: g in [0, n_groups) (Ir_verify) indexes mb.group_start. *)
-      let e = Array.unsafe_get mb.group_start g in
+      let e = Array.get mb.group_start g in
       if Int.equal atomic 1 then
         let sp' = once_commit mb in
         (run [@tailcall]) mb (pc + 3) e sp' rdepth mcc
@@ -2450,7 +2450,7 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          entry cont/eptr/rdepth), set mb.once_base, fall into the body. No tick.
          A matching branch reaches t_nassert_match (fail); exhausting all
          branches backtracks to the KIND_NASSERT record = SUCCESS. *)
-      let cont = (Array.unsafe_get code (pc + 2)) in
+      let cont = (Array.get code (pc + 2)) in
       let sp' = push_nassert mb sp cont eptr rdepth in
       (run [@tailcall]) mb (pc + 3) eptr sp' rdepth mcc
   | 44 ->
@@ -2474,11 +2474,11 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          saved_mark at base + nov + 2 and (chunk K2) saved_start_match at
          base + nov + 3. ov has nov slots. *)
       for i = 2 to nov - 1 do
-        Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+        Array.set ov i (Array.get d (base + i - 2))
       done;
-      mb.once_base <- Array.unsafe_get d (base + nov - 2);
-      mb.mark <- Array.unsafe_get d (base + nov + 2) (* revert Fmark *);
-      mb.start_match <- Array.unsafe_get d (base + nov + 3) (* revert \K *);
+      mb.once_base <- Array.get d (base + nov - 2);
+      mb.mark <- Array.get d (base + nov + 2) (* revert Fmark *);
+      mb.start_match <- Array.get d (base + nov + 3) (* revert \K *);
       (backtrack [@tailcall]) mb base mcc
   | 45 ->
       (* ASSERTBACK_CHECK (fast-design.md §3; the variable-lookbehind end-point
@@ -2486,9 +2486,9 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          lookbehind match only if it ended exactly at the assertion entry
          position; otherwise this back-length fails (backtrack into the VREVERSE
          RM37 loop / next branch). No tick. *)
-      let g = (Array.unsafe_get code (pc + 1)) in
+      let g = (Array.get code (pc + 1)) in
       (* safe: g in [0, n_groups) (Ir_verify). *)
-      if not (Int.equal eptr (Array.unsafe_get mb.group_start g)) then
+      if not (Int.equal eptr (Array.get mb.group_start g)) then
         (bt [@tailcall]) mb eptr sp mcc
       else (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
   | 46 ->
@@ -2500,10 +2500,10 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          (chunk H) so an OP_CLOSE reached at an inner ( *ACCEPT) reads the CURRENT
          iteration start (a possessive capture is non-optimized, so OP_CLOSE uses
          cap_start; its ovector holds only the last COMMITTED iteration). *)
-      let cap_ovbase = (Array.unsafe_get code (pc + 1)) in
+      let cap_ovbase = (Array.get code (pc + 1)) in
       if cap_ovbase > 0 then
-        Array.unsafe_set mb.cap_start cap_ovbase (eptr - mb.start_subject);
-      let sp' = push_pos mb sp eptr rdepth (Array.unsafe_get code (pc + 2)) in
+        Array.set mb.cap_start cap_ovbase (eptr - mb.start_subject);
+      let sp' = push_pos mb sp eptr rdepth (Array.get code (pc + 2)) in
       (run [@tailcall]) mb (pc + 3) eptr sp' rdepth mcc
   | 47 ->
       (* KETRPOS (fast-design.md §3; OP_KETRPOS pcre2_match.c:5292-5302/6092-6098)
@@ -2524,7 +2524,7 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          at the recursion level), NOT the possessive success/fail test. This MUST
          precede the mb.once_base read (which is not a KIND_POS during a
          recursion). current_recurse >= 0 only inside a recursion. *)
-      if Int.equal mb.current_recurse (Array.unsafe_get code (pc + 1)) then
+      if Int.equal mb.current_recurse (Array.get code (pc + 1)) then
         (bt [@tailcall]) mb eptr sp mcc
       else
       let base = mb.once_base in
@@ -2533,24 +2533,24 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
       (* safe: [base] is a KIND_POS record base; matched_once at base+nov,
          zero_allowed at base+nov+1, prev_once_base at base+nov-2, saved_mark at
          base+nov+3, saved_start_match at base+nov+4 (chunk K2 widened). *)
-      let matched_once = Array.unsafe_get d (base + nov) in
-      let zero_allowed = Array.unsafe_get d (base + nov + 1) in
+      let matched_once = Array.get d (base + nov) in
+      let zero_allowed = Array.get d (base + nov + 1) in
       if matched_once <> 0 || zero_allowed <> 0 then (
         (* success: commit — restore once_base, keep mb.mark (the last matched
            iteration's mark persists) and the KIND_POS boundary (its snapshot
            restores captures/mark if the group is later backtracked past). *)
-        mb.once_base <- Array.unsafe_get d (base + nov - 2);
+        mb.once_base <- Array.get d (base + nov - 2);
         (run [@tailcall]) mb (pc + 2) eptr (base + nov + 6) rdepth mcc)
       else (
         (* failure: restore the snapshot + once_base + mark + start_match,
            propagate NOMATCH. *)
         let ov = mb.ovector in
         for i = 2 to nov - 1 do
-          Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+          Array.set ov i (Array.get d (base + i - 2))
         done;
-        mb.once_base <- Array.unsafe_get d (base + nov - 2);
-        mb.mark <- Array.unsafe_get d (base + nov + 3) (* revert Fmark *);
-        mb.start_match <- Array.unsafe_get d (base + nov + 4) (* revert \K *);
+        mb.once_base <- Array.get d (base + nov - 2);
+        mb.mark <- Array.get d (base + nov + 3) (* revert Fmark *);
+        mb.start_match <- Array.get d (base + nov + 4) (* revert \K *);
         (backtrack [@tailcall]) mb base mcc)
   | 49 ->
       (* OP_MARK (pcre2_match.c:6340-6342 / interpreter.ml:3322-3333) — set the
@@ -2558,7 +2558,7 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          that reverts mb.mark on backtrack-past and catches a name-matching
          MATCH_SKIP_ARG (RM12), then RMATCH the continuation. The RMATCH ticks a
          child frame (RM12), so the continuation runs at rdepth+1. *)
-      let name_off = (Array.unsafe_get code (pc + 1)) in
+      let name_off = (Array.get code (pc + 1)) in
       let old_mark = mb.mark in
       mb.mark <- name_off;
       mb.nomatch_mark <- name_off;
@@ -2573,7 +2573,7 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          mark/nomatch_mark (mark_off >= 0). RMATCH the continuation (RM13/RM36
          ticks a child frame); on its exhaustion the KIND_VERB (vt_commit) fires
          MATCH_COMMIT (disable bumpalong). *)
-      let mark_off = (Array.unsafe_get code (pc + 1)) in
+      let mark_off = (Array.get code (pc + 1)) in
       let old_mark = mb.mark in
       if mark_off >= 0 then (
         mb.mark <- mark_off;
@@ -2587,7 +2587,7 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
   | 51 ->
       (* OP_PRUNE / OP_PRUNE_ARG (pcre2_match.c:6379-6390) — RMATCH the
          continuation (RM14/RM15 tick); fires MATCH_PRUNE (fail to bumpalong). *)
-      let mark_off = (Array.unsafe_get code (pc + 1)) in
+      let mark_off = (Array.get code (pc + 1)) in
       let old_mark = mb.mark in
       if mark_off >= 0 then (
         mb.mark <- mark_off;
@@ -2621,7 +2621,7 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
       if mb.skip_arg_count <= mb.ignore_skip_arg then
         (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
       else
-        let name_off = (Array.unsafe_get code (pc + 1)) in
+        let name_off = (Array.get code (pc + 1)) in
         let old_mark = mb.mark in
         let mcc' = tick_child mb mcc (rdepth + 1) in
         if mcc' < 0 then mcc'
@@ -2634,7 +2634,7 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          (RM18/RM19 tick); fires MATCH_THEN, passing back this opcode's IR pc
          (verb_then_pc) for the enclosing alternation's KIND_ALT scope check. The
          _ARG form sets mark/nomatch_mark. *)
-      let mark_off = (Array.unsafe_get code (pc + 1)) in
+      let mark_off = (Array.get code (pc + 1)) in
       let old_mark = mb.mark in
       if mark_off >= 0 then (
         mb.mark <- mark_off;
@@ -2672,8 +2672,8 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          backtracks (its empty-match rejection). For an optimized capture the
          start is already in ovector[ovb] (CAP_START wrote it); for a referenced
          capture the start is in mb.cap_start[ovb] (written at CAP_START_REF). *)
-      let ovb = (Array.unsafe_get code (pc + 1)) in
-      let referenced = (Array.unsafe_get code (pc + 2)) in
+      let ovb = (Array.get code (pc + 1)) in
+      let referenced = (Array.get code (pc + 2)) in
       let ss = mb.ss in
       let need = sp + Save_stack.width_cap in
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
@@ -2681,39 +2681,39 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
       let ov = mb.ovector in
       (* safe: [grow] ensured length >= sp + width_cap; ovb in [2, 2*top]
          (Ir_verify) so ovb, ovb+1 < 2*oveccount and ovb < |cap_start|. *)
-      Array.unsafe_set d sp ovb;
-      Array.unsafe_set d (sp + 1) (Array.unsafe_get ov ovb);
-      Array.unsafe_set d (sp + 2) (Array.unsafe_get ov (ovb + 1));
-      Array.unsafe_set d (sp + 3) Save_stack.kind_cap;
+      Array.set d sp ovb;
+      Array.set d (sp + 1) (Array.get ov ovb);
+      Array.set d (sp + 2) (Array.get ov (ovb + 1));
+      Array.set d (sp + 3) Save_stack.kind_cap;
       if Int.equal referenced 1 then
-        Array.unsafe_set ov ovb (Array.unsafe_get mb.cap_start ovb);
-      Array.unsafe_set ov (ovb + 1) (eptr - mb.start_subject);
+        Array.set ov ovb (Array.get mb.cap_start ovb);
+      Array.set ov (ovb + 1) (eptr - mb.start_subject);
       (run [@tailcall]) mb (pc + 3) eptr (sp + Save_stack.width_cap) rdepth mcc
   | 63 ->
       (* COND_CREF (fast-design.md §2/§4; OP_CREF pcre2_match.c:5668-5671 /
          interpreter.ml:2506-2514) — numbered-group-set test for a conditional.
          TRUE (group N set: ovector.(ovbase) <> UNSET) falls through to the
          yes-branch; FALSE jumps to [no_target]. No tick, no choice point. *)
-      let ovb = (Array.unsafe_get code (pc + 1)) in
+      let ovb = (Array.get code (pc + 1)) in
       (* safe: ovb = 2N, 2 <= ovb < 2*oveccount = Array.length mb.ovector
          (Ir_verify ovbase_ok). *)
-      if not (Int.equal (Array.unsafe_get mb.ovector ovb) Frames.unset) then
+      if not (Int.equal (Array.get mb.ovector ovb) Frames.unset) then
         (run [@tailcall]) mb (pc + 3) eptr sp rdepth mcc
-      else (run [@tailcall]) mb (Array.unsafe_get code (pc + 2)) eptr sp rdepth mcc
+      else (run [@tailcall]) mb (Array.get code (pc + 2)) eptr sp rdepth mcc
   | 64 ->
       (* COND_DNCREF (fast-design.md §2/§4; OP_DNCREF pcre2_match.c:5673-5685 /
          interpreter.ml:2515-2524) — duplicate-named-group-set test: TRUE iff any
          group in the name list is set (dncref_test). No tick, no choice point. *)
-      if dncref_test mb (Array.unsafe_get code (pc + 2)) (Array.unsafe_get code (pc + 1)) then
+      if dncref_test mb (Array.get code (pc + 2)) (Array.get code (pc + 1)) then
         (run [@tailcall]) mb (pc + 4) eptr sp rdepth mcc
-      else (run [@tailcall]) mb (Array.unsafe_get code (pc + 3)) eptr sp rdepth mcc
+      else (run [@tailcall]) mb (Array.get code (pc + 3)) eptr sp rdepth mcc
   | 65 ->
       (* COND_FALSE (fast-design.md §2; OP_FALSE/OP_FAIL pcre2_match.c:5687-5689,
          and OP_RREF/OP_DNRREF which are always false without recursion,
          :5645-5666) — the condition is always false: jump to [no_target].
          (?(DEFINE)…) rides this arm (its body is the never-taken yes-branch).
          No tick, no choice point. *)
-      (run [@tailcall]) mb (Array.unsafe_get code (pc + 1)) eptr sp rdepth mcc
+      (run [@tailcall]) mb (Array.get code (pc + 1)) eptr sp rdepth mcc
   | 66 ->
       (* COND_ASSERT (fast-design.md §3; the assertion-condition entry
          pcre2_match.c:5701-5708 / interpreter.ml:2534-2548) — push a
@@ -2723,7 +2723,7 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          branch's ALT ticks — the C's RM5). Exhausting all branches backtracks to
          the boundary -> backtrack_nassert -> [nomatch_target]; a matching branch
          reaches t_cond_assert_match. *)
-      let nomatch_target = (Array.unsafe_get code (pc + 1)) in
+      let nomatch_target = (Array.get code (pc + 1)) in
       let sp' = push_nassert mb sp nomatch_target eptr rdepth in
       (run [@tailcall]) mb (pc + 2) eptr sp' rdepth mcc
   | 67 ->
@@ -2742,7 +2742,7 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          eptr is put back to the conditional entry — record it here (this arm
          is the fast MATCH-return), gated on has_recurse. *)
       if mb.has_recurse && eptr > mb.last_used_ptr then mb.last_used_ptr <- eptr;
-      let match_target = (Array.unsafe_get code (pc + 1)) in
+      let match_target = (Array.get code (pc + 1)) in
       let base = mb.once_base in
       let nov = 2 * mb.oveccount in
       let d = mb.ss.Save_stack.data in
@@ -2750,11 +2750,11 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          t_cond_assert): snapshot [base, base+nov-2), prev_once_base at base+nov-2,
          cont(nov-1)/eptr_enter(nov)/rdepth_enter(nov+1), saved_mark(nov+2),
          saved_start_match(nov+3) (chunk K2 widened). *)
-      let prev = Array.unsafe_get d (base + nov - 2) in
-      let entry_eptr = Array.unsafe_get d (base + nov) in
-      let entry_rdepth = Array.unsafe_get d (base + nov + 1) in
-      let saved_mark = Array.unsafe_get d (base + nov + 2) in
-      let saved_start_match = Array.unsafe_get d (base + nov + 3) in
+      let prev = Array.get d (base + nov - 2) in
+      let entry_eptr = Array.get d (base + nov) in
+      let entry_rdepth = Array.get d (base + nov + 1) in
+      let saved_mark = Array.get d (base + nov + 2) in
+      let saved_start_match = Array.get d (base + nov + 3) in
       (* Convert KIND_NASSERT (width nov+6) -> KIND_ONCE (SAME width nov+6, chunk
          K2): the snapshot + prev_once_base(nov-2) prefix is identical, and the
          NASSERT's eptr_enter(nov)/rdepth_enter(nov+1) are ALREADY the KIND_ONCE
@@ -2766,11 +2766,11 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          (the ket does NOT copy P->start_match — a \K in the condition does not
          escape). *)
       mb.start_match <- saved_start_match;
-      Array.unsafe_set d (base + nov - 1) saved_mark;
-      Array.unsafe_set d (base + nov + 2) saved_start_match;
-      Array.unsafe_set d (base + nov + 3) (-1) (* cont, unread *);
-      Array.unsafe_set d (base + nov + 4) Ir.once_group;
-      Array.unsafe_set d (base + nov + 5) Save_stack.kind_once;
+      Array.set d (base + nov - 1) saved_mark;
+      Array.set d (base + nov + 2) saved_start_match;
+      Array.set d (base + nov + 3) (-1) (* cont, unread *);
+      Array.set d (base + nov + 4) Ir.once_group;
+      Array.set d (base + nov + 5) Save_stack.kind_once;
       mb.once_base <- prev;
       (run [@tailcall]) mb match_target entry_eptr (base + nov + 6) entry_rdepth
         mcc
@@ -2793,9 +2793,9 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          current (advanced) eptr. Non-atomic: the body's choice points stay live
          (a failed continuation re-enters the branches and re-checks the new
          span). No tick (the C's ket continues in the matching branch's frame). *)
-      let g = (Array.unsafe_get code (pc + 1)) in
+      let g = (Array.get code (pc + 1)) in
       (* safe: g in [0, n_groups) (Ir_verify) indexes mb.group_start. *)
-      let s = Array.unsafe_get mb.group_start g in
+      let s = Array.get mb.group_start g in
       if Script_run.script_run mb.subject s eptr mb.utf then
         (run [@tailcall]) mb (pc + 2) eptr sp rdepth mcc
       else (bt [@tailcall]) mb eptr sp mcc
@@ -2808,8 +2808,8 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          (snapshots + sets mb.current_recurse = number / mb.recurse_base) and jump
          to the group's first-branch entry; its grouploop ALTs tick per branch =
          the C's RM11 (§4). No tick in this arm (the branch ALT ticks). *)
-      let number = (Array.unsafe_get code (pc + 1)) in
-      let entry_pc = (Array.unsafe_get code (pc + 2)) in
+      let number = (Array.get code (pc + 1)) in
+      let entry_pc = (Array.get code (pc + 2)) in
       if mb.current_recurse >= 0 && recurse_loop_check mb number eptr then
         Errors.error_recurseloop
       else
@@ -2820,20 +2820,20 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          for a conditional: TRUE iff inside a recursion (mb.current_recurse >= 0)
          AND (number = RREF_ANY or number = mb.current_recurse). TRUE falls through
          to the yes-branch; FALSE jumps to [no_target]. No tick, no choice point. *)
-      let number = (Array.unsafe_get code (pc + 1)) in
+      let number = (Array.get code (pc + 1)) in
       if
         mb.current_recurse >= 0
         && (Int.equal number Ir.rref_any
            || Int.equal number mb.current_recurse)
       then (run [@tailcall]) mb (pc + 3) eptr sp rdepth mcc
-      else (run [@tailcall]) mb (Array.unsafe_get code (pc + 2)) eptr sp rdepth mcc
+      else (run [@tailcall]) mb (Array.get code (pc + 2)) eptr sp rdepth mcc
   | 72 ->
       (* COND_DNRREF (chunk K1b; OP_DNRREF pcre2_match.c:5653-5666) — duplicate-
          named recursion test: TRUE iff inside a recursion AND any group in the
          name list equals mb.current_recurse (dnrref_test). No tick. *)
-      if mb.current_recurse >= 0 && dnrref_test mb (Array.unsafe_get code (pc + 2)) (Array.unsafe_get code (pc + 1))
+      if mb.current_recurse >= 0 && dnrref_test mb (Array.get code (pc + 2)) (Array.get code (pc + 1))
       then (run [@tailcall]) mb (pc + 4) eptr sp rdepth mcc
-      else (run [@tailcall]) mb (Array.unsafe_get code (pc + 3)) eptr sp rdepth mcc
+      else (run [@tailcall]) mb (Array.get code (pc + 3)) eptr sp rdepth mcc
   | 74 ->
       (* SET_SOM (chunk K2; \K / OP_SET_SOM pcre2_match.c:6252-6255 /
          interpreter.ml:3076-3078) — reset the reported match start to the current
@@ -2846,8 +2846,8 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
       let d = ss.Save_stack.data in
       (* safe: [grow] ensured length >= sp + width_set_som. *)
-      Array.unsafe_set d sp mb.start_match;
-      Array.unsafe_set d (sp + 1) Save_stack.kind_set_som;
+      Array.set d sp mb.start_match;
+      Array.set d (sp + 1) Save_stack.kind_set_som;
       mb.start_match <- eptr;
       (run [@tailcall]) mb (pc + 1) eptr need rdepth mcc
   | 75 ->
@@ -2857,8 +2857,8 @@ and[@inline never] run_cold (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth
          commits it (the RM3/RM4/RM5 arms). The compile-time conv_kind / target
          name the action. *)
       if mb.has_recurse && eptr > mb.last_used_ptr then mb.last_used_ptr <- eptr;
-      (backtrack_accept [@tailcall]) mb sp eptr rdepth mcc (Array.unsafe_get code (pc + 1))
-        (Array.unsafe_get code (pc + 2))
+      (backtrack_accept [@tailcall]) mb sp eptr rdepth mcc (Array.get code (pc + 1))
+        (Array.get code (pc + 2))
   | _ ->
       (* Ir_verify rejects any other tag before the runner sees it; a
          compiled Ir.t cannot reach here (fast-design.md §2). *)
@@ -2889,7 +2889,7 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
     (* safe: sp > 0 and sp is the sum of the fixed record widths [run] pushed,
        so sp-1 is a written kind slot and the record base computed below is
        within the reserved region. *)
-    let kind = Array.unsafe_get d (sp - 1) in
+    let kind = Array.get d (sp - 1) in
     if Int.equal kind Save_stack.kind_alt then
       (* KIND_ALT [handler; eptr; rdepth; then_end; kind] — resume the next
          alternative (shared with the THEN convert in [backtrack_code]). *)
@@ -2899,11 +2899,11 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
          ovector pair (JIT optimized-cbracket exhaustion restore
          pcre2_jit_compile.c:13443-13452) and keep popping. *)
       let base = sp - Save_stack.width_cap in
-      let ovb = Array.unsafe_get d base in
+      let ovb = Array.get d base in
       let ov = mb.ovector in
       (* safe: ovb, ovb+1 written by CAP_START within bounds. *)
-      Array.unsafe_set ov ovb (Array.unsafe_get d (base + 1));
-      Array.unsafe_set ov (ovb + 1) (Array.unsafe_get d (base + 2));
+      Array.set ov ovb (Array.get d (base + 1));
+      Array.set ov (ovb + 1) (Array.get d (base + 2));
       (backtrack [@tailcall]) mb base mcc)
     else if Int.equal kind Save_stack.kind_rep_max then
       (* KIND_REP_MAX [rep_pc; try_pos; floor; rdepth; kind] — greedy repeat
@@ -2918,9 +2918,9 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
          g's iteration-start slot to the enclosing iteration's value and keep
          popping (the C's per-frame group start, pcre2_match.c:6107). *)
       let base = sp - Save_stack.width_gstart in
-      let g = Array.unsafe_get d base in
+      let g = Array.get d base in
       (* safe: g written by GROUP_START, in [0, n_groups). *)
-      Array.unsafe_set mb.group_start g (Array.unsafe_get d (base + 1));
+      Array.set mb.group_start g (Array.get d (base + 1));
       (backtrack [@tailcall]) mb base mcc)
     else if Int.equal kind Save_stack.kind_capstart then (
       (* KIND_CAPSTART [ovbase; old_cap_start; kind] (fast-design.md §3; the JIT
@@ -2929,9 +2929,9 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
          enclosing value, then keep popping. The ovector was already rolled back
          by the KIND_CAP pushed at CLOSE (popped earlier in this unwind). *)
       let base = sp - Save_stack.width_capstart in
-      let ovb = Array.unsafe_get d base in
+      let ovb = Array.get d base in
       (* safe: ovb written by CAP_START_REF, < Array.length mb.cap_start. *)
-      Array.unsafe_set mb.cap_start ovb (Array.unsafe_get d (base + 1));
+      Array.set mb.cap_start ovb (Array.get d (base + 1));
       (backtrack [@tailcall]) mb base mcc)
     else if Int.equal kind Save_stack.kind_ref_min then
       (* KIND_REF_MIN [rep_pc; count; eptr; rdepth; kind] — minimizing ref
@@ -2974,10 +2974,10 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
          backtracking — a MARK itself has no failure action, pcre2_match.c:6357
          `RRETURN(rrc)` with rrc = NOMATCH). *)
       let base = sp - Save_stack.width_verb in
-      let vtype = Array.unsafe_get d base in
-      let aux = Array.unsafe_get d (base + 1) in
-      let veptr = Array.unsafe_get d (base + 2) in
-      mb.mark <- Array.unsafe_get d (base + 3);
+      let vtype = Array.get d base in
+      let aux = Array.get d (base + 1) in
+      let veptr = Array.get d (base + 2) in
+      mb.mark <- Array.get d (base + 3);
       if Int.equal vtype vt_mark then (backtrack [@tailcall]) mb base mcc
       else (
         (* Chunk K1b — record the recursion the firing verb is in
@@ -3011,7 +3011,7 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
          (:5495): record call_eptr (usually already recorded by the recursed
          group's FAIL head, but exact either way — last_used is a monotone max). *)
       let base = sp - recurse_width mb in
-      let call_eptr = Array.unsafe_get d (base + recurse_tail_off mb + 5) in
+      let call_eptr = Array.get d (base + recurse_tail_off mb + 5) in
       if mb.has_recurse && call_eptr > mb.last_used_ptr then
         mb.last_used_ptr <- call_eptr;
       restore_recurse mb base;
@@ -3024,15 +3024,15 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
       let base = sp - recurse_ret_width mb in
       let g = base + recurse_tail_off mb in
       restore_arrays mb d base;
-      mb.current_recurse <- Array.unsafe_get d g;
-      mb.recurse_base <- Array.unsafe_get d (g + 1);
+      mb.current_recurse <- Array.get d g;
+      mb.recurse_base <- Array.get d (g + 1);
       (backtrack [@tailcall]) mb base mcc)
     else if Int.equal kind Save_stack.kind_set_som then (
       (* KIND_SET_SOM [old_start_match; kind] (chunk K2) — backtrack past a \K:
          restore mb.start_match to its pre-\K value (the C's per-frame Fstart_match
          restore), then keep popping. No tick. *)
       let base = sp - Save_stack.width_set_som in
-      mb.start_match <- Array.unsafe_get d base;
+      mb.start_match <- Array.get d base;
       (backtrack [@tailcall]) mb base mcc)
     else
       (* KIND_CONT [target; eptr; rdepth; kind] (fast-design.md §3) — a
@@ -3041,9 +3041,9 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
          RM9/RM10/RM7 NOMATCH (skip the group / carry on past the group) or
          the KETRMIN reiteration `Fecode -= GET; break`. *)
       let base = sp - Save_stack.width_cont in
-      let target = Array.unsafe_get d base in
-      let e = Array.unsafe_get d (base + 1) in
-      let dsaved = Array.unsafe_get d (base + 2) in
+      let target = Array.get d base in
+      let e = Array.get d (base + 1) in
+      let dsaved = Array.get d (base + 2) in
       (run [@tailcall]) mb target e base dsaved mcc
 
 (* Resume the next alternative of a KIND_ALT record at [base] (fast-design.md
@@ -3052,20 +3052,20 @@ and backtrack (mb : mb) (sp : int) (mcc : int) : int =
    run its handler at the saved eptr/rdepth. *)
 and resume_alt (mb : mb) (base : int) (mcc : int) : int =
   let d = mb.ss.Save_stack.data in
-  let handler = Array.unsafe_get d base in
-  let e = Array.unsafe_get d (base + 1) in
-  let dsaved = Array.unsafe_get d (base + 2) in
+  let handler = Array.get d base in
+  let e = Array.get d (base + 1) in
+  let dsaved = Array.get d (base + 2) in
   let code = mb.code in
   (* safe: [handler] is a KIND_ALT record's stored handler = an ALT.next jump
      target, which the verifier proved is a valid instruction head in [code]
      (ir_verify.ml), so reading its tag is in range. *)
   if
     Int.equal dsaved 0
-    && (not (Int.equal (Array.unsafe_get code (handler)) 5 (* ALT *)))
-    && (not (Int.equal (Array.unsafe_get code (handler)) 15 (* FAIL *)))
-    && (not (Int.equal (Array.unsafe_get code (handler)) 73 (* FAIL_NASSERT — as FAIL (chunk K1b) *)))
+    && (not (Int.equal (Array.get code (handler)) 5 (* ALT *)))
+    && (not (Int.equal (Array.get code (handler)) 15 (* FAIL *)))
+    && (not (Int.equal (Array.get code (handler)) 73 (* FAIL_NASSERT — as FAIL (chunk K1b) *)))
     && not
-         (Int.equal (Array.unsafe_get code (handler)) 48 (* POSSESS_DONE — a loop break, not a
+         (Int.equal (Array.get code (handler)) 48 (* POSSESS_DONE — a loop break, not a
             ticked branch (chunk G); exclude so a dsaved=0 last-ALT handler
             cannot spuriously tick *))
   then
@@ -3150,7 +3150,7 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
   if sp <= 0 then vcode
   else
     let d = mb.ss.Save_stack.data in
-    let kind = Array.unsafe_get d (sp - 1) in
+    let kind = Array.get d (sp - 1) in
     if Int.equal kind Save_stack.kind_alt then (
       (* KIND_ALT: THEN is scoped to the innermost enclosing >= 2-branch
          alternation branch (pcre2_match.c:5401-5407); convert it to NOMATCH
@@ -3160,29 +3160,29 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
       let base = sp - Save_stack.width_alt in
       if
         Int.equal vcode match_then
-        && mb.verb_then_pc < Array.unsafe_get d (base + 3)
+        && mb.verb_then_pc < Array.get d (base + 3)
       then (resume_alt [@tailcall]) mb base mcc
       else (backtrack_code [@tailcall]) mb base mcc vcode)
     else if Int.equal kind Save_stack.kind_cap then (
       (* Restore the capture's ovector pair (the frame unwind's abandon) and keep
          propagating. *)
       let base = sp - Save_stack.width_cap in
-      let ovb = Array.unsafe_get d base in
+      let ovb = Array.get d base in
       let ov = mb.ovector in
-      Array.unsafe_set ov ovb (Array.unsafe_get d (base + 1));
-      Array.unsafe_set ov (ovb + 1) (Array.unsafe_get d (base + 2));
+      Array.set ov ovb (Array.get d (base + 1));
+      Array.set ov (ovb + 1) (Array.get d (base + 2));
       (backtrack_code [@tailcall]) mb base mcc vcode)
     else if Int.equal kind Save_stack.kind_gstart then (
       let base = sp - Save_stack.width_gstart in
-      Array.unsafe_set mb.group_start
-        (Array.unsafe_get d base)
-        (Array.unsafe_get d (base + 1));
+      Array.set mb.group_start
+        (Array.get d base)
+        (Array.get d (base + 1));
       (backtrack_code [@tailcall]) mb base mcc vcode)
     else if Int.equal kind Save_stack.kind_capstart then (
       let base = sp - Save_stack.width_capstart in
-      Array.unsafe_set mb.cap_start
-        (Array.unsafe_get d base)
-        (Array.unsafe_get d (base + 1));
+      Array.set mb.cap_start
+        (Array.get d base)
+        (Array.get d (base + 1));
       (backtrack_code [@tailcall]) mb base mcc vcode)
     else if Int.equal kind Save_stack.kind_verb then (
       (* A verb's own record on the propagation path (RRETURN passes rrc up). MARK
@@ -3190,10 +3190,10 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
          it to MATCH_SKIP with the position passed back (RM12,
          pcre2_match.c:6351-6356); every other case reverts mark and passes up. *)
       let base = sp - Save_stack.width_verb in
-      let vtype = Array.unsafe_get d base in
-      let aux = Array.unsafe_get d (base + 1) in
-      let veptr = Array.unsafe_get d (base + 2) in
-      mb.mark <- Array.unsafe_get d (base + 3);
+      let vtype = Array.get d base in
+      let aux = Array.get d (base + 1) in
+      let veptr = Array.get d (base + 2) in
+      mb.mark <- Array.get d (base + 3);
       if
         Int.equal vtype vt_mark
         && Int.equal vcode match_skip_arg
@@ -3215,11 +3215,11 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
       let base = sp - (nov + 6) in
       let ov = mb.ovector in
       for i = 2 to nov - 1 do
-        Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+        Array.set ov i (Array.get d (base + i - 2))
       done;
-      mb.once_base <- Array.unsafe_get d (base + nov - 2);
-      mb.mark <- Array.unsafe_get d (base + nov - 1);
-      mb.start_match <- Array.unsafe_get d (base + nov + 2) (* revert \K *);
+      mb.once_base <- Array.get d (base + nov - 2);
+      mb.mark <- Array.get d (base + nov - 1);
+      mb.start_match <- Array.get d (base + nov + 2) (* revert \K *);
       (* Chunk K1b — a verb code passing this boundary is an RRETURN(rrc) FROM
          the construct's frame in the C (:5408 RM2 / :5529 RM3), so
          RETURN_SWITCH (:6470) records the construct's ENTRY Feptr — which can
@@ -3227,10 +3227,10 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
          body (rewound below entry). Record the stored entry_eptr; also for the
          THEN-contained pos-assert case (its committed-body exhaustion is
          RRETURN(MATCH_NOMATCH) at the entry, :5531). Gated on has_recurse. *)
-      let entry_eptr = Array.unsafe_get d (base + nov) in
+      let entry_eptr = Array.get d (base + nov) in
       if mb.has_recurse && entry_eptr > mb.last_used_ptr then
         mb.last_used_ptr <- entry_eptr;
-      let subtype = Array.unsafe_get d (base + nov + 4) in
+      let subtype = Array.get d (base + nov + 4) in
       if
         Int.equal vcode match_then
         && (Int.equal subtype Ir.once_pos_assert
@@ -3248,15 +3248,15 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
       let base = sp - (nov + 6) in
       let ov = mb.ovector in
       for i = 2 to nov - 1 do
-        Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+        Array.set ov i (Array.get d (base + i - 2))
       done;
-      mb.once_base <- Array.unsafe_get d (base + nov - 2);
-      mb.mark <- Array.unsafe_get d (base + nov + 3);
-      mb.start_match <- Array.unsafe_get d (base + nov + 4) (* revert \K *);
+      mb.once_base <- Array.get d (base + nov - 2);
+      mb.mark <- Array.get d (base + nov + 3);
+      mb.start_match <- Array.get d (base + nov + 4) (* revert \K *);
       (* Chunk K1b — the RM8 pass-up RRETURN(rrc) (:5315) is executed by the
          bracket frame whose Feptr = the CURRENT iteration start (the KETRPOS
          frame copy-back, :6094-6096): record the stored iter_start. *)
-      let iter_start = Array.unsafe_get d (base + nov - 1) in
+      let iter_start = Array.get d (base + nov - 1) in
       if mb.has_recurse && iter_start > mb.last_used_ptr then
         mb.last_used_ptr <- iter_start;
       (backtrack_code [@tailcall]) mb base mcc vcode)
@@ -3271,15 +3271,15 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
         let base = sp - (nov + 6) in
         let ov = mb.ovector in
         for i = 2 to nov - 1 do
-          Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+          Array.set ov i (Array.get d (base + i - 2))
         done;
-        mb.once_base <- Array.unsafe_get d (base + nov - 2);
-        mb.mark <- Array.unsafe_get d (base + nov + 2);
-        mb.start_match <- Array.unsafe_get d (base + nov + 3) (* revert \K *);
+        mb.once_base <- Array.get d (base + nov - 2);
+        mb.mark <- Array.get d (base + nov + 2);
+        mb.start_match <- Array.get d (base + nov + 3) (* revert \K *);
         (* Chunk K1b — this escape IS an RRETURN from the assertion frame
            (:5574), so it records the assertion's entry Feptr (stored as
            eptr_enter at base + nov). *)
-        let entry_eptr = Array.unsafe_get d (base + nov) in
+        let entry_eptr = Array.get d (base + nov) in
         if mb.has_recurse && entry_eptr > mb.last_used_ptr then
           mb.last_used_ptr <- entry_eptr;
         (backtrack_code [@tailcall]) mb base mcc vcode)
@@ -3316,12 +3316,12 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
          5487): convert to a plain NOMATCH backtrack below the boundary. A verb
          from OUTSIDE this recursion passes through unchanged (5493). *)
       let base = sp - recurse_width mb in
-      let number = Array.unsafe_get d (base + recurse_tail_off mb + 4) in
+      let number = Array.get d (base + recurse_tail_off mb + 4) in
       (* Chunk K1b — both the contained (:5487) and pass-through (:5493) cases
          are RRETURNs from the OP_RECURSE frame at the CALL position: record
          call_eptr (the verb path DISCARDS the group's FAIL head, so this is
          the only record of it here). *)
-      let call_eptr = Array.unsafe_get d (base + recurse_tail_off mb + 5) in
+      let call_eptr = Array.get d (base + recurse_tail_off mb + 5) in
       if mb.has_recurse && call_eptr > mb.last_used_ptr then
         mb.last_used_ptr <- call_eptr;
       restore_recurse mb base;
@@ -3336,15 +3336,15 @@ and backtrack_code (mb : mb) (sp : int) (mcc : int) (vcode : int) : int =
       let base = sp - recurse_ret_width mb in
       let g = base + recurse_tail_off mb in
       restore_arrays mb d base;
-      mb.current_recurse <- Array.unsafe_get d g;
-      mb.recurse_base <- Array.unsafe_get d (g + 1);
+      mb.current_recurse <- Array.get d g;
+      mb.recurse_base <- Array.get d (g + 1);
       (backtrack_code [@tailcall]) mb base mcc vcode)
     else if Int.equal kind Save_stack.kind_set_som then (
       (* KIND_SET_SOM (chunk K2) — a \K on the verb-propagation path: revert
          mb.start_match (the C's per-frame Fstart_match unwind) then keep
          propagating (a restore-only record, like KIND_GSTART). *)
       let base = sp - Save_stack.width_set_som in
-      mb.start_match <- Array.unsafe_get d base;
+      mb.start_match <- Array.get d base;
       (backtrack_code [@tailcall]) mb base mcc vcode)
     else
       (* KIND_CONT — a group choice point; discard and keep propagating. *)
@@ -3376,10 +3376,10 @@ and backtrack_accept (mb : mb) (sp : int) (eptr : int) (rdepth : int) (mcc : int
   else
     let d = mb.ss.Save_stack.data in
     let nov = 2 * mb.oveccount in
-    let kind = Array.unsafe_get d (sp - 1) in
+    let kind = Array.get d (sp - 1) in
     if Int.equal kind Save_stack.kind_once then (
       let base = sp - (nov + 6) in
-      let subtype = Array.unsafe_get d (base + nov + 4) in
+      let subtype = Array.get d (base + nov + 4) in
       if Int.equal subtype Ir.once_group then
         (* an atomic GROUP (or an already-ACCEPT-committed assertion, converted to
            once_group below) between the ACCEPT and the target assertion: the C's
@@ -3407,12 +3407,12 @@ and backtrack_accept (mb : mb) (sp : int) (eptr : int) (rdepth : int) (mcc : int
            ket `break` at :5534-5535 continues in the MATCHING BRANCH's frame,
            whose Fstart_match carries the \K forward — t_assert_end keeps
            mb.start_match.) *)
-        mb.once_base <- Array.unsafe_get d (base + nov - 2);
-        let e = Array.unsafe_get d (base + nov) in
-        let erd = Array.unsafe_get d (base + nov + 1) in
-        mb.start_match <- Array.unsafe_get d (base + nov + 2) (* revert \K *);
-        let cont = Array.unsafe_get d (base + nov + 3) in
-        Array.unsafe_set d (base + nov + 4) Ir.once_group (* consumed *);
+        mb.once_base <- Array.get d (base + nov - 2);
+        let e = Array.get d (base + nov) in
+        let erd = Array.get d (base + nov + 1) in
+        mb.start_match <- Array.get d (base + nov + 2) (* revert \K *);
+        let cont = Array.get d (base + nov + 3) in
+        Array.set d (base + nov + 4) Ir.once_group (* consumed *);
         (run [@tailcall]) mb cont e (base + nov + 6) erd mcc))
     else if Int.equal kind Save_stack.kind_nassert then (
       let base = sp - (nov + 6) in
@@ -3423,11 +3423,11 @@ and backtrack_accept (mb : mb) (sp : int) (eptr : int) (rdepth : int) (mcc : int
            the boundary (as t_nassert_match). *)
         let ov = mb.ovector in
         for i = 2 to nov - 1 do
-          Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+          Array.set ov i (Array.get d (base + i - 2))
         done;
-        mb.once_base <- Array.unsafe_get d (base + nov - 2);
-        mb.mark <- Array.unsafe_get d (base + nov + 2);
-        mb.start_match <- Array.unsafe_get d (base + nov + 3);
+        mb.once_base <- Array.get d (base + nov - 2);
+        mb.mark <- Array.get d (base + nov + 2);
+        mb.start_match <- Array.get d (base + nov + 3);
         (backtrack [@tailcall]) mb base mcc)
       else (
         (* assertion CONDITION (accept_cond): the condition is Lpositive = TRUE
@@ -3439,18 +3439,18 @@ and backtrack_accept (mb : mb) (sp : int) (eptr : int) (rdepth : int) (mcc : int
            MATCH_ACCEPT does NOT copy the mark, so mb.mark REVERTS to the condition
            entry (saved_mark); \K likewise does not escape here (revert
            saved_start_match). *)
-        let prev = Array.unsafe_get d (base + nov - 2) in
-        let entry_eptr = Array.unsafe_get d (base + nov) in
-        let entry_rdepth = Array.unsafe_get d (base + nov + 1) in
-        let saved_mark = Array.unsafe_get d (base + nov + 2) in
-        let saved_start_match = Array.unsafe_get d (base + nov + 3) in
+        let prev = Array.get d (base + nov - 2) in
+        let entry_eptr = Array.get d (base + nov) in
+        let entry_rdepth = Array.get d (base + nov + 1) in
+        let saved_mark = Array.get d (base + nov + 2) in
+        let saved_start_match = Array.get d (base + nov + 3) in
         mb.mark <- saved_mark (* RM5 does not copy the accept mark *);
         mb.start_match <- saved_start_match;
-        Array.unsafe_set d (base + nov - 1) saved_mark;
-        Array.unsafe_set d (base + nov + 2) saved_start_match;
-        Array.unsafe_set d (base + nov + 3) (-1) (* cont, unread *);
-        Array.unsafe_set d (base + nov + 4) Ir.once_group;
-        Array.unsafe_set d (base + nov + 5) Save_stack.kind_once;
+        Array.set d (base + nov - 1) saved_mark;
+        Array.set d (base + nov + 2) saved_start_match;
+        Array.set d (base + nov + 3) (-1) (* cont, unread *);
+        Array.set d (base + nov + 4) Ir.once_group;
+        Array.set d (base + nov + 5) Save_stack.kind_once;
         mb.once_base <- prev;
         (run [@tailcall]) mb target entry_eptr (base + nov + 6) entry_rdepth mcc))
     else if Int.equal kind Save_stack.kind_pos then
@@ -3465,14 +3465,14 @@ and backtrack_accept (mb : mb) (sp : int) (eptr : int) (rdepth : int) (mcc : int
          them at the call), then keep walking. *)
       let base = sp - recurse_width mb in
       let f = base + recurse_tail_off mb in
-      mb.current_recurse <- Array.unsafe_get d (f + 1);
-      mb.recurse_base <- Array.unsafe_get d (f + 2);
+      mb.current_recurse <- Array.get d (f + 1);
+      mb.recurse_base <- Array.get d (f + 2);
       (backtrack_accept [@tailcall]) mb base eptr rdepth mcc conv_kind target)
     else if Int.equal kind Save_stack.kind_recurse_ret then (
       let base = sp - recurse_ret_width mb in
       let g = base + recurse_tail_off mb in
-      mb.current_recurse <- Array.unsafe_get d g;
-      mb.recurse_base <- Array.unsafe_get d (g + 1);
+      mb.current_recurse <- Array.get d g;
+      mb.recurse_base <- Array.get d (g + 1);
       (backtrack_accept [@tailcall]) mb base eptr rdepth mcc conv_kind target)
     else
       (* any fixed-width choice-point / restore-only record: discard WITHOUT
@@ -3512,16 +3512,16 @@ and backtrack_accept (mb : mb) (sp : int) (eptr : int) (rdepth : int) (mcc : int
 and backtrack_rep_max (mb : mb) (sp : int) (mcc : int) : int =
   let d = mb.ss.Save_stack.data in
   let base = sp - Save_stack.width_rep_max in
-  let rep_pc = Array.unsafe_get d base in
-  let try_pos = Array.unsafe_get d (base + 1) in
-  let floor = Array.unsafe_get d (base + 2) in
-  let dd = Array.unsafe_get d (base + 3) in
+  let rep_pc = Array.get d base in
+  let try_pos = Array.get d (base + 1) in
+  let floor = Array.get d (base + 2) in
+  let dd = Array.get d (base + 3) in
   (* safe: [rep_pc] was stored by a REP push (a repeat instruction head), so its
      tag read + Ir.arity advance are in range (verifier-proven, ir_verify.ml). *)
-  let cont = rep_pc + Ir.arity.((Array.unsafe_get mb.code (rep_pc))) in
+  let cont = rep_pc + Ir.arity.((Array.get mb.code (rep_pc))) in
   if
-    Int.equal (Array.unsafe_get mb.code (rep_pc)) 31 (* t_class_rep *)
-    || Int.equal (Array.unsafe_get mb.code (rep_pc)) 58 (* t_xclass_rep *)
+    Int.equal (Array.get mb.code (rep_pc)) 31 (* t_class_rep *)
+    || Int.equal (Array.get mb.code (rep_pc)) 58 (* t_xclass_rep *)
   then
     (* CLASS (pcre2_match.c:2143-2148, RM24/RM201) / XCLASS (:2278-2288,
        RM101): EVERY position is a ticked RMATCH — including the final one at
@@ -3535,7 +3535,7 @@ and backtrack_rep_max (mb : mb) (sp : int) (mcc : int) : int =
       if mcc' < 0 then mcc'
       else (
         (* one char (UTF) / code unit back; at try_pos <= floor stores -1. *)
-        Array.unsafe_set d (base + 1) (rep_giveback mb rep_pc floor try_pos);
+        Array.set d (base + 1) (rep_giveback mb rep_pc floor try_pos);
         (run [@tailcall]) mb cont try_pos sp (dd + 1) mcc'))
     else (backtrack [@tailcall]) mb base mcc (* pop, propagate *)
   else if try_pos > floor then (
@@ -3545,7 +3545,7 @@ and backtrack_rep_max (mb : mb) (sp : int) (mcc : int) : int =
     let mcc' = tick_child mb mcc (dd + 1) in
     if mcc' < 0 then mcc'
     else (
-      Array.unsafe_set d (base + 1) (rep_giveback mb rep_pc floor try_pos);
+      Array.set d (base + 1) (rep_giveback mb rep_pc floor try_pos);
       (run [@tailcall]) mb cont try_pos sp (dd + 1) mcc'))
   else
     (* try_pos <= floor: the minimum-length position, tried IN PLACE at rdepth
@@ -3565,10 +3565,10 @@ and backtrack_rep_max (mb : mb) (sp : int) (mcc : int) : int =
 and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
   let d = mb.ss.Save_stack.data in
   let base = sp - Save_stack.width_rep_min in
-  let rep_pc = Array.unsafe_get d base in
-  let count = Array.unsafe_get d (base + 1) in
-  let eptr = Array.unsafe_get d (base + 2) in
-  let dd = Array.unsafe_get d (base + 3) in
+  let rep_pc = Array.get d base in
+  let count = Array.get d (base + 1) in
+  let eptr = Array.get d (base + 2) in
+  let dd = Array.get d (base + 3) in
   setup_rep mb rep_pc;
   if count >= mb.rep_lmax then
     (* Chunk K1b — the C's count exhaustion is `if (Lmin++ >= Lmax)
@@ -3596,8 +3596,8 @@ and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
           let mcc' = tick_child mb mcc (dd + 1) in
           if mcc' < 0 then mcc'
           else (
-            Array.unsafe_set d (base + 1) (count + 1);
-            Array.unsafe_set d (base + 2) e';
+            Array.set d (base + 1) (count + 1);
+            Array.set d (base + 2) e';
             (run [@tailcall]) mb mb.rep_cont e' sp (dd + 1) mcc')
     else if eptr >= mb.end_subject then
       let r = scheck_partial mb eptr in
@@ -3619,8 +3619,8 @@ and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
         let mcc' = tick_child mb mcc (dd + 1) in
         if mcc' < 0 then mcc'
         else (
-          Array.unsafe_set d (base + 1) (count + 1);
-          Array.unsafe_set d (base + 2) (eptr + l);
+          Array.set d (base + 1) (count + 1);
+          Array.set d (base + 2) (eptr + l);
           (run [@tailcall]) mb mb.rep_cont (eptr + l) sp (dd + 1) mcc')
     else if not (rep_unit_matches mb eptr) then
       (* Chunk K1b — record the C-exact mismatch position (minimize=true). *)
@@ -3629,8 +3629,8 @@ and backtrack_rep_min (mb : mb) (sp : int) (mcc : int) : int =
       let mcc' = tick_child mb mcc (dd + 1) in
       if mcc' < 0 then mcc'
       else (
-        Array.unsafe_set d (base + 1) (count + 1);
-        Array.unsafe_set d (base + 2) (eptr + 1);
+        Array.set d (base + 1) (count + 1);
+        Array.set d (base + 2) (eptr + 1);
         (run [@tailcall]) mb mb.rep_cont (eptr + 1) sp (dd + 1) mcc')
 
 (* RM33 for OP_ANY (pcre2_match.c:3973-3989): the reiterated char must not be a
@@ -3661,8 +3661,8 @@ and rep_bt_min_any (mb : mb) (base : int) (count : int) (eptr : int) (dd : int)
       else (
         (* Chunk I — OP_ANY consumes one CHARACTER (multi-byte in UTF). *)
         let adv = if mb.utf then cp_len mb eptr else 1 in
-        Array.unsafe_set d (base + 1) (count + 1);
-        Array.unsafe_set d (base + 2) (eptr + adv);
+        Array.set d (base + 1) (count + 1);
+        Array.set d (base + 2) (eptr + adv);
         (run [@tailcall]) mb mb.rep_cont (eptr + adv)
           (base + Save_stack.width_rep_min)
           (dd + 1) mcc')
@@ -3717,8 +3717,8 @@ and rep_bt_min_anynl_step (mb : mb) (base : int) (count : int) (e' : int)
     let d = mb.ss.Save_stack.data in
     (* safe: base+1/base+2 are inside the popped REP_MIN record [backtrack]
        located at data.(sp-1). *)
-    Array.unsafe_set d (base + 1) (count + 1);
-    Array.unsafe_set d (base + 2) e';
+    Array.set d (base + 1) (count + 1);
+    Array.set d (base + 2) e';
     (run [@tailcall]) mb mb.rep_cont e'
       (base + Save_stack.width_rep_min)
       (dd + 1) mcc')
@@ -3751,10 +3751,10 @@ and op_ref_repeat (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
   setup_ref_rep mb pc;
   let ov = mb.ovector in
   let ovbase = mb.ref_ovbase in
-  if not (Int.equal (Array.unsafe_get ov ovbase) Frames.unset) then
+  if not (Int.equal (Array.get ov ovbase) Frames.unset) then
     (* pcre2_match.c:5066-5069 — group is set. *)
     if
-      Int.equal (Array.unsafe_get ov ovbase) (Array.unsafe_get ov (ovbase + 1))
+      Int.equal (Array.get ov ovbase) (Array.get ov (ovbase + 1))
     then (run [@tailcall]) mb mb.ref_cont eptr sp rdepth mcc (* zero length, 5068 *)
     else (ref_min [@tailcall]) mb 1 eptr sp rdepth mcc
   else if Int.equal mb.ref_lmin 0 || mb.match_unset_backref then
@@ -3791,11 +3791,11 @@ and ref_min (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
       let need = sp + Save_stack.width_ref_min in
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
       let d = ss.Save_stack.data in
-      Array.unsafe_set d sp mb.ref_pc;
-      Array.unsafe_set d (sp + 1) mb.ref_lmin (* count so far *);
-      Array.unsafe_set d (sp + 2) eptr;
-      Array.unsafe_set d (sp + 3) rdepth;
-      Array.unsafe_set d (sp + 4) Save_stack.kind_ref_min;
+      Array.set d sp mb.ref_pc;
+      Array.set d (sp + 1) mb.ref_lmin (* count so far *);
+      Array.set d (sp + 2) eptr;
+      Array.set d (sp + 3) rdepth;
+      Array.set d (sp + 4) Save_stack.kind_ref_min;
       (run [@tailcall]) mb mb.ref_cont eptr need (rdepth + 1) mcc'))
   else
     (* pcre2_match.c:5120-5124 — maximize: Lstart = eptr (position after Lmin
@@ -3805,7 +3805,7 @@ and ref_min (mb : mb) (i : int) (eptr : int) (sp : int) (rdepth : int)
        counts per copy, routing to the RM22 rescan path (chunk I2). *)
     let ov = mb.ovector in
     let flength =
-      Array.unsafe_get ov (mb.ref_ovbase + 1) - Array.unsafe_get ov mb.ref_ovbase
+      Array.get ov (mb.ref_ovbase + 1) - Array.get ov mb.ref_ovbase
     in
     (ref_max_scan [@tailcall]) mb mb.ref_lmin flength eptr eptr true sp rdepth
       mcc
@@ -3858,12 +3858,12 @@ and ref_max_end (mb : mb) (i : int) (flength : int) (lstart : int) (eptr : int)
       let need = sp + Save_stack.width_ref_max in
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
       let d = ss.Save_stack.data in
-      Array.unsafe_set d sp mb.ref_cont;
-      Array.unsafe_set d (sp + 1) eptr;
-      Array.unsafe_set d (sp + 2) flength;
-      Array.unsafe_set d (sp + 3) lstart;
-      Array.unsafe_set d (sp + 4) rdepth;
-      Array.unsafe_set d (sp + 5) Save_stack.kind_ref_max;
+      Array.set d sp mb.ref_cont;
+      Array.set d (sp + 1) eptr;
+      Array.set d (sp + 2) flength;
+      Array.set d (sp + 3) lstart;
+      Array.set d (sp + 4) rdepth;
+      Array.set d (sp + 5) Save_stack.kind_ref_max;
       (run [@tailcall]) mb mb.ref_cont eptr need (rdepth + 1) mcc'))
   else (
     (* pcre2_match.c:5164-5172 — differing lengths (chunk I2): Lmax = i (the
@@ -3877,12 +3877,12 @@ and ref_max_end (mb : mb) (i : int) (flength : int) (lstart : int) (eptr : int)
       let need = sp + Save_stack.width_ref_max2 in
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
       let d = ss.Save_stack.data in
-      Array.unsafe_set d sp mb.ref_pc;
-      Array.unsafe_set d (sp + 1) i (* lmax_cur *);
-      Array.unsafe_set d (sp + 2) eptr (* try_eptr *);
-      Array.unsafe_set d (sp + 3) lstart;
-      Array.unsafe_set d (sp + 4) rdepth;
-      Array.unsafe_set d (sp + 5) Save_stack.kind_ref_max2;
+      Array.set d sp mb.ref_pc;
+      Array.set d (sp + 1) i (* lmax_cur *);
+      Array.set d (sp + 2) eptr (* try_eptr *);
+      Array.set d (sp + 3) lstart;
+      Array.set d (sp + 4) rdepth;
+      Array.set d (sp + 5) Save_stack.kind_ref_max2;
       (run [@tailcall]) mb mb.ref_cont eptr need (rdepth + 1) mcc'))
 
 (* KIND_REF_MIN backtrack (RM20, pcre2_match.c:5102-5113 / interpreter.ml
@@ -3892,10 +3892,10 @@ and ref_max_end (mb : mb) (i : int) (flength : int) (lstart : int) (eptr : int)
 and backtrack_ref_min (mb : mb) (sp : int) (mcc : int) : int =
   let d = mb.ss.Save_stack.data in
   let base = sp - Save_stack.width_ref_min in
-  let rep_pc = Array.unsafe_get d base in
-  let count = Array.unsafe_get d (base + 1) in
-  let eptr = Array.unsafe_get d (base + 2) in
-  let dd = Array.unsafe_get d (base + 3) in
+  let rep_pc = Array.get d base in
+  let count = Array.get d (base + 1) in
+  let eptr = Array.get d (base + 2) in
+  let dd = Array.get d (base + 3) in
   setup_ref_rep mb rep_pc;
   if count >= mb.ref_lmax then
     (* pcre2_match.c:5104 — Lmin++ >= Lmax: RRETURN(MATCH_NOMATCH) from the
@@ -3914,8 +3914,8 @@ and backtrack_ref_min (mb : mb) (sp : int) (mcc : int) : int =
       if mcc' < 0 then mcc'
       else (
         let eptr' = eptr + mb.ref_length in
-        Array.unsafe_set d (base + 1) (count + 1);
-        Array.unsafe_set d (base + 2) eptr';
+        Array.set d (base + 1) (count + 1);
+        Array.set d (base + 2) eptr';
         (run [@tailcall]) mb mb.ref_cont eptr' sp (dd + 1) mcc')
 
 (* KIND_REF_MAX backtrack (RM21, pcre2_match.c:5158-5161 / interpreter.ml
@@ -3924,17 +3924,17 @@ and backtrack_ref_min (mb : mb) (sp : int) (mcc : int) : int =
 and backtrack_ref_max (mb : mb) (sp : int) (mcc : int) : int =
   let d = mb.ss.Save_stack.data in
   let base = sp - Save_stack.width_ref_max in
-  let cont = Array.unsafe_get d base in
-  let try_eptr = Array.unsafe_get d (base + 1) in
-  let flength = Array.unsafe_get d (base + 2) in
-  let lstart = Array.unsafe_get d (base + 3) in
-  let dd = Array.unsafe_get d (base + 4) in
+  let cont = Array.get d base in
+  let try_eptr = Array.get d (base + 1) in
+  let flength = Array.get d (base + 2) in
+  let lstart = Array.get d (base + 3) in
+  let dd = Array.get d (base + 4) in
   let new_eptr = try_eptr - flength in
   if new_eptr >= lstart then (
     let mcc' = tick_child mb mcc (dd + 1) in
     if mcc' < 0 then mcc'
     else (
-      Array.unsafe_set d (base + 1) new_eptr;
+      Array.set d (base + 1) new_eptr;
       (run [@tailcall]) mb cont new_eptr sp (dd + 1) mcc'))
   else (backtrack [@tailcall]) mb base mcc (* Feptr < Lstart: NOMATCH, 5186 *)
 
@@ -3948,11 +3948,11 @@ and backtrack_ref_max (mb : mb) (sp : int) (mcc : int) : int =
 and backtrack_ref_max2 (mb : mb) (sp : int) (mcc : int) : int =
   let d = mb.ss.Save_stack.data in
   let base = sp - Save_stack.width_ref_max2 in
-  let ref_pc = Array.unsafe_get d base in
-  let lmax_cur = Array.unsafe_get d (base + 1) in
-  let try_eptr = Array.unsafe_get d (base + 2) in
-  let lstart = Array.unsafe_get d (base + 3) in
-  let dd = Array.unsafe_get d (base + 4) in
+  let ref_pc = Array.get d base in
+  let lmax_cur = Array.get d (base + 1) in
+  let try_eptr = Array.get d (base + 2) in
+  let lstart = Array.get d (base + 3) in
+  let dd = Array.get d (base + 4) in
   if Int.equal try_eptr lstart then (backtrack [@tailcall]) mb base mcc
     (* pcre2_match.c:5174 — fail after the minimal repetition. *)
   else (
@@ -3964,8 +3964,8 @@ and backtrack_ref_max2 (mb : mb) (sp : int) (mcc : int) : int =
     let mcc' = tick_child mb mcc (dd + 1) in
     if mcc' < 0 then mcc'
     else (
-      Array.unsafe_set d (base + 1) lmax_cur;
-      Array.unsafe_set d (base + 2) e;
+      Array.set d (base + 1) lmax_cur;
+      Array.set d (base + 2) e;
       (run [@tailcall]) mb mb.ref_cont e sp (dd + 1) mcc'))
 
 (* ---------- Lookaround / atomic groups (chunk G, §2/§3) ---------- *)
@@ -3991,11 +3991,11 @@ and backtrack_once (mb : mb) (sp : int) (mcc : int) : int =
      downstream construct recorded >= its own spine position >= this entry when it
      failed, §4). ov has nov slots. *)
   for i = 2 to nov - 1 do
-    Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+    Array.set ov i (Array.get d (base + i - 2))
   done;
-  mb.once_base <- Array.unsafe_get d (base + nov - 2);
-  mb.mark <- Array.unsafe_get d (base + nov - 1) (* revert Fmark *);
-  mb.start_match <- Array.unsafe_get d (base + nov + 2) (* revert \K *);
+  mb.once_base <- Array.get d (base + nov - 2);
+  mb.mark <- Array.get d (base + nov - 1) (* revert Fmark *);
+  mb.start_match <- Array.get d (base + nov + 2) (* revert \K *);
   (backtrack [@tailcall]) mb base mcc
 
 (* KIND_NASSERT backtrack (fast-design.md §3): ALL branches of a negative
@@ -4016,14 +4016,14 @@ and backtrack_nassert (mb : mb) (sp : int) (mcc : int) : int =
      saved_start_match at base + nov + 3, pad at base + nov + 4. ov has nov
      slots. *)
   for i = 2 to nov - 1 do
-    Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+    Array.set ov i (Array.get d (base + i - 2))
   done;
-  mb.once_base <- Array.unsafe_get d (base + nov - 2);
-  let cont = Array.unsafe_get d (base + nov - 1) in
-  let eptr = Array.unsafe_get d (base + nov) in
-  let rdepth = Array.unsafe_get d (base + nov + 1) in
-  mb.mark <- Array.unsafe_get d (base + nov + 2) (* revert Fmark to entry *);
-  mb.start_match <- Array.unsafe_get d (base + nov + 3) (* revert \K to entry *);
+  mb.once_base <- Array.get d (base + nov - 2);
+  let cont = Array.get d (base + nov - 1) in
+  let eptr = Array.get d (base + nov) in
+  let rdepth = Array.get d (base + nov + 1) in
+  mb.mark <- Array.get d (base + nov + 2) (* revert Fmark to entry *);
+  mb.start_match <- Array.get d (base + nov + 3) (* revert \K to entry *);
   (run [@tailcall]) mb cont eptr base rdepth mcc
 
 (* OP_VREVERSE forward (fast-design.md §2/§3; pcre2_match.c:5834-5883,
@@ -4052,8 +4052,8 @@ and op_vreverse (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     (mcc : int) : int =
   (* safe: [pc] is a VREVERSE head (arity 3), so pc+1/pc+2 are its operands,
      in range (verifier-proven, ir_verify.ml). *)
-  let lmin = (Array.unsafe_get mb.code (pc + 1)) in
-  let lmax = (Array.unsafe_get mb.code (pc + 2)) in
+  let lmin = (Array.get mb.code (pc + 1)) in
+  let lmax = (Array.get mb.code (pc + 2)) in
   let body_pc = pc + 3 in
   if mb.utf then
     (* pcre2_match.c:5843-5857 (interpreter.ml op_vreverse_utf_loop) — UTF
@@ -4132,12 +4132,12 @@ and vreverse_try (mb : mb) (body_pc : int) (cur_lmax : int) (lmin : int)
     let d = ss.Save_stack.data in
     (* safe: [grow] ensured length >= sp + width_vreverse. Layout: [body_pc;
        cur_lmax; lmin; cur_eptr; rdepth; KIND_VREVERSE]. *)
-    Array.unsafe_set d sp body_pc;
-    Array.unsafe_set d (sp + 1) cur_lmax;
-    Array.unsafe_set d (sp + 2) lmin;
-    Array.unsafe_set d (sp + 3) start_eptr;
-    Array.unsafe_set d (sp + 4) rdepth;
-    Array.unsafe_set d (sp + 5) Save_stack.kind_vreverse;
+    Array.set d sp body_pc;
+    Array.set d (sp + 1) cur_lmax;
+    Array.set d (sp + 2) lmin;
+    Array.set d (sp + 3) start_eptr;
+    Array.set d (sp + 4) rdepth;
+    Array.set d (sp + 5) Save_stack.kind_vreverse;
     (run [@tailcall]) mb body_pc start_eptr need (rdepth + 1) mcc')
 
 (* KIND_VREVERSE backtrack (RM37, pcre2_match.c:5877-5882): the branch failed at
@@ -4146,11 +4146,11 @@ and vreverse_try (mb : mb) (body_pc : int) (cur_lmax : int) (lmin : int)
 and backtrack_vreverse (mb : mb) (sp : int) (mcc : int) : int =
   let d = mb.ss.Save_stack.data in
   let base = sp - Save_stack.width_vreverse in
-  let body_pc = Array.unsafe_get d base in
-  let cur_lmax = Array.unsafe_get d (base + 1) in
-  let lmin = Array.unsafe_get d (base + 2) in
-  let cur_eptr = Array.unsafe_get d (base + 3) in
-  let dd = Array.unsafe_get d (base + 4) in
+  let body_pc = Array.get d base in
+  let cur_lmax = Array.get d (base + 1) in
+  let lmin = Array.get d (base + 2) in
+  let cur_eptr = Array.get d (base + 3) in
+  let dd = Array.get d (base + 4) in
   if cur_lmax <= lmin then (backtrack [@tailcall]) mb base mcc (* NOMATCH, 5878 *)
   else
     let mcc' = tick_child mb mcc (dd + 1) in
@@ -4163,8 +4163,8 @@ and backtrack_vreverse (mb : mb) (sp : int) (mcc : int) : int =
           Utf.forwardchartest mb.subject (cur_eptr + 1) mb.end_subject
         else cur_eptr + 1
       in
-      Array.unsafe_set d (base + 1) (cur_lmax - 1);
-      Array.unsafe_set d (base + 3) new_eptr;
+      Array.set d (base + 1) (cur_lmax - 1);
+      Array.set d (base + 3) new_eptr;
       (run [@tailcall]) mb body_pc new_eptr sp (dd + 1) mcc')
 
 (* OP_KETRPOS (fast-design.md §3; pcre2_match.c:5292-5302 / 6092-6098): a
@@ -4190,18 +4190,18 @@ and op_ketrpos (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
      recursion ran the branches grouploop-style and the ket restores the pre-call
      captures + continues past the call. current_recurse >= 0 only inside a
      recursion, so normal possessive matching falls through. *)
-  if Int.equal mb.current_recurse ((Array.unsafe_get code (pc + 3))) then
+  if Int.equal mb.current_recurse ((Array.get code (pc + 3))) then
     (recurse_return [@tailcall]) mb eptr sp rdepth mcc
   else
-  let body_entry = (Array.unsafe_get code (pc + 1)) in
-  let cap_ovbase = (Array.unsafe_get code (pc + 2)) in
+  let body_entry = (Array.get code (pc + 1)) in
+  let cap_ovbase = (Array.get code (pc + 2)) in
   let base = mb.once_base in
   let nov = 2 * mb.oveccount in
   let d = mb.ss.Save_stack.data in
   (* safe: [base] is a KIND_POS record base; iter_start at base+nov-1,
      matched_once at base+nov, entry_rdepth at base+nov+2. *)
-  let iter_start = Array.unsafe_get d (base + nov - 1) in
-  let entry_rdepth = Array.unsafe_get d (base + nov + 2) in
+  let iter_start = Array.get d (base + nov - 1) in
+  let entry_rdepth = Array.get d (base + nov + 2) in
   (* pcre2_match.c:6079-6083 — a capturing possessive bracket writes its ovector
      pair each iteration (the last committed iteration wins). The ovector is
      written only HERE (at close), so a mid-body backref sees only closed values
@@ -4209,9 +4209,9 @@ and op_ketrpos (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
      2N (Ir_verify) < 2*oveccount. *)
   if cap_ovbase > 0 then (
     let ov = mb.ovector in
-    Array.unsafe_set ov cap_ovbase (iter_start - mb.start_subject);
-    Array.unsafe_set ov (cap_ovbase + 1) (eptr - mb.start_subject));
-  Array.unsafe_set d (base + nov) 1 (* Lmatched_once = TRUE, 5294 *);
+    Array.set ov cap_ovbase (iter_start - mb.start_subject);
+    Array.set ov (cap_ovbase + 1) (eptr - mb.start_subject));
+  Array.set d (base + nov) 1 (* Lmatched_once = TRUE, 5294 *);
   let sp' = base + nov + 6 (* commit: truncate to boundary + width_pos *) in
   if Int.equal eptr iter_start then
     (* pcre2_match.c:5295-5299 — empty match: break the loop (to POSSESS_DONE at
@@ -4219,11 +4219,11 @@ and op_ketrpos (mb : mb) (pc : int) (eptr : int) (sp : int) (rdepth : int)
     (run [@tailcall]) mb (pc + 4) eptr sp' entry_rdepth mcc
   else (
     (* pcre2_match.c:5301-5302 — restart from the bracket for the next iteration. *)
-    Array.unsafe_set d (base + nov - 1) eptr (* iter_start = eptr *);
+    Array.set d (base + nov - 1) eptr (* iter_start = eptr *);
     (* Chunk H — refresh cap_start to the NEW iteration's start (for an OP_CLOSE
        at an inner ( *ACCEPT); see the POSSESS arm). *)
     if cap_ovbase > 0 then
-      Array.unsafe_set mb.cap_start cap_ovbase (eptr - mb.start_subject);
+      Array.set mb.cap_start cap_ovbase (eptr - mb.start_subject);
     (run [@tailcall]) mb body_entry eptr sp' entry_rdepth mcc)
 
 (* KIND_POS backtrack (fast-design.md §3): the possessive group is backtracked
@@ -4238,11 +4238,11 @@ and backtrack_pos (mb : mb) (sp : int) (mcc : int) : int =
      [base, base + nov - 2), prev_once_base at base + nov - 2, saved_mark at
      base + nov + 3, saved_start_match at base + nov + 4. *)
   for i = 2 to nov - 1 do
-    Array.unsafe_set ov i (Array.unsafe_get d (base + i - 2))
+    Array.set ov i (Array.get d (base + i - 2))
   done;
-  mb.once_base <- Array.unsafe_get d (base + nov - 2);
-  mb.mark <- Array.unsafe_get d (base + nov + 3) (* revert Fmark *);
-  mb.start_match <- Array.unsafe_get d (base + nov + 4) (* revert \K *);
+  mb.once_base <- Array.get d (base + nov - 2);
+  mb.mark <- Array.get d (base + nov + 3) (* revert Fmark *);
+  mb.start_match <- Array.get d (base + nov + 4) (* revert \K *);
   (backtrack [@tailcall]) mb base mcc
 
 (* ---------- Repeat superinstructions (§2/§4) ----------
@@ -4536,11 +4536,11 @@ and rep_after_min (mb : mb) (eptr : int) (sp : int) (rdepth : int) (mcc : int) :
       let need = sp + Save_stack.width_rep_min in
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
       let d = ss.Save_stack.data in
-      Array.unsafe_set d sp mb.rep_pc;
-      Array.unsafe_set d (sp + 1) mb.rep_lmin (* count = matched so far *);
-      Array.unsafe_set d (sp + 2) eptr;
-      Array.unsafe_set d (sp + 3) rdepth;
-      Array.unsafe_set d (sp + 4) Save_stack.kind_rep_min;
+      Array.set d sp mb.rep_pc;
+      Array.set d (sp + 1) mb.rep_lmin (* count = matched so far *);
+      Array.set d (sp + 2) eptr;
+      Array.set d (sp + 3) rdepth;
+      Array.set d (sp + 4) Save_stack.kind_rep_min;
       (run [@tailcall]) mb mb.rep_cont eptr need (rdepth + 1) mcc'))
   else (
     (* Maximize or possessive: greedy scan from Lmin. floor = Lstart_eptr.
@@ -4866,11 +4866,11 @@ and rep_greedy_done (mb : mb) (pmax : int) (sp : int) (rdepth : int) (mcc : int)
       let need = sp + Save_stack.width_rep_max in
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
       let d = ss.Save_stack.data in
-      Array.unsafe_set d sp mb.rep_pc;
-      Array.unsafe_set d (sp + 1) (rep_giveback mb mb.rep_pc mb.rep_floor pmax);
-      Array.unsafe_set d (sp + 2) mb.rep_floor;
-      Array.unsafe_set d (sp + 3) rdepth;
-      Array.unsafe_set d (sp + 4) Save_stack.kind_rep_max;
+      Array.set d sp mb.rep_pc;
+      Array.set d (sp + 1) (rep_giveback mb mb.rep_pc mb.rep_floor pmax);
+      Array.set d (sp + 2) mb.rep_floor;
+      Array.set d (sp + 3) rdepth;
+      Array.set d (sp + 4) Save_stack.kind_rep_max;
       (run [@tailcall]) mb mb.rep_cont pmax need (rdepth + 1) mcc')
 
 (* CLASS maximize (pcre2_match.c:2143-2150) / XCLASS maximize
@@ -4890,16 +4890,16 @@ and rep_greedy_done_class (mb : mb) (pmax : int) (sp : int) (rdepth : int)
       let need = sp + Save_stack.width_rep_max in
       if need > Array.length ss.Save_stack.data then Save_stack.grow ss need;
       let d = ss.Save_stack.data in
-      Array.unsafe_set d sp mb.rep_pc;
-      Array.unsafe_set d (sp + 1)
+      Array.set d sp mb.rep_pc;
+      Array.set d (sp + 1)
         (rep_giveback mb mb.rep_pc mb.rep_floor pmax)
         (* next give-back: one char (UTF) / code unit back; pmax = floor
            stores the -1 pop sentinel. The UTF step from pmax > floor may
            land BELOW a mid-character floor (\C) — still a try, per the C's
            RM201/RM101 loops (regression 144922). *);
-      Array.unsafe_set d (sp + 2) mb.rep_floor;
-      Array.unsafe_set d (sp + 3) rdepth;
-      Array.unsafe_set d (sp + 4) Save_stack.kind_rep_max;
+      Array.set d (sp + 2) mb.rep_floor;
+      Array.set d (sp + 3) rdepth;
+      Array.set d (sp + 4) Save_stack.kind_rep_max;
       (run [@tailcall]) mb mb.rep_cont pmax need (rdepth + 1) mcc')
 
 (* Single character type (fast-design.md §2; the non-UTF single-type arms
@@ -5451,7 +5451,7 @@ and run_attempt (mb : mb) (start_match : int) (req_cu_ptr : int) : int =
        attempt starts with all group slots UNSET (the whole-match [0,1] is set
        at END). Group slots only: [0,1] are overwritten at END. *)
     for i = 2 to (2 * mb.oveccount) - 1 do
-      Array.unsafe_set mb.ovector i Frames.unset
+      Array.set mb.ovector i Frames.unset
     done;
     let rc =
       (* pcre2_match.c:644-657 + 776-783 — match() enters through frame 0's
@@ -6151,8 +6151,8 @@ let exec ?(match_limit = Limits.match_limit)
 (* ---------- Module-initialization asserts ----------
 
    Pin every literal int tag used by [run]'s dispatch arms and the two
-   ALT-detection sites (the BRA arm's `(Array.unsafe_get code (pc + 1)) 5` and [backtrack]'s
-   `(Array.unsafe_get code (handler)) 5`) against Ir's constants (interpreter.ml's opcode-pin
+   ALT-detection sites (the BRA arm's `(Array.get code (pc + 1)) 5` and [backtrack]'s
+   `(Array.get code (handler)) 5`) against Ir's constants (interpreter.ml's opcode-pin
    style, see its dispatch note): if a tag value in ir.ml ever changes, the
    library fails to load rather than silently mis-dispatching. *)
 let () =

@@ -523,7 +523,7 @@ let push (a : t) (f : int) : int =
     let dst = (n * a.frame_size_ints) + slot_eptr in
     let len = a.frame_size_ints - slot_eptr in
     for i = 0 to len - 1 do
-      Array.unsafe_set fr (dst + i) (Array.unsafe_get fr (src + i))
+      Array.set fr (dst + i) (Array.get fr (src + i))
     done;
     (* pcre2_match.c:753 — N->rdepth = Frdepth + 1 *)
     a.frames.((n * a.frame_size_ints) + slot_rdepth) <-
