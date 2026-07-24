@@ -5,6 +5,9 @@
 (library
  (name pcre2_engine)
  (public_name pcre2.engine)
+ ; Diagnostic: disable flambda's aggressive middle-end (see src/fast/dune).
+ (ocamlopt_flags
+  (:standard -Oclassic))
  ; [dls_compat_4]/[dls_compat_5] are version variants copied to [dls_compat]
  ; by the rules below; only the generated copy is compiled into the library.
  (modules

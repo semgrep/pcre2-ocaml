@@ -4,5 +4,8 @@
 (library
  (name pcre2_matcher)
  (public_name pcre2.matcher)
+ ; Diagnostic: disable flambda's aggressive middle-end (see src/fast/dune).
+ (ocamlopt_flags
+  (:standard -Oclassic))
  (preprocess
   (pps ppx_deriving.show ppx_deriving.eq)))

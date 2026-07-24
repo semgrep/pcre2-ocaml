@@ -5,4 +5,8 @@
 (library
  (name pcre2_fast)
  (public_name pcre2.fast)
+ ; Diagnostic: disable flambda's aggressive middle-end for the matcher to test
+ ; whether the prod heap corruption is a flambda miscompilation.
+ (ocamlopt_flags
+  (:standard -Oclassic))
  (libraries pcre2.engine pcre2.matcher))
