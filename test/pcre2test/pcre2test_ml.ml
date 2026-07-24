@@ -12,8 +12,6 @@ module H_oracle = Pcre2test_harness.Harness.Make (Pcre2_test_driver.Test_driver)
 module H_engine =
   Pcre2test_harness.Harness.Make (Pcre2test_harness.Engine_driver)
 
-module H_fast = Pcre2test_harness.Harness.Make (Pcre2test_harness.Fast_driver)
-
 let read_lines_with_newlines ic =
   (* Preserve exact line framing: keep '\n'; the final line may lack one. *)
   let buf = Buffer.create 4096 in
@@ -52,7 +50,6 @@ let () =
     (fun a ->
       if a = "--driver=oracle" then driver := `Oracle
       else if a = "--driver=engine" then driver := `Engine
-      else if a = "--driver=fast" then driver := `Fast
       else if String.length a >= 9 && String.sub a 0 9 = "--driver=" then (
         prerr_endline ("pcre2test_ml: unknown driver in '" ^ a ^ "'");
         exit 2)
@@ -68,6 +65,3 @@ let () =
   | `Engine ->
       run ~create:H_engine.create ~process_line:H_engine.process_line
         ~finish:H_engine.finish lines
-  | `Fast ->
-      run ~create:H_fast.create ~process_line:H_fast.process_line
-        ~finish:H_fast.finish lines

@@ -1,8 +1,0 @@
-; The fast engine (M11, docs/ocaml-engine/11-fast-engine.md): a second pure-
-; OCaml execution engine over the shared compiler's bytecode. Pure OCaml,
-; stdlib + pcre2.engine + pcre2.matcher only -- builds under
-; `dune build -p pcre2` (CI: build-pure.yml). NO C, NO new dependencies.
-(library
- (name pcre2_fast)
- (public_name pcre2.fast)
- (libraries pcre2.engine pcre2.matcher))

@@ -6,20 +6,13 @@
    7046) and default to the build limits (Limits, pcre2_context.c:166-179).
 
    The suite is ONE functor over Pcre2_matcher.Intf.Matcher instantiated for
-   Pcre2.Interp, Pcre2.Jit and Pcre2_fast.Matcher, so every assertion is
-   exercised against all three engines (they must agree — the interpreter is
-   the oracle). Because Pcre2.match_error is abstract in the frozen public
-   surface (src/pcre2.mli:168; distinct from Pcre2_matcher.Error.match_error),
-   the functor stays over the plain Matcher signature (match_error abstract)
-   and takes the three expected error values as a per-instance parameter,
-   comparing with the signature-provided [equal_match_error].
-
-   The final interop test outside the functor proves the pcre2_fast.mli
-   manifest-equality fix: one shared Options.Interp.match_option list value
-   passed to BOTH Pcre2.Interp.find and Pcre2_fast.Matcher.find, and the fast
-   result read with the shared Pcre2_matcher.Match.range_of_match — neither
-   compiled before the fix made Pcre2_fast.Matcher's match_option / match_
-   manifest. *)
+   Pcre2.Interp and Pcre2.Jit, so every assertion is exercised against both
+   engines (they must agree — the interpreter is the oracle). Because
+   Pcre2.match_error is abstract in the frozen public surface (src/pcre2.mli:168;
+   distinct from Pcre2_matcher.Error.match_error), the functor stays over the
+   plain Matcher signature (match_error abstract) and takes the three expected
+   error values as a per-instance parameter, comparing with the
+   signature-provided [equal_match_error]. *)
 
 module Make
     (M : Pcre2_matcher.Intf.Matcher) (P : sig
@@ -217,63 +210,9 @@ module Jit_tests =
       let heaplimit = Pcre2.HEAPLIMIT
     end)
 
-module Fast_tests =
-  Make
-    (Pcre2_fast.Matcher)
-    (struct
-      let matchlimit = Pcre2_matcher.Error.MATCHLIMIT
-      let depthlimit = Pcre2_matcher.Error.DEPTHLIMIT
-      let heaplimit = Pcre2_matcher.Error.HEAPLIMIT
-    end)
-
-(* Interop: one shared Options.Interp.match_option list value passed to BOTH
-   Pcre2.Interp.find and Pcre2_fast.Matcher.find, and the fast result read with
-   the shared Pcre2_matcher.Match.range_of_match. This only typechecks because
-   Pcre2_fast.Matcher exposes match_option = Pcre2_matcher.Options.Interp.
-   match_option (structurally equal to Pcre2.Options.Interp.match_option) and
-   match_ = Pcre2_matcher.Match.match_ (the pcre2_fast.mli manifest-equality
-   fix); before the fix both were abstract and neither line compiled. Pcre2.Jit
-   uses the narrower Options.Jit.match_option, so it is intentionally not part
-   of this cross-engine unification. *)
-let interop_tests =
-  [
-    Alcotest.test_case "shared match_option list + shared range across \
-                        Interp/Fast" `Quick (fun () ->
-        let opts : Pcre2_matcher.Options.Interp.match_option list =
-          [ `NOTEMPTY ]
-        in
-        let interp_re =
-          match Pcre2.Interp.compile "a(b)c" with
-          | Ok r -> r
-          | Error _ -> Alcotest.fail "interp compile failed"
-        in
-        let fast_re =
-          match Pcre2_fast.Matcher.compile "a(b)c" with
-          | Ok r -> r
-          | Error _ -> Alcotest.fail "fast compile failed"
-        in
-        let ri = Pcre2.Interp.find ~options:opts interp_re "abc" in
-        let rf = Pcre2_fast.Matcher.find ~options:opts fast_re "abc" in
-        match (ri, rf) with
-        | Ok (Some mi), Ok (Some mf) ->
-            (* Interp result via Interp's own range_of_match; fast result via
-               the SHARED matcher-library range_of_match (post-fix). *)
-            let { Pcre2.Interp.start = is_; end_ = ie } =
-              Pcre2.Interp.range_of_match mi
-            in
-            let { Pcre2_matcher.Match.start = fs; end_ = fe } =
-              Pcre2_matcher.Match.range_of_match mf
-            in
-            Alcotest.(check (pair int int)) "interp [0,3)" (0, 3) (is_, ie);
-            Alcotest.(check (pair int int)) "fast == interp" (is_, ie) (fs, fe)
-        | _ -> Alcotest.fail "expected both engines to match");
-  ]
-
 let () =
   Alcotest.run "pcre2_limits"
     [
       ("interp per-call limits", Interp_tests.tests);
       ("jit per-call limits", Jit_tests.tests);
-      ("fast per-call limits", Fast_tests.tests);
-      ("cross-engine interop", interop_tests);
     ]

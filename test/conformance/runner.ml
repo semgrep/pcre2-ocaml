@@ -40,9 +40,6 @@ module Oracle_harness =
 module Engine_harness =
   Pcre2test_harness.Harness.Make (Pcre2test_harness.Engine_driver)
 
-module Fast_harness =
-  Pcre2test_harness.Harness.Make (Pcre2test_harness.Fast_driver)
-
 module Units = Conformance_lib.Units
 module Sexp_lite = Conformance_lib.Sexp_lite
 
@@ -372,9 +369,6 @@ let () =
         else if String.equal a "--driver=engine" then (
           driver := `Engine;
           false)
-        else if String.equal a "--driver=fast" then (
-          driver := `Fast;
-          false)
         else if String.length a >= 9 && String.sub a 0 9 = "--driver=" then (
           prerr_endline ("runner: unknown driver in '" ^ a ^ "'");
           exit 2)
@@ -400,7 +394,7 @@ let () =
             exit 2)
     | _ ->
         prerr_endline
-          "usage: runner [--driver=oracle|engine|fast] [--frontier | \
+          "usage: runner [--driver=oracle|engine] [--frontier | \
            --failures | --regressions | --only <file>:<ordinal> | \
            --update-baseline]";
         exit 2
@@ -417,13 +411,6 @@ let () =
     | `Engine ->
         ( (module Engine_harness : HARNESS),
           "test/conformance/engine_baseline_counts.sexp",
-          false )
-    | `Fast ->
-        (* Fast engine (M11): unsupported patterns surface as "harness"-
-           category skips ("unsupported:<reason>"); the baseline is a
-           ratchet that only rises as chunk coverage grows. *)
-        ( (module Fast_harness : HARNESS),
-          "test/conformance/fast_baseline_counts.sexp",
           false )
   in
   let run_file = run_file harness in
@@ -550,7 +537,6 @@ let () =
             match !driver with
             | `Oracle -> ""
             | `Engine -> "--driver=engine "
-            | `Fast -> "--driver=fast "
           in
           Printf.fprintf oc
             "; Conformance baseline: ((<file> <passed> <total-in-scope>) ...)\n\

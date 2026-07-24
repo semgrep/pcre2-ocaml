@@ -9,13 +9,10 @@
 # Gc deltas and test/engine pins module-init order (frames_test first).
 # `dune runtest` below still runs the separate test executables in parallel.
 #
-# Usage: scripts/battery.sh [fuzz-seeds...]   (default seeds: 2 random)
+# Usage: scripts/battery.sh
 # Exit 0 iff every stage passed. Runs from the repo root.
 set -u
 cd "$(dirname "$0")/.."
-
-SEEDS=("$@")
-if [ ${#SEEDS[@]} -eq 0 ]; then SEEDS=($RANDOM$RANDOM $RANDOM$RANDOM); fi
 
 # One dune invocation covers build AND the unit suites (@runtest as build
 # rules) — a single lock acquisition, fully parallel internally. Retry a few
@@ -51,17 +48,11 @@ run_bg() { # name cmd...
   PIDS[$name]=$!
 }
 
-echo "battery: launching parallel stages (seeds: ${SEEDS[*]})..."
+echo "battery: launching parallel stages..."
 run_bg oracle       $RUNNER
 run_bg engine       $RUNNER --driver=engine
-run_bg fast         $RUNNER --driver=fast
 run_bg regressions  $RUNNER --regressions
 run_bg fuzz-oracle  $FUZZ --cases 10000
-i=0
-for s in "${SEEDS[@]}"; do
-  run_bg "fuzz-fast-$i" $FUZZ --mode fast-vs-interp --cases 50000 --seed "$s"
-  i=$((i+1))
-done
 run_bg pure-build   bash -c 'eval $(opam env) && dune build -p pcre2'
 
 FAIL=0
@@ -73,8 +64,6 @@ for name in "${!PIDS[@]}"; do
   fi
 done
 
-# one-line summaries for the interesting stages
-grep -h "compared=" "$OUT"/fuzz-fast-*.log 2>/dev/null | sed 's/^/battery: /'
 if [ "$FAIL" -eq 0 ]; then
   echo "battery: ALL STAGES PASS (logs: $OUT)"
 else

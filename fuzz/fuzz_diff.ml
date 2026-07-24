@@ -25,19 +25,6 @@
 
 module E = Pcre2_engine.Engine
 module O = Pcre2_test_driver.Test_driver
-module Fast = Pcre2_fast
-
-(* Differential mode. Default [`Oracle]: the pure engine vs the C oracle
-   (unchanged behavior). [`Fast]: the fast engine (Pcre2_fast) vs the pure
-   interpreter (Pcre2_engine.Engine) — pure OCaml, no oracle. In fast mode a
-   pattern the fast engine declines ([Unsupported]) is a SKIP, not a
-   divergence; both-Ok cases compare exec_full byte-for-byte, including the
-   imposed LIMIT_MATCH trip point (fast and interp must tick identically,
-   fast-design.md §4 — so the oracle-mode -47/-53 confound suppression does
-   NOT apply here). *)
-let mode : [ `Oracle | `Fast ] ref = ref `Oracle
-let fast_skipped = ref 0 (* fast declined (Unsupported) — per diff_case call *)
-let fast_compared = ref 0 (* both compiled OK, exec compared — per call *)
 
 (* ================================================================== *)
 (*  PCRE2 option-bit constants (pcre2.h.generic 10.44, mirrored so the *)
@@ -684,22 +671,6 @@ let ora_exec c subj off mo : eres =
     Res { rc = r.O.rc; ov = r.O.ovector; mark = r.O.mark; sc = r.O.startchar }
   with e -> Crash (Printexc.to_string e)
 
-(* Fast engine, same shape as [eng_exec] (both return E.exec_result). *)
-let fast_exec c subj off mo : eres =
-  try
-    match Fast.exec_full c subj off (Int32.of_int mo) with
-    | E.Match { ovector; mark; start_char } ->
-        let oc = (Fast.info c).E.capture_count + 1 in
-        let full = Array.make (2 * oc) (-1) in
-        Array.blit ovector 0 full 0 (Array.length ovector);
-        Res { rc = Array.length ovector / 2; ov = full; mark; sc = start_char }
-    | E.No_match { mark } -> Res { rc = -1; ov = [||]; mark; sc = 0 }
-    | E.Partial { start; mark } ->
-        Res { rc = -2; ov = [| start; String.length subj |]; mark; sc = start }
-    | E.Error { code; start_char } ->
-        Res { rc = code; ov = [||]; mark = None; sc = start_char }
-  with e -> Crash (Printexc.to_string e)
-
 let mark_eq a b =
   match (a, b) with
   | None, None -> true
@@ -853,59 +824,7 @@ let diff_case_oracle (c : case) : (kind * string) option =
           | Some reason -> Some (Exec_diff, reason)
           | None -> None
 
-(* Fast engine vs pure interpreter (fast-vs-interp mode). Both use the SHARED
-   compiler, so compile outcomes agree except that the fast side may decline a
-   valid pattern ([Unsupported]) — counted as a skip, never a divergence.
-   Both-Ok cases compare exec_full over the same draw. No limit-confound
-   suppression: fast and interp must tick identically (fast-design.md §4). *)
-let diff_case_fast (c : case) : (kind * string) option =
-  let pat = effective_pat c in
-  let eng =
-    try
-      match
-        E.compile_ctx ~newline:c.newline ~bsr:c.bsr ~extra:c.extra pat
-          (Int32.of_int c.copts)
-      with
-      | Ok code -> `Ok code
-      | Error (ec, eo) -> `Err (ec, eo)
-    with e -> `Crash (Printexc.to_string e)
-  in
-  let fst =
-    try
-      match
-        Fast.compile_ctx ~newline:c.newline ~bsr:c.bsr ~extra:c.extra pat
-          (Int32.of_int c.copts)
-      with
-      | Ok code -> `Ok code
-      | Error (Fast.Compile_error { errcode; erroroffset }) ->
-          `Err (errcode, erroroffset)
-      | Error (Fast.Unsupported reason) -> `Unsup reason
-    with e -> `Crash (Printexc.to_string e)
-  in
-  match (eng, fst) with
-  | `Crash s, _ -> Some (Compile_diff, "engine compile raised: " ^ s)
-  | _, `Crash s -> Some (Compile_diff, "fast compile raised: " ^ s)
-  | _, `Unsup _ ->
-      incr fast_skipped;
-      None (* fast declined this pattern: skip, not a divergence *)
-  | `Err (e1, o1), `Err (e2, o2) ->
-      if e1 <> e2 then
-        Some (Compile_diff, Printf.sprintf "compile error code %d vs %d" e1 e2)
-      else if o1 <> o2 then
-        Some (Compile_diff, Printf.sprintf "compile error offset %d vs %d" o1 o2)
-      else None
-  | `Err (e1, _), `Ok _ ->
-      Some (Compile_diff, Printf.sprintf "engine error %d, fast Ok" e1)
-  | `Ok _, `Err (e2, _) ->
-      Some (Compile_diff, Printf.sprintf "engine Ok, fast error %d" e2)
-  | `Ok ec, `Ok fc ->
-      incr fast_compared;
-      let a = eng_exec ec c.subj c.off c.mopts in
-      let b = fast_exec fc c.subj c.off c.mopts in
-      (match cmp_exec a b with Some reason -> Some (Exec_diff, reason) | None -> None)
-
-let diff_case (c : case) : (kind * string) option =
-  match !mode with `Oracle -> diff_case_oracle c | `Fast -> diff_case_fast c
+let diff_case (c : case) : (kind * string) option = diff_case_oracle c
 
 let reproduces c = diff_case c <> None
 
@@ -1209,7 +1128,7 @@ let signature kind reason =
 let usage () =
   prerr_endline
     "usage: fuzz_diff [--cases N] [--seed S] [--max-failures N] [--verbose] \
-     [--dump-case N] [--selftest] [--mode oracle|fast-vs-interp]";
+     [--dump-case N] [--selftest]";
   exit 2
 
 let () =
@@ -1226,10 +1145,6 @@ let () =
     | "--max-failures" :: n :: t -> max_failures := int_of_string n; parse t
     | "--verbose" :: t -> verbose := true; parse t
     | "--selftest" :: t -> selftest := true; parse t
-    | "--mode" :: "oracle" :: t -> mode := `Oracle; parse t
-    | "--mode" :: "fast-vs-interp" :: t -> mode := `Fast; parse t
-    | "--mode" :: m :: _ ->
-        Printf.eprintf "fuzz_diff: unknown --mode %s\n" m; usage ()
     | "--dump-case" :: n :: t -> dump_case := int_of_string n; parse t
     | "--help" :: _ | "-help" :: _ -> usage ()
     | a :: _ -> Printf.eprintf "fuzz_diff: unknown argument %s\n" a; usage ()
@@ -1396,16 +1311,10 @@ let () =
   done;
   let dt = Sys.time () -. t0 in
   let rate = if dt > 0.0 then float_of_int !ci /. dt else 0.0 in
-  let mode_str = match !mode with `Oracle -> "oracle" | `Fast -> "fast-vs-interp" in
   Printf.printf
-    "\nfuzz_diff: mode=%s seed=%d cases_run=%d distinct-classes=%d dup-hits=%d  \
+    "\nfuzz_diff: seed=%d cases_run=%d distinct-classes=%d dup-hits=%d  \
      (%.0f cases/sec, %.1fs)\n"
-    mode_str !seed !ci !failures !dup_hits rate dt;
-  (match !mode with
-  | `Fast ->
-      Printf.printf "fuzz_diff: fast-vs-interp compared=%d skipped(unsupported)=%d\n"
-        !fast_compared !fast_skipped
-  | `Oracle -> ());
+    !seed !ci !failures !dup_hits rate dt;
   if !failures > 0 then (
     Printf.printf "repros written under %s:\n" (Lazy.force regressions_dir);
     List.iter (fun f -> Printf.printf "  %s\n" f) (List.rev !repros);

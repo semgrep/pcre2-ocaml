@@ -13,7 +13,7 @@
  (public_names pcre2-bench pcre2-bench-compare)
  (package pcre2-dev)
  (modules bench compare bench_json)
- (libraries pcre2.engine pcre2.fast pcre2-dev.test-driver unix)
+ (libraries pcre2.engine pcre2-dev.test-driver unix)
  (foreign_stubs
   (language c)
   (names raw_c_stubs)
