@@ -44,6 +44,10 @@
 #include <ctype.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 
 #include <caml/mlvalues.h>
 #include <caml/alloc.h>
@@ -492,6 +496,140 @@ static inline void handle_pcre2_match_result(
   while (++ovec_dst < ovec_clear_stop) *ovec_dst = -1;
 }
 
+/* [_Thread_local] needs C11; MSVC only accepts it from VS2019 16.8 with
+   /std:c11, and older GCC/Clang spell it [__thread]. */
+#if defined(_MSC_VER) && !defined(_Thread_local)
+# define THREAD_LOCAL __declspec(thread)
+#elif __STDC_VERSION__ >= 201112L
+# define THREAD_LOCAL _Thread_local
+#else
+# define THREAD_LOCAL __thread
+#endif
+
+/* Match calls used to create and free a [pcre2_match_data] per call. Under
+   multiple threads (OCaml 5 domains included) those malloc/free pairs
+   serialize on the C allocator's lock and dominate the cost of cheap
+   matches, so each thread instead keeps one match_data in [tls_match_data]
+   and reuses it across matches. PCRE2 retains the backtracking frames vector
+   inside the block, so reuse skips that allocation too.
+
+   [acquire_match_data] takes the block out of the slot and
+   [release_match_data] puts it back, so a match that starts while another is
+   already running on this thread -- a callout function that matches again --
+   finds the slot empty and allocates a block of its own, as it did before
+   this cache existed. Sharing one block would corrupt the outer match, whose
+   frames vector lives in it.
+
+   The block grows to fit the widest pattern the thread has matched and is
+   never shrunk. On POSIX a [pthread_key_t] destructor frees it at thread
+   exit -- important because callers such as semgrep create and destroy
+   worker threads (domains) throughout a process's lifetime; see
+   [enrol_match_data] for what that misses. */
+static THREAD_LOCAL pcre2_match_data *tls_match_data = NULL;
+
+#ifndef _WIN32
+static pthread_key_t tls_match_data_key;
+static pthread_once_t tls_match_data_key_once = PTHREAD_ONCE_INIT;
+
+/* [pthread_once] init routines cannot report failure; stash it here instead.
+   Returning from [pthread_once] synchronizes with the init routine. */
+static int tls_match_data_key_err = 0;
+
+/* Runs on the terminating thread. The block must come from the argument,
+   which is the thread-specific-data value: C11 thread-local storage may
+   already be torn down by this point (it is on macOS), so [tls_match_data]
+   can read back as NULL here. */
+static void tls_match_data_destroy(void *md)
+{
+  pcre2_match_data_free((pcre2_match_data *) md);
+}
+
+static void tls_match_data_make_key(void)
+{
+  tls_match_data_key_err =
+    pthread_key_create(&tls_match_data_key, tls_match_data_destroy);
+}
+#endif
+
+/* Records [md] as the block to free at thread exit. Called only where a
+   cacheable block is created, so the thread-specific-data value and
+   [tls_match_data] always name the same block.
+
+   Best effort, and only about the block a thread leaves behind in its slot.
+   Every other block is freed regardless of platform: growing the cache frees
+   the block it replaces, and [release_match_data] frees the ones it cannot
+   cache. So what this misses costs one block per thread, not per match:
+
+     - Windows, where no destructor is registered at all, an [FlsAlloc]
+       callback being the analogue. A program that creates and destroys
+       threads grows with the number that have come and gone.
+     - The initial thread, since POSIX runs no thread-specific-data
+       destructors for it when [main] returns or [exit] is called.
+     - A thread whose key could not be created or set. */
+static void enrol_match_data(pcre2_match_data *md __unused)
+{
+#ifndef _WIN32
+  if (pthread_once(&tls_match_data_key_once, tls_match_data_make_key) == 0
+      && tls_match_data_key_err == 0)
+    (void) pthread_setspecific(tls_match_data_key, md);
+#endif
+}
+
+/* Produces a match_data able to hold every capture of [code], taking this
+   thread's cached block when the slot is free and the block is wide enough.
+
+   [cacheable] is false for callers that must not be handed a block wider than
+   the pattern needs -- DFA matching, whose yield counts alternative match
+   lengths rather than captures -- and they get a single-use block sized from
+   the pattern, as every call did before this cache existed.
+
+   Raises [Out_of_memory] if a block has to be allocated and cannot be;
+   otherwise every path out of the caller, exceptions included, must hand the
+   block to [release_match_data]. The one gap is an [Out_of_memory] from the
+   [caml_stat_alloc] calls on the callout path, which orphans the block -- the
+   process is out of memory at that point either way. */
+static pcre2_match_data *acquire_match_data(const pcre2_code *code, bool cacheable)
+{
+  if (!cacheable) {
+    pcre2_match_data *fresh = pcre2_match_data_create_from_pattern(code, NULL);
+    if (fresh == NULL) caml_raise_out_of_memory();
+    return fresh;
+  }
+
+  uint32_t capture_count = 0;
+  pcre2_pattern_info(code, PCRE2_INFO_CAPTURECOUNT, &capture_count);
+  const uint32_t pairs = capture_count + 1;
+
+  /* Emptying the slot is what makes a nested match allocate its own block
+     rather than share ours. */
+  pcre2_match_data *md = tls_match_data;
+  tls_match_data = NULL;
+
+  if (md == NULL || pcre2_get_ovector_count(md) < pairs) {
+    /* Allocate the replacement before freeing the old block so an
+       allocation failure leaves the cache as we found it. */
+    pcre2_match_data *fresh = pcre2_match_data_create(pairs, NULL);
+    if (fresh == NULL) {
+      tls_match_data = md;
+      caml_raise_out_of_memory();
+    }
+    if (md != NULL) pcre2_match_data_free(md);
+    md = fresh;
+    enrol_match_data(md);
+  }
+  return md;
+}
+
+/* Indicates that the caller is done with a block from [acquire_match_data].
+   Caches it for this thread's next match if it is cacheable and the slot is
+   free, and frees it otherwise -- the nested case, where the outer call
+   refills the slot. */
+static void release_match_data(pcre2_match_data *md, bool cacheable)
+{
+  if (cacheable && tls_match_data == NULL) tls_match_data = md;
+  else pcre2_match_data_free(md);
+}
+
 /* Executes a pattern match with runtime options, a regular expression, a
    matching position, the start of the the subject string, a subject string,
    a number of subgroup offsets, an offset vector and an optional callout
@@ -502,7 +640,13 @@ CAMLprim value pcre2_match_stub0(
     value v_ovec, value v_maybe_cof, value v_workspace)
 {
   int ret;
-  int is_dfa = v_workspace != (value) NULL;
+  const bool is_dfa = v_workspace != (value) NULL;
+  /* A DFA match fills its ovector with alternative match lengths rather than
+     captures, so its yield -- and with it the number of pairs copied into
+     [v_ovec] -- grows with the ovector it is given. It must therefore not be
+     handed a block from the shared cache, which is wider than the pattern
+     needs. */
+  const bool cacheable = !is_dfa;
   long
     pos = v_pos,
     subj_start = v_subj_start;
@@ -524,7 +668,7 @@ CAMLprim value pcre2_match_stub0(
     pcre2_match_context* mcontext = get_mcontext(v_rex);  /* Match context */
     PCRE2_SPTR ocaml_subj = (PCRE2_SPTR)String_val(v_subj) + subj_start;  /* Subject string */
 
-    pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(code, NULL);
+    pcre2_match_data* match_data = acquire_match_data(code, cacheable);
 
     /* Special case when no callout functions specified */
     if (Is_none(v_maybe_cof)) {
@@ -539,7 +683,7 @@ CAMLprim value pcre2_match_stub0(
       size_t *ovec = pcre2_get_ovector_pointer(match_data);
 
       if (ret < 0) {
-        pcre2_match_data_free(match_data);
+        release_match_data(match_data, cacheable);
         handle_match_error("pcre2_match_stub", ret);
       } else {
         handle_pcre2_match_result(ovec, v_ovec, ovec_len, subj_start, ret);
@@ -589,7 +733,7 @@ CAMLprim value pcre2_match_stub0(
       size_t* ovec = pcre2_get_ovector_pointer(match_data);
       if (ret < 0) {
         if (is_dfa) caml_stat_free(workspace);
-        pcre2_match_data_free(match_data);
+        release_match_data(match_data, cacheable);
         if (ret == PCRE2_ERROR_CALLOUT) caml_raise(cod.v_exn);
         else handle_match_error("pcre2_match_stub(callout)", ret);
       } else {
@@ -608,7 +752,10 @@ CAMLprim value pcre2_match_stub0(
         }
       }
     }
-    pcre2_match_data_free(match_data);
+
+    /* Both branches above have finished reading the ovector by now, and the
+       error paths released already before raising. */
+    release_match_data(match_data, cacheable);
   }
 
   return Val_unit;

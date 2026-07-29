@@ -1,6 +1,6 @@
 (test
  (name pcre2_tests)
- (libraries pcre2 ounit2)
+ (libraries pcre2 ounit2 threads.posix)
 )
 
 (env
