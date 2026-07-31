@@ -1,5 +1,11 @@
 # pcre2-ocaml changelog
 
+## Unreleased
+
+* Fixed a segfault under major GC compaction: the capture-group name table for
+  a pattern with no named groups was built as a zero-length `caml_alloc_small`
+  block rather than the shared atom.
+
 ## 7.5.3 (2024-04-18)
 
 * Fixed bug in `raise_bad_pattern` regarding string creation for the exception,

@@ -128,13 +128,54 @@ end = struct
           (* 0 is the whole match *)
           [ ("A", 1); ("B", 2); ("C", 3) ]
           (capture_groups re));
-    match compile "(?<A>a)(b)(?<C>c)" with
+    (match compile "(?<A>a)(b)(?<C>c)" with
     | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         assert_equal ~printer:[%show: (string * int) list]
           (* 0 is the whole match *)
           [ ("A", 1); ("C", 3) ]
-          (capture_groups re)
+          (capture_groups re));
+    (* A pattern with no named groups at all: the name table is empty rather
+       than absent, so it is a distinct case from the two above. *)
+    match compile "(a+)(b+)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re -> (
+        assert_equal ~printer:[%show: (string * int) list] []
+          (capture_groups re);
+        match captures re "aaabbb" with
+        | Ok (Some c) ->
+            assert_equal ~printer:[%show: string option] None
+              (named_match_of_captures c "A" |> Option.map substring_of_match)
+        | Ok None -> assert_failure "expected a match for aaabbb"
+        | Error e -> assert_failure ("match error: " ^ show_match_error e))
+
+  (* Regression: for a pattern with no named groups the name table must be the
+     shared atom, not a zero-length block, which the major GC cannot walk.  The
+     retention below is what makes this bite -- a table that dies before the
+     next collection is never scanned, so the values have to survive the GC. *)
+  let name_table_compaction ctxt =
+    match compile "(a+)(b+)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let kept = ref [] in
+        for _ = 1 to 200 do
+          match captures re "aaabbb" with
+          | Ok (Some c) -> kept := c :: !kept
+          | Ok None -> assert_failure "expected a match for aaabbb"
+          | Error e -> assert_failure ("match error: " ^ show_match_error e)
+        done;
+        Gc.minor ();
+        Gc.full_major ();
+        Gc.compact ();
+        assert_equal ~printer:[%show: int] 200 (List.length !kept);
+        (* Read the retained values back, so a table the compactor moved
+           incorrectly is not merely walked but used. *)
+        List.iter
+          (fun c ->
+            assert_equal ~printer:[%show: int] 3 (captures_length c);
+            assert_equal ~printer:[%show: (string * int) list] []
+              (capture_groups re))
+          !kept
 
   let find_iter_test ctxt =
     match compile "a+" with
@@ -325,6 +366,7 @@ end = struct
       "bad_pattern" >:: bad_pattern;
       "bad_offset" >:: bad_offset;
       "capture_group_names" >:: capture_group_names;
+      "name_table_compaction" >:: name_table_compaction;
       "find_iter" >:: find_iter_test;
       "find_iter_empty" >:: find_iter_empty;
       "find_iter_with_offset" >:: find_iter_with_offset;

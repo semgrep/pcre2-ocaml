@@ -396,11 +396,11 @@ value make_capture_group_name_table(const pcre2_code *regex) /* -> (string * int
         uint32_t entry_size;
         PCRE2_SPTR names = names_of_regex(regex, &name_count, &entry_size);
 
-        if (!names) {
-                array = caml_alloc_small(0, ARRAY_TAG);
-                // SAFETY(caml_alloc_small): There are no fields in the
-                // allocation, so it is trivially well-formed.
-                CAMLreturn(array);
+        if (!names || name_count == 0) {
+                // Zero-length blocks must be the shared static atom;
+                // `caml_alloc_small(0, _)` produces one the major GC cannot
+                // walk (and trips its `wosize > 0` assertion).
+                CAMLreturn(Atom(ARRAY_TAG));
         }
 
         if (name_count < Max_young_wosize) { /* likely */
