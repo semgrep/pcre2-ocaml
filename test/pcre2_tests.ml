@@ -356,6 +356,210 @@ end = struct
           [ Ok { start = 0; end_ = 2 }; Ok { start = 2; end_ = 4 } ]
           (List.map (Result.map range_of_match) results)
 
+  (* Substrings of the capture groups, excluding the whole match.  [None] for a
+     group the match left unset. *)
+  let group_substrings c =
+    List.init (captures_length c - 1) (fun i ->
+        match_of_captures c (i + 1) |> Option.map substring_of_match)
+
+  let big_pattern =
+    "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)(m)(n)(o)(p)(q)(r)(s)(t)"
+
+  let with_pattern pat f =
+    match compile pat with
+    | Error e ->
+        assert_failure ("failed to compile " ^ pat ^ ": " ^ show_compile_error e)
+    | Ok re -> f re
+
+  (* The match data cache is per-thread and grow-only, so alternating between
+     patterns with few and many capture groups exercises both the growth path
+     and reuse of an oversized ovector.  The small pattern's assertions are the
+     interesting half: reading the cache's capacity rather than the current
+     match's capture count would surface stale groups from the big pattern.
+
+     Note this asserts behavioural equivalence, not that reuse happens: nothing
+     about the cache is observable from OCaml, so the same assertions pass if
+     every match allocates its own block. *)
+  let match_data_reuse ctxt =
+    match (compile "([a-z]+)-([0-9]+)", compile big_pattern) with
+    | Error e, _ | _, Error e ->
+        assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok small, Ok big ->
+        let printer = [%show: string option list] in
+        let expected_big =
+          List.init 20 (fun k ->
+              Some (String.make 1 (Char.chr (Char.code 'a' + k))))
+        in
+        for i = 0 to 999 do
+          let subj = Printf.sprintf "item-%d" i in
+          (match captures small subj with
+          | Ok (Some c) ->
+              assert_equal ~printer
+                [ Some "item"; Some (string_of_int i) ]
+                (group_substrings c)
+          | Ok None -> assert_failure ("expected a match for " ^ subj)
+          | Error e -> assert_failure ("match error: " ^ show_match_error e));
+          (* Grows the cache to 21 pairs, against the 3 the small pattern needs. *)
+          (match captures big "abcdefghijklmnopqrst" with
+          | Ok (Some c) ->
+              assert_equal ~printer:[%show: int] 21 (captures_length c);
+              assert_equal ~printer expected_big (group_substrings c)
+          | Ok None -> assert_failure "expected a match for the 20-group pattern"
+          | Error e -> assert_failure ("match error: " ^ show_match_error e));
+          (* Back to the small pattern, now on the grown cache.  Asserting the
+             range rather than just a bool is deliberate: [is_match] discards
+             the offsets, so it cannot see the non-capture path reading the
+             wrong ovector slots. *)
+          assert_equal
+            ~printer:[%show: (range option, match_error) result]
+            (Ok (Some { start = 0; end_ = String.length subj }))
+            (find small subj >+= range_of_match)
+        done
+
+  (* Every case here runs against a cache already grown to 21 pairs, so each one
+     would break if a result were sized from the cache's capacity rather than
+     from the current match's capture count. *)
+  let grown_cache_edge_cases ctxt =
+    let grow () =
+      with_pattern big_pattern (fun re ->
+          match captures re "abcdefghijklmnopqrst" with
+          | Ok (Some c) ->
+              assert_equal ~printer:[%show: int] 21 (captures_length c)
+          | Ok None -> assert_failure "expected a match for the 20-group pattern"
+          | Error e -> assert_failure ("match error: " ^ show_match_error e))
+    in
+    let check ~pat ~subject ~len ~groups =
+      with_pattern pat (fun re ->
+          match captures re subject with
+          | Ok (Some c) ->
+              assert_equal ~printer:[%show: int]
+                ~msg:(pat ^ " on " ^ subject ^ ": captures_length")
+                len (captures_length c);
+              assert_equal ~printer:[%show: string option list]
+                ~msg:(pat ^ " on " ^ subject ^ ": groups")
+                groups (group_substrings c)
+          | Ok None ->
+              assert_failure ("expected a match: " ^ pat ^ " on " ^ subject)
+          | Error e -> assert_failure ("match error: " ^ show_match_error e))
+    in
+    grow ();
+    (* No capture groups at all needs one pair against the cache's 21 -- the
+       widest gap between capacity and capture count. *)
+    check ~pat:"abc" ~subject:"xxabc" ~len:1 ~groups:[];
+    (* An interior group the match left unset comes back [None] via
+       PCRE2_UNSET; a trailing one via the capture count instead. *)
+    check ~pat:"(x)|(y)" ~subject:"y" ~len:3 ~groups:[ None; Some "y" ];
+    check ~pat:"(1)(z)?" ~subject:"1" ~len:2 ~groups:[ Some "1" ];
+    (* Zero-width match on an empty subject. *)
+    check ~pat:"()" ~subject:"" ~len:2 ~groups:[ Some "" ];
+    grow ();
+    with_pattern "abc" (fun re ->
+        assert_equal ~printer:[%show: range] { start = 2; end_ = 5 }
+          (match captures re "xxabc" with
+          | Ok (Some c) -> range_of_captures c
+          | _ -> assert_failure "expected a match for xxabc"));
+    (* An offset at the very end of the subject, on a grown cache. *)
+    with_pattern "a*" (fun re ->
+        assert_equal
+          ~printer:[%show: (range option, match_error) result]
+          (Ok (Some { start = 3; end_ = 3 }))
+          (find ~subject_offset:3 re "bbb" >+= range_of_match))
+
+  (* [find] and [is_match] acquire match data too, but every other test grows
+     the cache through [captures].  A fresh thread starts with an empty cache,
+     so this is the only place growth driven by the non-capture path is
+     observable.  Results are funnelled out rather than asserted in the worker:
+     an [assert_failure] raised in a thread body is lost. *)
+  let growth_via_find ctxt =
+    let errors = ref [] in
+    let record msg = errors := msg :: !errors in
+    let worker () =
+      try
+        (match compile big_pattern with
+        | Error _ -> record "the 20-group pattern failed to compile"
+        | Ok re -> (
+            match is_match re "abcdefghijklmnopqrst" with
+            | Ok true -> ()
+            | Ok false -> record "is_match found nothing for the 20-group pattern"
+            | Error e -> record ("is_match errored: " ^ show_match_error e)));
+        match compile "([a-z]+)-([0-9]+)" with
+        | Error _ -> record "the small pattern failed to compile"
+        | Ok re -> (
+            match captures re "item-42" with
+            | Ok (Some c) ->
+                if captures_length c <> 3 then
+                  record
+                    (Printf.sprintf "captures_length = %d, want 3"
+                       (captures_length c));
+                if group_substrings c <> [ Some "item"; Some "42" ] then
+                  record "wrong groups after growth driven by is_match"
+            | Ok None -> record "expected a match for item-42"
+            | Error e -> record ("captures errored: " ^ show_match_error e))
+      with e -> record ("worker raised: " ^ Printexc.to_string e)
+    in
+    Thread.join (Thread.create worker ());
+    assert_equal ~printer:[%show: string list]
+      ~msg:"growth driven through the non-capture path" [] !errors
+
+  (* Each thread caches its own match data, so matching through one shared
+     compiled regexp from several threads must stay correct.  Note these are
+     systhreads, which take turns holding the domain lock, so they interleave
+     rather than run in parallel -- see the Domain-based test for that.  This is
+     also the only coverage of the thread-exit destructor: eight threads each
+     populate a cache and then die. *)
+  let concurrent_matching ctxt =
+    match compile "([a-z]+)-([0-9]+)-([a-z]+)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let iterations = 5_000 in
+        let workers = 8 in
+        let failures = Atomic.make 0 in
+        let completed = Atomic.make 0 in
+        let errors = Atomic.make [] in
+        (* A worker killed by an exception still lets [Thread.join] return
+           normally, so without recording the exception and counting completed
+           iterations this test would pass having matched nothing. *)
+        let record e =
+          let msg = Printexc.to_string e in
+          let rec push () =
+            let cur = Atomic.get errors in
+            if not (Atomic.compare_and_set errors cur (msg :: cur)) then push ()
+          in
+          push ()
+        in
+        let worker tid () =
+          (* Letters only, since the outer groups are [a-z]+. *)
+          let tag = String.make 3 (Char.chr (Char.code 'a' + tid)) in
+          try
+            for i = 0 to iterations - 1 do
+              let subj = Printf.sprintf "left%s-%d-right%s" tag i tag in
+              let expected =
+                [
+                  Some ("left" ^ tag); Some (string_of_int i);
+                  Some ("right" ^ tag);
+                ]
+              in
+              let ok =
+                match captures re subj with
+                | Ok (Some c) -> group_substrings c = expected
+                | Ok None | Error _ -> false
+              in
+              if not ok then Atomic.incr failures;
+              Atomic.incr completed
+            done
+          with e -> record e
+        in
+        let threads =
+          List.init workers (fun tid -> Thread.create (worker tid) ())
+        in
+        List.iter Thread.join threads;
+        assert_equal ~printer:[%show: string list] ~msg:"worker exceptions" []
+          (Atomic.get errors);
+        assert_equal ~printer:string_of_int ~msg:"iterations completed"
+          (workers * iterations) (Atomic.get completed);
+        assert_equal ~printer:string_of_int ~msg:"mismatched captures" 0
+          (Atomic.get failures)
+
   let tests =
     [
       "simple_test" >:: simple_test;
@@ -379,11 +583,121 @@ end = struct
       "empty_pattern" >:: empty_pattern_test;
       "unicode" >:: unicode_test;
       "overlapping_matches" >:: overlapping_matches_test;
+      "match_data_reuse" >:: match_data_reuse;
+      "grown_cache_edge_cases" >:: grown_cache_edge_cases;
+      "growth_via_find" >:: growth_via_find;
+      "concurrent_matching" >:: concurrent_matching;
     ]
 end
 
 let check_version ctxt =
   assert_bool "Version is older than newest tested" (Pcre2.version >= (10, 43))
+
+let wide_20 = "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)(m)(n)(o)(p)(q)(r)(s)(t)"
+let wide_20_subject = "abcdefghijklmnopqrst"
+
+(* One thread's match data is shared by both matchers, but [MakeTests] is
+   instantiated once per matcher, so nothing else mixes them on a single thread.
+   Alternating widths across the two means each call runs against a block last
+   sized by the other. *)
+let jit_and_interp_share_a_cache ctxt =
+  let wide_24 = wide_20 ^ "(u)(v)(w)(x)" in
+  let wide_24_subject = wide_20_subject ^ "uvwx" in
+  let named = "(?<word>[a-z]+)-(?<num>[0-9]+)" in
+  let named_subject = "item-42" in
+  match
+    ( Interp.compile wide_20,
+      Interp.compile named,
+      Jit.compile wide_24,
+      Jit.compile named )
+  with
+  | Error e, _, _, _ | _, Error e, _, _ ->
+      assert_failure ("failed to compile: " ^ Interp.show_compile_error e)
+  | _, _, Error e, _ | _, _, _, Error e ->
+      assert_failure ("failed to compile: " ^ Jit.show_compile_error e)
+  | Ok i_wide, Ok i_named, Ok j_wide, Ok j_named ->
+      for _ = 1 to 1_000 do
+        (match Interp.captures i_wide wide_20_subject with
+        | Ok (Some c) ->
+            assert_equal ~printer:[%show: int] ~msg:"interp 20-group" 21
+              (Interp.captures_length c)
+        | _ -> assert_failure "expected an interp match for the 20-group pattern");
+        (match Jit.captures j_named named_subject with
+        | Ok (Some c) ->
+            assert_equal ~printer:[%show: int] ~msg:"jit named" 3
+              (Jit.captures_length c);
+            assert_equal ~printer:[%show: string option] ~msg:"jit named group"
+              (Some "item")
+              (Jit.named_match_of_captures c "word"
+              |> Option.map Jit.substring_of_match)
+        | _ -> assert_failure "expected a jit match for the named pattern");
+        (match Jit.captures j_wide wide_24_subject with
+        | Ok (Some c) ->
+            assert_equal ~printer:[%show: int] ~msg:"jit 24-group" 25
+              (Jit.captures_length c)
+        | _ -> assert_failure "expected a jit match for the 24-group pattern");
+        match Interp.captures i_named named_subject with
+        | Ok (Some c) ->
+            assert_equal ~printer:[%show: int] ~msg:"interp named" 3
+              (Interp.captures_length c);
+            assert_equal ~printer:[%show: string option]
+              ~msg:"interp named group" (Some "42")
+              (Interp.named_match_of_captures c "num"
+              |> Option.map Interp.substring_of_match)
+        | _ -> assert_failure "expected an interp match for the named pattern"
+      done
+
+let rss_kb () =
+  if Sys.os_type <> "Unix" then None
+  else
+    try
+      let ic =
+        Unix.open_process_in
+          (Printf.sprintf "ps -o rss= -p %d" (Unix.getpid ()))
+      in
+      let line = try Some (input_line ic) with End_of_file -> None in
+      ignore (Unix.close_process_in ic);
+      Option.map (fun l -> int_of_string (String.trim l)) line
+    with _ -> None
+
+(* The thread-exit destructor is otherwise unobservable from OCaml: the rest of
+   the suite passes with it unregistered entirely.  A block that is not freed
+   shows up as resident memory growing with the number of threads that have come
+   and gone, so churn threads and watch it.  Each leaked block is far larger than
+   its ovector, since PCRE2 also attaches a heap frame vector.
+
+   This is also the only check that the destructor reads the block from the
+   pthread TSD value rather than from thread-local storage, which some platforms
+   (macOS among them) tear down before running TSD destructors. *)
+let thread_exit_frees_match_data ctxt =
+  skip_if (rss_kb () = None) "cannot read RSS on this platform";
+  let churn = 8_000 in
+  match Interp.compile wide_20 with
+  | Error e ->
+      assert_failure ("failed to compile: " ^ Interp.show_compile_error e)
+  | Ok re ->
+      let run n =
+        for _ = 1 to n do
+          Thread.join
+            (Thread.create
+               (fun () -> ignore (Interp.captures re wide_20_subject))
+               ())
+        done
+      in
+      (* Warm up first, so the measured window excludes the main thread's own
+         cache and the allocator's arena growth, which settles early. *)
+      run 2_000;
+      let before = Option.get (rss_kb ()) in
+      run churn;
+      let after = Option.get (rss_kb ()) in
+      let growth = after - before in
+      assert_bool
+        (Printf.sprintf
+           "resident memory grew %d KB across %d thread exits (%.2f KB per \
+            thread); a retained match data is roughly 20 KB per thread"
+           growth churn
+           (float_of_int growth /. float_of_int churn))
+        (growth < 20_000)
 
 let suite =
   let module Interp_Tests = MakeTests (Interp) in
@@ -391,6 +705,8 @@ let suite =
   "Test pcre"
   >::: [
          "version" >:: check_version;
+         "jit_and_interp_share_a_cache" >:: jit_and_interp_share_a_cache;
+         "thread_exit_frees_match_data" >:: thread_exit_frees_match_data;
          "Interp" >::: Interp_Tests.tests;
          "JIT" >::: Jit_Tests.tests;
        ]

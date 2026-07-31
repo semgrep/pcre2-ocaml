@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+* Match calls now reuse a per-thread `pcre2_match_data` instead of allocating
+  one per call, so matching in parallel across domains no longer serializes on
+  the C allocator. Systhreads within a single domain still take turns, since
+  matching holds the OCaml runtime lock. Compiled regexps remain shareable
+  across threads.
+
+  The cached block grows to fit the widest pattern a thread has matched and is
+  not shrunk, so a thread's resident memory reflects its widest pattern for as
+  long as it lives. It is freed when the thread exits on POSIX; the initial
+  thread is the exception, since POSIX runs no thread-specific-data destructors
+  when `main` returns or `exit` is called. Windows does not free it at all.
 * Fixed a segfault under major GC compaction: the capture-group name table for
   a pattern with no named groups was built as a zero-length `caml_alloc_small`
   block rather than the shared atom.

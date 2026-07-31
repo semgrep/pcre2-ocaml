@@ -1,5 +1,17 @@
 (test
  (name pcre2_tests)
+ (modules pcre2_tests)
+ (libraries pcre2 ounit2 threads.posix unix)
+ (preprocess
+  (pps ppx_deriving.show)))
+
+; Separate stanza so the rest of the suite keeps building on the 4.12 floor
+; declared in dune-project; Domain needs 5.0.
+(test
+ (name pcre2_domain_tests)
+ (modules pcre2_domain_tests)
+ (enabled_if
+  (>= %{ocaml_version} 5.0))
  (libraries pcre2 ounit2)
  (preprocess
   (pps ppx_deriving.show)))

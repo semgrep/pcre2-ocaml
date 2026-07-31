@@ -9,6 +9,10 @@
 #include "caml/misc.h"
 #include "caml/mlvalues.h"
 
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+
 // NOTE: Currently these bindings support only 8-bit code units. Below we use
 // the generically named functions. Future versions could include support for
 // non-8-bit code units.
@@ -20,6 +24,28 @@
 #else
 #define UNUSED __attribute__((unused))
 #endif
+
+/* `_Thread_local` needs C11; MSVC only accepts it from VS2019 16.8 with
+ * /std:c11, and older GCC/Clang spell it `__thread`. */
+#if defined(_MSC_VER) && !defined(_Thread_local)
+#define THREAD_LOCAL __declspec(thread)
+#elif __STDC_VERSION__ >= 201112L
+#define THREAD_LOCAL _Thread_local
+#else
+#define THREAD_LOCAL __thread
+#endif
+
+/* Thread local state
+ *
+ * Each thread keeps one `pcre2_match_data` in `tls_match_data` and reuses it
+ * across matches; `match_data_acquire` takes the block out of the slot
+ * and `match_data_release` puts it back, so a re-entrant match finds an
+ * empty slot and allocates its own.
+ *
+ * The block grows to fit the widest pattern the thread has matched, and is
+ * freed at thread exit; see `tls_match_data_enrol`.
+ */
+static THREAD_LOCAL pcre2_match_data *tls_match_data = NULL;
 
 const int OPTION_SOME_TAG = 0;
 const int RESULT_OK_TAG = 0;
@@ -50,11 +76,6 @@ static struct custom_operations regex_ops = {.identifier = "pcre2_ocaml_regexp",
                                              .compare_ext = NULL,
                                              .fixed_length = NULL};
 
-CAMLprim void pcre2_ocaml_init(void) {
-        CAMLparam0();
-        CAMLreturn0;
-}
-
 /// Returns the PCRE2 version the library was compiled with.
 CAMLprim value get_version(void) /* -> int * int */ {
         CAMLparam0();
@@ -65,6 +86,109 @@ CAMLprim value get_version(void) /* -> int * int */ {
         Field(version, 0) = Val_int(PCRE2_MAJOR);
         Field(version, 1) = Val_int(PCRE2_MINOR);
         CAMLreturn(version);
+}
+
+/* Thread local state lifecycle management */
+
+#ifndef _WIN32
+static pthread_key_t tls_match_data_key;
+static pthread_once_t tls_match_data_key_once = PTHREAD_ONCE_INIT;
+
+/* `pthread_once` init routines cannot report failure; stash it here instead.
+ * Returning from `pthread_once` synchronises with the init routine. */
+static int tls_match_data_key_err = 0;
+
+/* Runs on the terminating thread.  The block must come from the TSD value: C11
+ * thread-local storage may already be torn down by this point (it is on macOS),
+ * so `tls_match_data` can read back as NULL here. */
+static void tls_match_data_destroy(void *md) {
+        pcre2_match_data_free((pcre2_match_data *)md);
+}
+
+static void tls_match_data_make_key(void) {
+        tls_match_data_key_err = pthread_key_create(&tls_match_data_key, tls_match_data_destroy);
+}
+
+#endif
+
+/* Records `md` as the block to free at thread exit.  Called only where a
+ * cacheable block is created, so the TSD value and `tls_match_data` always name
+ * the same block.
+ *
+ * Best effort.  Windows has no hook here, so blocks are never freed there and a
+ * thread-churning program grows without bound.  The initial thread keeps its
+ * block too -- POSIX runs no destructors for it when `main` returns or `exit` is
+ * called -- as does a thread whose key could not be set.
+ */
+static void tls_match_data_enrol(pcre2_match_data *md UNUSED) {
+#ifndef _WIN32
+        if (pthread_once(&tls_match_data_key_once, tls_match_data_make_key) == 0 &&
+            tls_match_data_key_err == 0) {
+                (void)pthread_setspecific(tls_match_data_key, md);
+        }
+#endif
+}
+
+CAMLprim value pcre2_ocaml_init(value v_unit UNUSED) {
+        CAMLparam0();
+        CAMLreturn(Val_unit);
+}
+
+/// Writes the result a match stub returns for the negative PCRE2 error code
+/// `code` to `*dst`, which must be a registered root.
+static void match_error_of_code(value *dst /* : (_, match_error) Result.t */, int code) {
+        // SAFETY: This allocation is immediately filled with well-formed values.
+        *dst = caml_alloc_small(1, RESULT_ERROR_TAG);
+        Field(*dst, 0) = Val_int(code);
+}
+
+/// Produces a `pcre2_match_data` able to hold every capture of `re`.
+///
+/// Uses this thread's cached block, growing it if `re` needs more pairs, and
+/// allocates a fresh one when the slot is empty or this match is nested inside
+/// another on this thread.
+///
+/// Returns NULL on failure, writing the `Error e` the stub should return to
+/// `*error`; `match_data_release` must not be called then.  Never raises, so
+/// callers may allocate on the OCaml heap before releasing.
+static pcre2_match_data *match_data_acquire(const pcre2_code *re,
+                                            value *error /* : (_, match_error) Result.t */) {
+        uint32_t capture_count = 0;
+        if (pcre2_pattern_info(re, PCRE2_INFO_CAPTURECOUNT, &capture_count) != 0) {
+                match_error_of_code(error, PCRE2_ERROR_INTERNAL);
+                return NULL;
+        }
+        uint32_t pairs = capture_count + 1;
+
+        /* Emptying the slot is what makes a nested match allocate its own block
+         * rather than share ours. */
+        pcre2_match_data *md = tls_match_data;
+        tls_match_data = NULL;
+
+        if (md == NULL || pcre2_get_ovector_count(md) < pairs) {
+                pcre2_match_data *fresh = pcre2_match_data_create(pairs, NULL);
+                if (fresh == NULL) {
+                        tls_match_data = md; /* leave the cache as we found it */
+                        match_error_of_code(error, PCRE2_ERROR_NOMEMORY);
+                        return NULL;
+                }
+                pcre2_match_data_free(md);
+                md = fresh;
+                tls_match_data_enrol(md);
+        }
+        return md;
+}
+
+/// Indicates that the caller is done with a block from `match_data_acquire`.
+///
+/// Caches it for this thread's next match if the slot is free, and frees it
+/// otherwise -- the nested case, where the outer call refills the slot.
+static void match_data_release(pcre2_match_data *d) {
+        if (tls_match_data == NULL) {
+                tls_match_data = d;
+        } else {
+                pcre2_match_data_free(d);
+        }
 }
 
 /// Compiles the provided pattern.
@@ -160,21 +284,24 @@ CAMLprim value match_unboxed(value ocaml_re /* : _ regex */, value subject /* : 
         // TODO: support match/depth limits. Or callouts. May need to be
         // bundled with the compiled regex.
         pcre2_match_context *mcontext = NULL;
-        pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
+        pcre2_match_data *match_data = match_data_acquire(re, &result);
+        if (match_data == NULL) {
+                CAMLreturn(result);
+        }
 
         int ret = pcre2_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset, options,
                               match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (ret == PCRE2_ERROR_NOMATCH || ret == PCRE2_ERROR_PARTIAL) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_OK_TAG);
                 Field(result, 0) = Val_none;
                 CAMLreturn(result);
         } else if (ret <= 0) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
@@ -187,7 +314,7 @@ CAMLprim value match_unboxed(value ocaml_re /* : _ regex */, value subject /* : 
         Field(range, 0) = Val_int(ovec[0]);
         Field(range, 1) = Val_int(ovec[1]);
 
-        pcre2_match_data_free(match_data);
+        match_data_release(match_data);
 
         // SAFETY: This allocation is immediately filled with well-formed values.
         match = caml_alloc_small(1, OPTION_SOME_TAG);
@@ -307,7 +434,10 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
         // TODO: support match/depth limits. Or callouts. May need to be
         // bundled with the compiled regex.
         pcre2_match_context *mcontext = NULL;
-        pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
+        pcre2_match_data *match_data = match_data_acquire(re, &result);
+        if (match_data == NULL) {
+                CAMLreturn(result);
+        }
 
         // SAFETY: Passing in the value of String_val(subject) here is fine
         // since a GC cannot occur.
@@ -316,14 +446,14 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (ret == PCRE2_ERROR_NOMATCH || ret == PCRE2_ERROR_PARTIAL) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_OK_TAG);
                 Field(result, 0) = Val_none;
                 CAMLreturn(result);
         } else if (ret <= 0) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
@@ -336,7 +466,7 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
         Field(range, 0) = Val_int(ovec[0]);
         Field(range, 1) = Val_int(ovec[1]);
 
-        pcre2_match_data_free(match_data);
+        match_data_release(match_data);
 
         // SAFETY: This allocation is immediately filled with well-formed values.
         match = caml_alloc_small(1, OPTION_SOME_TAG);
@@ -467,7 +597,10 @@ CAMLprim value capture_unboxed(
         // TODO: support match/depth limits. Or callouts. May need to be
         // bundled with the compiled regex.
         pcre2_match_context *mcontext = NULL;
-        pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
+        pcre2_match_data *match_data = match_data_acquire(re, &result);
+        if (match_data == NULL) {
+                CAMLreturn(result);
+        }
 
         // NOTE: Really one more than number of captures since it includes the
         // full match.
@@ -478,14 +611,14 @@ CAMLprim value capture_unboxed(
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (num_captures == PCRE2_ERROR_NOMATCH || num_captures == PCRE2_ERROR_PARTIAL) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_OK_TAG);
                 Field(result, 0) = Val_none;
                 CAMLreturn(result);
         } else if (num_captures <= 0) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
@@ -509,11 +642,12 @@ CAMLprim value capture_unboxed(
                 caml_modify(&Field(matches, i), match);
         }
 
+        /* `ovec` has been copied out, so the block is no longer needed. */
+        match_data_release(match_data);
+
         // TODO: cache this? May not be that expensive, but if it is then probably worth since we'll
         // match w/ capture many times.
         name_table = make_capture_group_name_table(re);
-
-        pcre2_match_data_free(match_data);
 
         // SAFETY: This allocation is immediately filled with well-formed
         // values.
@@ -578,7 +712,10 @@ CAMLprim value jit_capture_unboxed(
         // TODO: support match/depth limits. Or callouts. May need to be
         // bundled with the compiled regex.
         pcre2_match_context *mcontext = NULL;
-        pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
+        pcre2_match_data *match_data = match_data_acquire(re, &result);
+        if (match_data == NULL) {
+                CAMLreturn(result);
+        }
 
         // NOTE: Really one more than number of captures since it includes the
         // full match.
@@ -590,14 +727,14 @@ CAMLprim value jit_capture_unboxed(
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (num_captures == PCRE2_ERROR_NOMATCH || num_captures == PCRE2_ERROR_PARTIAL) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_OK_TAG);
                 Field(result, 0) = Val_none;
                 CAMLreturn(result);
         } else if (num_captures <= 0) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
@@ -621,11 +758,12 @@ CAMLprim value jit_capture_unboxed(
                 caml_modify(&Field(matches, i), match);
         }
 
+        /* `ovec` has been copied out, so the block is no longer needed. */
+        match_data_release(match_data);
+
         // TODO: cache this? May not be that expensive, but if it is then probably worth since we'll
         // match w/ capture many times.
         name_table = make_capture_group_name_table(re);
-
-        pcre2_match_data_free(match_data);
 
         // SAFETY: This allocation is immediately filled with well-formed
         // values.
