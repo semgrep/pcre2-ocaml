@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "caml/alloc.h"
 #include "caml/config.h"
@@ -8,6 +9,7 @@
 #include "caml/memory.h"
 #include "caml/misc.h"
 #include "caml/mlvalues.h"
+#include "caml/signals.h"
 
 // NOTE: Currently these bindings support only 8-bit code units. Below we use
 // the generically named functions. Future versions could include support for
@@ -124,6 +126,58 @@ CAMLprim value compile(value pattern /* : string */,
         return compile_unboxed(pattern, Int32_val(options));
 }
 
+/// Matches on subjects at least this long run with the runtime lock released
+/// so that other domains can proceed (including collecting garbage) during the
+/// match. That requires copying the subject, so shorter subjects skip it.
+#define LOCK_RELEASE_SUBJECT_THRESHOLD 1024
+
+/// Runs `pcre2_match` (or `pcre2_jit_match` if `use_jit`), releasing the
+/// runtime lock during the match for sufficiently long subjects.
+///
+/// The caller must have registered `subject` with the GC and must not reuse
+/// pointers derived from it (e.g. via `String_val`) after this returns, since
+/// the GC may move it while the lock is released.
+///
+/// The lock is released with caml_enter_blocking_section_no_pending rather
+/// than caml_release_runtime_system: the latter polls pending actions and so
+/// can raise an asynchronous exception (e.g. a signal-based timeout), which
+/// would leak the subject copy and the caller's match_data. Neither function
+/// used here polls (runtime/signals.c); pending actions instead run at the
+/// next poll point, after this stub has returned and freed its resources. See
+/// https://ocaml.org/manual/5.5/intfc.html#ss:parallel-execution-long-running-c-code
+static int run_match(bool use_jit, const pcre2_code *re, value subject /* : string */,
+                     size_t subject_length, size_t offset, uint32_t options,
+                     pcre2_match_data *match_data, pcre2_match_context *mcontext) {
+        if (subject_length < LOCK_RELEASE_SUBJECT_THRESHOLD) {
+                // SAFETY: Passing in the value of String_val(subject) here is
+                // fine since the runtime lock is held and no OCaml allocation
+                // occurs during the match, so a GC cannot occur.
+                PCRE2_SPTR subject_ptr = (PCRE2_SPTR)String_val(subject);
+                return use_jit ? pcre2_jit_match(re, subject_ptr, subject_length, offset, options,
+                                                 match_data, mcontext)
+                               : pcre2_match(re, subject_ptr, subject_length, offset, options,
+                                             match_data, mcontext);
+        }
+
+        // Copy the whole subject, not just from `offset`: lookbehinds, \b,
+        // etc. can inspect text preceding the offset.
+        char *subject_copy = caml_stat_alloc_noexc(subject_length);
+        if (!subject_copy) {
+                return PCRE2_ERROR_NOMEMORY;
+        }
+        memcpy(subject_copy, String_val(subject), subject_length);
+
+        caml_enter_blocking_section_no_pending();
+        int ret = use_jit ? pcre2_jit_match(re, (PCRE2_SPTR)subject_copy, subject_length, offset,
+                                            options, match_data, mcontext)
+                          : pcre2_match(re, (PCRE2_SPTR)subject_copy, subject_length, offset,
+                                        options, match_data, mcontext);
+        caml_leave_blocking_section();
+
+        caml_stat_free(subject_copy);
+        return ret;
+}
+
 /// Match with the provided pattern.
 ///
 /// @param[in] ocaml_re The compiled regex to use for matching.
@@ -157,8 +211,8 @@ CAMLprim value match_unboxed(value ocaml_re /* : _ regex */, value subject /* : 
         pcre2_match_context *mcontext = NULL;
         pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
 
-        int ret = pcre2_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset, options,
-                              match_data, mcontext);
+        int ret =
+            run_match(false, re, subject, subject_length, offset, options, match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (ret == PCRE2_ERROR_NOMATCH || ret == PCRE2_ERROR_PARTIAL) {
@@ -307,10 +361,8 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
         pcre2_match_context *mcontext = NULL;
         pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
 
-        // SAFETY: Passing in the value of String_val(subject) here is fine
-        // since a GC cannot occur.
-        int ret = pcre2_jit_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset,
-                                  options, match_data, mcontext);
+        int ret =
+            run_match(true, re, subject, subject_length, offset, options, match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (ret == PCRE2_ERROR_NOMATCH || ret == PCRE2_ERROR_PARTIAL) {
@@ -468,10 +520,8 @@ CAMLprim value capture_unboxed(
 
         // NOTE: Really one more than number of captures since it includes the
         // full match.
-        // SAFETY: Passing in the value of String_val(subject) here is fine
-        // since a GC cannot occur.
-        int num_captures = pcre2_match(re, (PCRE2_SPTR)String_val(subject), subject_length, offset,
-                                       options, match_data, mcontext);
+        int num_captures =
+            run_match(false, re, subject, subject_length, offset, options, match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (num_captures == PCRE2_ERROR_NOMATCH || num_captures == PCRE2_ERROR_PARTIAL) {
@@ -582,11 +632,9 @@ CAMLprim value jit_capture_unboxed(
 
         // NOTE: Really one more than number of captures since it includes the
         // full match.
-        // SAFETY: Passing in the value of String_val(subject) here is fine
-        // since a GC cannot occur.
         // TODO: Compare notes on using pcre2_jit_match in jit_match_unboxed.
-        int num_captures = pcre2_jit_match(re, (PCRE2_SPTR)String_val(subject), subject_length,
-                                           offset, options, match_data, mcontext);
+        int num_captures =
+            run_match(true, re, subject, subject_length, offset, options, match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (num_captures == PCRE2_ERROR_NOMATCH || num_captures == PCRE2_ERROR_PARTIAL) {
