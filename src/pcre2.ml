@@ -665,12 +665,17 @@ module Interp = struct
 
   let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (match_, match_error) Result.t Seq.t =
+    let options = bitvector_of_match_options options in
+    (* Copy the subject out of the OCaml heap once, rather than on every
+       iteration (see [Bindings.pin_subject]). *)
+    let pinned = Bindings.pin_subject subject in
     Seq.unfold
       (fun offset ->
-        match find ~options ~subject_offset:offset re subject with
-        | Ok (Some (m : match_)) -> Some (Ok m, (range_of_match m).end_)
+        match Bindings.pcre2_match_pinned re pinned offset options with
+        | Ok (Some (start, end_)) -> Some (Ok (subject, start, end_), end_)
         | Ok None -> None
-        | Error e -> Some (Error e, String.length subject))
+        | Error n ->
+            Some (Error (match_error_of_int n), String.length subject))
       subject_offset
 
   let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
@@ -684,12 +689,19 @@ module Interp = struct
   let captures_iter ?(options : match_option list = [])
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (captures, match_error) Result.t Seq.t =
+    let options = bitvector_of_match_options options in
+    (* Copy the subject out of the OCaml heap once, rather than on every
+       iteration (see [Bindings.pin_subject]). *)
+    let pinned = Bindings.pin_subject subject in
     Seq.unfold
       (fun offset ->
-        match captures ~options ~subject_offset:offset re subject with
-        | Ok (Some (c : captures)) -> Some (Ok c, (range_of_captures c).end_)
+        match Bindings.pcre2_capture_pinned re pinned offset options with
+        | Ok (Some (arr, names)) ->
+            let c : captures = (subject, arr, names) in
+            Some (Ok c, (range_of_captures c).end_)
         | Ok None -> None
-        | Error e -> Some (Error e, String.length subject))
+        | Error n ->
+            Some (Error (match_error_of_int n), String.length subject))
       subject_offset
 
   let split ?(options : match_option list = []) ?(subject_offset : int = 0)
@@ -780,12 +792,17 @@ module Jit = struct
   (* TODO(cooper): dedup impl with a functor? - entirely derived from find *)
   let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (match_, match_error) Result.t Seq.t =
+    let options = bitvector_of_match_options options in
+    (* Copy the subject out of the OCaml heap once, rather than on every
+       iteration (see [Bindings.pin_subject]). *)
+    let pinned = Bindings.pin_subject subject in
     Seq.unfold
       (fun offset ->
-        match find ~options ~subject_offset:offset re subject with
-        | Ok (Some (m : match_)) -> Some (Ok m, (range_of_match m).end_)
+        match Bindings.pcre2_jit_match_pinned re pinned offset options with
+        | Ok (Some (start, end_)) -> Some (Ok (subject, start, end_), end_)
         | Ok None -> None
-        | Error e -> Some (Error e, String.length subject))
+        | Error n ->
+            Some (Error (match_error_of_int n), String.length subject))
       subject_offset
 
   let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
@@ -801,12 +818,19 @@ module Jit = struct
   let captures_iter ?(options : match_option list = [])
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (captures, match_error) Result.t Seq.t =
+    let options = bitvector_of_match_options options in
+    (* Copy the subject out of the OCaml heap once, rather than on every
+       iteration (see [Bindings.pin_subject]). *)
+    let pinned = Bindings.pin_subject subject in
     Seq.unfold
       (fun offset ->
-        match captures ~options ~subject_offset:offset re subject with
-        | Ok (Some (c : captures)) -> Some (Ok c, (range_of_captures c).end_)
+        match Bindings.pcre2_jit_capture_pinned re pinned offset options with
+        | Ok (Some (arr, names)) ->
+            let c : captures = (subject, arr, names) in
+            Some (Ok c, (range_of_captures c).end_)
         | Ok None -> None
-        | Error e -> Some (Error e, String.length subject))
+        | Error n ->
+            Some (Error (match_error_of_int n), String.length subject))
       subject_offset
 
   let split ?(options : match_option list = []) ?(subject_offset : int = 0)
