@@ -89,3 +89,7 @@ external get_version : unit -> int * int = "get_version"
 
 external get_capture_groups : _ regex -> (string * int) array
   = "get_capture_groups"
+
+external regex_is_utf : _ regex -> bool = "regex_is_utf"
+(** Whether the regex was compiled with the UTF option, whether via the
+    compile options or the in-pattern "(*UTF)" directive. *)

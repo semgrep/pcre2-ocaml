@@ -315,6 +315,66 @@ end = struct
           [ Ok { start = 0; end_ = 2 }; Ok { start = 2; end_ = 4 } ]
           (List.map (Result.map range_of_match) results)
 
+  let find_iter_empty_matches ctxt =
+    match compile "a*" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let printer = [%show: (range, match_error) result list] in
+        (* An empty match at the end position of the previous match is skipped
+           rather than repeated forever. *)
+        assert_equal ~printer
+          [
+            Ok { start = 0; end_ = 0 };
+            Ok { start = 1; end_ = 1 };
+            Ok { start = 2; end_ = 2 };
+            Ok { start = 3; end_ = 3 };
+          ]
+          (find_iter re "bcd" |> List.of_seq
+          |> List.map (Result.map range_of_match));
+        assert_equal ~printer
+          [ Ok { start = 0; end_ = 2 }; Ok { start = 3; end_ = 3 } ]
+          (find_iter re "aab" |> List.of_seq
+          |> List.map (Result.map range_of_match))
+
+  let find_iter_empty_matches_utf ctxt =
+    match compile "(*UTF)x*" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let printer = [%show: (range, match_error) result list] in
+        (* Skipping an empty match in a UTF pattern resumes at the next
+           character boundary; \xc3\xa9 is a two-byte character. *)
+        assert_equal ~printer
+          [
+            Ok { start = 0; end_ = 0 };
+            Ok { start = 1; end_ = 1 };
+            Ok { start = 3; end_ = 3 };
+          ]
+          (find_iter re "a\xc3\xa9" |> List.of_seq
+          |> List.map (Result.map range_of_match))
+
+  let captures_iter_empty_matches ctxt =
+    match compile "(a*)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let printer = [%show: (range, match_error) result list] in
+        assert_equal ~printer
+          [
+            Ok { start = 0; end_ = 0 };
+            Ok { start = 1; end_ = 1 };
+            Ok { start = 2; end_ = 2 };
+          ]
+          (captures_iter re "bc" |> List.of_seq
+          |> List.map (Result.map range_of_captures))
+
+  let split_empty_pattern ctxt =
+    match compile "" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal
+          ~printer:[%show: (string list, match_error) result]
+          (Ok [ ""; "a"; "b"; "" ])
+          (split re "ab")
+
   let tests =
     [
       "simple_test" >:: simple_test;
@@ -335,6 +395,10 @@ end = struct
       "split_advanced" >:: split_advanced_test;
       "split_with_offset" >:: split_with_offset_test;
       "empty_pattern" >:: empty_pattern_test;
+      "find_iter_empty_matches" >:: find_iter_empty_matches;
+      "find_iter_empty_matches_utf" >:: find_iter_empty_matches_utf;
+      "captures_iter_empty_matches" >:: captures_iter_empty_matches;
+      "split_empty_pattern" >:: split_empty_pattern;
       "unicode" >:: unicode_test;
       "overlapping_matches" >:: overlapping_matches_test;
     ]

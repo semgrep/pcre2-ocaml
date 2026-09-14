@@ -537,6 +537,15 @@ CAMLprim value get_capture_groups(value ocaml_regex /* : regex */) /* -> (string
         CAMLreturn(make_capture_group_name_table(regex_of_value(ocaml_regex)->regex));
 }
 
+/// Returns whether the regex was compiled with PCRE2_UTF, whether via the
+/// compile options or in-pattern (e.g. `(*UTF)`).
+CAMLprim value regex_is_utf(value ocaml_regex /* : _ regex */) /* -> bool */ {
+        CAMLparam1(ocaml_regex);
+        uint32_t all_options = 0;
+        pcre2_pattern_info(regex_of_value(ocaml_regex)->regex, PCRE2_INFO_ALLOPTIONS, &all_options);
+        CAMLreturn(Val_bool(all_options & PCRE2_UTF));
+}
+
 /// Match, with capture groups, the provided pattern. Shared implementation
 /// for the capture stubs.
 ///

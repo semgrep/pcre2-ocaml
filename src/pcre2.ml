@@ -49,6 +49,35 @@ end
 
 include Match
 
+(* Iteration must not revisit a match position, or an empty (zero-width) match
+   would repeat forever: an empty match at the end position of the previous
+   match is instead skipped by resuming the search one character further on. *)
+
+(* The next offset at which to resume a search when skipping past an empty
+   match. For a UTF regex this must be the next character boundary: PCRE2
+   rejects offsets inside a UTF-8 sequence. *)
+let next_search_offset ~is_utf (subject : string) (offset : int) : int =
+  (* In UTF-8, bytes of the form 0b10xxxxxx occur only in the middle of a
+     character; every other byte starts one. *)
+  let is_utf8_continuation_byte c = Char.code c land 0xc0 = 0x80 in
+  let length = String.length subject in
+  let rec next_boundary o =
+    if o < length && is_utf8_continuation_byte subject.[o] then
+      next_boundary (o + 1)
+    else o
+  in
+  if is_utf then next_boundary (offset + 1) else offset + 1
+
+(* Whether a match spanning [start, end_) is an empty match overlapping the
+   end of the previous match (if any). *)
+let is_overlapping_empty_match ~(last_match_end : int option) (start : int)
+    (end_ : int) : bool =
+  Int.equal start end_
+  &&
+  match last_match_end with
+  | Some last -> Int.equal last end_
+  | None -> false
+
 module Error = struct
   type compile_error =
     | END_BACKSLASH
@@ -666,17 +695,24 @@ module Interp = struct
   let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (match_, match_error) Result.t Seq.t =
     let options = bitvector_of_match_options options in
+    let is_utf = Bindings.regex_is_utf re in
+    let subject_length = String.length subject in
     (* Copy the subject out of the OCaml heap once, rather than on every
        iteration (see [Bindings.pin_subject]). *)
     let pinned = Bindings.pin_subject subject in
-    Seq.unfold
-      (fun offset ->
-        match Bindings.pcre2_match_pinned re pinned offset options with
-        | Ok (Some (start, end_)) -> Some (Ok (subject, start, end_), end_)
-        | Ok None -> None
-        | Error n ->
-            Some (Error (match_error_of_int n), String.length subject))
-      subject_offset
+    let rec next (offset, last_match_end) =
+      match Bindings.pcre2_match_pinned re pinned offset options with
+      | Ok (Some (start, end_))
+        when is_overlapping_empty_match ~last_match_end start end_ ->
+          if offset >= subject_length then None
+          else next (next_search_offset ~is_utf subject offset, last_match_end)
+      | Ok (Some (start, end_)) ->
+          Some (Ok (subject, start, end_), (end_, Some end_))
+      | Ok None -> None
+      | Error n ->
+          Some (Error (match_error_of_int n), (subject_length, last_match_end))
+    in
+    Seq.unfold next (subject_offset, None)
 
   let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (captures option, match_error) Result.t =
@@ -690,19 +726,27 @@ module Interp = struct
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (captures, match_error) Result.t Seq.t =
     let options = bitvector_of_match_options options in
+    let is_utf = Bindings.regex_is_utf re in
+    let subject_length = String.length subject in
     (* Copy the subject out of the OCaml heap once, rather than on every
        iteration (see [Bindings.pin_subject]). *)
     let pinned = Bindings.pin_subject subject in
-    Seq.unfold
-      (fun offset ->
-        match Bindings.pcre2_capture_pinned re pinned offset options with
-        | Ok (Some (arr, names)) ->
-            let c : captures = (subject, arr, names) in
-            Some (Ok c, (range_of_captures c).end_)
-        | Ok None -> None
-        | Error n ->
-            Some (Error (match_error_of_int n), String.length subject))
-      subject_offset
+    let rec next (offset, last_match_end) =
+      match Bindings.pcre2_capture_pinned re pinned offset options with
+      | Ok (Some (arr, _))
+        when (let start, end_ = arr.(0) in
+              is_overlapping_empty_match ~last_match_end start end_) ->
+          if offset >= subject_length then None
+          else next (next_search_offset ~is_utf subject offset, last_match_end)
+      | Ok (Some (arr, names)) ->
+          let c : captures = (subject, arr, names) in
+          let end_ = (range_of_captures c).end_ in
+          Some (Ok c, (end_, Some end_))
+      | Ok None -> None
+      | Error n ->
+          Some (Error (match_error_of_int n), (subject_length, last_match_end))
+    in
+    Seq.unfold next (subject_offset, None)
 
   let split ?(options : match_option list = []) ?(subject_offset : int = 0)
       ?(limit : int option) (re : t) (subject : string) :
@@ -793,17 +837,24 @@ module Jit = struct
   let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (match_, match_error) Result.t Seq.t =
     let options = bitvector_of_match_options options in
+    let is_utf = Bindings.regex_is_utf re in
+    let subject_length = String.length subject in
     (* Copy the subject out of the OCaml heap once, rather than on every
        iteration (see [Bindings.pin_subject]). *)
     let pinned = Bindings.pin_subject subject in
-    Seq.unfold
-      (fun offset ->
-        match Bindings.pcre2_jit_match_pinned re pinned offset options with
-        | Ok (Some (start, end_)) -> Some (Ok (subject, start, end_), end_)
-        | Ok None -> None
-        | Error n ->
-            Some (Error (match_error_of_int n), String.length subject))
-      subject_offset
+    let rec next (offset, last_match_end) =
+      match Bindings.pcre2_jit_match_pinned re pinned offset options with
+      | Ok (Some (start, end_))
+        when is_overlapping_empty_match ~last_match_end start end_ ->
+          if offset >= subject_length then None
+          else next (next_search_offset ~is_utf subject offset, last_match_end)
+      | Ok (Some (start, end_)) ->
+          Some (Ok (subject, start, end_), (end_, Some end_))
+      | Ok None -> None
+      | Error n ->
+          Some (Error (match_error_of_int n), (subject_length, last_match_end))
+    in
+    Seq.unfold next (subject_offset, None)
 
   let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (captures option, match_error) Result.t =
@@ -819,19 +870,27 @@ module Jit = struct
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (captures, match_error) Result.t Seq.t =
     let options = bitvector_of_match_options options in
+    let is_utf = Bindings.regex_is_utf re in
+    let subject_length = String.length subject in
     (* Copy the subject out of the OCaml heap once, rather than on every
        iteration (see [Bindings.pin_subject]). *)
     let pinned = Bindings.pin_subject subject in
-    Seq.unfold
-      (fun offset ->
-        match Bindings.pcre2_jit_capture_pinned re pinned offset options with
-        | Ok (Some (arr, names)) ->
-            let c : captures = (subject, arr, names) in
-            Some (Ok c, (range_of_captures c).end_)
-        | Ok None -> None
-        | Error n ->
-            Some (Error (match_error_of_int n), String.length subject))
-      subject_offset
+    let rec next (offset, last_match_end) =
+      match Bindings.pcre2_jit_capture_pinned re pinned offset options with
+      | Ok (Some (arr, _))
+        when (let start, end_ = arr.(0) in
+              is_overlapping_empty_match ~last_match_end start end_) ->
+          if offset >= subject_length then None
+          else next (next_search_offset ~is_utf subject offset, last_match_end)
+      | Ok (Some (arr, names)) ->
+          let c : captures = (subject, arr, names) in
+          let end_ = (range_of_captures c).end_ in
+          Some (Ok c, (end_, Some end_))
+      | Ok None -> None
+      | Error n ->
+          Some (Error (match_error_of_int n), (subject_length, last_match_end))
+    in
+    Seq.unfold next (subject_offset, None)
 
   let split ?(options : match_option list = []) ?(subject_offset : int = 0)
       ?(limit : int option) (re : t) (subject : string) :
