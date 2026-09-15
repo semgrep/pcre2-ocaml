@@ -96,7 +96,19 @@ end = struct
 
   let bad_pattern ctxt =
     match compile "ab(" with
-    | Error MISSING_CLOSING_PARENTHESIS -> ()
+    | Error ({ code = MISSING_CLOSING_PARENTHESIS; offset } as e) ->
+        assert_equal ~printer:string_of_int ~msg:"Error offset" 3 offset;
+        assert_equal ~printer:Fun.id ~msg:"Error message"
+          "missing closing parenthesis (at offset 3)" (show_compile_error e)
+    | Error e ->
+        assert_failure ("Incorrectly error for pattern: " ^ show_compile_error e)
+    | Ok _ -> assert_failure "Incorrectly compiled invalid pattern"
+
+  let bad_pattern_lookbehind ctxt =
+    match compile "x(?<=a*)b" with
+    | Error { code = LOOKBEHIND_NOT_FIXED_LENGTH; offset } ->
+        assert_equal ~printer:string_of_int
+          ~msg:"Error offset points to start of the failing assertion" 1 offset
     | Error e ->
         assert_failure ("Incorrectly error for pattern: " ^ show_compile_error e)
     | Ok _ -> assert_failure "Incorrectly compiled invalid pattern"
@@ -106,6 +118,8 @@ end = struct
     | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (range option, match_error) result] in
+        assert_equal ~printer:Fun.id ~msg:"Error message" "bad offset value"
+          (show_match_error BADOFFSET);
         assert_equal ~printer ~msg:"Negative offset" (Error BADOFFSET)
           (find ~subject_offset:(-1) re "ab" >+= range_of_match);
         assert_equal ~printer ~msg:"Offset too large" (Error BADOFFSET)
@@ -375,6 +389,17 @@ end = struct
           (Ok [ ""; "a"; "b"; "" ])
           (split re "ab")
 
+  let split_propagates_match_error ctxt =
+    match compile "," with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        (* A match error in the delimiter stream must not be swallowed: an
+           invalid (negative) offset makes matching fail immediately. *)
+        assert_equal
+          ~printer:[%show: (string list, match_error) result]
+          (Error BADOFFSET)
+          (split ~subject_offset:(-1) re "a,b,c")
+
   let tests =
     [
       "simple_test" >:: simple_test;
@@ -383,6 +408,7 @@ end = struct
       "non_contiguous_capture" >:: non_contiguous_capture;
       "non_contiguous_named_capture" >:: non_contiguous_named_capture;
       "bad_pattern" >:: bad_pattern;
+      "bad_pattern_lookbehind" >:: bad_pattern_lookbehind;
       "bad_offset" >:: bad_offset;
       "capture_group_names" >:: capture_group_names;
       "find_iter" >:: find_iter_test;
@@ -399,6 +425,7 @@ end = struct
       "find_iter_empty_matches_utf" >:: find_iter_empty_matches_utf;
       "captures_iter_empty_matches" >:: captures_iter_empty_matches;
       "split_empty_pattern" >:: split_empty_pattern;
+      "split_propagates_match_error" >:: split_propagates_match_error;
       "unicode" >:: unicode_test;
       "overlapping_matches" >:: overlapping_matches_test;
     ]

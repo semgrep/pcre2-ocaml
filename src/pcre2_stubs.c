@@ -175,6 +175,34 @@ CAMLprim value get_config_int(value request /* : int */) /* -> int */ {
         CAMLreturn(Val_int(result));
 }
 
+/// Returns the human-readable message PCRE2 associates with a compile or
+/// match error code, as produced by `pcre2_get_error_message(3)`.
+CAMLprim value get_error_message(value error_code /* : int */) /* -> string */ {
+        CAMLparam1(error_code);
+        CAMLlocal1(message);
+
+        // Per `pcre2api(3)`, 120 code units is enough for any message PCRE2
+        // currently produces; doubled here for headroom against future ones.
+        PCRE2_UCHAR buffer[240];
+        int rc = pcre2_get_error_message(Int_val(error_code), buffer,
+                                         sizeof buffer / sizeof buffer[0]);
+
+        // [error_code] isn't a recognized PCRE2 error code, so [buffer] was
+        // left untouched.
+        if (rc == PCRE2_ERROR_BADDATA) {
+                CAMLreturn(caml_copy_string("unknown PCRE2 error code"));
+        }
+
+        // Otherwise, [rc] is either the message length (excluding the
+        // trailing zero) or PCRE2_ERROR_NOMEMORY because [buffer] was too
+        // small to hold it---in which case [buffer] holds a truncated but
+        // still zero-terminated message, which is still fine to copy out.
+        // SAFETY: with PCRE2_CODE_UNIT_WIDTH == 8, PCRE2_UCHAR is a plain
+        // [unsigned char], compatible with the [char *] expected here.
+        message = caml_copy_string((const char *)buffer);
+        CAMLreturn(message);
+}
+
 /// Compiles the provided pattern.
 ///
 /// Note that the options from OCaml are not split between those which can
@@ -195,9 +223,9 @@ CAMLprim value compile_unboxed(value pattern /* : string */,
                                intnat depth_limit /* : int [@untagged] */,
                                intnat heap_limit /* : int [@untagged] */
                                /* another arg for compile context options? */
-                               ) /* : -> (regex, int) Result.t */ {
+                               ) /* : -> (regex, int * int) Result.t */ {
         CAMLparam1(pattern);
-        CAMLlocal2(result, regex_value);
+        CAMLlocal3(result, regex_value, error);
 
         size_t ocaml_regexp_size = sizeof(struct ocaml_regex);
         int error_code;
@@ -214,11 +242,16 @@ CAMLprim value compile_unboxed(value pattern /* : string */,
         pcre2_compile_context_free(ccontext);
 
         if (!regex) {
-                // Returns [Error e] since the pattern could not be compiled.
+                // Returns [Error (code, offset)] since the pattern could not
+                // be compiled.
+                // SAFETY: This allocation is immediately filled with
+                // well-formed values prior to returning.
+                error = caml_alloc_small(2, TUPLE_TAG);
+                Field(error, 0) = Val_int(error_code);
+                Field(error, 1) = Val_int(error_offset);
+
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
-                // TODO(cooper): mapping between error codes here and datatype
-                // above.
-                Field(result, 0) = Val_int(error_code);
+                Field(result, 0) = error;
                 CAMLreturn(result);
         }
 
@@ -226,9 +259,16 @@ CAMLprim value compile_unboxed(value pattern /* : string */,
         if (!make_match_context(match_limit, depth_limit, heap_limit, &mcontext)) {
                 pcre2_code_free(regex);
                 // Report the allocation failure as a compile-time heap failure
-                // (PCRE2_ERROR_HEAP_FAILED), the nearest structured error.
+                // (PCRE2_ERROR_HEAP_FAILED), the nearest structured error. The
+                // offset is not meaningful here, so it is reported as 0.
+                // SAFETY: This allocation is immediately filled with well-formed
+                // values prior to returning.
+                error = caml_alloc_small(2, TUPLE_TAG);
+                Field(error, 0) = Val_int(PCRE2_ERROR_HEAP_FAILED);
+                Field(error, 1) = Val_int(0);
+
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
-                Field(result, 0) = Val_int(PCRE2_ERROR_HEAP_FAILED);
+                Field(result, 0) = error;
                 CAMLreturn(result);
         }
 
@@ -252,7 +292,7 @@ CAMLprim value compile_unboxed(value pattern /* : string */,
 /// Boxed argument version of [compile_unboxed] (for bytecode).
 CAMLprim value compile(value pattern /* : string */, value options /* : int32 */,
                        value match_limit /* : int */, value depth_limit /* : int */,
-                       value heap_limit /* : int */) /* : -> (regex, int) Result.t */ {
+                       value heap_limit /* : int */) /* : -> (regex, int * int) Result.t */ {
         return compile_unboxed(pattern, Int32_val(options), Int_val(match_limit),
                                Int_val(depth_limit), Int_val(heap_limit));
 }

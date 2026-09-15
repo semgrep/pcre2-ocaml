@@ -4,8 +4,8 @@ type match_ [@@deriving show, eq]
 type captures [@@deriving show, eq]
 (** A set comprising an entire match alongside any matches for capture groups *)
 
-(** Errors which may occur during compilation of the pattern *)
-type compile_error =
+(** The kinds of errors which may occur during compilation of a pattern *)
+type compile_error_code =
   | END_BACKSLASH  (** A pattern string ends in a backslash *)
   | END_BACKSLASH_C
       (** A pattern string ends in \c, which should require an additional
@@ -151,6 +151,18 @@ type compile_error =
       (** Atomic assertion expected after (?( or (?(?C) *)
   | BACKSLASH_K_IN_LOOKAROUND
       (** \K is not allowed in lookarounds (cf.  EXTRA_ALLOW_LOOKAROUND_BSK) *)
+[@@deriving show, eq]
+
+(** An error encountered while compiling a pattern, alongside [offset], the
+    offset (in code units, not characters) into the pattern at which it
+    occurred. A non-zero [offset] is not necessarily the furthest point in the
+    pattern that was read: for example, after
+    {!LOOKBEHIND_NOT_FIXED_LENGTH}, [offset] points to the start of the
+    failing assertion. Some errors are not detected until the whole pattern
+    has been scanned, in which case [offset] is the length of the pattern.
+    Errors not produced by scanning the pattern itself (e.g. those raised
+    while JIT-compiling an already-compiled pattern) report [offset] as 0. *)
+type compile_error = { code : compile_error_code; offset : int }
 [@@deriving show, eq]
 
 (** Errors which may occur during matching of a pattern *)

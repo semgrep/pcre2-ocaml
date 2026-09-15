@@ -14,11 +14,12 @@ external pcre2_compile :
   (int[@untagged]) ->
   (int[@untagged]) ->
   (int[@untagged]) ->
-  (interp regex, int) Result.t = "compile" "compile_unboxed"
+  (interp regex, int * int) Result.t = "compile" "compile_unboxed"
 (** [pcre2_compile pattern options match_limit depth_limit heap_limit] compiles
     [pattern]. Each limit is a match-context limit bundled with the compiled
     regex, or a negative value to leave PCRE2's default in force. See
-    [pcre2_set_match_limit(3)] and friends. *)
+    [pcre2_set_match_limit(3)] and friends. On failure the error is the pair of
+    the error code and the offset into the pattern at which it occurred. *)
 
 external get_config_int : int -> int = "get_config_int"
 (** [get_config_int request] is the PCRE2 build-time configuration value for the
@@ -99,6 +100,8 @@ external pcre2_jit_capture_pinned :
   = "jit_capture_pinned" "jit_capture_pinned_unboxed"
 
 external get_version : unit -> int * int = "get_version"
+
+external pcre2_get_error_message : int -> string = "get_error_message"
 
 external get_capture_groups : _ regex -> (string * int) array
   = "get_capture_groups"
