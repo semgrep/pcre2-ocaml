@@ -436,10 +436,19 @@ module Options = struct
       | `USE_OFFSET_LIMIT
       | `EXTENDED_MORE
       | `LITERAL
-      | `MATCH_INVALID_UTF ]
+      | `MATCH_INVALID_UTF
+      | (* These carry an integer payload and are not PCRE2 compile flags: they
+           are match/depth/heap limits bundled with the compiled pattern. See
+           [limits_of_compile_options]. *)
+        `MATCH_LIMIT of int
+      | `DEPTH_LIMIT of int
+      | `HEAP_LIMIT of int ]
     [@@deriving show, eq]
 
     let int32_of_compile_option : compile_option -> int32 = function
+      (* Limits contribute no bits to the compile options; they are handled
+         separately by [limits_of_compile_options]. *)
+      | `MATCH_LIMIT _ | `DEPTH_LIMIT _ | `HEAP_LIMIT _ -> 0l
       | #compile_match_options as opt -> int32_of_compile_match_option opt
       | `ALLOW_EMPTY_CLASS            -> 0x00000001l
       | `ALT_BSUX                     -> 0x00000002l
@@ -472,6 +481,20 @@ module Options = struct
 
     let bitvector_of_compile_options (opts : compile_option list) : int32 =
       opts |> List.map int32_of_compile_option |> List.fold_left Int32.logor 0l
+
+    (* Extracts the match/depth/heap limits from a compile option list as the
+       triple [(match_limit, depth_limit, heap_limit)]. A limit absent from the
+       list is reported as [-1], the sentinel meaning "leave PCRE2's default in
+       force"; if one is given more than once, the last occurrence wins. *)
+    let limits_of_compile_options (opts : compile_option list) : int * int * int
+        =
+      List.fold_left
+        (fun (match_limit, depth_limit, heap_limit) -> function
+          | `MATCH_LIMIT n -> (n, depth_limit, heap_limit)
+          | `DEPTH_LIMIT n -> (match_limit, n, heap_limit)
+          | `HEAP_LIMIT n -> (match_limit, depth_limit, n)
+          | _ -> (match_limit, depth_limit, heap_limit))
+        (-1, -1, -1) opts
 
     (* for compile ctx - can combine and just split back as needed in bindings? *)
     type compile_ctx =
@@ -555,11 +578,20 @@ let version : int * int = Bindings.get_version ()
 
 let config_unicode : bool = true
 
+(* PCRE2_CONFIG_* request codes; see pcre2_config(3). These are part of the
+   stable ABI and so are safe to hardcode. *)
+let config_matchlimit = 4
+let config_depthlimit = 7
+let config_heaplimit = 12
+
 (** Default limit for calls to internal matching function *)
-let config_match_limit : int = -1
+let config_match_limit : int = Bindings.get_config_int config_matchlimit
 
 (** Default limit for depth of nested backtracking *)
-let config_depth_limit : int = -1
+let config_depth_limit : int = Bindings.get_config_int config_depthlimit
+
+(** Default limit on heap memory (in kibibytes) used while matching *)
+let config_heap_limit : int = Bindings.get_config_int config_heaplimit
 
 (** Indicates use of stack recursion in matching function *)
 let config_stackrecurse : bool = true
@@ -575,8 +607,11 @@ module Interp = struct
 
   let compile ?(options : compile_option list = []) (pattern : string) :
       (t, compile_error) Result.t =
+    let match_limit, depth_limit, heap_limit =
+      limits_of_compile_options options
+    in
     let options = bitvector_of_compile_options options in
-    Bindings.pcre2_compile pattern options
+    Bindings.pcre2_compile pattern options match_limit depth_limit heap_limit
     |> Result.map_error compile_error_of_int_pair
 
   let capture_groups (r : t) = Bindings.get_capture_groups r |> Array.to_list
@@ -718,6 +753,10 @@ module Jit = struct
           | _ -> .)
         options
     in
+    (* Any limits are interp compile options, so they travel with
+       [interp_options] and are bundled with the regex that [of_interp] reuses.
+       NOTE: depth and heap limits are ignored by JIT matching; only the match
+       limit applies. *)
     let* interp = Interp.compile ~options:interp_options pattern in
     of_interp ~options:jit_options ~mode:JIT_COMPLETE interp
   (* TODO: determine best way to support matching mode with uniform interface.

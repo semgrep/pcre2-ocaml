@@ -25,6 +25,11 @@ const int ARRAY_TAG = 0;
 
 struct ocaml_regex {
         pcre2_code *regex;
+        // Holds any match/depth/heap limits configured at compile time, or NULL
+        // if none were requested (in which case PCRE2's defaults apply). Shared
+        // by every match against this regex; safe to do so since a match
+        // context is only read, never written, while matching.
+        pcre2_match_context *mcontext;
 };
 
 static inline struct ocaml_regex *regex_of_value(value v) {
@@ -35,6 +40,9 @@ static inline struct ocaml_regex *regex_of_value(value v) {
 static void ocaml_regex_free(value ocaml_regex) {
         struct ocaml_regex *re = Data_custom_val(ocaml_regex);
         pcre2_code_free(re->regex);
+        // pcre2_match_context_free ignores NULL, so this is safe when no limits
+        // were configured.
+        pcre2_match_context_free(re->mcontext);
 }
 
 static struct custom_operations regex_ops = {.identifier = "pcre2_ocaml_regexp",
@@ -107,6 +115,66 @@ CAMLprim value get_version(void) /* -> int * int */ {
         CAMLreturn(version);
 }
 
+/// Builds a match context holding the requested match/depth/heap limits, or
+/// returns NULL if none are requested (a negative value means "unset", leaving
+/// PCRE2's default in force).
+///
+/// These limits guard against pathological patterns that would otherwise
+/// consume unbounded time or memory while backtracking. Note their differing
+/// interaction with JIT matching (see `pcre2api(3)`):
+///   - match_limit is honoured by both the interpreter and JIT (though JIT
+///     counts the limited quantity differently);
+///   - depth_limit and heap_limit are honoured only by the interpreter and are
+///     ignored when matching with JIT, which instead bounds its own stack and
+///     reports PCRE2_ERROR_JIT_STACKLIMIT.
+///
+/// @param[out] out The created context (set to NULL if none is needed).
+/// @return true on success; false only if a context was needed but could not
+/// be allocated.
+static bool make_match_context(intnat match_limit, intnat depth_limit, intnat heap_limit,
+                               pcre2_match_context **out) {
+        if (match_limit < 0 && depth_limit < 0 && heap_limit < 0) {
+                *out = NULL;
+                return true;
+        }
+
+        pcre2_match_context *mcontext = pcre2_match_context_create(NULL);
+        if (!mcontext) {
+                return false;
+        }
+        // A limit of exactly 0 is a legitimate (if extreme) request, so the
+        // sentinel for "unset" is any negative value. The cast is safe since we
+        // have excluded negatives; oversized values are truncated to uint32, as
+        // documented on the OCaml side.
+        if (match_limit >= 0) {
+                pcre2_set_match_limit(mcontext, (uint32_t)match_limit);
+        }
+        if (depth_limit >= 0) {
+                pcre2_set_depth_limit(mcontext, (uint32_t)depth_limit);
+        }
+        if (heap_limit >= 0) {
+                pcre2_set_heap_limit(mcontext, (uint32_t)heap_limit);
+        }
+        *out = mcontext;
+        return true;
+}
+
+/// Queries a PCRE2 build-time configuration value that fits in an int (e.g. the
+/// default match or depth limit). See `pcre2_config(3)` for the request codes.
+///
+/// @param[in] request The PCRE2_CONFIG_* request code.
+/// @return The configuration value, or a negative PCRE2 error code if the
+/// request is not recognized by the linked library.
+CAMLprim value get_config_int(value request /* : int */) /* -> int */ {
+        CAMLparam1(request);
+        uint32_t result = 0;
+        int rc = pcre2_config(Int_val(request), &result);
+        if (rc < 0) {
+                CAMLreturn(Val_int(rc));
+        }
+        CAMLreturn(Val_int(result));
+}
+
 /// Returns the human-readable message PCRE2 associates with a compile or
 /// match error code, as produced by `pcre2_get_error_message(3)`.
 CAMLprim value get_error_message(value error_code /* : int */) /* -> string */ {
@@ -145,9 +213,15 @@ CAMLprim value get_error_message(value error_code /* : int */) /* -> string */ {
 /// details.
 /// @param[in] options The options, specified via a bitvector. See
 /// `pcre2_compile(3)`.
+/// @param[in] match_limit The match limit to enforce, or negative for none.
+/// @param[in] depth_limit The backtracking depth limit, or negative for none.
+/// @param[in] heap_limit The heap limit (in kibibytes), or negative for none.
 /// @return A result comprising the compiled pattern or a structured error.
 CAMLprim value compile_unboxed(value pattern /* : string */,
-                               uint32_t options /* : int32 [@unboxed] */
+                               uint32_t options /* : int32 [@unboxed] */,
+                               intnat match_limit /* : int [@untagged] */,
+                               intnat depth_limit /* : int [@untagged] */,
+                               intnat heap_limit /* : int [@untagged] */
                                /* another arg for compile context options? */
                                ) /* : -> (regex, int * int) Result.t */ {
         CAMLparam1(pattern);
@@ -181,12 +255,30 @@ CAMLprim value compile_unboxed(value pattern /* : string */,
                 CAMLreturn(result);
         }
 
+        pcre2_match_context *mcontext;
+        if (!make_match_context(match_limit, depth_limit, heap_limit, &mcontext)) {
+                pcre2_code_free(regex);
+                // Report the allocation failure as a compile-time heap failure
+                // (PCRE2_ERROR_HEAP_FAILED), the nearest structured error. The
+                // offset is not meaningful here, so it is reported as 0.
+                // SAFETY: This allocation is immediately filled with well-formed
+                // values prior to returning.
+                error = caml_alloc_small(2, TUPLE_TAG);
+                Field(error, 0) = Val_int(PCRE2_ERROR_HEAP_FAILED);
+                Field(error, 1) = Val_int(0);
+
+                result = caml_alloc_small(1, RESULT_ERROR_TAG);
+                Field(result, 0) = error;
+                CAMLreturn(result);
+        }
+
         // caml_alloc_custom_mem wants a size estimate of the allocated
         size_t pcre2_allocated_mem;
         pcre2_pattern_info(regex, PCRE2_INFO_SIZE, &pcre2_allocated_mem);
         // TODO(cooper): used mem amount needs increased later if we jit?
         regex_value = caml_alloc_custom_mem(&regex_ops, ocaml_regexp_size, pcre2_allocated_mem);
         regex_of_value(regex_value)->regex = regex;
+        regex_of_value(regex_value)->mcontext = mcontext;
 
         // Return [Ok regex]
         // SAFETY: This allocation is immediately filled with well-formed
@@ -198,9 +290,11 @@ CAMLprim value compile_unboxed(value pattern /* : string */,
 }
 
 /// Boxed argument version of [compile_unboxed] (for bytecode).
-CAMLprim value compile(value pattern /* : string */,
-                       value options /* : int32 */) /* : -> (regex, int * int) Result.t */ {
-        return compile_unboxed(pattern, Int32_val(options));
+CAMLprim value compile(value pattern /* : string */, value options /* : int32 */,
+                       value match_limit /* : int */, value depth_limit /* : int */,
+                       value heap_limit /* : int */) /* : -> (regex, int * int) Result.t */ {
+        return compile_unboxed(pattern, Int32_val(options), Int_val(match_limit),
+                               Int_val(depth_limit), Int_val(heap_limit));
 }
 
 /// Matches on subjects at least this long run with the runtime lock released
@@ -315,10 +409,13 @@ static value match_general(value ocaml_re /* : _ regex */,
         }
         size_t offset = subject_offset;
 
-        const pcre2_code *re = regex_of_value(ocaml_re)->regex;
-        // TODO: support match/depth limits. Or callouts. May need to be
-        // bundled with the compiled regex.
-        pcre2_match_context *mcontext = NULL;
+        const struct ocaml_regex *ore = regex_of_value(ocaml_re);
+        const pcre2_code *re = ore->regex;
+        // Any match/depth/heap limits configured at compile time live here (or
+        // NULL for PCRE2's defaults). The context is only read while matching,
+        // so sharing it across matches -- including concurrent ones while the
+        // runtime lock is released -- is safe. TODO: callouts.
+        pcre2_match_context *mcontext = ore->mcontext;
         pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
 
         int ret = run_match(use_jit, re, subject, pinned, offset, options, match_data, mcontext);
@@ -616,10 +713,10 @@ static value capture_general(value ocaml_re /* : _ regex */,
         }
         size_t offset = subject_offset;
 
-        const pcre2_code *re = regex_of_value(ocaml_re)->regex;
-        // TODO: support match/depth limits. Or callouts. May need to be
-        // bundled with the compiled regex.
-        pcre2_match_context *mcontext = NULL;
+        const struct ocaml_regex *ore = regex_of_value(ocaml_re);
+        const pcre2_code *re = ore->regex;
+        // See [match_general] regarding the shared match context. TODO: callouts.
+        pcre2_match_context *mcontext = ore->mcontext;
         pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
 
         // NOTE: Really one more than number of captures since it includes the

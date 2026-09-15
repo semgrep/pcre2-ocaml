@@ -434,14 +434,116 @@ end
 let check_version ctxt =
   assert_bool "Version is older than newest tested" (Pcre2.version >= (10, 43))
 
+let check_config ctxt =
+  (* These are queried from the linked library and should be positive defaults,
+     not the -1 sentinel they previously returned. *)
+  assert_bool "config_match_limit is positive" (Pcre2.config_match_limit > 0);
+  assert_bool "config_depth_limit is positive" (Pcre2.config_depth_limit > 0);
+  assert_bool "config_heap_limit is positive" (Pcre2.config_heap_limit > 0)
+
+(* A pattern that backtracks catastrophically on a non-matching subject, so a
+   low match/depth limit is reliably exceeded. The limit options are a compile
+   option shared structurally by both [Interp] and [Jit], but the test functor
+   above treats [compile_option] abstractly, so these tests live out here and
+   exercise each engine concretely. *)
+let pathological_pattern = "(a+)+$"
+let catastrophic_subject = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"
+let result_printer = [%show: (bool, Pcre2.match_error) result]
+
+(* The match limit is exceeded on the catastrophic subject. *)
+let assert_match_limit_hit result =
+  assert_equal ~printer:result_printer ~msg:"low match limit is exceeded"
+    (Error Pcre2.MATCHLIMIT) result
+
+(* The interpreter honours the depth limit; JIT ignores it and on this
+   catastrophic input instead hits its own stack limit or the default match
+   limit, or fails to match. Any of the latter is fine -- it must just not
+   spuriously succeed. *)
+let assert_depth_limit_hit ~jit result =
+  match result with
+  | Error Pcre2.DEPTHLIMIT when not jit -> ()
+  | (Error Pcre2.JIT_STACKLIMIT | Error Pcre2.MATCHLIMIT | Ok false) when jit ->
+      ()
+  | other ->
+      assert_failure
+        (Printf.sprintf "unexpected depth-limit result (jit=%b): %s" jit
+           (result_printer other))
+
+let compile_or_fail c =
+  match c with
+  | Ok re -> re
+  | Error e ->
+      assert_failure ("failed to compile: " ^ Pcre2.show_compile_error e)
+
+let interp_limit_tests =
+  [
+    ( "match_limit" >:: fun _ ->
+      let re =
+        compile_or_fail
+          (Interp.compile ~options:[ `MATCH_LIMIT 100 ] pathological_pattern)
+      in
+      assert_match_limit_hit (Interp.is_match re catastrophic_subject);
+      (* A limited pattern still matches easy input. *)
+      assert_equal ~printer:result_printer (Ok true)
+        (Interp.is_match re "aaaa") );
+    ( "depth_limit" >:: fun _ ->
+      let re =
+        compile_or_fail
+          (Interp.compile ~options:[ `DEPTH_LIMIT 10 ] pathological_pattern)
+      in
+      assert_depth_limit_hit ~jit:false
+        (Interp.is_match re catastrophic_subject) );
+    ( "limits_dont_affect_normal_patterns" >:: fun _ ->
+      let re =
+        compile_or_fail
+          (Interp.compile
+             ~options:[ `MATCH_LIMIT 1000; `DEPTH_LIMIT 1000; `HEAP_LIMIT 1000 ]
+             "a+")
+      in
+      assert_equal
+        ~printer:[%show: (Interp.range option, Pcre2.match_error) result]
+        (Ok (Some Interp.{ start = 0; end_ = 3 }))
+        (Interp.find re "aaa" |> Result.map (Option.map Interp.range_of_match))
+    );
+  ]
+
+let jit_limit_tests =
+  [
+    ( "match_limit" >:: fun _ ->
+      let re =
+        compile_or_fail
+          (Jit.compile ~options:[ `MATCH_LIMIT 100 ] pathological_pattern)
+      in
+      assert_match_limit_hit (Jit.is_match re catastrophic_subject);
+      assert_equal ~printer:result_printer (Ok true) (Jit.is_match re "aaaa") );
+    ( "depth_limit" >:: fun _ ->
+      let re =
+        compile_or_fail
+          (Jit.compile ~options:[ `DEPTH_LIMIT 10 ] pathological_pattern)
+      in
+      assert_depth_limit_hit ~jit:true (Jit.is_match re catastrophic_subject) );
+    ( "limits_dont_affect_normal_patterns" >:: fun _ ->
+      let re =
+        compile_or_fail
+          (Jit.compile
+             ~options:[ `MATCH_LIMIT 1000; `DEPTH_LIMIT 1000; `HEAP_LIMIT 1000 ]
+             "a+")
+      in
+      assert_equal
+        ~printer:[%show: (Jit.range option, Pcre2.match_error) result]
+        (Ok (Some Jit.{ start = 0; end_ = 3 }))
+        (Jit.find re "aaa" |> Result.map (Option.map Jit.range_of_match)) );
+  ]
+
 let suite =
   let module Interp_Tests = MakeTests (Interp) in
   let module Jit_Tests = MakeTests (Jit) in
   "Test pcre"
   >::: [
          "version" >:: check_version;
-         "Interp" >::: Interp_Tests.tests;
-         "JIT" >::: Jit_Tests.tests;
+         "config" >:: check_config;
+         "Interp" >::: Interp_Tests.tests @ interp_limit_tests;
+         "JIT" >::: Jit_Tests.tests @ jit_limit_tests;
        ]
 
 let _ = if not !Sys.interactive then run_test_tt_main suite else ()

@@ -53,7 +53,30 @@ module type Matcher = sig
     ?options:compile_option list -> string -> (t, compile_error) Result.t
   (** [compile options pattern] compiles [pattern] with any specified [options]
       into the matcher type (e.g., a finite automata which can perform
-      matching). In the case of an error, [Error c] is returned. *)
+      matching). In the case of an error, [Error c] is returned.
+
+      Among [options], the [`MATCH_LIMIT], [`DEPTH_LIMIT], and [`HEAP_LIMIT]
+      options bound the resources any match against the resulting pattern may
+      consume, guarding against pathological (e.g. catastrophically
+      backtracking) inputs. They are bundled with the compiled pattern and apply
+      to every subsequent match. When omitted, PCRE2's build-time defaults apply
+      (see [config_match_limit], [config_depth_limit], and [config_heap_limit]).
+
+      - [`MATCH_LIMIT n] caps the number of times the internal matching function
+        is called. Exceeding it yields [Error MATCHLIMIT]. It applies to both
+        interpreted and JIT matching (though JIT counts the quantity
+        differently).
+      - [`DEPTH_LIMIT n] caps the depth of nested backtracking. Exceeding it
+        yields [Error DEPTHLIMIT]. NOTE: it is honoured only by interpreted
+        matching and is ignored by JIT, which bounds its own stack and instead
+        reports [Error JIT_STACKLIMIT].
+      - [`HEAP_LIMIT n] caps, in kibibytes, the heap used to record backtracking
+        state. Exceeding it yields [Error HEAPLIMIT]. NOTE: like [`DEPTH_LIMIT],
+        it is ignored by JIT matching.
+
+      A limit given here can only ever be tightened, never loosened, by a
+      corresponding in-pattern setting such as a [LIMIT_MATCH] verb: PCRE2
+      ignores an in-pattern limit larger than the one set here. *)
 
   val capture_groups : t -> (string * int) list
   (** [capture_groups re] is a list where elements identify each named capture
