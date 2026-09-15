@@ -375,6 +375,17 @@ end = struct
           (Ok [ ""; "a"; "b"; "" ])
           (split re "ab")
 
+  let split_propagates_match_error ctxt =
+    match compile "," with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        (* A match error in the delimiter stream must not be swallowed: an
+           invalid (negative) offset makes matching fail immediately. *)
+        assert_equal
+          ~printer:[%show: (string list, match_error) result]
+          (Error BADOFFSET)
+          (split ~subject_offset:(-1) re "a,b,c")
+
   let tests =
     [
       "simple_test" >:: simple_test;
@@ -399,6 +410,7 @@ end = struct
       "find_iter_empty_matches_utf" >:: find_iter_empty_matches_utf;
       "captures_iter_empty_matches" >:: captures_iter_empty_matches;
       "split_empty_pattern" >:: split_empty_pattern;
+      "split_propagates_match_error" >:: split_propagates_match_error;
       "unicode" >:: unicode_test;
       "overlapping_matches" >:: overlapping_matches_test;
     ]
