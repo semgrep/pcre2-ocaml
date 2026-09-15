@@ -9,7 +9,7 @@ let unset = (-1, -1)
 external pcre2_ocaml_init : unit -> unit = "pcre2_ocaml_init"
 
 external pcre2_compile :
-  string -> (int32[@unboxed]) -> (interp regex, int) Result.t
+  string -> (int32[@unboxed]) -> (interp regex, int * int) Result.t
   = "compile" "compile_unboxed"
 
 external pcre2_match :
