@@ -121,9 +121,9 @@ CAMLprim value get_version(void) /* -> int * int */ {
 CAMLprim value compile_unboxed(value pattern /* : string */,
                                uint32_t options /* : int32 [@unboxed] */
                                /* another arg for compile context options? */
-                               ) /* : -> (regex, int) Result.t */ {
+                               ) /* : -> (regex, int * int) Result.t */ {
         CAMLparam1(pattern);
-        CAMLlocal2(result, regex_value);
+        CAMLlocal3(result, regex_value, error);
 
         size_t ocaml_regexp_size = sizeof(struct ocaml_regex);
         int error_code;
@@ -140,11 +140,16 @@ CAMLprim value compile_unboxed(value pattern /* : string */,
         pcre2_compile_context_free(ccontext);
 
         if (!regex) {
-                // Returns [Error e] since the pattern could not be compiled.
+                // Returns [Error (code, offset)] since the pattern could not
+                // be compiled.
+                // SAFETY: This allocation is immediately filled with
+                // well-formed values prior to returning.
+                error = caml_alloc_small(2, TUPLE_TAG);
+                Field(error, 0) = Val_int(error_code);
+                Field(error, 1) = Val_int(error_offset);
+
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
-                // TODO(cooper): mapping between error codes here and datatype
-                // above.
-                Field(result, 0) = Val_int(error_code);
+                Field(result, 0) = error;
                 CAMLreturn(result);
         }
 
@@ -166,7 +171,7 @@ CAMLprim value compile_unboxed(value pattern /* : string */,
 
 /// Boxed argument version of [compile_unboxed] (for bytecode).
 CAMLprim value compile(value pattern /* : string */,
-                       value options /* : int32 */) /* : -> (regex, int) Result.t */ {
+                       value options /* : int32 */) /* : -> (regex, int * int) Result.t */ {
         return compile_unboxed(pattern, Int32_val(options));
 }
 

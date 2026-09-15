@@ -96,7 +96,17 @@ end = struct
 
   let bad_pattern ctxt =
     match compile "ab(" with
-    | Error MISSING_CLOSING_PARENTHESIS -> ()
+    | Error { code = MISSING_CLOSING_PARENTHESIS; offset } ->
+        assert_equal ~printer:string_of_int ~msg:"Error offset" 3 offset
+    | Error e ->
+        assert_failure ("Incorrectly error for pattern: " ^ show_compile_error e)
+    | Ok _ -> assert_failure "Incorrectly compiled invalid pattern"
+
+  let bad_pattern_lookbehind ctxt =
+    match compile "x(?<=a*)b" with
+    | Error { code = LOOKBEHIND_NOT_FIXED_LENGTH; offset } ->
+        assert_equal ~printer:string_of_int
+          ~msg:"Error offset points to start of the failing assertion" 1 offset
     | Error e ->
         assert_failure ("Incorrectly error for pattern: " ^ show_compile_error e)
     | Ok _ -> assert_failure "Incorrectly compiled invalid pattern"
@@ -394,6 +404,7 @@ end = struct
       "non_contiguous_capture" >:: non_contiguous_capture;
       "non_contiguous_named_capture" >:: non_contiguous_named_capture;
       "bad_pattern" >:: bad_pattern;
+      "bad_pattern_lookbehind" >:: bad_pattern_lookbehind;
       "bad_offset" >:: bad_offset;
       "capture_group_names" >:: capture_group_names;
       "find_iter" >:: find_iter_test;

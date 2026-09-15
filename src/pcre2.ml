@@ -79,7 +79,7 @@ let is_overlapping_empty_match ~(last_match_end : int option) (start : int)
   | None -> false
 
 module Error = struct
-  type compile_error =
+  type compile_error_code =
     | END_BACKSLASH
     | END_BACKSLASH_C
     | UNKNOWN_ESCAPE
@@ -183,7 +183,7 @@ module Error = struct
     | BACKSLASH_K_IN_LOOKAROUND
   [@@deriving show, eq]
 
-  let compile_error_of_int : int -> compile_error = function
+  let compile_error_code_of_int : int -> compile_error_code = function
     | 101 -> END_BACKSLASH
     | 102 -> END_BACKSLASH_C
     | 103 -> UNKNOWN_ESCAPE
@@ -285,6 +285,16 @@ module Error = struct
     | 199 -> BACKSLASH_K_IN_LOOKAROUND
     | n ->
         invalid_arg (Printf.sprintf "%d is not a valid PCRE2 compile error" n)
+
+  (** An error encountered while compiling a pattern, alongside the offset (in
+      code units) into the pattern at which it occurred. Not all errors are
+      associated with a meaningful offset, in which case it is given as 0. See
+      `pcre2_compile(3)` for details. *)
+  type compile_error = { code : compile_error_code; offset : int }
+  [@@deriving show, eq]
+
+  let compile_error_of_int_pair ((code, offset) : int * int) : compile_error =
+    { code = compile_error_code_of_int code; offset }
 
   type match_error =
     (* Error codes for UTF-8 validity checks. See pcre2unicode(3). *)
@@ -678,9 +688,8 @@ module Interp = struct
   let compile ?(options : compile_option list = []) (pattern : string) :
       (t, compile_error) Result.t =
     let options = bitvector_of_compile_options options in
-    (* TODO: error location? *)
     Bindings.pcre2_compile pattern options
-    |> Result.map_error compile_error_of_int
+    |> Result.map_error compile_error_of_int_pair
 
   let capture_groups (r : t) = Bindings.get_capture_groups r |> Array.to_list
 
@@ -805,9 +814,11 @@ module Jit = struct
       (t, compile_error) Result.t =
     let mode = int32_of_matching_mode mode in
     let options = Int32.logor mode (bitvector_of_compile_options options) in
-    (* TODO: error location? *)
+    (* [pcre2_jit_compile] has no notion of an offset into the pattern, unlike
+       [pcre2_compile], so 0 is given here (see [compile_error]). *)
     Bindings.pcre2_jit_compile interp options
-    |> Result.map_error compile_error_of_int
+    |> Result.map_error (fun code ->
+           { code = compile_error_code_of_int code; offset = 0 })
 
   let compile ?(options : compile_option list = []) (pattern : string) :
       (t, compile_error) Result.t =
