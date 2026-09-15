@@ -15,12 +15,6 @@
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
 
-#if __STDC_VERSION__ >= 202311L
-#define UNUSED [[maybe_unused]]
-#else
-#define UNUSED __attribute__((unused))
-#endif
-
 const int OPTION_SOME_TAG = 0;
 const int RESULT_OK_TAG = 0;
 const int RESULT_ERROR_TAG = 1;
@@ -125,8 +119,9 @@ CAMLprim value compile_unboxed(value pattern /* : string */,
 }
 
 /// Boxed argument version of [compile_unboxed] (for bytecode).
-CAMLprim value compile(value *argv, int argc UNUSED) {
-        return compile_unboxed(argv[0], Int32_val(argv[1]));
+CAMLprim value compile(value pattern /* : string */,
+                       value options /* : int32 */) /* : -> (regex, int) Result.t */ {
+        return compile_unboxed(pattern, Int32_val(options));
 }
 
 /// Match with the provided pattern.
@@ -201,9 +196,11 @@ CAMLprim value match_unboxed(value ocaml_re /* : _ regex */, value subject /* : 
         CAMLreturn(result);
 }
 
-/// Boxed argument version of [jit_match_unboxed] (for bytecode).
-CAMLprim value match(value *argv, int argc UNUSED) {
-        return match_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
+/// Boxed argument version of [match_unboxed] (for bytecode).
+CAMLprim value match(value ocaml_re /* : _ regex */, value subject /* : string */,
+                     value subject_offset /* : int */,
+                     value options /* : int32 */) /* : -> ((int * int) option, int) Result.t */ {
+        return match_unboxed(ocaml_re, subject, Int_val(subject_offset), Int32_val(options));
 }
 
 /// Requests JIT compilation for a processed regex.
@@ -251,8 +248,9 @@ CAMLprim value jit_compile_unboxed(
 }
 
 /// Boxed argument version of [jit_compile_unboxed] (for bytecode).
-CAMLprim value jit_compile(value *argv, int argc UNUSED) {
-        return jit_compile_unboxed(argv[0], Int32_val(argv[1]));
+CAMLprim value jit_compile(value ocaml_re /* : interp regex */,
+                           value options /* : int32 */) /* : -> (jit regex, int) Result.t */ {
+        return jit_compile_unboxed(ocaml_re, Int32_val(options));
 }
 
 /// Match with the provided JIT compiled regex.
@@ -264,7 +262,7 @@ CAMLprim value jit_compile(value *argv, int argc UNUSED) {
 /// `pcre2_match(3)`. NOTE: PCRE2_ZERO_TERMINATED is not supported, but this
 /// isn't much of an issue since we are dealing with OCaml strings.
 CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject /* : string */,
-                                 int subject_offset /* : int [@untagged] */,
+                                 intnat subject_offset /* : int [@untagged] */,
                                  uint32_t options /* : int32 */
                                  ) /* : -> ((int * int) option, int) Result.t */ {
         // TODO: Mostly copied from match_stub impl
@@ -351,8 +349,10 @@ CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject
 }
 
 /// Boxed argument version of [jit_match_unboxed] (for bytecode).
-CAMLprim value jit_match(value *argv, int argc UNUSED) {
-        return jit_match_unboxed(argv[0], argv[1], Int_val(argv[2]), Int32_val(argv[3]));
+CAMLprim value jit_match(value ocaml_re /* : jit regex */, value subject /* : string */,
+                         value subject_offset /* : int */, value options /* : int32 */
+                         ) /* : -> ((int * int) option, int) Result.t */ {
+        return jit_match_unboxed(ocaml_re, subject, Int_val(subject_offset), Int32_val(options));
 }
 
 /// Returns the name table associated with a given regex.
@@ -535,8 +535,11 @@ CAMLprim value capture_unboxed(
 }
 
 /// Boxed argument version of [capture_unboxed] (for bytecode).
-CAMLprim value capture(value *argv, int argc UNUSED) {
-        return capture_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
+CAMLprim value capture(
+    value ocaml_re /* : _ regex */, value subject /* : string */, value subject_offset /* : int */,
+    value options /* : int32 */
+    ) /* : -> (((int * int) array * (string * int) array) option, match_error) Result.t */ {
+        return capture_unboxed(ocaml_re, subject, Int_val(subject_offset), Int32_val(options));
 }
 
 /// Match, with capture groups, the provided JIT-enabled pattern.
@@ -646,7 +649,10 @@ CAMLprim value jit_capture_unboxed(
         CAMLreturn(result);
 }
 
-/// Boxed argument version of [capture_unboxed] (for bytecode).
-CAMLprim value jit_capture(value *argv, int argc UNUSED) {
-        return jit_capture_unboxed(argv[0], argv[1], Nativeint_val(argv[2]), Int32_val(argv[3]));
+/// Boxed argument version of [jit_capture_unboxed] (for bytecode).
+CAMLprim value jit_capture(
+    value ocaml_re /* : jit regex */, value subject /* : string */,
+    value subject_offset /* : int */, value options /* : int32 */
+    ) /* : -> (((int * int) array * (string * int) array) option, match_error) Result.t */ {
+        return jit_capture_unboxed(ocaml_re, subject, Int_val(subject_offset), Int32_val(options));
 }
