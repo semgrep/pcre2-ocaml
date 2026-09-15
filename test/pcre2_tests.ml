@@ -96,8 +96,10 @@ end = struct
 
   let bad_pattern ctxt =
     match compile "ab(" with
-    | Error { code = MISSING_CLOSING_PARENTHESIS; offset } ->
-        assert_equal ~printer:string_of_int ~msg:"Error offset" 3 offset
+    | Error ({ code = MISSING_CLOSING_PARENTHESIS; offset } as e) ->
+        assert_equal ~printer:string_of_int ~msg:"Error offset" 3 offset;
+        assert_equal ~printer:Fun.id ~msg:"Error message"
+          "missing closing parenthesis (at offset 3)" (show_compile_error e)
     | Error e ->
         assert_failure ("Incorrectly error for pattern: " ^ show_compile_error e)
     | Ok _ -> assert_failure "Incorrectly compiled invalid pattern"
@@ -116,6 +118,8 @@ end = struct
     | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (range option, match_error) result] in
+        assert_equal ~printer:Fun.id ~msg:"Error message" "bad offset value"
+          (show_match_error BADOFFSET);
         assert_equal ~printer ~msg:"Negative offset" (Error BADOFFSET)
           (find ~subject_offset:(-1) re "ab" >+= range_of_match);
         assert_equal ~printer ~msg:"Offset too large" (Error BADOFFSET)

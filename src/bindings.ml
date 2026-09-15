@@ -87,6 +87,8 @@ external pcre2_jit_capture_pinned :
 
 external get_version : unit -> int * int = "get_version"
 
+external pcre2_get_error_message : int -> string = "get_error_message"
+
 external get_capture_groups : _ regex -> (string * int) array
   = "get_capture_groups"
 
