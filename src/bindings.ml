@@ -46,6 +46,45 @@ external pcre2_jit_capture :
   (((int * int) array * (string * int) array) option, int) Result.t
   = "jit_capture" "jit_capture_unboxed"
 
+type pinned_subject
+(** A copy of a subject string held outside the OCaml heap. Matching against a
+    pinned subject releases the runtime lock without re-copying the subject on
+    every call, which iterated matching (e.g. [find_iter]) benefits from. The
+    copy is freed when the value is collected. *)
+
+external pin_subject : string -> pinned_subject = "pin_subject"
+
+external pcre2_match_pinned :
+  _ regex ->
+  pinned_subject ->
+  (int[@untagged]) ->
+  (int32[@unboxed]) ->
+  ((int * int) option, int) Result.t = "match_pinned" "match_pinned_unboxed"
+
+external pcre2_capture_pinned :
+  _ regex ->
+  pinned_subject ->
+  (int[@untagged]) ->
+  (int32[@unboxed]) ->
+  (((int * int) array * (string * int) array) option, int) Result.t
+  = "capture_pinned" "capture_pinned_unboxed"
+
+external pcre2_jit_match_pinned :
+  jit regex ->
+  pinned_subject ->
+  (int[@untagged]) ->
+  (int32[@unboxed]) ->
+  ((int * int) option, int) Result.t
+  = "jit_match_pinned" "jit_match_pinned_unboxed"
+
+external pcre2_jit_capture_pinned :
+  jit regex ->
+  pinned_subject ->
+  (int[@untagged]) ->
+  (int32[@unboxed]) ->
+  (((int * int) array * (string * int) array) option, int) Result.t
+  = "jit_capture_pinned" "jit_capture_pinned_unboxed"
+
 external get_version : unit -> int * int = "get_version"
 
 external get_capture_groups : _ regex -> (string * int) array
