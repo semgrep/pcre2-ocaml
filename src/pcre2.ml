@@ -598,42 +598,69 @@ let config_stackrecurse : bool = true
 
 module type Matcher = Intf.Matcher
 
-module Interp = struct
-  include Options.Interp
-  include Match
-  include Error
+(* The engine-specific pieces from which [MakeMatcher] derives the rest of a
+   [Matcher] implementation: the regex type, that engine's match options, and
+   its raw matching entrypoints from [Bindings]. *)
+module type Engine = sig
+  type t
+  type match_option
 
-  type t = Bindings.interp Bindings.regex
+  val bitvector_of_match_options : match_option list -> int32
+  val match_ : t -> string -> int -> int32 -> ((int * int) option, int) Result.t
 
-  let compile ?(options : compile_option list = []) (pattern : string) :
-      (t, compile_error) Result.t =
-    let match_limit, depth_limit, heap_limit =
-      limits_of_compile_options options
-    in
-    let options = bitvector_of_compile_options options in
-    Bindings.pcre2_compile pattern options match_limit depth_limit heap_limit
-    |> Result.map_error compile_error_of_int_pair
+  val match_pinned :
+    t ->
+    Bindings.pinned_subject ->
+    int ->
+    int32 ->
+    ((int * int) option, int) Result.t
 
-  let capture_groups (r : t) = Bindings.get_capture_groups r |> Array.to_list
+  val capture :
+    t ->
+    string ->
+    int ->
+    int32 ->
+    (((int * int) array * (string * int) array) option, int) Result.t
 
-  let find ?(options : match_option list = []) ?(subject_offset : int = 0)
+  val capture_pinned :
+    t ->
+    Bindings.pinned_subject ->
+    int ->
+    int32 ->
+    (((int * int) array * (string * int) array) option, int) Result.t
+
+  val capture_groups : t -> (string * int) array
+  val is_utf : t -> bool
+end
+
+(* Everything in [Matcher] except compilation, derived uniformly from the
+   engine's matching entrypoints. Compilation isn't uniform across engines
+   (option types differ, and JIT can compile from an existing interpreted
+   regex), so each module provides its own. *)
+module MakeMatcher (E : Engine) = struct
+  type t = E.t
+
+  let capture_groups (r : t) = E.capture_groups r |> Array.to_list
+
+  let find ?(options : E.match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (match_ option, match_error) Result.t =
-    let options = bitvector_of_match_options options in
-    match Bindings.pcre2_match re subject subject_offset options with
+    let options = E.bitvector_of_match_options options in
+    match E.match_ re subject subject_offset options with
     | Ok (Some (start, end_)) -> Ok (Some (subject, start, end_))
     | Ok None -> Ok None
     | Error n -> Error (match_error_of_int n)
 
-  let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (match_, match_error) Result.t Seq.t =
-    let options = bitvector_of_match_options options in
-    let is_utf = Bindings.regex_is_utf re in
+  let find_iter ?(options : E.match_option list = [])
+      ?(subject_offset : int = 0) (re : t) (subject : string) :
+      (match_, match_error) Result.t Seq.t =
+    let options = E.bitvector_of_match_options options in
+    let is_utf = E.is_utf re in
     let subject_length = String.length subject in
     (* Copy the subject out of the OCaml heap once, rather than on every
        iteration (see [Bindings.pin_subject]). *)
     let pinned = Bindings.pin_subject subject in
     let rec next (offset, last_match_end) =
-      match Bindings.pcre2_match_pinned re pinned offset options with
+      match E.match_pinned re pinned offset options with
       | Ok (Some (start, end_))
         when is_overlapping_empty_match ~last_match_end start end_ ->
           if offset >= subject_length then None
@@ -646,28 +673,28 @@ module Interp = struct
     in
     Seq.unfold next (subject_offset, None)
 
-  let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
+  let captures ?(options : E.match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (captures option, match_error) Result.t =
-    let options = bitvector_of_match_options options in
-    match Bindings.pcre2_capture re subject subject_offset options with
+    let options = E.bitvector_of_match_options options in
+    match E.capture re subject subject_offset options with
     | Ok (Some (arr, names)) -> Ok (Some (subject, arr, names))
     | Ok None -> Ok None
     | Error n -> Error (match_error_of_int n)
 
-  let captures_iter ?(options : match_option list = [])
+  let captures_iter ?(options : E.match_option list = [])
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (captures, match_error) Result.t Seq.t =
-    let options = bitvector_of_match_options options in
-    let is_utf = Bindings.regex_is_utf re in
+    let options = E.bitvector_of_match_options options in
+    let is_utf = E.is_utf re in
     let subject_length = String.length subject in
     (* Copy the subject out of the OCaml heap once, rather than on every
        iteration (see [Bindings.pin_subject]). *)
     let pinned = Bindings.pin_subject subject in
     let rec next (offset, last_match_end) =
-      match Bindings.pcre2_capture_pinned re pinned offset options with
+      match E.capture_pinned re pinned offset options with
       | Ok (Some (arr, _))
-        when (let start, end_ = arr.(0) in
-              is_overlapping_empty_match ~last_match_end start end_) ->
+        when let start, end_ = arr.(0) in
+             is_overlapping_empty_match ~last_match_end start end_ ->
           if offset >= subject_length then None
           else next (next_search_offset ~is_utf subject offset, last_match_end)
       | Ok (Some (arr, names)) ->
@@ -680,7 +707,7 @@ module Interp = struct
     in
     Seq.unfold next (subject_offset, None)
 
-  let split ?(options : match_option list = []) ?(subject_offset : int = 0)
+  let split ?(options : E.match_option list = []) ?(subject_offset : int = 0)
       ?(limit : int option) (re : t) (subject : string) :
       (string list, match_error) Result.t =
     let delims = find_iter ~options ~subject_offset re subject in
@@ -714,9 +741,37 @@ module Interp = struct
          the right order. *)
       |> List.rev)
 
-  let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)
+  let is_match ?(options : E.match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (bool, match_error) Result.t =
     find ~options ~subject_offset re subject |> Result.map Option.is_some
+end
+
+module Interp = struct
+  include Options.Interp
+  include Match
+  include Error
+
+  include MakeMatcher (struct
+    type t = Bindings.interp Bindings.regex
+    type match_option = Options.Interp.match_option
+
+    let bitvector_of_match_options = Options.Interp.bitvector_of_match_options
+    let match_ = Bindings.pcre2_match
+    let match_pinned = Bindings.pcre2_match_pinned
+    let capture = Bindings.pcre2_capture
+    let capture_pinned = Bindings.pcre2_capture_pinned
+    let capture_groups = Bindings.get_capture_groups
+    let is_utf = Bindings.regex_is_utf
+  end)
+
+  let compile ?(options : compile_option list = []) (pattern : string) :
+      (t, compile_error) Result.t =
+    let match_limit, depth_limit, heap_limit =
+      limits_of_compile_options options
+    in
+    let options = bitvector_of_compile_options options in
+    Bindings.pcre2_compile pattern options match_limit depth_limit heap_limit
+    |> Result.map_error compile_error_of_int_pair
 end
 
 (* Fastpath to JIT match for perf *)
@@ -730,7 +785,18 @@ module Jit = struct
   include Match
   include Error
 
-  type t = Bindings.jit Bindings.regex
+  include MakeMatcher (struct
+    type t = Bindings.jit Bindings.regex
+    type match_option = Options.Jit.match_option
+
+    let bitvector_of_match_options = Options.Jit.bitvector_of_match_options
+    let match_ = Bindings.pcre2_jit_match
+    let match_pinned = Bindings.pcre2_jit_match_pinned
+    let capture = Bindings.pcre2_jit_capture
+    let capture_pinned = Bindings.pcre2_jit_capture_pinned
+    let capture_groups = Bindings.get_capture_groups
+    let is_utf = Bindings.regex_is_utf
+  end)
 
   let of_interp ?(options : jit_only_compile_option list = [])
       ?(mode : matching_mode = JIT_COMPLETE) (interp : Interp.t) :
@@ -761,112 +827,4 @@ module Jit = struct
     of_interp ~options:jit_options ~mode:JIT_COMPLETE interp
   (* TODO: determine best way to support matching mode with uniform interface.
      Probably make options more abstract in the shared interface *)
-
-  let capture_groups (r : t) = Bindings.get_capture_groups r |> Array.to_list
-
-  let find ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (match_ option, match_error) Result.t =
-    let options = bitvector_of_match_options options in
-    match Bindings.pcre2_jit_match re subject subject_offset options with
-    | Ok (Some (start, end_)) -> Ok (Some (subject, start, end_))
-    | Ok None -> Ok None
-    | Error n -> Error (match_error_of_int n)
-
-  (* TODO(cooper): dedup impl with a functor? - entirely derived from find *)
-  let find_iter ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (match_, match_error) Result.t Seq.t =
-    let options = bitvector_of_match_options options in
-    let is_utf = Bindings.regex_is_utf re in
-    let subject_length = String.length subject in
-    (* Copy the subject out of the OCaml heap once, rather than on every
-       iteration (see [Bindings.pin_subject]). *)
-    let pinned = Bindings.pin_subject subject in
-    let rec next (offset, last_match_end) =
-      match Bindings.pcre2_jit_match_pinned re pinned offset options with
-      | Ok (Some (start, end_))
-        when is_overlapping_empty_match ~last_match_end start end_ ->
-          if offset >= subject_length then None
-          else next (next_search_offset ~is_utf subject offset, last_match_end)
-      | Ok (Some (start, end_)) ->
-          Some (Ok (subject, start, end_), (end_, Some end_))
-      | Ok None -> None
-      | Error n ->
-          Some (Error (match_error_of_int n), (subject_length, last_match_end))
-    in
-    Seq.unfold next (subject_offset, None)
-
-  let captures ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (captures option, match_error) Result.t =
-    let options = bitvector_of_match_options options in
-    match Bindings.pcre2_jit_capture re subject subject_offset options with
-    | Ok (Some (arr, names)) -> Ok (Some (subject, arr, names))
-    | Ok None -> Ok None
-    | Error n -> Error (match_error_of_int n)
-
-  (* TODO(cooper): dedup impl with a functor? - entirely derived from
-     captures *)
-  let captures_iter ?(options : match_option list = [])
-      ?(subject_offset : int = 0) (re : t) (subject : string) :
-      (captures, match_error) Result.t Seq.t =
-    let options = bitvector_of_match_options options in
-    let is_utf = Bindings.regex_is_utf re in
-    let subject_length = String.length subject in
-    (* Copy the subject out of the OCaml heap once, rather than on every
-       iteration (see [Bindings.pin_subject]). *)
-    let pinned = Bindings.pin_subject subject in
-    let rec next (offset, last_match_end) =
-      match Bindings.pcre2_jit_capture_pinned re pinned offset options with
-      | Ok (Some (arr, _))
-        when (let start, end_ = arr.(0) in
-              is_overlapping_empty_match ~last_match_end start end_) ->
-          if offset >= subject_length then None
-          else next (next_search_offset ~is_utf subject offset, last_match_end)
-      | Ok (Some (arr, names)) ->
-          let c : captures = (subject, arr, names) in
-          let end_ = (range_of_captures c).end_ in
-          Some (Ok c, (end_, Some end_))
-      | Ok None -> None
-      | Error n ->
-          Some (Error (match_error_of_int n), (subject_length, last_match_end))
-    in
-    Seq.unfold next (subject_offset, None)
-
-  let split ?(options : match_option list = []) ?(subject_offset : int = 0)
-      ?(limit : int option) (re : t) (subject : string) :
-      (string list, match_error) Result.t =
-    let delims = find_iter ~options ~subject_offset re subject in
-    let delims =
-      match limit with
-      | Some n when n > 0 -> Seq.take (n - 1) delims
-      | None -> delims
-      | _ -> invalid_arg "todo: decide how to handle 0 or negative limit"
-    in
-    let* end_offset, substrings =
-      Seq.fold_left
-        (fun x m ->
-          match (x, m) with
-          | Ok (start, acc), Ok m ->
-              let { start = delim_start; end_ = delim_end } =
-                range_of_match m
-              in
-              let sub = String.sub subject start (delim_start - start) in
-              Ok (delim_end, sub :: acc)
-          | Ok _, Error e -> Error e
-          | (Error _ as e), _ -> e)
-        (Ok (0, []))
-        delims
-    in
-    Ok
-      ((* We still have one more substring to add: the one after the last
-          delimiter. *)
-       String.(sub subject end_offset (length subject - end_offset))
-       :: substrings
-      (* ... and we built this in reverse to be fast---but let's return it in
-         the right order. *)
-      |> List.rev)
-
-  (* TODO(cooper): dedup impl with a functor? *)
-  let is_match ?(options : match_option list = []) ?(subject_offset : int = 0)
-      (re : t) (subject : string) : (bool, match_error) Result.t =
-    find ~options ~subject_offset re subject |> Result.map Option.is_some
 end
