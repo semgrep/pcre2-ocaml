@@ -434,7 +434,13 @@ module Options : sig
       | `USE_OFFSET_LIMIT
       | `EXTENDED_MORE
       | `LITERAL
-      | `MATCH_INVALID_UTF ]
+      | `MATCH_INVALID_UTF
+      | (* Match/depth/heap limits bundled with the compiled pattern; see
+           [compile]. These are not PCRE2 compile flags -- they carry an integer
+           payload and configure the match context. *)
+        `MATCH_LIMIT of int
+      | `DEPTH_LIMIT of int
+      | `HEAP_LIMIT of int ]
 
     (* for compile ctx - can combine and just split back as needed in bindings? *)
     type compile_ctx =
@@ -461,7 +467,9 @@ module Options : sig
         (* not for pcre2_dfa_match() *)
         (* not for pcre2_dfa_match() or pcre2_jit_match() *) ]
     (* TODO: split to enforce restrictions (maybe except `NO_JIT) *)
-    (* TODO: add match_context options (depth, heap, match) limits here or separately? *)
+    (* NOTE: match/depth/heap limits are not match options; they are compile
+       options ([`MATCH_LIMIT], [`DEPTH_LIMIT], [`HEAP_LIMIT]) bundled with the
+       compiled pattern. See [compile]. *)
 
     type subst_options =
       (* shared *)
@@ -541,6 +549,9 @@ val config_match_limit : int
 
 val config_depth_limit : int
 (** Default limit for depth of nested backtracking *)
+
+val config_heap_limit : int
+(** Default limit, in kibibytes, on heap memory used while matching *)
 
 val config_stackrecurse : bool
 (** Indicates use of stack recursion in matching function *)

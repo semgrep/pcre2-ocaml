@@ -9,8 +9,21 @@ let unset = (-1, -1)
 external pcre2_ocaml_init : unit -> unit = "pcre2_ocaml_init"
 
 external pcre2_compile :
-  string -> (int32[@unboxed]) -> (interp regex, int) Result.t
-  = "compile" "compile_unboxed"
+  string ->
+  (int32[@unboxed]) ->
+  (int[@untagged]) ->
+  (int[@untagged]) ->
+  (int[@untagged]) ->
+  (interp regex, int) Result.t = "compile" "compile_unboxed"
+(** [pcre2_compile pattern options match_limit depth_limit heap_limit] compiles
+    [pattern]. Each limit is a match-context limit bundled with the compiled
+    regex, or a negative value to leave PCRE2's default in force. See
+    [pcre2_set_match_limit(3)] and friends. *)
+
+external get_config_int : int -> int = "get_config_int"
+(** [get_config_int request] is the PCRE2 build-time configuration value for the
+    given [PCRE2_CONFIG_*] request code, or a negative error code if the linked
+    library does not recognize it. *)
 
 external pcre2_match :
   _ regex ->
