@@ -768,7 +768,8 @@ module Interp = struct
               in
               let sub = String.sub subject start (delim_start - start) in
               Ok (delim_end, sub :: acc)
-          | e, _ -> e)
+          | Ok _, Error e -> Error e
+          | (Error _ as e), _ -> e)
         (Ok (0, []))
         delims
     in
@@ -912,7 +913,8 @@ module Jit = struct
               in
               let sub = String.sub subject start (delim_start - start) in
               Ok (delim_end, sub :: acc)
-          | e, _ -> e)
+          | Ok _, Error e -> Error e
+          | (Error _ as e), _ -> e)
         (Ok (0, []))
         delims
     in
