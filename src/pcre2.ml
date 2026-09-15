@@ -80,7 +80,7 @@ let is_overlapping_empty_match ~(last_match_end : int option) (start : int)
 
 module Error = struct
   type compile_error_code =
-    | END_BACKSLASH
+    | END_BACKSLASH [@value 101]
     | END_BACKSLASH_C
     | UNKNOWN_ESCAPE
     | QUANTIFIER_OUT_OF_ORDER
@@ -181,126 +181,20 @@ module Error = struct
     | TOO_MANY_CAPTURES
     | CONDITION_ATOMIC_ASSERTION_EXPECTED
     | BACKSLASH_K_IN_LOOKAROUND
-  [@@deriving eq]
+  [@@deriving eq, enum]
 
-  (* Each compile error code, paired with its PCRE2 integer code. Kept as
-     a single association list so [compile_error_code_of_int] and
-     [int_of_compile_error_code] can't drift out of sync with each other. *)
-  let compile_error_codes : (compile_error_code * int) list =
-    [
-      (END_BACKSLASH, 101);
-      (END_BACKSLASH_C, 102);
-      (UNKNOWN_ESCAPE, 103);
-      (QUANTIFIER_OUT_OF_ORDER, 104);
-      (QUANTIFIER_TOO_BIG, 105);
-      (MISSING_SQUARE_BRACKET, 106);
-      (ESCAPE_INVALID_IN_CLASS, 107);
-      (CLASS_RANGE_ORDER, 108);
-      (QUANTIFIER_INVALID, 109);
-      (INTERNAL_UNEXPECTED_REPEAT, 110);
-      (INVALID_AFTER_PARENS_QUERY, 111);
-      (POSIX_CLASS_NOT_IN_CLASS, 112);
-      (POSIX_NO_SUPPORT_COLLATING, 113);
-      (MISSING_CLOSING_PARENTHESIS, 114);
-      (BAD_SUBPATTERN_REFERENCE, 115);
-      (NULL_PATTERN, 116);
-      (BAD_OPTIONS, 117);
-      (MISSING_COMMENT_CLOSING, 118);
-      (PARENTHESES_NEST_TOO_DEEP, 119);
-      (PATTERN_TOO_LARGE, 120);
-      (HEAP_FAILED, 121);
-      (UNMATCHED_CLOSING_PARENTHESIS, 122);
-      (INTERNAL_CODE_OVERFLOW, 123);
-      (MISSING_CONDITION_CLOSING, 124);
-      (LOOKBEHIND_NOT_FIXED_LENGTH, 125);
-      (ZERO_RELATIVE_REFERENCE, 126);
-      (TOO_MANY_CONDITION_BRANCHES, 127);
-      (CONDITION_ASSERTION_EXPECTED, 128);
-      (BAD_RELATIVE_REFERENCE, 129);
-      (UNKNOWN_POSIX_CLASS, 130);
-      (INTERNAL_STUDY_ERROR, 131);
-      (UNICODE_NOT_SUPPORTED, 132);
-      (PARENTHESES_STACK_CHECK, 133);
-      (CODE_POINT_TOO_BIG, 134);
-      (LOOKBEHIND_TOO_COMPLICATED, 135);
-      (LOOKBEHIND_INVALID_BACKSLASH_C, 136);
-      (UNSUPPORTED_ESCAPE_SEQUENCE, 137);
-      (CALLOUT_NUMBER_TOO_BIG, 138);
-      (MISSING_CALLOUT_CLOSING, 139);
-      (ESCAPE_INVALID_IN_VERB, 140);
-      (UNRECOGNIZED_AFTER_QUERY_P, 141);
-      (MISSING_NAME_TERMINATOR, 142);
-      (DUPLICATE_SUBPATTERN_NAME, 143);
-      (INVALID_SUBPATTERN_NAME, 144);
-      (UNICODE_PROPERTIES_UNAVAILABLE, 145);
-      (MALFORMED_UNICODE_PROPERTY, 146);
-      (UNKNOWN_UNICODE_PROPERTY, 147);
-      (SUBPATTERN_NAME_TOO_LONG, 148);
-      (TOO_MANY_NAMED_SUBPATTERNS, 149);
-      (CLASS_INVALID_RANGE, 150);
-      (OCTAL_BYTE_TOO_BIG, 151);
-      (INTERNAL_OVERRAN_WORKSPACE, 152);
-      (INTERNAL_MISSING_SUBPATTERN, 153);
-      (DEFINE_TOO_MANY_BRANCHES, 154);
-      (BACKSLASH_O_MISSING_BRACE, 155);
-      (INTERNAL_UNKNOWN_NEWLINE, 156);
-      (BACKSLASH_G_SYNTAX, 157);
-      (PARENS_QUERY_R_MISSING_CLOSING, 158);
-      (VERB_ARGUMENT_NOT_ALLOWED, 159);
-      (VERB_UNKNOWN, 160);
-      (SUBPATTERN_NUMBER_TOO_BIG, 161);
-      (SUBPATTERN_NAME_EXPECTED, 162);
-      (INTERNAL_PARSED_OVERFLOW, 163);
-      (INVALID_OCTAL, 164);
-      (SUBPATTERN_NAMES_MISMATCH, 165);
-      (MARK_MISSING_ARGUMENT, 166);
-      (INVALID_HEXADECIMAL, 167);
-      (BACKSLASH_C_SYNTAX, 168);
-      (BACKSLASH_K_SYNTAX, 169);
-      (INTERNAL_BAD_CODE_LOOKBEHINDS, 170);
-      (BACKSLASH_N_IN_CLASS, 171);
-      (CALLOUT_STRING_TOO_LONG, 172);
-      (UNICODE_DISALLOWED_CODE_POINT, 173);
-      (UTF_IS_DISABLED, 174);
-      (UCP_IS_DISABLED, 175);
-      (VERB_NAME_TOO_LONG, 176);
-      (BACKSLASH_U_CODE_POINT_TOO_BIG, 177);
-      (MISSING_OCTAL_OR_HEX_DIGITS, 178);
-      (VERSION_CONDITION_SYNTAX, 179);
-      (INTERNAL_BAD_CODE_AUTO_POSSESS, 180);
-      (CALLOUT_NO_STRING_DELIMITER, 181);
-      (CALLOUT_BAD_STRING_DELIMITER, 182);
-      (BACKSLASH_C_CALLER_DISABLED, 183);
-      (QUERY_BARJX_NEST_TOO_DEEP, 184);
-      (BACKSLASH_C_LIBRARY_DISABLED, 185);
-      (PATTERN_TOO_COMPLICATED, 186);
-      (LOOKBEHIND_TOO_LONG, 187);
-      (PATTERN_STRING_TOO_LONG, 188);
-      (INTERNAL_BAD_CODE, 189);
-      (INTERNAL_BAD_CODE_IN_SKIP, 190);
-      (NO_SURROGATES_IN_UTF16, 191);
-      (BAD_LITERAL_OPTIONS, 192);
-      (SUPPORTED_ONLY_IN_UNICODE, 193);
-      (INVALID_HYPHEN_IN_OPTIONS, 194);
-      (ALPHA_ASSERTION_UNKNOWN, 195);
-      (SCRIPT_RUN_NOT_AVAILABLE, 196);
-      (TOO_MANY_CAPTURES, 197);
-      (CONDITION_ATOMIC_ASSERTION_EXPECTED, 198);
-      (BACKSLASH_K_IN_LOOKAROUND, 199);
-    ]
+  (* [compile_error_code_to_enum]/[compile_error_code_of_enum] are generated
+     by [@@deriving enum] from the [@value] annotation above, so the mapping
+     between a code and its PCRE2 integer lives in exactly one place: the
+     type declaration itself. *)
+  let int_of_compile_error_code : compile_error_code -> int =
+    compile_error_code_to_enum
 
   let compile_error_code_of_int (n : int) : compile_error_code =
-    match
-      List.find_opt (fun (_, code) -> Int.equal code n) compile_error_codes
-    with
-    | Some (c, _) -> c
+    match compile_error_code_of_enum n with
+    | Some c -> c
     | None ->
         invalid_arg (Printf.sprintf "%d is not a valid PCRE2 compile error" n)
-
-  let int_of_compile_error_code (code : compile_error_code) : int =
-    compile_error_codes
-    |> List.find (fun (c, _) -> equal_compile_error_code c code)
-    |> snd
 
   let pp_compile_error_code (fmt : Format.formatter)
       (code : compile_error_code) : unit =
@@ -331,27 +225,27 @@ module Error = struct
 
   type match_error =
     (* Error codes for UTF-8 validity checks. See pcre2unicode(3). *)
-    | UTF8_ERR1
-    | UTF8_ERR2
-    | UTF8_ERR3
-    | UTF8_ERR4
-    | UTF8_ERR5
-    | UTF8_ERR6
-    | UTF8_ERR7
-    | UTF8_ERR8
-    | UTF8_ERR9
-    | UTF8_ERR10
-    | UTF8_ERR11
-    | UTF8_ERR12
-    | UTF8_ERR13
-    | UTF8_ERR14
-    | UTF8_ERR15
-    | UTF8_ERR16
-    | UTF8_ERR17
-    | UTF8_ERR18
-    | UTF8_ERR19
-    | UTF8_ERR20
-    | UTF8_ERR21
+    | UTF8_ERR1 [@value -3]
+    | UTF8_ERR2 [@value -4]
+    | UTF8_ERR3 [@value -5]
+    | UTF8_ERR4 [@value -6]
+    | UTF8_ERR5 [@value -7]
+    | UTF8_ERR6 [@value -8]
+    | UTF8_ERR7 [@value -9]
+    | UTF8_ERR8 [@value -10]
+    | UTF8_ERR9 [@value -11]
+    | UTF8_ERR10 [@value -12]
+    | UTF8_ERR11 [@value -13]
+    | UTF8_ERR12 [@value -14]
+    | UTF8_ERR13 [@value -15]
+    | UTF8_ERR14 [@value -16]
+    | UTF8_ERR15 [@value -17]
+    | UTF8_ERR16 [@value -18]
+    | UTF8_ERR17 [@value -19]
+    | UTF8_ERR18 [@value -20]
+    | UTF8_ERR19 [@value -21]
+    | UTF8_ERR20 [@value -22]
+    | UTF8_ERR21 [@value -23]
     (* TODO(* (non-8 support) *):
        | UTF16_ERR1
        | UTF16_ERR2
@@ -363,117 +257,55 @@ module Error = struct
        functions, context functions, and serializing functions. They are in numerical
        order. Originally they were in alphabetical order too, but now that PCRE2 is
        released, the numbers must not be changed. *)
-    | BADDATA
-    | MIXEDTABLES
+    | BADDATA [@value -29]
+    | MIXEDTABLES [@value -30]
     (* Name was changed *)
-    | BADMAGIC
-    | BADMODE
-    | BADOFFSET
-    | BADOPTION (* TODO: shouldn't be possible? *)
-    | BADREPLACEMENT
-    | BADUTFOFFSET
-    | CALLOUT
-    | DFA_BADRESTART
-    | DFA_RECURSE
-    | DFA_UCOND
-    | DFA_UFUNC
-    | DFA_UITEM
-    | DFA_WSSIZE
-    | INTERNAL
-    | JIT_BADOPTION
-    | JIT_STACKLIMIT
-    | MATCHLIMIT
-    | NOMEMORY
-    | NOSUBSTRING
-    | NOUNIQUESUBSTRING
-    | NULL (* TODO: shouldn't be possible? *)
-    | RECURSELOOP
-    | DEPTHLIMIT
-    | UNAVAILABLE
-    | UNSET
-    | BADOFFSETLIMIT
-    | BADREPESCAPE
-    | REPMISSINGBRACE
-    | BADSUBSTITUTION
-    | BADSUBSPATTERN
-    | TOOMANYREPLACE
-    | BADSERIALIZEDDATA
-    | HEAPLIMIT
-    | CONVERT_SYNTAX
-    | INTERNAL_DUPMATCH
-    | DFA_UINVALID_UTF
-    | INVALIDOFFSET
-  [@@deriving eq]
+    | BADMAGIC [@value -31]
+    | BADMODE [@value -32]
+    | BADOFFSET [@value -33]
+    | BADOPTION [@value -34] (* TODO: shouldn't be possible? *)
+    | BADREPLACEMENT [@value -35]
+    | BADUTFOFFSET [@value -36]
+    | CALLOUT [@value -37]
+    | DFA_BADRESTART [@value -38]
+    | DFA_RECURSE [@value -39]
+    | DFA_UCOND [@value -40]
+    | DFA_UFUNC [@value -41]
+    | DFA_UITEM [@value -42]
+    | DFA_WSSIZE [@value -43]
+    | INTERNAL [@value -44]
+    | JIT_BADOPTION [@value -45]
+    | JIT_STACKLIMIT [@value -46]
+    | MATCHLIMIT [@value -47]
+    | NOMEMORY [@value -48]
+    | NOSUBSTRING [@value -49]
+    | NOUNIQUESUBSTRING [@value -50]
+    | NULL [@value -51] (* TODO: shouldn't be possible? *)
+    | RECURSELOOP [@value -52]
+    | DEPTHLIMIT [@value -53]
+    | UNAVAILABLE [@value -54]
+    | UNSET [@value -55]
+    | BADOFFSETLIMIT [@value -56]
+    | BADREPESCAPE [@value -57]
+    | REPMISSINGBRACE [@value -58]
+    | BADSUBSTITUTION [@value -59]
+    | BADSUBSPATTERN [@value -60]
+    | TOOMANYREPLACE [@value -61]
+    | BADSERIALIZEDDATA [@value -62]
+    | HEAPLIMIT [@value -63]
+    | CONVERT_SYNTAX [@value -64]
+    | INTERNAL_DUPMATCH [@value -65]
+    | DFA_UINVALID_UTF [@value -66]
+    | INVALIDOFFSET [@value -67]
+  [@@deriving eq, enum]
 
-  (* Each match error code, paired with its PCRE2 integer code. Kept as a
-     single association list so [match_error_of_int] and
-     [int_of_match_error] can't drift out of sync with each other. Codes
-     without a corresponding variant---NOMATCH, PARTIAL, and the
-     UTF-16/UTF-32 errors, since only the 8-bit library is supported---are
-     handled separately below. *)
-  let match_error_codes : (match_error * int) list =
-    [
-      (UTF8_ERR1, -3);
-      (UTF8_ERR2, -4);
-      (UTF8_ERR3, -5);
-      (UTF8_ERR4, -6);
-      (UTF8_ERR5, -7);
-      (UTF8_ERR6, -8);
-      (UTF8_ERR7, -9);
-      (UTF8_ERR8, -10);
-      (UTF8_ERR9, -11);
-      (UTF8_ERR10, -12);
-      (UTF8_ERR11, -13);
-      (UTF8_ERR12, -14);
-      (UTF8_ERR13, -15);
-      (UTF8_ERR14, -16);
-      (UTF8_ERR15, -17);
-      (UTF8_ERR16, -18);
-      (UTF8_ERR17, -19);
-      (UTF8_ERR18, -20);
-      (UTF8_ERR19, -21);
-      (UTF8_ERR20, -22);
-      (UTF8_ERR21, -23);
-      (BADDATA, -29);
-      (MIXEDTABLES, -30);
-      (BADMAGIC, -31);
-      (BADMODE, -32);
-      (BADOFFSET, -33);
-      (BADOPTION, -34);
-      (BADREPLACEMENT, -35);
-      (BADUTFOFFSET, -36);
-      (CALLOUT, -37);
-      (DFA_BADRESTART, -38);
-      (DFA_RECURSE, -39);
-      (DFA_UCOND, -40);
-      (DFA_UFUNC, -41);
-      (DFA_UITEM, -42);
-      (DFA_WSSIZE, -43);
-      (INTERNAL, -44);
-      (JIT_BADOPTION, -45);
-      (JIT_STACKLIMIT, -46);
-      (MATCHLIMIT, -47);
-      (NOMEMORY, -48);
-      (NOSUBSTRING, -49);
-      (NOUNIQUESUBSTRING, -50);
-      (NULL, -51);
-      (RECURSELOOP, -52);
-      (DEPTHLIMIT, -53);
-      (UNAVAILABLE, -54);
-      (UNSET, -55);
-      (BADOFFSETLIMIT, -56);
-      (BADREPESCAPE, -57);
-      (REPMISSINGBRACE, -58);
-      (BADSUBSTITUTION, -59);
-      (BADSUBSPATTERN, -60);
-      (TOOMANYREPLACE, -61);
-      (BADSERIALIZEDDATA, -62);
-      (HEAPLIMIT, -63);
-      (CONVERT_SYNTAX, -64);
-      (INTERNAL_DUPMATCH, -65);
-      (DFA_UINVALID_UTF, -66);
-      (INVALIDOFFSET, -67);
-    ]
+  (* [match_error_to_enum]/[match_error_of_enum] are generated by
+     [@@deriving enum] from the [@value] annotations above, so the mapping
+     between a code and its PCRE2 integer lives in exactly one place: the
+     type declaration itself. Codes without a corresponding variant---NOMATCH,
+     PARTIAL, and the UTF-16/UTF-32 errors, since only the 8-bit library is
+     supported---are handled separately below. *)
+  let int_of_match_error : match_error -> int = match_error_to_enum
 
   let match_error_of_int (n : int) : match_error =
     match n with
@@ -488,16 +320,11 @@ module Error = struct
           (Printf.sprintf
              "%d is a UTF16 or UTF32 error, but we only support UTF8" n)
     | n -> (
-        match
-          List.find_opt (fun (_, code) -> Int.equal code n) match_error_codes
-        with
-        | Some (e, _) -> e
+        match match_error_of_enum n with
+        | Some e -> e
         | None ->
             invalid_arg
               (Printf.sprintf "%d is not a valid PCRE2 match error" n))
-
-  let int_of_match_error (e : match_error) : int =
-    match_error_codes |> List.find (fun (c, _) -> equal_match_error c e) |> snd
 
   let pp_match_error (fmt : Format.formatter) (e : match_error) : unit =
     Format.pp_print_string fmt
