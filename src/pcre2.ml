@@ -80,245 +80,172 @@ let is_overlapping_empty_match ~(last_match_end : int option) (start : int)
 
 module Error = struct
   type compile_error_code =
-    | END_BACKSLASH
-    | END_BACKSLASH_C
-    | UNKNOWN_ESCAPE
-    | QUANTIFIER_OUT_OF_ORDER
-    | QUANTIFIER_TOO_BIG
-    | MISSING_SQUARE_BRACKET
-    | ESCAPE_INVALID_IN_CLASS
-    | CLASS_RANGE_ORDER
-    | QUANTIFIER_INVALID
-    | INTERNAL_UNEXPECTED_REPEAT
-    | INVALID_AFTER_PARENS_QUERY
-    | POSIX_CLASS_NOT_IN_CLASS
-    | POSIX_NO_SUPPORT_COLLATING
-    | MISSING_CLOSING_PARENTHESIS
-    | BAD_SUBPATTERN_REFERENCE
-    | NULL_PATTERN
-    | BAD_OPTIONS
+    | END_BACKSLASH [@value 101]
+    | END_BACKSLASH_C [@value 102]
+    | UNKNOWN_ESCAPE [@value 103]
+    | QUANTIFIER_OUT_OF_ORDER [@value 104]
+    | QUANTIFIER_TOO_BIG [@value 105]
+    | MISSING_SQUARE_BRACKET [@value 106]
+    | ESCAPE_INVALID_IN_CLASS [@value 107]
+    | CLASS_RANGE_ORDER [@value 108]
+    | QUANTIFIER_INVALID [@value 109]
+    | INTERNAL_UNEXPECTED_REPEAT [@value 110]
+    | INVALID_AFTER_PARENS_QUERY [@value 111]
+    | POSIX_CLASS_NOT_IN_CLASS [@value 112]
+    | POSIX_NO_SUPPORT_COLLATING [@value 113]
+    | MISSING_CLOSING_PARENTHESIS [@value 114]
+    | BAD_SUBPATTERN_REFERENCE [@value 115]
+    | NULL_PATTERN [@value 116]
+    | BAD_OPTIONS [@value 117]
       (* TODO: can we make this not possible with the API we expose? *)
-    | MISSING_COMMENT_CLOSING
-    | PARENTHESES_NEST_TOO_DEEP
-    | PATTERN_TOO_LARGE
-    | HEAP_FAILED
-    | UNMATCHED_CLOSING_PARENTHESIS
-    | INTERNAL_CODE_OVERFLOW
-    | MISSING_CONDITION_CLOSING
-    | LOOKBEHIND_NOT_FIXED_LENGTH
-    | ZERO_RELATIVE_REFERENCE
-    | TOO_MANY_CONDITION_BRANCHES
-    | CONDITION_ASSERTION_EXPECTED
-    | BAD_RELATIVE_REFERENCE
-    | UNKNOWN_POSIX_CLASS
-    | INTERNAL_STUDY_ERROR
-    | UNICODE_NOT_SUPPORTED
-    | PARENTHESES_STACK_CHECK
-    | CODE_POINT_TOO_BIG
-    | LOOKBEHIND_TOO_COMPLICATED
-    | LOOKBEHIND_INVALID_BACKSLASH_C
-    | UNSUPPORTED_ESCAPE_SEQUENCE
-    | CALLOUT_NUMBER_TOO_BIG
-    | MISSING_CALLOUT_CLOSING
-    | ESCAPE_INVALID_IN_VERB
-    | UNRECOGNIZED_AFTER_QUERY_P
-    | MISSING_NAME_TERMINATOR
-    | DUPLICATE_SUBPATTERN_NAME
-    | INVALID_SUBPATTERN_NAME
-    | UNICODE_PROPERTIES_UNAVAILABLE
-    | MALFORMED_UNICODE_PROPERTY
-    | UNKNOWN_UNICODE_PROPERTY
-    | SUBPATTERN_NAME_TOO_LONG
-    | TOO_MANY_NAMED_SUBPATTERNS
-    | CLASS_INVALID_RANGE
-    | OCTAL_BYTE_TOO_BIG
-    | INTERNAL_OVERRAN_WORKSPACE
-    | INTERNAL_MISSING_SUBPATTERN
-    | DEFINE_TOO_MANY_BRANCHES
-    | BACKSLASH_O_MISSING_BRACE
-    | INTERNAL_UNKNOWN_NEWLINE
-    | BACKSLASH_G_SYNTAX
-    | PARENS_QUERY_R_MISSING_CLOSING
-    | VERB_ARGUMENT_NOT_ALLOWED
+    | MISSING_COMMENT_CLOSING [@value 118]
+    | PARENTHESES_NEST_TOO_DEEP [@value 119]
+    | PATTERN_TOO_LARGE [@value 120]
+    | HEAP_FAILED [@value 121]
+    | UNMATCHED_CLOSING_PARENTHESIS [@value 122]
+    | INTERNAL_CODE_OVERFLOW [@value 123]
+    | MISSING_CONDITION_CLOSING [@value 124]
+    | LOOKBEHIND_NOT_FIXED_LENGTH [@value 125]
+    | ZERO_RELATIVE_REFERENCE [@value 126]
+    | TOO_MANY_CONDITION_BRANCHES [@value 127]
+    | CONDITION_ASSERTION_EXPECTED [@value 128]
+    | BAD_RELATIVE_REFERENCE [@value 129]
+    | UNKNOWN_POSIX_CLASS [@value 130]
+    | INTERNAL_STUDY_ERROR [@value 131]
+    | UNICODE_NOT_SUPPORTED [@value 132]
+    | PARENTHESES_STACK_CHECK [@value 133]
+    | CODE_POINT_TOO_BIG [@value 134]
+    | LOOKBEHIND_TOO_COMPLICATED [@value 135]
+    | LOOKBEHIND_INVALID_BACKSLASH_C [@value 136]
+    | UNSUPPORTED_ESCAPE_SEQUENCE [@value 137]
+    | CALLOUT_NUMBER_TOO_BIG [@value 138]
+    | MISSING_CALLOUT_CLOSING [@value 139]
+    | ESCAPE_INVALID_IN_VERB [@value 140]
+    | UNRECOGNIZED_AFTER_QUERY_P [@value 141]
+    | MISSING_NAME_TERMINATOR [@value 142]
+    | DUPLICATE_SUBPATTERN_NAME [@value 143]
+    | INVALID_SUBPATTERN_NAME [@value 144]
+    | UNICODE_PROPERTIES_UNAVAILABLE [@value 145]
+    | MALFORMED_UNICODE_PROPERTY [@value 146]
+    | UNKNOWN_UNICODE_PROPERTY [@value 147]
+    | SUBPATTERN_NAME_TOO_LONG [@value 148]
+    | TOO_MANY_NAMED_SUBPATTERNS [@value 149]
+    | CLASS_INVALID_RANGE [@value 150]
+    | OCTAL_BYTE_TOO_BIG [@value 151]
+    | INTERNAL_OVERRAN_WORKSPACE [@value 152]
+    | INTERNAL_MISSING_SUBPATTERN [@value 153]
+    | DEFINE_TOO_MANY_BRANCHES [@value 154]
+    | BACKSLASH_O_MISSING_BRACE [@value 155]
+    | INTERNAL_UNKNOWN_NEWLINE [@value 156]
+    | BACKSLASH_G_SYNTAX [@value 157]
+    | PARENS_QUERY_R_MISSING_CLOSING [@value 158]
+    | VERB_ARGUMENT_NOT_ALLOWED [@value 159]
         (** NOTE: Obsolete; should not occur - since when? *)
-    | VERB_UNKNOWN
-    | SUBPATTERN_NUMBER_TOO_BIG
-    | SUBPATTERN_NAME_EXPECTED
-    | INTERNAL_PARSED_OVERFLOW
-    | INVALID_OCTAL
-    | SUBPATTERN_NAMES_MISMATCH
-    | MARK_MISSING_ARGUMENT
-    | INVALID_HEXADECIMAL
-    | BACKSLASH_C_SYNTAX
-    | BACKSLASH_K_SYNTAX
-    | INTERNAL_BAD_CODE_LOOKBEHINDS
-    | BACKSLASH_N_IN_CLASS
-    | CALLOUT_STRING_TOO_LONG
-    | UNICODE_DISALLOWED_CODE_POINT
-    | UTF_IS_DISABLED
-    | UCP_IS_DISABLED
-    | VERB_NAME_TOO_LONG
-    | BACKSLASH_U_CODE_POINT_TOO_BIG
-    | MISSING_OCTAL_OR_HEX_DIGITS
-    | VERSION_CONDITION_SYNTAX
-    | INTERNAL_BAD_CODE_AUTO_POSSESS
-    | CALLOUT_NO_STRING_DELIMITER
-    | CALLOUT_BAD_STRING_DELIMITER
-    | BACKSLASH_C_CALLER_DISABLED
-    | QUERY_BARJX_NEST_TOO_DEEP
-    | BACKSLASH_C_LIBRARY_DISABLED
-    | PATTERN_TOO_COMPLICATED
-    | LOOKBEHIND_TOO_LONG
-    | PATTERN_STRING_TOO_LONG
-    | INTERNAL_BAD_CODE
-    | INTERNAL_BAD_CODE_IN_SKIP
-    | NO_SURROGATES_IN_UTF16
-    | BAD_LITERAL_OPTIONS
-    | SUPPORTED_ONLY_IN_UNICODE
-    | INVALID_HYPHEN_IN_OPTIONS
-    | ALPHA_ASSERTION_UNKNOWN
-    | SCRIPT_RUN_NOT_AVAILABLE
-    | TOO_MANY_CAPTURES
-    | CONDITION_ATOMIC_ASSERTION_EXPECTED
-    | BACKSLASH_K_IN_LOOKAROUND
-  [@@deriving show, eq]
+    | VERB_UNKNOWN [@value 160]
+    | SUBPATTERN_NUMBER_TOO_BIG [@value 161]
+    | SUBPATTERN_NAME_EXPECTED [@value 162]
+    | INTERNAL_PARSED_OVERFLOW [@value 163]
+    | INVALID_OCTAL [@value 164]
+    | SUBPATTERN_NAMES_MISMATCH [@value 165]
+    | MARK_MISSING_ARGUMENT [@value 166]
+    | INVALID_HEXADECIMAL [@value 167]
+    | BACKSLASH_C_SYNTAX [@value 168]
+    | BACKSLASH_K_SYNTAX [@value 169]
+    | INTERNAL_BAD_CODE_LOOKBEHINDS [@value 170]
+    | BACKSLASH_N_IN_CLASS [@value 171]
+    | CALLOUT_STRING_TOO_LONG [@value 172]
+    | UNICODE_DISALLOWED_CODE_POINT [@value 173]
+    | UTF_IS_DISABLED [@value 174]
+    | UCP_IS_DISABLED [@value 175]
+    | VERB_NAME_TOO_LONG [@value 176]
+    | BACKSLASH_U_CODE_POINT_TOO_BIG [@value 177]
+    | MISSING_OCTAL_OR_HEX_DIGITS [@value 178]
+    | VERSION_CONDITION_SYNTAX [@value 179]
+    | INTERNAL_BAD_CODE_AUTO_POSSESS [@value 180]
+    | CALLOUT_NO_STRING_DELIMITER [@value 181]
+    | CALLOUT_BAD_STRING_DELIMITER [@value 182]
+    | BACKSLASH_C_CALLER_DISABLED [@value 183]
+    | QUERY_BARJX_NEST_TOO_DEEP [@value 184]
+    | BACKSLASH_C_LIBRARY_DISABLED [@value 185]
+    | PATTERN_TOO_COMPLICATED [@value 186]
+    | LOOKBEHIND_TOO_LONG [@value 187]
+    | PATTERN_STRING_TOO_LONG [@value 188]
+    | INTERNAL_BAD_CODE [@value 189]
+    | INTERNAL_BAD_CODE_IN_SKIP [@value 190]
+    | NO_SURROGATES_IN_UTF16 [@value 191]
+    | BAD_LITERAL_OPTIONS [@value 192]
+    | SUPPORTED_ONLY_IN_UNICODE [@value 193]
+    | INVALID_HYPHEN_IN_OPTIONS [@value 194]
+    | ALPHA_ASSERTION_UNKNOWN [@value 195]
+    | SCRIPT_RUN_NOT_AVAILABLE [@value 196]
+    | TOO_MANY_CAPTURES [@value 197]
+    | CONDITION_ATOMIC_ASSERTION_EXPECTED [@value 198]
+    | BACKSLASH_K_IN_LOOKAROUND [@value 199]
+  [@@deriving eq, enum]
 
-  let compile_error_code_of_int : int -> compile_error_code = function
-    | 101 -> END_BACKSLASH
-    | 102 -> END_BACKSLASH_C
-    | 103 -> UNKNOWN_ESCAPE
-    | 104 -> QUANTIFIER_OUT_OF_ORDER
-    | 105 -> QUANTIFIER_TOO_BIG
-    | 106 -> MISSING_SQUARE_BRACKET
-    | 107 -> ESCAPE_INVALID_IN_CLASS
-    | 108 -> CLASS_RANGE_ORDER
-    | 109 -> QUANTIFIER_INVALID
-    | 110 -> INTERNAL_UNEXPECTED_REPEAT
-    | 111 -> INVALID_AFTER_PARENS_QUERY
-    | 112 -> POSIX_CLASS_NOT_IN_CLASS
-    | 113 -> POSIX_NO_SUPPORT_COLLATING
-    | 114 -> MISSING_CLOSING_PARENTHESIS
-    | 115 -> BAD_SUBPATTERN_REFERENCE
-    | 116 -> NULL_PATTERN
-    | 117 -> BAD_OPTIONS
-    | 118 -> MISSING_COMMENT_CLOSING
-    | 119 -> PARENTHESES_NEST_TOO_DEEP
-    | 120 -> PATTERN_TOO_LARGE
-    | 121 -> HEAP_FAILED
-    | 122 -> UNMATCHED_CLOSING_PARENTHESIS
-    | 123 -> INTERNAL_CODE_OVERFLOW
-    | 124 -> MISSING_CONDITION_CLOSING
-    | 125 -> LOOKBEHIND_NOT_FIXED_LENGTH
-    | 126 -> ZERO_RELATIVE_REFERENCE
-    | 127 -> TOO_MANY_CONDITION_BRANCHES
-    | 128 -> CONDITION_ASSERTION_EXPECTED
-    | 129 -> BAD_RELATIVE_REFERENCE
-    | 130 -> UNKNOWN_POSIX_CLASS
-    | 131 -> INTERNAL_STUDY_ERROR
-    | 132 -> UNICODE_NOT_SUPPORTED
-    | 133 -> PARENTHESES_STACK_CHECK
-    | 134 -> CODE_POINT_TOO_BIG
-    | 135 -> LOOKBEHIND_TOO_COMPLICATED
-    | 136 -> LOOKBEHIND_INVALID_BACKSLASH_C
-    | 137 -> UNSUPPORTED_ESCAPE_SEQUENCE
-    | 138 -> CALLOUT_NUMBER_TOO_BIG
-    | 139 -> MISSING_CALLOUT_CLOSING
-    | 140 -> ESCAPE_INVALID_IN_VERB
-    | 141 -> UNRECOGNIZED_AFTER_QUERY_P
-    | 142 -> MISSING_NAME_TERMINATOR
-    | 143 -> DUPLICATE_SUBPATTERN_NAME
-    | 144 -> INVALID_SUBPATTERN_NAME
-    | 145 -> UNICODE_PROPERTIES_UNAVAILABLE
-    | 146 -> MALFORMED_UNICODE_PROPERTY
-    | 147 -> UNKNOWN_UNICODE_PROPERTY
-    | 148 -> SUBPATTERN_NAME_TOO_LONG
-    | 149 -> TOO_MANY_NAMED_SUBPATTERNS
-    | 150 -> CLASS_INVALID_RANGE
-    | 151 -> OCTAL_BYTE_TOO_BIG
-    | 152 -> INTERNAL_OVERRAN_WORKSPACE
-    | 153 -> INTERNAL_MISSING_SUBPATTERN
-    | 154 -> DEFINE_TOO_MANY_BRANCHES
-    | 155 -> BACKSLASH_O_MISSING_BRACE
-    | 156 -> INTERNAL_UNKNOWN_NEWLINE
-    | 157 -> BACKSLASH_G_SYNTAX
-    | 158 -> PARENS_QUERY_R_MISSING_CLOSING
-    | 159 -> VERB_ARGUMENT_NOT_ALLOWED
-    | 160 -> VERB_UNKNOWN
-    | 161 -> SUBPATTERN_NUMBER_TOO_BIG
-    | 162 -> SUBPATTERN_NAME_EXPECTED
-    | 163 -> INTERNAL_PARSED_OVERFLOW
-    | 164 -> INVALID_OCTAL
-    | 165 -> SUBPATTERN_NAMES_MISMATCH
-    | 166 -> MARK_MISSING_ARGUMENT
-    | 167 -> INVALID_HEXADECIMAL
-    | 168 -> BACKSLASH_C_SYNTAX
-    | 169 -> BACKSLASH_K_SYNTAX
-    | 170 -> INTERNAL_BAD_CODE_LOOKBEHINDS
-    | 171 -> BACKSLASH_N_IN_CLASS
-    | 172 -> CALLOUT_STRING_TOO_LONG
-    | 173 -> UNICODE_DISALLOWED_CODE_POINT
-    | 174 -> UTF_IS_DISABLED
-    | 175 -> UCP_IS_DISABLED
-    | 176 -> VERB_NAME_TOO_LONG
-    | 177 -> BACKSLASH_U_CODE_POINT_TOO_BIG
-    | 178 -> MISSING_OCTAL_OR_HEX_DIGITS
-    | 179 -> VERSION_CONDITION_SYNTAX
-    | 180 -> INTERNAL_BAD_CODE_AUTO_POSSESS
-    | 181 -> CALLOUT_NO_STRING_DELIMITER
-    | 182 -> CALLOUT_BAD_STRING_DELIMITER
-    | 183 -> BACKSLASH_C_CALLER_DISABLED
-    | 184 -> QUERY_BARJX_NEST_TOO_DEEP
-    | 185 -> BACKSLASH_C_LIBRARY_DISABLED
-    | 186 -> PATTERN_TOO_COMPLICATED
-    | 187 -> LOOKBEHIND_TOO_LONG
-    | 188 -> PATTERN_STRING_TOO_LONG
-    | 189 -> INTERNAL_BAD_CODE
-    | 190 -> INTERNAL_BAD_CODE_IN_SKIP
-    | 191 -> NO_SURROGATES_IN_UTF16
-    | 192 -> BAD_LITERAL_OPTIONS
-    | 193 -> SUPPORTED_ONLY_IN_UNICODE
-    | 194 -> INVALID_HYPHEN_IN_OPTIONS
-    | 195 -> ALPHA_ASSERTION_UNKNOWN
-    | 196 -> SCRIPT_RUN_NOT_AVAILABLE
-    | 197 -> TOO_MANY_CAPTURES
-    | 198 -> CONDITION_ATOMIC_ASSERTION_EXPECTED
-    | 199 -> BACKSLASH_K_IN_LOOKAROUND
-    | n ->
+  (* [compile_error_code_to_enum]/[compile_error_code_of_enum] are generated
+     by [@@deriving enum] from the [@value] annotation above, so the mapping
+     between a code and its PCRE2 integer lives in exactly one place: the
+     type declaration itself. *)
+  let int_of_compile_error_code : compile_error_code -> int =
+    compile_error_code_to_enum
+
+  let compile_error_code_of_int (n : int) : compile_error_code =
+    match compile_error_code_of_enum n with
+    | Some c -> c
+    | None ->
         invalid_arg (Printf.sprintf "%d is not a valid PCRE2 compile error" n)
+
+  let pp_compile_error_code (fmt : Format.formatter)
+      (code : compile_error_code) : unit =
+    Format.pp_print_string fmt
+      (Bindings.pcre2_get_error_message (int_of_compile_error_code code))
+
+  let show_compile_error_code (code : compile_error_code) : string =
+    Bindings.pcre2_get_error_message (int_of_compile_error_code code)
 
   (** An error encountered while compiling a pattern, alongside the offset (in
       code units) into the pattern at which it occurred. Not all errors are
       associated with a meaningful offset, in which case it is given as 0. See
       `pcre2_compile(3)` for details. *)
   type compile_error = { code : compile_error_code; offset : int }
-  [@@deriving show, eq]
+  [@@deriving eq]
 
   let compile_error_of_int_pair ((code, offset) : int * int) : compile_error =
     { code = compile_error_code_of_int code; offset }
 
+  let pp_compile_error (fmt : Format.formatter)
+      ({ code; offset } : compile_error) : unit =
+    Format.fprintf fmt "%s (at offset %d)"
+      (Bindings.pcre2_get_error_message (int_of_compile_error_code code))
+      offset
+
+  let show_compile_error (e : compile_error) : string =
+    Format.asprintf "%a" pp_compile_error e
+
   type match_error =
     (* Error codes for UTF-8 validity checks. See pcre2unicode(3). *)
-    | UTF8_ERR1
-    | UTF8_ERR2
-    | UTF8_ERR3
-    | UTF8_ERR4
-    | UTF8_ERR5
-    | UTF8_ERR6
-    | UTF8_ERR7
-    | UTF8_ERR8
-    | UTF8_ERR9
-    | UTF8_ERR10
-    | UTF8_ERR11
-    | UTF8_ERR12
-    | UTF8_ERR13
-    | UTF8_ERR14
-    | UTF8_ERR15
-    | UTF8_ERR16
-    | UTF8_ERR17
-    | UTF8_ERR18
-    | UTF8_ERR19
-    | UTF8_ERR20
-    | UTF8_ERR21
+    | UTF8_ERR1 [@value -3]
+    | UTF8_ERR2 [@value -4]
+    | UTF8_ERR3 [@value -5]
+    | UTF8_ERR4 [@value -6]
+    | UTF8_ERR5 [@value -7]
+    | UTF8_ERR6 [@value -8]
+    | UTF8_ERR7 [@value -9]
+    | UTF8_ERR8 [@value -10]
+    | UTF8_ERR9 [@value -11]
+    | UTF8_ERR10 [@value -12]
+    | UTF8_ERR11 [@value -13]
+    | UTF8_ERR12 [@value -14]
+    | UTF8_ERR13 [@value -15]
+    | UTF8_ERR14 [@value -16]
+    | UTF8_ERR15 [@value -17]
+    | UTF8_ERR16 [@value -18]
+    | UTF8_ERR17 [@value -19]
+    | UTF8_ERR18 [@value -20]
+    | UTF8_ERR19 [@value -21]
+    | UTF8_ERR20 [@value -22]
+    | UTF8_ERR21 [@value -23]
     (* TODO(* (non-8 support) *):
        | UTF16_ERR1
        | UTF16_ERR2
@@ -330,120 +257,81 @@ module Error = struct
        functions, context functions, and serializing functions. They are in numerical
        order. Originally they were in alphabetical order too, but now that PCRE2 is
        released, the numbers must not be changed. *)
-    | BADDATA
-    | MIXEDTABLES
+    | BADDATA [@value -29]
+    | MIXEDTABLES [@value -30]
     (* Name was changed *)
-    | BADMAGIC
-    | BADMODE
-    | BADOFFSET
-    | BADOPTION (* TODO: shouldn't be possible? *)
-    | BADREPLACEMENT
-    | BADUTFOFFSET
-    | CALLOUT
-    | DFA_BADRESTART
-    | DFA_RECURSE
-    | DFA_UCOND
-    | DFA_UFUNC
-    | DFA_UITEM
-    | DFA_WSSIZE
-    | INTERNAL
-    | JIT_BADOPTION
-    | JIT_STACKLIMIT
-    | MATCHLIMIT
-    | NOMEMORY
-    | NOSUBSTRING
-    | NOUNIQUESUBSTRING
-    | NULL (* TODO: shouldn't be possible? *)
-    | RECURSELOOP
-    | DEPTHLIMIT
-    | UNAVAILABLE
-    | UNSET
-    | BADOFFSETLIMIT
-    | BADREPESCAPE
-    | REPMISSINGBRACE
-    | BADSUBSTITUTION
-    | BADSUBSPATTERN
-    | TOOMANYREPLACE
-    | BADSERIALIZEDDATA
-    | HEAPLIMIT
-    | CONVERT_SYNTAX
-    | INTERNAL_DUPMATCH
-    | DFA_UINVALID_UTF
-    | INVALIDOFFSET
-  [@@deriving show, eq]
+    | BADMAGIC [@value -31]
+    | BADMODE [@value -32]
+    | BADOFFSET [@value -33]
+    | BADOPTION [@value -34] (* TODO: shouldn't be possible? *)
+    | BADREPLACEMENT [@value -35]
+    | BADUTFOFFSET [@value -36]
+    | CALLOUT [@value -37]
+    | DFA_BADRESTART [@value -38]
+    | DFA_RECURSE [@value -39]
+    | DFA_UCOND [@value -40]
+    | DFA_UFUNC [@value -41]
+    | DFA_UITEM [@value -42]
+    | DFA_WSSIZE [@value -43]
+    | INTERNAL [@value -44]
+    | JIT_BADOPTION [@value -45]
+    | JIT_STACKLIMIT [@value -46]
+    | MATCHLIMIT [@value -47]
+    | NOMEMORY [@value -48]
+    | NOSUBSTRING [@value -49]
+    | NOUNIQUESUBSTRING [@value -50]
+    | NULL [@value -51] (* TODO: shouldn't be possible? *)
+    | RECURSELOOP [@value -52]
+    | DEPTHLIMIT [@value -53]
+    | UNAVAILABLE [@value -54]
+    | UNSET [@value -55]
+    | BADOFFSETLIMIT [@value -56]
+    | BADREPESCAPE [@value -57]
+    | REPMISSINGBRACE [@value -58]
+    | BADSUBSTITUTION [@value -59]
+    | BADSUBSPATTERN [@value -60]
+    | TOOMANYREPLACE [@value -61]
+    | BADSERIALIZEDDATA [@value -62]
+    | HEAPLIMIT [@value -63]
+    | CONVERT_SYNTAX [@value -64]
+    | INTERNAL_DUPMATCH [@value -65]
+    | DFA_UINVALID_UTF [@value -66]
+    | INVALIDOFFSET [@value -67]
+  [@@deriving eq, enum]
 
-  let match_error_of_int : int -> match_error = function
+  (* [match_error_to_enum]/[match_error_of_enum] are generated by
+     [@@deriving enum] from the [@value] annotations above, so the mapping
+     between a code and its PCRE2 integer lives in exactly one place: the
+     type declaration itself. Codes without a corresponding variant---NOMATCH,
+     PARTIAL, and the UTF-16/UTF-32 errors, since only the 8-bit library is
+     supported---are handled separately below. *)
+  let int_of_match_error : match_error -> int = match_error_to_enum
+
+  let match_error_of_int (n : int) : match_error =
+    match n with
     | -1 ->
         invalid_arg "NOMATCH has no corresponding match_error---None is used."
     | -2 ->
         invalid_arg
           "PARTIAL has no corresponding match_error---the partial match is \
            returned directly."
-    | -3 -> UTF8_ERR1
-    | -4 -> UTF8_ERR2
-    | -5 -> UTF8_ERR3
-    | -6 -> UTF8_ERR4
-    | -7 -> UTF8_ERR5
-    | -8 -> UTF8_ERR6
-    | -9 -> UTF8_ERR7
-    | -10 -> UTF8_ERR8
-    | -11 -> UTF8_ERR9
-    | -12 -> UTF8_ERR10
-    | -13 -> UTF8_ERR11
-    | -14 -> UTF8_ERR12
-    | -15 -> UTF8_ERR13
-    | -16 -> UTF8_ERR14
-    | -17 -> UTF8_ERR15
-    | -18 -> UTF8_ERR16
-    | -19 -> UTF8_ERR17
-    | -20 -> UTF8_ERR18
-    | -21 -> UTF8_ERR19
-    | -22 -> UTF8_ERR20
-    | -23 -> UTF8_ERR21
-    | (-24 | -25 | -26 | -27 | -28) as n ->
+    | -24 | -25 | -26 | -27 | -28 ->
         invalid_arg
           (Printf.sprintf
              "%d is a UTF16 or UTF32 error, but we only support UTF8" n)
-    | -29 -> BADDATA
-    | -30 -> MIXEDTABLES
-    | -31 -> BADMAGIC
-    | -32 -> BADMODE
-    | -33 -> BADOFFSET
-    | -34 -> BADOPTION
-    | -35 -> BADREPLACEMENT
-    | -36 -> BADUTFOFFSET
-    | -37 -> CALLOUT
-    | -38 -> DFA_BADRESTART
-    | -39 -> DFA_RECURSE
-    | -40 -> DFA_UCOND
-    | -41 -> DFA_UFUNC
-    | -42 -> DFA_UITEM
-    | -43 -> DFA_WSSIZE
-    | -44 -> INTERNAL
-    | -45 -> JIT_BADOPTION
-    | -46 -> JIT_STACKLIMIT
-    | -47 -> MATCHLIMIT
-    | -48 -> NOMEMORY
-    | -49 -> NOSUBSTRING
-    | -50 -> NOUNIQUESUBSTRING
-    | -51 -> NULL
-    | -52 -> RECURSELOOP
-    | -53 -> DEPTHLIMIT
-    | -54 -> UNAVAILABLE
-    | -55 -> UNSET
-    | -56 -> BADOFFSETLIMIT
-    | -57 -> BADREPESCAPE
-    | -58 -> REPMISSINGBRACE
-    | -59 -> BADSUBSTITUTION
-    | -60 -> BADSUBSPATTERN
-    | -61 -> TOOMANYREPLACE
-    | -62 -> BADSERIALIZEDDATA
-    | -63 -> HEAPLIMIT
-    | -64 -> CONVERT_SYNTAX
-    | -65 -> INTERNAL_DUPMATCH
-    | -66 -> DFA_UINVALID_UTF
-    | -67 -> INVALIDOFFSET
-    | n -> invalid_arg (Printf.sprintf "%d is not a valid PCRE2 match error" n)
+    | n -> (
+        match match_error_of_enum n with
+        | Some e -> e
+        | None ->
+            invalid_arg
+              (Printf.sprintf "%d is not a valid PCRE2 match error" n))
+
+  let pp_match_error (fmt : Format.formatter) (e : match_error) : unit =
+    Format.pp_print_string fmt
+      (Bindings.pcre2_get_error_message (int_of_match_error e))
+
+  let show_match_error (e : match_error) : string =
+    Bindings.pcre2_get_error_message (int_of_match_error e)
 end
 
 include Error

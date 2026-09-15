@@ -107,6 +107,34 @@ CAMLprim value get_version(void) /* -> int * int */ {
         CAMLreturn(version);
 }
 
+/// Returns the human-readable message PCRE2 associates with a compile or
+/// match error code, as produced by `pcre2_get_error_message(3)`.
+CAMLprim value get_error_message(value error_code /* : int */) /* -> string */ {
+        CAMLparam1(error_code);
+        CAMLlocal1(message);
+
+        // Per `pcre2api(3)`, 120 code units is enough for any message PCRE2
+        // currently produces; doubled here for headroom against future ones.
+        PCRE2_UCHAR buffer[240];
+        int rc = pcre2_get_error_message(Int_val(error_code), buffer,
+                                         sizeof buffer / sizeof buffer[0]);
+
+        // [error_code] isn't a recognized PCRE2 error code, so [buffer] was
+        // left untouched.
+        if (rc == PCRE2_ERROR_BADDATA) {
+                CAMLreturn(caml_copy_string("unknown PCRE2 error code"));
+        }
+
+        // Otherwise, [rc] is either the message length (excluding the
+        // trailing zero) or PCRE2_ERROR_NOMEMORY because [buffer] was too
+        // small to hold it---in which case [buffer] holds a truncated but
+        // still zero-terminated message, which is still fine to copy out.
+        // SAFETY: with PCRE2_CODE_UNIT_WIDTH == 8, PCRE2_UCHAR is a plain
+        // [unsigned char], compatible with the [char *] expected here.
+        message = caml_copy_string((const char *)buffer);
+        CAMLreturn(message);
+}
+
 /// Compiles the provided pattern.
 ///
 /// Note that the options from OCaml are not split between those which can
