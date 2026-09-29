@@ -1,5 +1,15 @@
 (test
  (name pcre2_tests)
+ (modules pcre2_tests)
+ (libraries pcre2 ounit2 threads unix)
+ (preprocess
+  (pps ppx_deriving.show)))
+
+(test
+ (name pcre2_domain_tests)
+ (modules pcre2_domain_tests)
+ (enabled_if
+  (>= %{ocaml_version} 5.0))
  (libraries pcre2 ounit2)
  (preprocess
   (pps ppx_deriving.show)))
