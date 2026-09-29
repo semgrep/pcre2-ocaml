@@ -11,6 +11,12 @@
 #include "caml/mlvalues.h"
 #include "caml/signals.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 // NOTE: Currently these bindings support only 8-bit code units. Below we use
 // the generically named functions. Future versions could include support for
 // non-8-bit code units.
@@ -22,6 +28,166 @@ const int RESULT_OK_TAG = 0;
 const int RESULT_ERROR_TAG = 1;
 const int TUPLE_TAG = 0;
 const int ARRAY_TAG = 0;
+
+/// Match data owned by one POSIX thread or Windows fiber. This is finer than
+/// an OCaml domain: several systhreads can belong to one domain, while each
+/// needs its own cache. No other execution context can access this cache, so
+/// the reentrancy flag needs no atomic or lock.
+struct match_data_cache {
+        /// Grow-only PCRE2 block retained between matches; NULL until first use.
+        pcre2_match_data *data;
+        /// True while the owner uses `data`. Nested matches allocate a temporary
+        /// block rather than overwriting the outer match's ovector.
+        bool busy;
+};
+
+/// Free the cached PCRE2 block and its cache wrapper.
+static void match_data_cache_destroy(void *ptr) {
+        struct match_data_cache *cache = ptr;
+        if (cache != NULL) {
+                pcre2_match_data_free(cache->data);
+                free(cache);
+        }
+}
+
+#ifdef _WIN32
+static INIT_ONCE match_data_key_once = INIT_ONCE_STATIC_INIT;
+static DWORD match_data_key = FLS_OUT_OF_INDEXES;
+
+static VOID CALLBACK match_data_cache_destroy_windows(PVOID ptr) {
+        match_data_cache_destroy(ptr);
+}
+
+static BOOL CALLBACK make_match_data_key(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+        (void)once;
+        (void)parameter;
+        (void)context;
+        match_data_key = FlsAlloc(match_data_cache_destroy_windows);
+        return TRUE;
+}
+
+static bool match_data_key_ready(void) {
+        return InitOnceExecuteOnce(&match_data_key_once, make_match_data_key, NULL, NULL) &&
+               match_data_key != FLS_OUT_OF_INDEXES;
+}
+
+static struct match_data_cache *match_data_cache_current(void) {
+        return match_data_key_ready() ? FlsGetValue(match_data_key) : NULL;
+}
+
+static bool match_data_cache_attach(struct match_data_cache *cache) {
+        return FlsSetValue(match_data_key, cache);
+}
+#else
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define THREAD_LOCAL _Thread_local
+#else
+#define THREAD_LOCAL __thread
+#endif
+
+static THREAD_LOCAL struct match_data_cache *thread_match_data_cache;
+static pthread_key_t match_data_key;
+static pthread_once_t match_data_key_once = PTHREAD_ONCE_INIT;
+static int match_data_key_error;
+
+/// Clear the fast lookup before freeing: another thread-specific-data
+/// destructor may still call back into this library.
+static void match_data_cache_destroy_posix(void *ptr) {
+        thread_match_data_cache = NULL;
+        match_data_cache_destroy(ptr);
+}
+
+static void make_match_data_key(void) {
+        match_data_key_error = pthread_key_create(&match_data_key,
+                                                 match_data_cache_destroy_posix);
+}
+
+static bool match_data_key_ready(void) {
+        return pthread_once(&match_data_key_once, make_match_data_key) == 0 &&
+               match_data_key_error == 0;
+}
+
+static struct match_data_cache *match_data_cache_current(void) {
+        return thread_match_data_cache;
+}
+
+static bool match_data_cache_attach(struct match_data_cache *cache) {
+        if (pthread_setspecific(match_data_key, cache) != 0) {
+                return false;
+        }
+        thread_match_data_cache = cache;
+        return true;
+}
+#endif
+
+/// Return this execution context's cache, creating and registering it on first
+/// use. Return NULL if key setup or allocation fails.
+static struct match_data_cache *get_match_data_cache(void) {
+        struct match_data_cache *cache = match_data_cache_current();
+        if (cache != NULL) {
+                return cache;
+        }
+        if (!match_data_key_ready()) {
+                return NULL;
+        }
+        cache = calloc(1, sizeof *cache);
+        if (cache == NULL) {
+                return NULL;
+        }
+        if (!match_data_cache_attach(cache)) {
+                free(cache);
+                return NULL;
+        }
+        return cache;
+}
+
+/// Acquire a block large enough for every capture in `re`. A nested match gets
+/// a temporary block while the cached one is busy.
+/// @param[out] error PCRE2 error code when NULL is returned.
+/// @return Match data to pass to `match_data_release`, or NULL on failure.
+static pcre2_match_data *match_data_acquire(const pcre2_code *re, int *error) {
+        struct match_data_cache *cache = get_match_data_cache();
+        if (cache == NULL) {
+                *error = PCRE2_ERROR_NOMEMORY;
+                return NULL;
+        }
+        uint32_t capture_count;
+        if (pcre2_pattern_info(re, PCRE2_INFO_CAPTURECOUNT, &capture_count) != 0) {
+                *error = PCRE2_ERROR_INTERNAL;
+                return NULL;
+        }
+        // PCRE2 caps match-data ovectors at UINT16_MAX pairs, even for a
+        // pattern with the maximum 65535 capture groups. Compare against that
+        // actual capacity so the largest pattern does not trigger growth on
+        // every match.
+        uint32_t pairs = capture_count < UINT16_MAX ? capture_count + 1 : UINT16_MAX;
+        if (cache->busy || cache->data == NULL ||
+            pcre2_get_ovector_count(cache->data) < pairs) {
+                pcre2_match_data *fresh = pcre2_match_data_create(pairs, NULL);
+                if (fresh == NULL) {
+                        *error = PCRE2_ERROR_NOMEMORY;
+                        return NULL;
+                }
+                if (cache->busy) {
+                        return fresh;
+                }
+                pcre2_match_data_free(cache->data);
+                cache->data = fresh;
+        }
+        cache->busy = true;
+        return cache->data;
+}
+
+/// Make the cached block available again, or free a nested match's temporary
+/// block. `data` must have come from `match_data_acquire` on this owner.
+static void match_data_release(pcre2_match_data *data) {
+        struct match_data_cache *cache = match_data_cache_current();
+        if (data == cache->data) {
+                cache->busy = false;
+        } else {
+                pcre2_match_data_free(data);
+        }
+}
 
 struct ocaml_regex {
         pcre2_code *regex;
@@ -385,9 +551,6 @@ static int run_match(bool use_jit, const pcre2_code *re,
 /// @param[in] use_jit Whether to match with `pcre2_jit_match`.
 /// @param[in] subject_offset The byte index in the subject at which to begin.
 /// @param[in] options Matching options, specified via a bitvector . See `pcre2_match(3)`.
-// TODO: allow reusing the pcre2_match_data struct so that exec_all / find_iter
-// / captures_iter can avoid a bunch of allocations.
-// Ideally this function doesn't allocate except for some `caml_alloc_small`s.
 static value match_general(value ocaml_re /* : _ regex */,
                            value subject /* : string or pinned_subject */, bool pinned,
                            bool use_jit, intnat subject_offset,
@@ -416,20 +579,26 @@ static value match_general(value ocaml_re /* : _ regex */,
         // so sharing it across matches -- including concurrent ones while the
         // runtime lock is released -- is safe. TODO: callouts.
         pcre2_match_context *mcontext = ore->mcontext;
-        pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
+        int acquisition_error;
+        pcre2_match_data *match_data = match_data_acquire(re, &acquisition_error);
+        if (match_data == NULL) {
+                result = caml_alloc_small(1, RESULT_ERROR_TAG);
+                Field(result, 0) = Val_int(acquisition_error);
+                CAMLreturn(result);
+        }
 
         int ret = run_match(use_jit, re, subject, pinned, offset, options, match_data, mcontext);
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (ret == PCRE2_ERROR_NOMATCH || ret == PCRE2_ERROR_PARTIAL) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_OK_TAG);
                 Field(result, 0) = Val_none;
                 CAMLreturn(result);
         } else if (ret <= 0) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
@@ -437,12 +606,15 @@ static value match_general(value ocaml_re /* : _ regex */,
                 CAMLreturn(result);
         }
 
+        PCRE2_SIZE start = ovec[0];
+        PCRE2_SIZE end = ovec[1];
+        match_data_release(match_data);
+
+        // No OCaml allocation occurs while the cache is busy on this path.
         // SAFETY: This allocation is immediately filled with well-formed values.
         range = caml_alloc_small(2, TUPLE_TAG);
-        Field(range, 0) = Val_int(ovec[0]);
-        Field(range, 1) = Val_int(ovec[1]);
-
-        pcre2_match_data_free(match_data);
+        Field(range, 0) = Val_int(start);
+        Field(range, 1) = Val_int(end);
 
         // SAFETY: This allocation is immediately filled with well-formed values.
         match = caml_alloc_small(1, OPTION_SOME_TAG);
@@ -685,8 +857,6 @@ CAMLprim value regex_is_utf(value ocaml_regex /* : _ regex */) /* -> bool */ {
 /// @param[in] use_jit Whether to match with `pcre2_jit_match`.
 /// @param[in] subject_offset The byte index in the subject at which to begin.
 /// @param[in] options Matching options, specified via a bitvector . See `pcre2_match(3)`.
-// TODO: allow reusing the pcre2_match_data struct so that captures_iter can avoid a bunch of
-// allocations. Ideally this function doesn't allocate (except maybe a result).
 static value capture_general(value ocaml_re /* : _ regex */,
                              value subject /* : string or pinned_subject */, bool pinned,
                              bool use_jit, intnat subject_offset,
@@ -717,7 +887,13 @@ static value capture_general(value ocaml_re /* : _ regex */,
         const pcre2_code *re = ore->regex;
         // See [match_general] regarding the shared match context. TODO: callouts.
         pcre2_match_context *mcontext = ore->mcontext;
-        pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
+        int acquisition_error;
+        pcre2_match_data *match_data = match_data_acquire(re, &acquisition_error);
+        if (match_data == NULL) {
+                result = caml_alloc_small(1, RESULT_ERROR_TAG);
+                Field(result, 0) = Val_int(acquisition_error);
+                CAMLreturn(result);
+        }
 
         // NOTE: Really one more than number of captures since it includes the
         // full match.
@@ -726,14 +902,14 @@ static value capture_general(value ocaml_re /* : _ regex */,
         PCRE2_SIZE *ovec = pcre2_get_ovector_pointer(match_data);
 
         if (num_captures == PCRE2_ERROR_NOMATCH || num_captures == PCRE2_ERROR_PARTIAL) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_OK_TAG);
                 Field(result, 0) = Val_none;
                 CAMLreturn(result);
         } else if (num_captures <= 0) {
-                pcre2_match_data_free(match_data);
+                match_data_release(match_data);
                 // SAFETY: This allocation is immediately filled with
                 // well-formed values prior to returning.
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
@@ -761,7 +937,7 @@ static value capture_general(value ocaml_re /* : _ regex */,
         // match w/ capture many times.
         name_table = make_capture_group_name_table(re);
 
-        pcre2_match_data_free(match_data);
+        match_data_release(match_data);
 
         // SAFETY: This allocation is immediately filled with well-formed
         // values.

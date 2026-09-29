@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+* Reuse one PCRE2 match-data block per thread, growing it when a pattern needs
+  more capture slots. This removes repeated allocation in matching and iterators
+  while keeping compiled patterns shareable across domains. Nested matches use
+  temporary blocks. Worker-thread caches are freed at thread exit on POSIX and
+  Windows; process exit reclaims the initial thread's cache.
+
 * Added `` `MATCH_LIMIT ``, `` `DEPTH_LIMIT ``, and `` `HEAP_LIMIT `` compile
   options, bounding the resources any match against the pattern may consume
   (guarding against catastrophic backtracking). The limits are bundled with the

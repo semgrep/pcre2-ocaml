@@ -535,6 +535,132 @@ let jit_limit_tests =
         (Jit.find re "aaa" |> Result.map (Option.map Jit.range_of_match)) );
   ]
 
+let match_data_reuse _ =
+  let wide_pattern =
+    "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)(m)(n)(o)(p)(q)(r)(s)(t)"
+  in
+  let wide_subject = "abcdefghijklmnopqrst" in
+  let wide = compile_or_fail (Interp.compile wide_pattern) in
+  let narrow = compile_or_fail (Interp.compile "(x)|(y)") in
+  let jit_wide = compile_or_fail (Jit.compile wide_pattern) in
+  let jit_narrow = compile_or_fail (Jit.compile "(?<word>[a-z]+)") in
+  for _ = 1 to 200 do
+    (match Interp.captures wide wide_subject with
+    | Ok (Some c) -> assert_equal 21 (Interp.captures_length c)
+    | _ -> assert_failure "wide interpreter match failed");
+    (match Interp.captures narrow "y" with
+    | Ok (Some c) ->
+        assert_equal 3 (Interp.captures_length c);
+        assert_equal None (Interp.match_of_captures c 1);
+        assert_equal (Some "y")
+          (Interp.match_of_captures c 2 |> Option.map Interp.substring_of_match)
+    | _ -> assert_failure "narrow interpreter match failed");
+    (match Jit.captures jit_wide wide_subject with
+    | Ok (Some c) -> assert_equal 21 (Jit.captures_length c)
+    | _ -> assert_failure "wide JIT match failed");
+    (match Jit.captures jit_narrow "item" with
+    | Ok (Some c) ->
+        assert_equal 2 (Jit.captures_length c);
+        assert_equal (Some "item")
+          (Jit.named_match_of_captures c "word"
+          |> Option.map Jit.substring_of_match)
+    | _ -> assert_failure "narrow JIT match failed");
+    assert_equal (Ok true) (Interp.is_match wide wide_subject);
+    assert_equal (Ok true) (Jit.is_match jit_narrow "item")
+  done;
+  (* Exercise both the copied-subject and pinned-subject paths with the runtime
+     lock released. The iterator pins once and reuses its match data. *)
+  let long_subject = String.make 2_048 'x' ^ "aa" in
+  let tail = compile_or_fail (Interp.compile "(a+)") in
+  let check = function
+    | Ok (Some c) ->
+        assert_equal 2 (Interp.captures_length c);
+        assert_equal (Some "aa")
+          (Interp.match_of_captures c 1 |> Option.map Interp.substring_of_match)
+    | _ -> assert_failure "long-subject match failed"
+  in
+  check (Interp.captures tail long_subject);
+  let iterated = Interp.captures_iter tail long_subject |> List.of_seq in
+  assert_equal 1 (List.length iterated);
+  List.iter
+    (function
+      | Ok c -> check (Ok (Some c))
+      | Error _ -> assert_failure "long-subject iterator failed")
+    iterated
+
+let thread_reuse _ =
+  let wide =
+    compile_or_fail
+      (Interp.compile
+         "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)(m)(n)(o)(p)(q)(r)(s)(t)")
+  in
+  let narrow = compile_or_fail (Interp.compile "([a-z]+)-([0-9]+)") in
+  let worker () =
+    try
+      for i = 0 to 199 do
+        (match Interp.is_match wide "abcdefghijklmnopqrst" with
+        | Ok true -> ()
+        | _ -> failwith "wide match failed");
+        match Interp.captures narrow ("item-" ^ string_of_int i) with
+        | Ok (Some c) ->
+            if Interp.captures_length c <> 3 then failwith "wrong capture count";
+            let group n =
+              Interp.match_of_captures c n |> Option.map Interp.substring_of_match
+            in
+            if group 1 <> Some "item" || group 2 <> Some (string_of_int i) then
+              failwith "wrong captures"
+        | _ -> failwith "match failed"
+      done;
+      None
+    with exn -> Some (Printexc.to_string exn)
+  in
+  let results = Array.make 8 None in
+  let threads =
+    Array.init 8 (fun i -> Thread.create (fun () -> results.(i) <- worker ()) ())
+  in
+  Array.iter Thread.join threads;
+  assert_equal ~printer:[%show: string option array]
+    (Array.make 8 None) results
+
+let rss_kb () =
+  if Sys.os_type <> "Unix" then None
+  else
+    try
+      let ic = Unix.open_process_in (Printf.sprintf "ps -o rss= -p %d" (Unix.getpid ())) in
+      let line = try Some (input_line ic) with End_of_file -> None in
+      ignore (Unix.close_process_in ic);
+      Option.map (fun s -> int_of_string (String.trim s)) line
+    with _ -> None
+
+let thread_exit_frees_match_data _ =
+  skip_if (rss_kb () = None) "RSS unavailable";
+  let wide =
+    compile_or_fail
+      (Interp.compile
+         "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)(m)(n)(o)(p)(q)(r)(s)(t)")
+  in
+  let churn n =
+    for _ = 1 to n do
+      let matched = ref false in
+      Thread.join
+        (Thread.create
+           (fun () ->
+             matched :=
+               match Interp.captures wide "abcdefghijklmnopqrst" with
+               | Ok (Some c) -> Interp.captures_length c = 21
+               | _ -> false)
+           ());
+      assert_bool "thread did not complete its match" !matched
+    done
+  in
+  churn 1_000;
+  let before = Option.get (rss_kb ()) in
+  churn 4_000;
+  let growth = Option.get (rss_kb ()) - before in
+  assert_bool
+    (Printf.sprintf "RSS grew %d KB after 4,000 thread exits" growth)
+    (growth < 20_000)
+
 let suite =
   let module Interp_Tests = MakeTests (Interp) in
   let module Jit_Tests = MakeTests (Jit) in
@@ -542,6 +668,9 @@ let suite =
   >::: [
          "version" >:: check_version;
          "config" >:: check_config;
+         "match_data_reuse" >:: match_data_reuse;
+         "thread_reuse" >:: thread_reuse;
+         "thread_exit_frees_match_data" >:: thread_exit_frees_match_data;
          "Interp" >::: Interp_Tests.tests @ interp_limit_tests;
          "JIT" >::: Jit_Tests.tests @ jit_limit_tests;
        ]

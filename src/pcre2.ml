@@ -1,6 +1,6 @@
 [@@@warning "-32"]
 
-(* Registers exceptions with the C runtime and caches polymorphic variants *)
+(* Keeps a module-load hook available to the C stubs. *)
 let () = Bindings.pcre2_ocaml_init ()
 let ( >+= ) x f = Option.map f x
 let ( let* ) = Result.bind
