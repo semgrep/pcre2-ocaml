@@ -7,8 +7,6 @@
   while keeping compiled patterns shareable across domains. Nested matches use
   temporary blocks. Worker-thread caches are freed at thread exit on POSIX and
   Windows; process exit reclaims the initial thread's cache.
-  Matches using `COPY_MATCHED_SUBJECT` use single-use blocks to avoid a PCRE2
-  invalid-free bug when a direct JIT match follows one of those matches.
 
 * Added `` `MATCH_LIMIT ``, `` `DEPTH_LIMIT ``, and `` `HEAP_LIMIT `` compile
   options, bounding the resources any match against the pattern may consume

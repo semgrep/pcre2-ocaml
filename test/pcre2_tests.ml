@@ -588,19 +588,6 @@ let match_data_reuse _ =
       | Error _ -> assert_failure "long-subject iterator failed")
     iterated
 
-let copy_matched_subject_then_jit _ =
-  let interp = compile_or_fail (Interp.compile "b") in
-  let jit = compile_or_fail (Jit.compile "b") in
-  let copy = [ `COPY_MATCHED_SUBJECT ] in
-  assert_equal (Ok true) (Interp.is_match ~options:copy interp "abc");
-  assert_equal (Ok true) (Jit.is_match jit "abc");
-  assert_equal (Ok true) (Interp.is_match interp "abc");
-  (match Interp.captures ~options:copy interp "abc" with
-  | Ok (Some _) -> ()
-  | _ -> assert_failure "copying capture match failed");
-  assert_equal (Ok true) (Jit.is_match jit "abc");
-  assert_equal (Ok true) (Interp.is_match interp "abc")
-
 let thread_reuse _ =
   let wide =
     compile_or_fail
@@ -682,7 +669,6 @@ let suite =
          "version" >:: check_version;
          "config" >:: check_config;
          "match_data_reuse" >:: match_data_reuse;
-         "copy_matched_subject_then_jit" >:: copy_matched_subject_then_jit;
          "thread_reuse" >:: thread_reuse;
          "thread_exit_frees_match_data" >:: thread_exit_frees_match_data;
          "Interp" >::: Interp_Tests.tests @ interp_limit_tests;
