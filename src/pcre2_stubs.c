@@ -141,11 +141,12 @@ static struct match_data_cache *get_match_data_cache(void) {
         return cache;
 }
 
-/// Acquire a block large enough for every capture in `re`. A nested match gets
-/// a temporary block while the cached one is busy.
+/// Acquire a block large enough for every capture in `re`. A nested match or
+/// one using `PCRE2_COPY_MATCHED_SUBJECT` gets a temporary block.
 /// @param[out] error PCRE2 error code when NULL is returned.
 /// @return Match data to pass to `match_data_release`, or NULL on failure.
-static pcre2_match_data *match_data_acquire(const pcre2_code *re, int *error) {
+static pcre2_match_data *match_data_acquire(const pcre2_code *re, uint32_t options,
+                                            int *error) {
         struct match_data_cache *cache = get_match_data_cache();
         if (cache == NULL) {
                 *error = PCRE2_ERROR_NOMEMORY;
@@ -161,14 +162,17 @@ static pcre2_match_data *match_data_acquire(const pcre2_code *re, int *error) {
         // actual capacity so the largest pattern does not trigger growth on
         // every match.
         uint32_t pairs = capture_count < UINT16_MAX ? capture_count + 1 : UINT16_MAX;
-        if (cache->busy || cache->data == NULL ||
+        // PCRE2 before 10.48 leaves a copied-subject flag behind when a direct
+        // JIT match reuses this block. Never retain a block that may own a copy.
+        bool temporary = cache->busy || (options & PCRE2_COPY_MATCHED_SUBJECT) != 0;
+        if (temporary || cache->data == NULL ||
             pcre2_get_ovector_count(cache->data) < pairs) {
                 pcre2_match_data *fresh = pcre2_match_data_create(pairs, NULL);
                 if (fresh == NULL) {
                         *error = PCRE2_ERROR_NOMEMORY;
                         return NULL;
                 }
-                if (cache->busy) {
+                if (temporary) {
                         return fresh;
                 }
                 pcre2_match_data_free(cache->data);
@@ -178,8 +182,8 @@ static pcre2_match_data *match_data_acquire(const pcre2_code *re, int *error) {
         return cache->data;
 }
 
-/// Make the cached block available again, or free a nested match's temporary
-/// block. `data` must have come from `match_data_acquire` on this owner.
+/// Make the cached block available again, or free a temporary block. `data`
+/// must have come from `match_data_acquire` on this owner.
 static void match_data_release(pcre2_match_data *data) {
         struct match_data_cache *cache = match_data_cache_current();
         if (data == cache->data) {
@@ -580,7 +584,7 @@ static value match_general(value ocaml_re /* : _ regex */,
         // runtime lock is released -- is safe. TODO: callouts.
         pcre2_match_context *mcontext = ore->mcontext;
         int acquisition_error;
-        pcre2_match_data *match_data = match_data_acquire(re, &acquisition_error);
+        pcre2_match_data *match_data = match_data_acquire(re, options, &acquisition_error);
         if (match_data == NULL) {
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
                 Field(result, 0) = Val_int(acquisition_error);
@@ -888,7 +892,7 @@ static value capture_general(value ocaml_re /* : _ regex */,
         // See [match_general] regarding the shared match context. TODO: callouts.
         pcre2_match_context *mcontext = ore->mcontext;
         int acquisition_error;
-        pcre2_match_data *match_data = match_data_acquire(re, &acquisition_error);
+        pcre2_match_data *match_data = match_data_acquire(re, options, &acquisition_error);
         if (match_data == NULL) {
                 result = caml_alloc_small(1, RESULT_ERROR_TAG);
                 Field(result, 0) = Val_int(acquisition_error);
