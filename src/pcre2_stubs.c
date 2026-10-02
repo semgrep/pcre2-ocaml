@@ -728,7 +728,7 @@ CAMLprim value jit_compile(value ocaml_re /* : interp regex */,
 /// TODO: either implement a UTF check or force INVALID_UTF in UTF mode.
 ///
 /// NOTE: restricted option set. Use polymorphic variants on the OCaml side.
-/// The supported options are PCRE2_NOTBOL, PCRE2_NOTEOL,
+/// The supported options are PCRE2_ANCHORED, PCRE2_NOTBOL, PCRE2_NOTEOL,
 /// PCRE2_NOTEMPTY, PCRE2_NOTEMPTY_ATSTART, PCRE2_PARTIAL_HARD, and
 /// PCRE2_PARTIAL_SOFT. Unsupported options are ignored.
 CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject /* : string */,

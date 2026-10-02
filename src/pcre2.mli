@@ -407,7 +407,8 @@ module Options : sig
     type jit_only_compile_option = [ `JIT_INVALID_UTF ]
 
     type match_option =
-      [ `NOTBOL
+      [ `ANCHORED
+      | `NOTBOL
       | `NOTEOL
       | `NOTEMPTY
       | `NOTEMPTY_ATSTART

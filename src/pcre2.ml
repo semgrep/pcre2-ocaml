@@ -49,10 +49,9 @@ end
 
 include Match
 
-(* After an empty match, retry at the same position with PCRE2_ANCHORED and
-   PCRE2_NOTEMPTY_ATSTART. This can find a non-empty alternative there. If the
+(* After an empty match, retry at the same position with [`ANCHORED] and
+   [`NOTEMPTY_ATSTART]. This can find a non-empty alternative there. If the
    retry fails, resume at the next character boundary. *)
-let anchored_notempty_atstart = Int32.logor 0x80000000l 0x00000008l
 
 (* The next offset at which to resume a search when skipping past an empty
    match. For a UTF regex this must be the next character boundary: PCRE2
@@ -351,7 +350,8 @@ module Options = struct
       opts |> List.map int32_of_compile_option |> List.fold_left Int32.logor 0l
 
     type match_option =
-      [ `NOTBOL
+      [ `ANCHORED
+      | `NOTBOL
       | `NOTEOL
       | `NOTEMPTY
       | `NOTEMPTY_ATSTART
@@ -360,6 +360,7 @@ module Options = struct
     [@@deriving show, eq]
 
     let int32_of_match_option : match_option -> int32 = function
+      | `ANCHORED        -> 0x80000000l
       | `NOTBOL           -> 0x00000001l
       | `NOTEOL           -> 0x00000002l
       | `NOTEMPTY         -> 0x00000004l
@@ -597,6 +598,7 @@ module type Engine = sig
   type match_option
 
   val bitvector_of_match_options : match_option list -> int32
+  val empty_match_retry_options : match_option list
   val match_ : t -> string -> int -> int32 -> ((int * int) option, int) Result.t
 
   val match_pinned :
@@ -635,7 +637,10 @@ module MakeMatcher (E : Engine) = struct
 
   let iter_pinned ~options ~subject_offset (re : t) (subject : string)
       match_pinned range wrap =
-    let options = E.bitvector_of_match_options options in
+    let normal_options = E.bitvector_of_match_options options in
+    let retry_options =
+      E.bitvector_of_match_options (E.empty_match_retry_options @ options)
+    in
     let is_utf = E.is_utf re in
     let subject_length = String.length subject in
     (* Copy the subject out of the OCaml heap once, rather than on every
@@ -643,8 +648,7 @@ module MakeMatcher (E : Engine) = struct
     let pinned = Bindings.pin_subject subject in
     let rec next (offset, retry_nonempty) =
       let match_options =
-        if retry_nonempty then Int32.logor options anchored_notempty_atstart
-        else options
+        if retry_nonempty then retry_options else normal_options
       in
       match match_pinned re pinned offset match_options with
       | Ok (Some found) ->
@@ -736,6 +740,7 @@ module Interp = struct
     type match_option = Options.Interp.match_option
 
     let bitvector_of_match_options = Options.Interp.bitvector_of_match_options
+    let empty_match_retry_options = [ `ANCHORED; `NOTEMPTY_ATSTART ]
     let match_ = Bindings.pcre2_match
     let match_pinned = Bindings.pcre2_match_pinned
     let capture = Bindings.pcre2_capture
@@ -770,6 +775,7 @@ module Jit = struct
     type match_option = Options.Jit.match_option
 
     let bitvector_of_match_options = Options.Jit.bitvector_of_match_options
+    let empty_match_retry_options = [ `ANCHORED; `NOTEMPTY_ATSTART ]
     let match_ = Bindings.pcre2_jit_match
     let match_pinned = Bindings.pcre2_jit_match_pinned
     let capture = Bindings.pcre2_jit_capture
