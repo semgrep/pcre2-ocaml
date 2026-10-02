@@ -334,8 +334,7 @@ end = struct
     | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
     | Ok re ->
         let printer = [%show: (range, match_error) result list] in
-        (* An empty match at the end position of the previous match is skipped
-           rather than repeated forever. *)
+        (* Empty matches are returned once at each position. *)
         assert_equal ~printer
           [
             Ok { start = 0; end_ = 0 };
@@ -346,9 +345,54 @@ end = struct
           (find_iter re "bcd" |> List.of_seq
           |> List.map (Result.map range_of_match));
         assert_equal ~printer
-          [ Ok { start = 0; end_ = 2 }; Ok { start = 3; end_ = 3 } ]
+          [
+            Ok { start = 0; end_ = 2 };
+            Ok { start = 2; end_ = 2 };
+            Ok { start = 3; end_ = 3 };
+          ]
           (find_iter re "aab" |> List.of_seq
+          |> List.map (Result.map range_of_match));
+        assert_equal ~printer
+          [ Ok { start = 0; end_ = 0 } ]
+          (find_iter re "" |> List.of_seq
           |> List.map (Result.map range_of_match))
+
+  let find_iter_nonempty_after_empty ctxt =
+    match compile "b*|c" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal ~printer:[%show: (range, match_error) result list]
+          [
+            Ok { start = 0; end_ = 0 };
+            Ok { start = 1; end_ = 1 };
+            Ok { start = 1; end_ = 2 };
+            Ok { start = 2; end_ = 2 };
+          ]
+          (find_iter re "ac" |> List.of_seq
+          |> List.map (Result.map range_of_match))
+
+  let find_iter_g_anchor_after_empty ctxt =
+    match compile "\\G|c" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal ~printer:[%show: (range, match_error) result list]
+          [
+            Ok { start = 0; end_ = 0 };
+            Ok { start = 1; end_ = 1 };
+            Ok { start = 1; end_ = 2 };
+            Ok { start = 2; end_ = 2 };
+          ]
+          (find_iter re "ac" |> List.of_seq
+          |> List.map (Result.map range_of_match))
+
+  let split_adjacent_empty_matches ctxt =
+    match compile " *" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        (* Joining the split pieces with the replacement gives _a__b_. *)
+        assert_equal ~printer:[%show: (string list, match_error) result]
+          (Ok [ ""; "a"; ""; "b"; "" ])
+          (split re "a  b")
 
   let find_iter_empty_matches_utf ctxt =
     match compile "(*UTF)x*" with
@@ -366,6 +410,36 @@ end = struct
           (find_iter re "a\xc3\xa9" |> List.of_seq
           |> List.map (Result.map range_of_match))
 
+  let find_iter_empty_matches_crlf ctxt =
+    let printer = [%show: (range, match_error) result list] in
+    let check pattern expected =
+      match compile pattern with
+      | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+      | Ok re ->
+          assert_equal ~printer expected
+            (find_iter re "\r\n" |> List.of_seq
+            |> List.map (Result.map range_of_match))
+    in
+    let skip_crlf =
+      [ Ok { start = 0; end_ = 0 }; Ok { start = 2; end_ = 2 } ]
+    in
+    List.iter
+      (fun pattern -> check pattern skip_crlf)
+      [ "(*CRLF)"; "(*ANYCRLF)"; "(*ANY)"; "(*UTF)(*CRLF)" ];
+    check "(*LF)"
+      [
+        Ok { start = 0; end_ = 0 };
+        Ok { start = 1; end_ = 1 };
+        Ok { start = 2; end_ = 2 };
+      ];
+    match compile "(*CRLF)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal
+          ~printer:[%show: (string list, match_error) result]
+          (Ok [ ""; "\r\n"; "" ])
+          (split re "\r\n")
+
   let captures_iter_empty_matches ctxt =
     match compile "(a*)" with
     | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
@@ -378,7 +452,83 @@ end = struct
             Ok { start = 2; end_ = 2 };
           ]
           (captures_iter re "bc" |> List.of_seq
+          |> List.map (Result.map range_of_captures));
+        assert_equal ~printer
+          [ Ok { start = 0; end_ = 0 } ]
+          (captures_iter re "" |> List.of_seq
           |> List.map (Result.map range_of_captures))
+
+  let captures_iter_nonempty_after_empty ctxt =
+    match compile "(b*|c)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        let ranges =
+          captures_iter re "ac" |> List.of_seq
+          |> List.map
+               (Result.map (fun c ->
+                    ( range_of_captures c,
+                      Option.map range_of_match (match_of_captures c 1) )))
+        in
+        assert_equal
+          ~printer:[%show: (range * range option, match_error) result list]
+          [
+            Ok ({ start = 0; end_ = 0 }, Some { start = 0; end_ = 0 });
+            Ok ({ start = 1; end_ = 1 }, Some { start = 1; end_ = 1 });
+            Ok ({ start = 1; end_ = 2 }, Some { start = 1; end_ = 2 });
+            Ok ({ start = 2; end_ = 2 }, Some { start = 2; end_ = 2 });
+          ]
+          ranges
+
+  let captures_iter_g_anchor_after_empty ctxt =
+    match compile "(\\G|c)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal ~printer:[%show: (range, match_error) result list]
+          [
+            Ok { start = 0; end_ = 0 };
+            Ok { start = 1; end_ = 1 };
+            Ok { start = 1; end_ = 2 };
+            Ok { start = 2; end_ = 2 };
+          ]
+          (captures_iter re "ac" |> List.of_seq
+          |> List.map (Result.map range_of_captures))
+
+  let captures_iter_empty_matches_utf ctxt =
+    match compile "(*UTF)(x*)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal ~printer:[%show: (range, match_error) result list]
+          [
+            Ok { start = 0; end_ = 0 };
+            Ok { start = 1; end_ = 1 };
+            Ok { start = 3; end_ = 3 };
+          ]
+          (captures_iter re "a\xc3\xa9"
+          |> List.of_seq
+          |> List.map (Result.map range_of_captures))
+
+  let captures_iter_empty_matches_crlf ctxt =
+    let printer = [%show: (range, match_error) result list] in
+    let check pattern expected =
+      match compile pattern with
+      | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+      | Ok re ->
+          assert_equal ~printer expected
+            (captures_iter re "\r\n" |> List.of_seq
+            |> List.map (Result.map range_of_captures))
+    in
+    let skip_crlf =
+      [ Ok { start = 0; end_ = 0 }; Ok { start = 2; end_ = 2 } ]
+    in
+    List.iter
+      (fun pattern -> check pattern skip_crlf)
+      [ "(*CRLF)()"; "(*ANYCRLF)()"; "(*ANY)()"; "(*UTF)(*CRLF)()" ];
+    check "(*LF)()"
+      [
+        Ok { start = 0; end_ = 0 };
+        Ok { start = 1; end_ = 1 };
+        Ok { start = 2; end_ = 2 };
+      ]
 
   let split_empty_pattern ctxt =
     match compile "" with
@@ -422,8 +572,18 @@ end = struct
       "split_with_offset" >:: split_with_offset_test;
       "empty_pattern" >:: empty_pattern_test;
       "find_iter_empty_matches" >:: find_iter_empty_matches;
+      "find_iter_nonempty_after_empty" >:: find_iter_nonempty_after_empty;
+      "find_iter_g_anchor_after_empty" >:: find_iter_g_anchor_after_empty;
       "find_iter_empty_matches_utf" >:: find_iter_empty_matches_utf;
+      "find_iter_empty_matches_crlf" >:: find_iter_empty_matches_crlf;
       "captures_iter_empty_matches" >:: captures_iter_empty_matches;
+      "captures_iter_nonempty_after_empty"
+      >:: captures_iter_nonempty_after_empty;
+      "captures_iter_g_anchor_after_empty"
+      >:: captures_iter_g_anchor_after_empty;
+      "captures_iter_empty_matches_utf" >:: captures_iter_empty_matches_utf;
+      "captures_iter_empty_matches_crlf" >:: captures_iter_empty_matches_crlf;
+      "split_adjacent_empty_matches" >:: split_adjacent_empty_matches;
       "split_empty_pattern" >:: split_empty_pattern;
       "split_propagates_match_error" >:: split_propagates_match_error;
       "unicode" >:: unicode_test;

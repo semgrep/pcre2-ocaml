@@ -477,10 +477,14 @@ static size_t subject_length_of(value subject /* : string or pinned_subject */, 
 static int do_match(bool use_jit, const pcre2_code *re, PCRE2_SPTR subject_ptr,
                     size_t subject_length, size_t offset, uint32_t options,
                     pcre2_match_data *match_data, pcre2_match_context *mcontext) {
-        return use_jit ? pcre2_jit_match(re, subject_ptr, subject_length, offset, options,
-                                         match_data, mcontext)
-                       : pcre2_match(re, subject_ptr, subject_length, offset, options, match_data,
-                                     mcontext);
+        // Direct JIT matching ignores PCRE2_ANCHORED. The interpreted API
+        // honors it, including on a pattern that has already been JIT-compiled.
+        if (use_jit && (options & PCRE2_ANCHORED) == 0) {
+                return pcre2_jit_match(re, subject_ptr, subject_length, offset, options,
+                                       match_data, mcontext);
+        }
+        return pcre2_match(re, subject_ptr, subject_length, offset, options, match_data,
+                           mcontext);
 }
 
 /// Runs `pcre2_match` (or `pcre2_jit_match` if `use_jit`), releasing the
@@ -846,6 +850,17 @@ CAMLprim value regex_is_utf(value ocaml_regex /* : _ regex */) /* -> bool */ {
         uint32_t all_options = 0;
         pcre2_pattern_info(regex_of_value(ocaml_regex)->regex, PCRE2_INFO_ALLOPTIONS, &all_options);
         CAMLreturn(Val_bool(all_options & PCRE2_UTF));
+}
+
+/// Returns whether CRLF is a valid newline sequence for this regex. Global
+/// matching advances over both bytes together after an unsuccessful retry at
+/// an empty match.
+CAMLprim value regex_crlf_is_newline(value ocaml_regex /* : _ regex */) /* -> bool */ {
+        CAMLparam1(ocaml_regex);
+        uint32_t newline = 0;
+        pcre2_pattern_info(regex_of_value(ocaml_regex)->regex, PCRE2_INFO_NEWLINE, &newline);
+        CAMLreturn(Val_bool(newline == PCRE2_NEWLINE_CRLF || newline == PCRE2_NEWLINE_ANYCRLF
+                            || newline == PCRE2_NEWLINE_ANY));
 }
 
 /// Match, with capture groups, the provided pattern. Shared implementation

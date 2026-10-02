@@ -109,3 +109,6 @@ external get_capture_groups : _ regex -> (string * int) array
 external regex_is_utf : _ regex -> bool = "regex_is_utf"
 (** Whether the regex was compiled with the UTF option, whether via the
     compile options or the in-pattern "(*UTF)" directive. *)
+
+external regex_crlf_is_newline : _ regex -> bool = "regex_crlf_is_newline"
+(** Whether the regex's newline convention recognizes CRLF as one newline. *)
