@@ -371,6 +371,20 @@ end = struct
           (find_iter re "ac" |> List.of_seq
           |> List.map (Result.map range_of_match))
 
+  let find_iter_g_anchor_after_empty ctxt =
+    match compile "\\G|c" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal ~printer:[%show: (range, match_error) result list]
+          [
+            Ok { start = 0; end_ = 0 };
+            Ok { start = 1; end_ = 1 };
+            Ok { start = 1; end_ = 2 };
+            Ok { start = 2; end_ = 2 };
+          ]
+          (find_iter re "ac" |> List.of_seq
+          |> List.map (Result.map range_of_match))
+
   let split_adjacent_empty_matches ctxt =
     match compile " *" with
     | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
@@ -395,6 +409,36 @@ end = struct
           ]
           (find_iter re "a\xc3\xa9" |> List.of_seq
           |> List.map (Result.map range_of_match))
+
+  let find_iter_empty_matches_crlf ctxt =
+    let printer = [%show: (range, match_error) result list] in
+    let check pattern expected =
+      match compile pattern with
+      | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+      | Ok re ->
+          assert_equal ~printer expected
+            (find_iter re "\r\n" |> List.of_seq
+            |> List.map (Result.map range_of_match))
+    in
+    let skip_crlf =
+      [ Ok { start = 0; end_ = 0 }; Ok { start = 2; end_ = 2 } ]
+    in
+    List.iter
+      (fun pattern -> check pattern skip_crlf)
+      [ "(*CRLF)"; "(*ANYCRLF)"; "(*ANY)"; "(*UTF)(*CRLF)" ];
+    check "(*LF)"
+      [
+        Ok { start = 0; end_ = 0 };
+        Ok { start = 1; end_ = 1 };
+        Ok { start = 2; end_ = 2 };
+      ];
+    match compile "(*CRLF)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal
+          ~printer:[%show: (string list, match_error) result]
+          (Ok [ ""; "\r\n"; "" ])
+          (split re "\r\n")
 
   let captures_iter_empty_matches ctxt =
     match compile "(a*)" with
@@ -435,6 +479,20 @@ end = struct
           ]
           ranges
 
+  let captures_iter_g_anchor_after_empty ctxt =
+    match compile "(\\G|c)" with
+    | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+    | Ok re ->
+        assert_equal ~printer:[%show: (range, match_error) result list]
+          [
+            Ok { start = 0; end_ = 0 };
+            Ok { start = 1; end_ = 1 };
+            Ok { start = 1; end_ = 2 };
+            Ok { start = 2; end_ = 2 };
+          ]
+          (captures_iter re "ac" |> List.of_seq
+          |> List.map (Result.map range_of_captures))
+
   let captures_iter_empty_matches_utf ctxt =
     match compile "(*UTF)(x*)" with
     | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
@@ -448,6 +506,29 @@ end = struct
           (captures_iter re "a\xc3\xa9"
           |> List.of_seq
           |> List.map (Result.map range_of_captures))
+
+  let captures_iter_empty_matches_crlf ctxt =
+    let printer = [%show: (range, match_error) result list] in
+    let check pattern expected =
+      match compile pattern with
+      | Error e -> assert_failure ("failed to compile: " ^ show_compile_error e)
+      | Ok re ->
+          assert_equal ~printer expected
+            (captures_iter re "\r\n" |> List.of_seq
+            |> List.map (Result.map range_of_captures))
+    in
+    let skip_crlf =
+      [ Ok { start = 0; end_ = 0 }; Ok { start = 2; end_ = 2 } ]
+    in
+    List.iter
+      (fun pattern -> check pattern skip_crlf)
+      [ "(*CRLF)()"; "(*ANYCRLF)()"; "(*ANY)()"; "(*UTF)(*CRLF)()" ];
+    check "(*LF)()"
+      [
+        Ok { start = 0; end_ = 0 };
+        Ok { start = 1; end_ = 1 };
+        Ok { start = 2; end_ = 2 };
+      ]
 
   let split_empty_pattern ctxt =
     match compile "" with
@@ -492,11 +573,16 @@ end = struct
       "empty_pattern" >:: empty_pattern_test;
       "find_iter_empty_matches" >:: find_iter_empty_matches;
       "find_iter_nonempty_after_empty" >:: find_iter_nonempty_after_empty;
+      "find_iter_g_anchor_after_empty" >:: find_iter_g_anchor_after_empty;
       "find_iter_empty_matches_utf" >:: find_iter_empty_matches_utf;
+      "find_iter_empty_matches_crlf" >:: find_iter_empty_matches_crlf;
       "captures_iter_empty_matches" >:: captures_iter_empty_matches;
       "captures_iter_nonempty_after_empty"
       >:: captures_iter_nonempty_after_empty;
+      "captures_iter_g_anchor_after_empty"
+      >:: captures_iter_g_anchor_after_empty;
       "captures_iter_empty_matches_utf" >:: captures_iter_empty_matches_utf;
+      "captures_iter_empty_matches_crlf" >:: captures_iter_empty_matches_crlf;
       "split_adjacent_empty_matches" >:: split_adjacent_empty_matches;
       "split_empty_pattern" >:: split_empty_pattern;
       "split_propagates_match_error" >:: split_propagates_match_error;

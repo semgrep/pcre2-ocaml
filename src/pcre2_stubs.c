@@ -728,7 +728,7 @@ CAMLprim value jit_compile(value ocaml_re /* : interp regex */,
 /// TODO: either implement a UTF check or force INVALID_UTF in UTF mode.
 ///
 /// NOTE: restricted option set. Use polymorphic variants on the OCaml side.
-/// The supported options are PCRE2_ANCHORED, PCRE2_NOTBOL, PCRE2_NOTEOL,
+/// The supported options are PCRE2_NOTBOL, PCRE2_NOTEOL,
 /// PCRE2_NOTEMPTY, PCRE2_NOTEMPTY_ATSTART, PCRE2_PARTIAL_HARD, and
 /// PCRE2_PARTIAL_SOFT. Unsupported options are ignored.
 CAMLprim value jit_match_unboxed(value ocaml_re /* : jit regex */, value subject /* : string */,
@@ -846,6 +846,17 @@ CAMLprim value regex_is_utf(value ocaml_regex /* : _ regex */) /* -> bool */ {
         uint32_t all_options = 0;
         pcre2_pattern_info(regex_of_value(ocaml_regex)->regex, PCRE2_INFO_ALLOPTIONS, &all_options);
         CAMLreturn(Val_bool(all_options & PCRE2_UTF));
+}
+
+/// Returns whether CRLF is a valid newline sequence for this regex. Global
+/// matching advances over both bytes together after an unsuccessful retry at
+/// an empty match.
+CAMLprim value regex_crlf_is_newline(value ocaml_regex /* : _ regex */) /* -> bool */ {
+        CAMLparam1(ocaml_regex);
+        uint32_t newline = 0;
+        pcre2_pattern_info(regex_of_value(ocaml_regex)->regex, PCRE2_INFO_NEWLINE, &newline);
+        CAMLreturn(Val_bool(newline == PCRE2_NEWLINE_CRLF || newline == PCRE2_NEWLINE_ANYCRLF
+                            || newline == PCRE2_NEWLINE_ANY));
 }
 
 /// Match, with capture groups, the provided pattern. Shared implementation

@@ -53,10 +53,11 @@ include Match
    [`NOTEMPTY_ATSTART]. This can find a non-empty alternative there. If the
    retry fails, resume at the next character boundary. *)
 
-(* The next offset at which to resume a search when skipping past an empty
-   match. For a UTF regex this must be the next character boundary: PCRE2
-   rejects offsets inside a UTF-8 sequence. *)
-let next_search_offset ~is_utf (subject : string) (offset : int) : int =
+(* The next offset at which to resume after an unsuccessful non-empty retry.
+   CRLF advances as one newline when the pattern recognizes it; a UTF regex
+   must otherwise advance to the next character boundary. *)
+let next_search_offset ~is_utf ~crlf_is_newline (subject : string) (offset : int)
+    : int =
   (* In UTF-8, bytes of the form 0b10xxxxxx occur only in the middle of a
      character; every other byte starts one. *)
   let is_utf8_continuation_byte c = Char.code c land 0xc0 = 0x80 in
@@ -66,7 +67,12 @@ let next_search_offset ~is_utf (subject : string) (offset : int) : int =
       next_boundary (o + 1)
     else o
   in
-  if is_utf then next_boundary (offset + 1) else offset + 1
+  if
+    crlf_is_newline && offset + 1 < length && Char.equal subject.[offset] '\r'
+    && Char.equal subject.[offset + 1] '\n'
+  then offset + 2
+  else if is_utf then next_boundary (offset + 1)
+  else offset + 1
 
 module Error = struct
   type compile_error_code =
@@ -350,8 +356,7 @@ module Options = struct
       opts |> List.map int32_of_compile_option |> List.fold_left Int32.logor 0l
 
     type match_option =
-      [ `ANCHORED
-      | `NOTBOL
+      [ `NOTBOL
       | `NOTEOL
       | `NOTEMPTY
       | `NOTEMPTY_ATSTART
@@ -360,7 +365,6 @@ module Options = struct
     [@@deriving show, eq]
 
     let int32_of_match_option : match_option -> int32 = function
-      | `ANCHORED        -> 0x80000000l
       | `NOTBOL           -> 0x00000001l
       | `NOTEOL           -> 0x00000002l
       | `NOTEMPTY         -> 0x00000004l
@@ -377,6 +381,7 @@ module Options = struct
     type match_option =
       (* shared *)
       [ Jit.match_option
+      | `ANCHORED
       | `COPY_MATCHED_SUBJECT
       | `DISABLE_RECURSELOOP_CHECK
       | `NO_JIT ]
@@ -384,6 +389,7 @@ module Options = struct
 
     let int32_of_match_option : match_option -> int32 = function
       | #Jit.match_option as jit_opt -> Jit.int32_of_match_option jit_opt
+      | `ANCHORED -> 0x80000000l
       | `COPY_MATCHED_SUBJECT -> 0x00004000l
       | `DISABLE_RECURSELOOP_CHECK -> 0x00040000l
       | `NO_JIT -> 0x00002000l
@@ -598,10 +604,17 @@ module type Engine = sig
   type match_option
 
   val bitvector_of_match_options : match_option list -> int32
-  val empty_match_retry_options : match_option list
+  val bitvector_of_retry_options : match_option list -> int32
   val match_ : t -> string -> int -> int32 -> ((int * int) option, int) Result.t
 
   val match_pinned :
+    t ->
+    Bindings.pinned_subject ->
+    int ->
+    int32 ->
+    ((int * int) option, int) Result.t
+
+  val retry_match_pinned :
     t ->
     Bindings.pinned_subject ->
     int ->
@@ -622,8 +635,16 @@ module type Engine = sig
     int32 ->
     (((int * int) array * (string * int) array) option, int) Result.t
 
+  val retry_capture_pinned :
+    t ->
+    Bindings.pinned_subject ->
+    int ->
+    int32 ->
+    (((int * int) array * (string * int) array) option, int) Result.t
+
   val capture_groups : t -> (string * int) array
   val is_utf : t -> bool
+  val crlf_is_newline : t -> bool
 end
 
 (* Everything in [Matcher] except compilation, derived uniformly from the
@@ -636,26 +657,29 @@ module MakeMatcher (E : Engine) = struct
   let capture_groups (r : t) = E.capture_groups r |> Array.to_list
 
   let iter_pinned ~options ~subject_offset (re : t) (subject : string)
-      match_pinned range wrap =
+      match_pinned retry_match_pinned range wrap =
     let normal_options = E.bitvector_of_match_options options in
-    let retry_options =
-      E.bitvector_of_match_options (E.empty_match_retry_options @ options)
-    in
+    let retry_options = E.bitvector_of_retry_options options in
     let is_utf = E.is_utf re in
+    let crlf_is_newline = E.crlf_is_newline re in
     let subject_length = String.length subject in
     (* Copy the subject out of the OCaml heap once, rather than on every
        iteration (see [Bindings.pin_subject]). *)
     let pinned = Bindings.pin_subject subject in
     let rec next (offset, retry_nonempty) =
-      let match_options =
-        if retry_nonempty then retry_options else normal_options
+      let result =
+        if retry_nonempty then
+          retry_match_pinned re pinned offset retry_options
+        else match_pinned re pinned offset normal_options
       in
-      match match_pinned re pinned offset match_options with
+      match result with
       | Ok (Some found) ->
           let start, end_ = range found in
           Some (Ok (wrap found), (end_, Int.equal start end_))
       | Ok None when retry_nonempty && offset < subject_length ->
-          next (next_search_offset ~is_utf subject offset, false)
+          next
+            ( next_search_offset ~is_utf ~crlf_is_newline subject offset,
+              false )
       | Ok None -> None
       | Error n -> Some (Error (match_error_of_int n), (subject_length, false))
     in
@@ -673,6 +697,7 @@ module MakeMatcher (E : Engine) = struct
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (match_, match_error) Result.t Seq.t =
     iter_pinned ~options ~subject_offset re subject E.match_pinned
+      E.retry_match_pinned
       (fun match_ -> match_)
       (fun (start, end_) -> (subject, start, end_))
 
@@ -688,6 +713,7 @@ module MakeMatcher (E : Engine) = struct
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (captures, match_error) Result.t Seq.t =
     iter_pinned ~options ~subject_offset re subject E.capture_pinned
+      E.retry_capture_pinned
       (fun (arr, _) -> arr.(0))
       (fun (arr, names) -> (subject, arr, names))
 
@@ -740,13 +766,18 @@ module Interp = struct
     type match_option = Options.Interp.match_option
 
     let bitvector_of_match_options = Options.Interp.bitvector_of_match_options
-    let empty_match_retry_options = [ `ANCHORED; `NOTEMPTY_ATSTART ]
+    let bitvector_of_retry_options options =
+      Options.Interp.bitvector_of_match_options
+        (`ANCHORED :: `NOTEMPTY_ATSTART :: options)
     let match_ = Bindings.pcre2_match
     let match_pinned = Bindings.pcre2_match_pinned
+    let retry_match_pinned = Bindings.pcre2_match_pinned
     let capture = Bindings.pcre2_capture
     let capture_pinned = Bindings.pcre2_capture_pinned
+    let retry_capture_pinned = Bindings.pcre2_capture_pinned
     let capture_groups = Bindings.get_capture_groups
     let is_utf = Bindings.regex_is_utf
+    let crlf_is_newline = Bindings.regex_crlf_is_newline
   end)
 
   let compile ?(options : compile_option list = []) (pattern : string) :
@@ -775,13 +806,20 @@ module Jit = struct
     type match_option = Options.Jit.match_option
 
     let bitvector_of_match_options = Options.Jit.bitvector_of_match_options
-    let empty_match_retry_options = [ `ANCHORED; `NOTEMPTY_ATSTART ]
+    let bitvector_of_retry_options (options : match_option list) =
+      Options.Interp.bitvector_of_match_options
+        (`ANCHORED :: `NOTEMPTY_ATSTART
+        :: (options :> Options.Interp.match_option list))
     let match_ = Bindings.pcre2_jit_match
     let match_pinned = Bindings.pcre2_jit_match_pinned
+    (* JIT matching ignores ANCHORED, so use the interpreter for this retry. *)
+    let retry_match_pinned = Bindings.pcre2_match_pinned
     let capture = Bindings.pcre2_jit_capture
     let capture_pinned = Bindings.pcre2_jit_capture_pinned
+    let retry_capture_pinned = Bindings.pcre2_capture_pinned
     let capture_groups = Bindings.get_capture_groups
     let is_utf = Bindings.regex_is_utf
+    let crlf_is_newline = Bindings.regex_crlf_is_newline
   end)
 
   let of_interp ?(options : jit_only_compile_option list = [])

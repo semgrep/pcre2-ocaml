@@ -407,8 +407,7 @@ module Options : sig
     type jit_only_compile_option = [ `JIT_INVALID_UTF ]
 
     type match_option =
-      [ `ANCHORED
-      | `NOTBOL
+      [ `NOTBOL
       | `NOTEOL
       | `NOTEMPTY
       | `NOTEMPTY_ATSTART
@@ -474,6 +473,7 @@ module Options : sig
     type match_option =
       (* shared *)
       [ Jit.match_option
+      | `ANCHORED
       | `COPY_MATCHED_SUBJECT
       | `DISABLE_RECURSELOOP_CHECK
       | `NO_JIT
