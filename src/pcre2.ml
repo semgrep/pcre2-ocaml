@@ -49,9 +49,10 @@ end
 
 include Match
 
-(* Iteration must not revisit a match position, or an empty (zero-width) match
-   would repeat forever: an empty match at the end position of the previous
-   match is instead skipped by resuming the search one character further on. *)
+(* After an empty match, retry at the same position with PCRE2_ANCHORED and
+   PCRE2_NOTEMPTY_ATSTART. This can find a non-empty alternative there. If the
+   retry fails, resume at the next character boundary. *)
+let anchored_notempty_atstart = Int32.logor 0x80000000l 0x00000008l
 
 (* The next offset at which to resume a search when skipping past an empty
    match. For a UTF regex this must be the next character boundary: PCRE2
@@ -67,16 +68,6 @@ let next_search_offset ~is_utf (subject : string) (offset : int) : int =
     else o
   in
   if is_utf then next_boundary (offset + 1) else offset + 1
-
-(* Whether a match spanning [start, end_) is an empty match overlapping the
-   end of the previous match (if any). *)
-let is_overlapping_empty_match ~(last_match_end : int option) (start : int)
-    (end_ : int) : bool =
-  Int.equal start end_
-  &&
-  match last_match_end with
-  | Some last -> Int.equal last end_
-  | None -> false
 
 module Error = struct
   type compile_error_code =
@@ -642,6 +633,30 @@ module MakeMatcher (E : Engine) = struct
 
   let capture_groups (r : t) = E.capture_groups r |> Array.to_list
 
+  let iter_pinned ~options ~subject_offset (re : t) (subject : string)
+      match_pinned range wrap =
+    let options = E.bitvector_of_match_options options in
+    let is_utf = E.is_utf re in
+    let subject_length = String.length subject in
+    (* Copy the subject out of the OCaml heap once, rather than on every
+       iteration (see [Bindings.pin_subject]). *)
+    let pinned = Bindings.pin_subject subject in
+    let rec next (offset, retry_nonempty) =
+      let match_options =
+        if retry_nonempty then Int32.logor options anchored_notempty_atstart
+        else options
+      in
+      match match_pinned re pinned offset match_options with
+      | Ok (Some found) ->
+          let start, end_ = range found in
+          Some (Ok (wrap found), (end_, Int.equal start end_))
+      | Ok None when retry_nonempty && offset < subject_length ->
+          next (next_search_offset ~is_utf subject offset, false)
+      | Ok None -> None
+      | Error n -> Some (Error (match_error_of_int n), (subject_length, false))
+    in
+    Seq.unfold next (subject_offset, false)
+
   let find ?(options : E.match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (match_ option, match_error) Result.t =
     let options = E.bitvector_of_match_options options in
@@ -653,25 +668,9 @@ module MakeMatcher (E : Engine) = struct
   let find_iter ?(options : E.match_option list = [])
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (match_, match_error) Result.t Seq.t =
-    let options = E.bitvector_of_match_options options in
-    let is_utf = E.is_utf re in
-    let subject_length = String.length subject in
-    (* Copy the subject out of the OCaml heap once, rather than on every
-       iteration (see [Bindings.pin_subject]). *)
-    let pinned = Bindings.pin_subject subject in
-    let rec next (offset, last_match_end) =
-      match E.match_pinned re pinned offset options with
-      | Ok (Some (start, end_))
-        when is_overlapping_empty_match ~last_match_end start end_ ->
-          if offset >= subject_length then None
-          else next (next_search_offset ~is_utf subject offset, last_match_end)
-      | Ok (Some (start, end_)) ->
-          Some (Ok (subject, start, end_), (end_, Some end_))
-      | Ok None -> None
-      | Error n ->
-          Some (Error (match_error_of_int n), (subject_length, last_match_end))
-    in
-    Seq.unfold next (subject_offset, None)
+    iter_pinned ~options ~subject_offset re subject E.match_pinned
+      (fun match_ -> match_)
+      (fun (start, end_) -> (subject, start, end_))
 
   let captures ?(options : E.match_option list = []) ?(subject_offset : int = 0)
       (re : t) (subject : string) : (captures option, match_error) Result.t =
@@ -684,28 +683,9 @@ module MakeMatcher (E : Engine) = struct
   let captures_iter ?(options : E.match_option list = [])
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (captures, match_error) Result.t Seq.t =
-    let options = E.bitvector_of_match_options options in
-    let is_utf = E.is_utf re in
-    let subject_length = String.length subject in
-    (* Copy the subject out of the OCaml heap once, rather than on every
-       iteration (see [Bindings.pin_subject]). *)
-    let pinned = Bindings.pin_subject subject in
-    let rec next (offset, last_match_end) =
-      match E.capture_pinned re pinned offset options with
-      | Ok (Some (arr, _))
-        when let start, end_ = arr.(0) in
-             is_overlapping_empty_match ~last_match_end start end_ ->
-          if offset >= subject_length then None
-          else next (next_search_offset ~is_utf subject offset, last_match_end)
-      | Ok (Some (arr, names)) ->
-          let c : captures = (subject, arr, names) in
-          let end_ = (range_of_captures c).end_ in
-          Some (Ok c, (end_, Some end_))
-      | Ok None -> None
-      | Error n ->
-          Some (Error (match_error_of_int n), (subject_length, last_match_end))
-    in
-    Seq.unfold next (subject_offset, None)
+    iter_pinned ~options ~subject_offset re subject E.capture_pinned
+      (fun (arr, _) -> arr.(0))
+      (fun (arr, names) -> (subject, arr, names))
 
   let split ?(options : E.match_option list = []) ?(subject_offset : int = 0)
       ?(limit : int option) (re : t) (subject : string) :
