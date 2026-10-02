@@ -614,13 +614,6 @@ module type Engine = sig
     int32 ->
     ((int * int) option, int) Result.t
 
-  val retry_match_pinned :
-    t ->
-    Bindings.pinned_subject ->
-    int ->
-    int32 ->
-    ((int * int) option, int) Result.t
-
   val capture :
     t ->
     string ->
@@ -629,13 +622,6 @@ module type Engine = sig
     (((int * int) array * (string * int) array) option, int) Result.t
 
   val capture_pinned :
-    t ->
-    Bindings.pinned_subject ->
-    int ->
-    int32 ->
-    (((int * int) array * (string * int) array) option, int) Result.t
-
-  val retry_capture_pinned :
     t ->
     Bindings.pinned_subject ->
     int ->
@@ -657,7 +643,7 @@ module MakeMatcher (E : Engine) = struct
   let capture_groups (r : t) = E.capture_groups r |> Array.to_list
 
   let iter_pinned ~options ~subject_offset (re : t) (subject : string)
-      match_pinned retry_match_pinned range wrap =
+      match_pinned range wrap =
     let normal_options = E.bitvector_of_match_options options in
     let retry_options = E.bitvector_of_retry_options options in
     let is_utf = E.is_utf re in
@@ -667,12 +653,10 @@ module MakeMatcher (E : Engine) = struct
        iteration (see [Bindings.pin_subject]). *)
     let pinned = Bindings.pin_subject subject in
     let rec next (offset, retry_nonempty) =
-      let result =
-        if retry_nonempty then
-          retry_match_pinned re pinned offset retry_options
-        else match_pinned re pinned offset normal_options
+      let match_options =
+        if retry_nonempty then retry_options else normal_options
       in
-      match result with
+      match match_pinned re pinned offset match_options with
       | Ok (Some found) ->
           let start, end_ = range found in
           Some (Ok (wrap found), (end_, Int.equal start end_))
@@ -697,7 +681,6 @@ module MakeMatcher (E : Engine) = struct
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (match_, match_error) Result.t Seq.t =
     iter_pinned ~options ~subject_offset re subject E.match_pinned
-      E.retry_match_pinned
       (fun match_ -> match_)
       (fun (start, end_) -> (subject, start, end_))
 
@@ -713,7 +696,6 @@ module MakeMatcher (E : Engine) = struct
       ?(subject_offset : int = 0) (re : t) (subject : string) :
       (captures, match_error) Result.t Seq.t =
     iter_pinned ~options ~subject_offset re subject E.capture_pinned
-      E.retry_capture_pinned
       (fun (arr, _) -> arr.(0))
       (fun (arr, names) -> (subject, arr, names))
 
@@ -771,10 +753,8 @@ module Interp = struct
         (`ANCHORED :: `NOTEMPTY_ATSTART :: options)
     let match_ = Bindings.pcre2_match
     let match_pinned = Bindings.pcre2_match_pinned
-    let retry_match_pinned = Bindings.pcre2_match_pinned
     let capture = Bindings.pcre2_capture
     let capture_pinned = Bindings.pcre2_capture_pinned
-    let retry_capture_pinned = Bindings.pcre2_capture_pinned
     let capture_groups = Bindings.get_capture_groups
     let is_utf = Bindings.regex_is_utf
     let crlf_is_newline = Bindings.regex_crlf_is_newline
@@ -812,11 +792,8 @@ module Jit = struct
         :: (options :> Options.Interp.match_option list))
     let match_ = Bindings.pcre2_jit_match
     let match_pinned = Bindings.pcre2_jit_match_pinned
-    (* JIT matching ignores ANCHORED, so use the interpreter for this retry. *)
-    let retry_match_pinned = Bindings.pcre2_match_pinned
     let capture = Bindings.pcre2_jit_capture
     let capture_pinned = Bindings.pcre2_jit_capture_pinned
-    let retry_capture_pinned = Bindings.pcre2_capture_pinned
     let capture_groups = Bindings.get_capture_groups
     let is_utf = Bindings.regex_is_utf
     let crlf_is_newline = Bindings.regex_crlf_is_newline

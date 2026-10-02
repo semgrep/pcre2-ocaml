@@ -477,10 +477,14 @@ static size_t subject_length_of(value subject /* : string or pinned_subject */, 
 static int do_match(bool use_jit, const pcre2_code *re, PCRE2_SPTR subject_ptr,
                     size_t subject_length, size_t offset, uint32_t options,
                     pcre2_match_data *match_data, pcre2_match_context *mcontext) {
-        return use_jit ? pcre2_jit_match(re, subject_ptr, subject_length, offset, options,
-                                         match_data, mcontext)
-                       : pcre2_match(re, subject_ptr, subject_length, offset, options, match_data,
-                                     mcontext);
+        // Direct JIT matching ignores PCRE2_ANCHORED. The interpreted API
+        // honors it, including on a pattern that has already been JIT-compiled.
+        if (use_jit && (options & PCRE2_ANCHORED) == 0) {
+                return pcre2_jit_match(re, subject_ptr, subject_length, offset, options,
+                                       match_data, mcontext);
+        }
+        return pcre2_match(re, subject_ptr, subject_length, offset, options, match_data,
+                           mcontext);
 }
 
 /// Runs `pcre2_match` (or `pcre2_jit_match` if `use_jit`), releasing the
