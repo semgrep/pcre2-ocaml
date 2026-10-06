@@ -473,6 +473,7 @@ module Options : sig
     type match_option =
       (* shared *)
       [ Jit.match_option
+      | `ANCHORED
       | `COPY_MATCHED_SUBJECT
       | `DISABLE_RECURSELOOP_CHECK
       | `NO_JIT
