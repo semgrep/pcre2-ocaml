@@ -514,6 +514,8 @@ end
 module type Matcher = Intf.Matcher
 (** Module type for matchers. *)
 
+(** Patterns are fully initialized before [compile] returns and may be shared
+    across domains. There is no in-place conversion to JIT. *)
 module Interp : sig
   include module type of Options.Interp
 
@@ -527,6 +529,12 @@ module Interp : sig
        and type match_error = match_error
 end
 
+(** [compile] initializes JIT before returning a shareable pattern. Compile
+    from the pattern string rather than converting an existing [Interp.t]:
+    in-place conversion would mutate a pattern that may already be shared.
+
+    Matching retries [JIT_STACKLIMIT] with the interpreter, using the same
+    offset, match options, and configured resource limits. *)
 module Jit : sig
   include module type of Options.Jit
 
@@ -539,15 +547,6 @@ module Jit : sig
        and type compile_error = compile_error
        and type match_option = Options.Jit.match_option
        and type match_error = match_error
-
-  val of_interp :
-    ?options:jit_only_compile_option list ->
-    ?mode:matching_mode ->
-    Interp.t ->
-    (t, compile_error) Result.t
-  (** [of_interp options mode re] is either [Ok jit_re], the JIT-enabled
-      version of the provided pattern, or [Error c], where [c] is the relevant
-      compilation error. *)
 end
 
 (** Version information *)

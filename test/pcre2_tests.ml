@@ -615,14 +615,13 @@ let assert_match_limit_hit result =
   assert_equal ~printer:result_printer ~msg:"low match limit is exceeded"
     (Error Pcre2.MATCHLIMIT) result
 
-(* The interpreter honours the depth limit; JIT ignores it and on this
-   catastrophic input instead hits its own stack limit or the default match
-   limit, or fails to match. Any of the latter is fine -- it must just not
-   spuriously succeed. *)
+(* JIT ignores the depth limit unless stack exhaustion triggers an interpreter
+   retry. This catastrophic input must not spuriously succeed under either
+   engine. *)
 let assert_depth_limit_hit ~jit result =
   match result with
   | Error Pcre2.DEPTHLIMIT when not jit -> ()
-  | (Error Pcre2.JIT_STACKLIMIT | Error Pcre2.MATCHLIMIT | Ok false) when jit ->
+  | (Error Pcre2.DEPTHLIMIT | Error Pcre2.MATCHLIMIT | Ok false) when jit ->
       ()
   | other ->
       assert_failure
@@ -693,6 +692,83 @@ let jit_limit_tests =
         ~printer:[%show: (Jit.range option, Pcre2.match_error) result]
         (Ok (Some Jit.{ start = 0; end_ = 3 }))
         (Jit.find re "aaa" |> Result.map (Option.map Jit.range_of_match)) );
+  ]
+
+(* A repeated capturing group exceeds PCRE2's default 32 KiB JIT stack on long
+   successful inputs, even though the interpreter fits within Semgrep-style
+   resource limits. Include a trailing 'c' to avoid the required-character
+   optimization rejecting the input before the stack is exercised. *)
+let jit_stack_subject = String.make 3_000 'a' ^ "c"
+
+let jit_stack_tests =
+  let options = [ `UTF; `MATCH_LIMIT 1_000_000; `DEPTH_LIMIT 10_000 ] in
+  let pattern = "(?<letter>a|b)*c" in
+  [
+    ( "stack_retry_match_and_capture" >:: fun _ ->
+      let re = compile_or_fail (Jit.compile ~options pattern) in
+      let subject = "ac " ^ jit_stack_subject in
+      assert_equal ~printer:result_printer (Ok true)
+        (Jit.is_match ~subject_offset:3 re subject);
+      (match Jit.find ~subject_offset:3 re subject with
+      | Ok (Some m) ->
+          assert_equal jit_stack_subject (Jit.substring_of_match m);
+          assert_equal 3 (Jit.range_of_match m).start
+      | _ -> assert_failure "JIT stack retry lost the match");
+      match Jit.captures ~subject_offset:3 re subject with
+      | Ok (Some c) ->
+          assert_equal (Some "a")
+            (Jit.named_match_of_captures c "letter"
+            |> Option.map Jit.substring_of_match)
+      | _ -> assert_failure "JIT stack retry lost the captures" );
+    ( "stack_retry_iteration" >:: fun _ ->
+      let re = compile_or_fail (Jit.compile ~options pattern) in
+      let subject = "ac " ^ jit_stack_subject ^ " ac" in
+      let expected = [ "ac"; jit_stack_subject; "ac" ] in
+      let found =
+        Jit.find_iter re subject |> List.of_seq
+        |> List.map (function
+          | Ok m -> Jit.substring_of_match m
+          | Error e -> assert_failure (show_match_error e))
+      in
+      assert_equal ~printer:[%show: string list] expected found;
+      let captured =
+        Jit.captures_iter re subject
+        |> List.of_seq
+        |> List.map (function
+          | Ok c ->
+              assert_equal (Some "a")
+                (Jit.named_match_of_captures c "letter"
+                |> Option.map Jit.substring_of_match);
+              Jit.match_of_captures c 0 |> Option.get |> Jit.substring_of_match
+          | Error e -> assert_failure (show_match_error e))
+      in
+      assert_equal ~printer:[%show: string list] expected captured );
+    ( "stack_retry_empty_matches" >:: fun _ ->
+      let re = compile_or_fail (Jit.compile ~options (pattern ^ "|")) in
+      let results =
+        Jit.find_iter re jit_stack_subject
+        |> List.of_seq
+        |> List.map (function
+          | Ok m -> Jit.substring_of_match m
+          | Error e -> assert_failure (show_match_error e))
+      in
+      assert_equal ~printer:[%show: string list] [ jit_stack_subject; "" ]
+        results );
+    ( "stack_retry_preserves_options" >:: fun _ ->
+      let re = compile_or_fail (Jit.compile ~options ("|" ^ pattern)) in
+      match Jit.find ~options:[ `NOTEMPTY_ATSTART ] re jit_stack_subject with
+      | Ok (Some m) ->
+          assert_equal jit_stack_subject (Jit.substring_of_match m)
+      | _ -> assert_failure "JIT stack retry lost NOTEMPTY_ATSTART" );
+    ( "stack_retry_honors_depth_limit" >:: fun _ ->
+      let re =
+        compile_or_fail
+          (Jit.compile
+             ~options:[ `DEPTH_LIMIT 10; `MATCH_LIMIT 1_000_000 ]
+             pattern)
+      in
+      assert_equal ~printer:result_printer (Error DEPTHLIMIT)
+        (Jit.is_match re jit_stack_subject) );
   ]
 
 let match_data_reuse _ =
@@ -832,7 +908,7 @@ let suite =
          "thread_reuse" >:: thread_reuse;
          "thread_exit_frees_match_data" >:: thread_exit_frees_match_data;
          "Interp" >::: Interp_Tests.tests @ interp_limit_tests;
-         "JIT" >::: Jit_Tests.tests @ jit_limit_tests;
+         "JIT" >::: Jit_Tests.tests @ jit_limit_tests @ jit_stack_tests;
        ]
 
 let _ = if not !Sys.interactive then run_test_tt_main suite else ()

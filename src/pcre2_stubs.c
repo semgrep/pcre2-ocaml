@@ -292,7 +292,8 @@ CAMLprim value get_version(void) /* -> int * int */ {
 ///     counts the limited quantity differently);
 ///   - depth_limit and heap_limit are honoured only by the interpreter and are
 ///     ignored when matching with JIT, which instead bounds its own stack and
-///     reports PCRE2_ERROR_JIT_STACKLIMIT.
+///     falls back to the interpreter on PCRE2_ERROR_JIT_STACKLIMIT. Depth and
+///     heap limits apply to that retry.
 ///
 /// @param[out] out The created context (set to NULL if none is needed).
 /// @return true on success; false only if a context was needed but could not
@@ -480,8 +481,15 @@ static int do_match(bool use_jit, const pcre2_code *re, PCRE2_SPTR subject_ptr,
         // Direct JIT matching ignores PCRE2_ANCHORED. The interpreted API
         // honors it, including on a pattern that has already been JIT-compiled.
         if (use_jit && (options & PCRE2_ANCHORED) == 0) {
-                return pcre2_jit_match(re, subject_ptr, subject_length, offset, options,
-                                       match_data, mcontext);
+                int ret = pcre2_jit_match(re, subject_ptr, subject_length, offset, options,
+                                          match_data, mcontext);
+                if (ret != PCRE2_ERROR_JIT_STACKLIMIT) {
+                        return ret;
+                }
+                // Retry this match, not the entire iterator: preserve the offset
+                // and options without replaying previously returned captures.
+                // NO_JIT is essential since re already has JIT code attached.
+                options |= PCRE2_NO_JIT;
         }
         return pcre2_match(re, subject_ptr, subject_length, offset, options, match_data,
                            mcontext);
@@ -696,13 +704,8 @@ CAMLprim value jit_compile_unboxed(
         // SAFETY: This allocation is immediately filled with well-formed
         // values prior to returning.
         result = caml_alloc_small(1, RESULT_OK_TAG);
-        // TODO: this seems bad, since in OCaml we could then have
-        // {x : interp regex} and {y : jit regex}, pointers to the same regex.
-        //
-        // This is maybe actually fine here, and mostly depends on if you can
-        // call pcre2_jit_compile multiple times on the same pcer2_code*
-        // safely. Since pcre2_match permits jit, and while {interp regex} is
-        // "really" interpreted OR JIT, {jit regex} is definitely JIT.
+        // Internal construction only: the caller must not publish ocaml_re
+        // before this mutation completes. No public in-place conversion exists.
         Field(result, 0) = ocaml_re;
         CAMLreturn(result);
 }

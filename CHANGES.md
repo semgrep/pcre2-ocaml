@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+* Remove the public in-place `Jit.of_interp` conversion and make the raw
+  bindings private. Use `Jit.compile` to initialize JIT before a pattern can be
+  shared across domains. Callers needing both engines must compile separately.
+* Retry JIT stack exhaustion with the interpreter, preserving the match offset,
+  options, and configured resource limits. Iterators retain earlier matches.
+
 * Reuse one PCRE2 match-data block per thread, growing it when a pattern needs
   more capture slots. This removes repeated allocation in matching and iterators
   while keeping compiled patterns shareable across domains. Nested matches use
@@ -13,7 +19,8 @@
   (guarding against catastrophic backtracking). The limits are bundled with the
   compiled pattern and apply to every subsequent match. Note that `` `DEPTH_LIMIT ``
   and `` `HEAP_LIMIT `` are ignored by JIT matching; only `` `MATCH_LIMIT ``
-  applies to JIT.
+  applies to JIT. Depth and heap limits apply when JIT stack exhaustion causes
+  a retry with the interpreter.
 * `config_match_limit` and `config_depth_limit` now report the linked library's
   actual defaults (previously the `-1` placeholder), and `config_heap_limit` was
   added.

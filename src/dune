@@ -1,5 +1,6 @@
 (library
  (public_name pcre2)
+ (private_modules bindings)
  (preprocess
   (pps ppx_inline_test ppx_deriving.show ppx_deriving.eq ppx_deriving.enum))
  (inline_tests)
