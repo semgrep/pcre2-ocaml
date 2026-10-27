@@ -69,7 +69,8 @@ module type Matcher = sig
       - [`DEPTH_LIMIT n] caps the depth of nested backtracking. Exceeding it
         yields [Error DEPTHLIMIT]. NOTE: it is honoured only by interpreted
         matching and is ignored by JIT, which bounds its own stack and instead
-        reports [Error JIT_STACKLIMIT].
+        retries with the interpreter on [JIT_STACKLIMIT]. The configured depth
+        and heap limits apply to that retry.
       - [`HEAP_LIMIT n] caps, in kibibytes, the heap used to record backtracking
         state. Exceeding it yields [Error HEAPLIMIT]. NOTE: like [`DEPTH_LIMIT],
         it is ignored by JIT matching.

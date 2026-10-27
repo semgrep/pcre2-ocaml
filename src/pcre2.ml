@@ -635,8 +635,7 @@ end
 
 (* Everything in [Matcher] except compilation, derived uniformly from the
    engine's matching entrypoints. Compilation isn't uniform across engines
-   (option types differ, and JIT can compile from an existing interpreted
-   regex), so each module provides its own. *)
+   (option types differ), so each module provides its own. *)
 module MakeMatcher (E : Engine) = struct
   type t = E.t
 
@@ -799,17 +798,6 @@ module Jit = struct
     let crlf_is_newline = Bindings.regex_crlf_is_newline
   end)
 
-  let of_interp ?(options : jit_only_compile_option list = [])
-      ?(mode : matching_mode = JIT_COMPLETE) (interp : Interp.t) :
-      (t, compile_error) Result.t =
-    let mode = int32_of_matching_mode mode in
-    let options = Int32.logor mode (bitvector_of_compile_options options) in
-    (* [pcre2_jit_compile] has no notion of an offset into the pattern, unlike
-       [pcre2_compile], so 0 is given here (see [compile_error]). *)
-    Bindings.pcre2_jit_compile interp options
-    |> Result.map_error (fun code ->
-           { code = compile_error_code_of_int code; offset = 0 })
-
   let compile ?(options : compile_option list = []) (pattern : string) :
       (t, compile_error) Result.t =
     let interp_options, jit_options =
@@ -820,12 +808,18 @@ module Jit = struct
           | _ -> .)
         options
     in
-    (* Any limits are interp compile options, so they travel with
-       [interp_options] and are bundled with the regex that [of_interp] reuses.
-       NOTE: depth and heap limits are ignored by JIT matching; only the match
-       limit applies. *)
+    (* Keep the intermediate regex private: JIT compilation mutates its native
+       pattern. Neither handle may escape until initialization is complete. *)
     let* interp = Interp.compile ~options:interp_options pattern in
-    of_interp ~options:jit_options ~mode:JIT_COMPLETE interp
+    let options =
+      Int32.logor
+        (int32_of_matching_mode JIT_COMPLETE)
+        (bitvector_of_compile_options jit_options)
+    in
+    (* JIT errors do not refer to an offset into the source pattern. *)
+    Bindings.pcre2_jit_compile interp options
+    |> Result.map_error (fun code ->
+        { code = compile_error_code_of_int code; offset = 0 })
   (* TODO: determine best way to support matching mode with uniform interface.
      Probably make options more abstract in the shared interface *)
 end
