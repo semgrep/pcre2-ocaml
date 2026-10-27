@@ -5,3 +5,5 @@ _build
 compile_commands.json
 .cache
 .direnv
+
+.DS_Store
